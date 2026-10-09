@@ -1,0 +1,18 @@
+import { chromium } from 'playwright';
+const shots = '/tmp/claude-0/-home-user-vertical-bot-ros/25e24200-66a7-5233-b5cf-23e3c701b805/scratchpad/shots';
+const browser = await chromium.launch({ executablePath: '/opt/pw-browsers/chromium-1194/chrome-linux/chrome', args: ['--use-gl=swiftshader', '--enable-unsafe-swiftshader', '--ignore-gpu-blocklist'] });
+const ctx = await browser.newContext({ viewport: { width: 1500, height: 900 } });
+await ctx.addInitScript(() => { try { localStorage.setItem('vbs.lang', 'ru'); } catch {} });
+const page = await ctx.newPage();
+const errors = [];
+page.on('pageerror', (e) => errors.push(e.message));
+await page.goto('http://127.0.0.1:4173/?demo=greenhouse&server=off', { waitUntil: 'load' });
+await page.waitForTimeout(1200);
+await page.click('text=Агро');
+await page.waitForTimeout(200);
+await page.screenshot({ path: `${shots}/ru.png` });
+await page.keyboard.press('Escape');
+await page.click('text=Robot >> nth=0').catch(() => {});
+console.log('menu text:', (await page.textContent('.menubar')).replace(/\s+/g, ' '));
+console.log('ERRORS:', errors.length ? errors.join('\n') : 'none');
+await browser.close();

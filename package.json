@@ -1,0 +1,42 @@
+{
+  "name": "verticalbot-studio",
+  "version": "0.1.0",
+  "description": "Browser-native robot simulation & offline programming studio (RoboDK / Visual Components class) for industrial, mobile and agricultural robotics",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit -p tsconfig.json && vite build",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "server": "npm run build:server && node dist-server/index.js",
+    "build:server": "vite build -c vite.server.config.ts",
+    "smoke": "node scripts/smoke.mjs",
+    "scenarios": "SCENARIO_REPORT=1 vitest run tests/scenarios.test.ts",
+    "test:coverage": "vitest run --coverage --reporter=default --reporter=json --outputFile.json=coverage/unit-results.json",
+    "test:e2e": "vitest run -c vitest.e2e.config.ts",
+    "test:all": "npm run build && npm run test:coverage && npm run test:e2e && npm run scenarios && node scripts/test-report.mjs",
+    "test:report": "node scripts/test-report.mjs"
+  },
+  "dependencies": {
+    "mqtt": "^5.15.2",
+    "occt-import-js": "^0.0.23",
+    "onnxruntime-web": "^1.30.0",
+    "three": "^0.186.0",
+    "ws": "^8.21.3"
+  },
+  "devDependencies": {
+    "@types/node": "*",
+    "@types/three": "^0.186.0",
+    "@types/ws": "*",
+    "@vitest/coverage-v8": "^5.0.1",
+    "aedes": "^0.51.3",
+    "jsdom": "*",
+    "playwright": "^1.63.0",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.0",
+    "vitest": "^5.0.1"
+  }
+}

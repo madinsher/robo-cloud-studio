@@ -1,0 +1,8 @@
+node_modules
+dist
+*.log
+.vite
+dist-server
+__pycache__/
+coverage/
+test-results/
