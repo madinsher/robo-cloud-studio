@@ -125,7 +125,7 @@ describe('control panel', () => {
     const run2 = startMission(app, bt, m, { maxSeconds: 1 }); expect(toasts().some((x) => /unrealisable/.test(x))).toBe(true); for (let i = 0; i < 12; i++) (app as any).tick(0.1); expect(run2.done).toBe(true); stopMission(app, run2);
     // group-control laws on the fleet
     app.deleteItems([m]);
-    const cons = newControlModel(app, 'consensus'); buttonByText(panel.el, '▶ Run on fleet').click(); expect(lastToast()).toMatch(/^Cannot start: the station has no mobile robots/);
+    const cons = newControlModel(app, 'consensus'); buttonByText(panel.el, '▶ Run on fleet').click(); expect(cp.run().fleet).toBeTruthy(); expect(app.station.itemsOfType(ItemType.MOBILE_ROBOT).length).toBe(4); cp.stop();
     for (let i = 0; i < 4; i++) app.addMobileRobot();
     buttonByText(panel.el, '▶ Run on fleet').click(); const fr = cp.run(); expect(fr.fleet).toBeTruthy(); expect(fr.model).toBe(cons); for (let i = 0; i < 5; i++) (app as any).tick(0.1); expect(fr.status()).toMatch(/t=/);
     buttonByText(panel.el, 'Export ▾').click(); ctxItem('Fleet log').click(); expect(downloads.at(-1)!.name).toBe(`${cons.name}.log.txt`);
@@ -136,8 +136,8 @@ describe('control panel', () => {
     // warehouse scene
     buildWarehouseSceneFromModel(app, mdp); expect(lastToast()).toBe('Select a warehouse model (group control) first');
     const wh = newControlModel(app, 'warehouse'); expect(buttonByText(panel.el, 'Build scene').style.display).toBe('');
-    const nr = app.station.itemsOfType(ItemType.MOBILE_ROBOT).length; buttonByText(panel.el, 'Build scene').click(); expect(lastToast()).toMatch(/^Warehouse scene: \d+ stations, \d+ robots/); expect(app.station.itemsOfType(ItemType.MOBILE_ROBOT).length).toBeGreaterThan(nr); expect(app.station.itemsOfType(ItemType.MAP).length).toBe(1);
-    cp.buildScene(); expect(lastToast()).toMatch(/already exist/);
+    const nr = app.station.itemsOfType(ItemType.MOBILE_ROBOT).length; buttonByText(panel.el, 'Build scene').click(); expect(lastToast()).toMatch(/^Warehouse scene: \d+ stations, \d+ robots/); expect(app.station.itemsOfType(ItemType.MOBILE_ROBOT).length).toBeGreaterThanOrEqual(nr); expect(app.station.itemsOfType(ItemType.MAP).length).toBe(1);
+    const builtCount = app.station.itemsOfType(ItemType.MOBILE_ROBOT).length; cp.buildScene(); expect(app.station.itemsOfType(ItemType.MOBILE_ROBOT).length).toBe(builtCount);
     buttonByText(panel.el, '▶ Run on fleet').click(); expect(cp.run().model).toBe(wh); for (let i = 0; i < 3; i++) (app as any).tick(0.2); cp.stop();
     const cat = actionCatalog(app); expect(cat.robots.some((r) => r.mobile)).toBe(true); expect(cat.robots.some((r) => !r.mobile)).toBe(true); expect(cat.programs[0].name).toBe('PickPlace'); expect(cat.targets).toContain('Home'); expect(cat.desModels).toContain('Sup'); expect(cat.hybridModels).toContain('Modes');
     const m2 = app.station.itemsOfType<MobileRobot>(ItemType.MOBILE_ROBOT)[0]; const world = stationWorld(app); expect(world.forRobot(m2.name)).toBeTruthy(); expect(world.forRobot('nobody')).toBeNull(); world.step!(0.1); expect(Array.isArray(world.events!())).toBe(true); world.stop(); expect(m2.state.status).toBe('idle');

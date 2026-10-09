@@ -37,6 +37,11 @@ export class ProgramSimulator {
   playing = false;
   speedFactor = 1;
   private currentStep = -1;
+  private initialObjects = new Map<SceneObject, { pose: Mat4; visible: boolean }>();
+  private initialTools = new Map<Tool, { closed: boolean; attached: string[] }>();
+  private initialRobots = new Map<Robot, { joints: number[]; frame: string | null; tool: string | null }>();
+  private initialIO: Record<string, number | boolean> = {};
+  private initialSignals: Record<string, number | boolean | string> = {};
   io: Record<string, number | boolean> = {};
   signals: Record<string, number | boolean | string> = {};
   /** Object -> tool attachment (object id -> tool id) during simulation. */
@@ -44,7 +49,7 @@ export class ProgramSimulator {
   /** Joint state at program end for each robot. */
   private robotEndJoints = new Map<string, number[]>();
   /** Collision checking during compile (sampled along trajectories). */
-  collisionOptions: (CollisionOptions & { enabled: boolean; sampleStep?: number }) = { enabled: false, sampleStep: 0.1 };
+  collisionOptions: (CollisionOptions & { enabled: boolean; sampleStep?: number }) = { enabled: false, sampleStep: 0.02 };
   collisions: Array<{ instructionId: string; t: number; pairs: CollisionPair[] }> = [];
   /** End times of parallel threads (the total duration covers them). */
   private threadEnds: number[] = [];
@@ -53,8 +58,16 @@ export class ProgramSimulator {
 
   /** Compile a program into steps. Returns validation result. */
   compile(program: Program, startJoints?: Map<string, number[]>): ProgramRunResult {
+    this.playing = false;
     this.steps = [];
     this.attachments.clear();
+    this.initialObjects.clear(); this.initialTools.clear(); this.initialRobots.clear();
+    for (const item of this.station.walk()) {
+      if (item instanceof SceneObject && !(item instanceof Tool)) this.initialObjects.set(item, { pose: item.pose(), visible: item.visible });
+      if (item instanceof Tool) this.initialTools.set(item, { closed: item.closed, attached: [...item.attached] });
+      if (item instanceof Robot) this.initialRobots.set(item, { joints: startJoints?.get(item.id) ?? item.joints(), frame: item.activeFrameId, tool: item.activeToolId });
+    }
+    this.initialIO = { ...this.io }; this.initialSignals = { ...this.signals };
     this.threadEnds = [];
     const problems: ProgramRunResult['problems'] = [];
     const jointsOf = new Map<string, number[]>(startJoints ?? []);
@@ -129,7 +142,7 @@ export class ProgramSimulator {
                 problems.push({ instructionId: ins.id, message: `${target?.name ?? 'pose'} unreachable`, severity: 'error' });
                 break;
               }
-              traj = planMoveJ(robot, q0, q1, speed.speedJoints, speed.accelJoints);
+              traj = planMoveJ(robot, q0, q1, speed.speedJoints, speed.accelJoints, 0.02, tool);
             } else {
               const p1 = this.resolvePose(robot, target, d, frame, tool, q0);
               if (!p1) {
@@ -143,9 +156,9 @@ export class ProgramSimulator {
                   problems.push({ instructionId: ins.id, message: 'MoveC via point missing', severity: 'error' });
                   break;
                 }
-                traj = planMoveC(robot, q0, pVia, p1, speedL, speed.accelLinear);
+                traj = planMoveC(robot, q0, pVia, p1, speedL, speed.accelLinear, 0.02, tool);
               } else {
-                traj = planMoveL(robot, q0, p1, speedL, speed.accelLinear, 0.02, speed.speedJoints);
+                traj = planMoveL(robot, q0, p1, speedL, speed.accelLinear, 0.02, speed.speedJoints, tool);
               }
             }
             if (!traj.ok) problems.push({ instructionId: ins.id, message: traj.error ?? 'motion failed', severity: 'error' });
@@ -291,20 +304,22 @@ export class ProgramSimulator {
     for (const s of this.steps) if (s.robot && !saved.has(s.robot.id)) saved.set(s.robot.id, s.robot.joints());
     // Resting contacts present before any motion (robot on its pedestal, part in a fixture) are not collisions:
     // record them once as warnings and ignore those pairs along the trajectory.
-    const ignore: Array<[string, string]> = [...(this.collisionOptions.ignore ?? [])];
+    const initialContacts = new Map<string, number>();
+    const keyOf = (p: CollisionPair) => `${p.a.item.id}/${p.a.part}|${p.b.item.id}/${p.b.part}`;
     const reported = new Set<string>();
     for (const [id] of saved) {
       const robot = this.station.findById(id) as Robot | null;
       if (!robot) continue;
       for (const p of checkRobotCollisions(this.station, robot, this.collisionOptions)) {
-        const key = `${p.a.item.id}|${p.b.item.id}`;
+        if (p.a.item === p.b.item || (p.a.item instanceof Tool && p.a.item.parent === p.b.item) || (p.b.item instanceof Tool && p.b.item.parent === p.a.item)) continue;
+        const key = keyOf(p);
         if (reported.has(key)) continue;
         reported.add(key);
-        ignore.push([p.a.item.id, p.b.item.id]);
+        initialContacts.set(key, p.depth);
         problems.push({ instructionId: '', message: `Initial contact ignored: ${p.a.item.name} × ${p.b.item.name} (${p.depth.toFixed(0)} mm)`, severity: 'warning' });
       }
     }
-    const collOpts = { ...this.collisionOptions, ignore };
+    const collOpts = this.collisionOptions;
     for (const s of this.steps) {
       if (!s.robot || !s.trajectory || !s.trajectory.samples.length) continue;
       let lastT = -Infinity;
@@ -312,7 +327,7 @@ export class ProgramSimulator {
         if (sample.t - lastT < step && sample !== s.trajectory.samples[s.trajectory.samples.length - 1]) continue;
         lastT = sample.t;
         s.robot.setJoints(sample.joints);
-        const pairs = checkRobotCollisions(this.station, s.robot, collOpts);
+        const pairs = checkRobotCollisions(this.station, s.robot, collOpts).filter((p) => p.depth > (initialContacts.get(keyOf(p)) ?? -Infinity) + 0.5);
         if (pairs.length) {
           this.collisions.push({ instructionId: s.instruction.id, t: s.t0 + sample.t, pairs });
           const p = pairs[0];
@@ -395,6 +410,7 @@ export class ProgramSimulator {
   /** Seek the simulation to absolute time t (applies robot joints and events up to t). */
   seek(t: number): void {
     t = Math.max(0, Math.min(this.duration, t));
+    const rewinding = t < this.time;
     this.time = t;
     // apply discrete events of steps that start before t (re-run from scratch if going backwards)
     let stepIdx = -1;
@@ -403,32 +419,37 @@ export class ProgramSimulator {
       if (s.t0 <= t) stepIdx = i;
       else break;
     }
-    if (stepIdx < this.currentStep) {
+    if (rewinding || stepIdx < this.currentStep) {
       this.attachments.clear();
+      for (const [obj, state] of this.initialObjects) { obj.setPose(state.pose); obj.setVisible(state.visible); }
+      for (const [tool, state] of this.initialTools) { tool.closed = state.closed; tool.attached = [...state.attached]; }
+      for (const [robot, state] of this.initialRobots) { robot.setJoints(state.joints); robot.activeFrameId = state.frame; robot.activeToolId = state.tool; }
+      this.io = { ...this.initialIO }; this.signals = { ...this.initialSignals };
       this.currentStep = -1;
     }
+    const poseAt = (at: number, lastIndex: number) => {
+      const lastByRobot = new Map<string, Step>();
+      for (let i = 0; i <= lastIndex; i++) {
+        const s = this.steps[i];
+        if (s.robot && s.trajectory?.samples.length && s.t0 <= at) lastByRobot.set(s.robot.id, s);
+      }
+      for (const s of lastByRobot.values()) {
+        const tr = s.trajectory!;
+        const local = at - s.t0;
+        s.robot!.setJoints(sampleAt(tr, Math.min(local, tr.duration)).joints);
+        s.robot!.state.moving = local < tr.duration;
+        s.robot!.state.progress = tr.duration > 0 ? Math.min(1, local / tr.duration) : 1;
+      }
+      this.updateAttachments();
+    };
     for (let i = this.currentStep + 1; i <= stepIdx; i++) {
       const s = this.steps[i];
+      poseAt(s.t0, i - 1);
       s.apply?.();
       this.events.emit('instruction', { program: s.instruction.parent as Program, instruction: s.instruction, index: i });
     }
     this.currentStep = stepIdx;
-    // find the active trajectory for each robot
-    const lastByRobot = new Map<string, Step>();
-    for (let i = 0; i <= stepIdx; i++) {
-      const s = this.steps[i];
-      if (s.robot && s.trajectory) lastByRobot.set(s.robot.id, s);
-    }
-    for (const s of lastByRobot.values()) {
-      const tr = s.trajectory!;
-      if (!tr.samples.length) continue;
-      const local = t - s.t0;
-      const sample = sampleAt(tr, Math.min(local, tr.duration));
-      s.robot!.setJoints(sample.joints);
-      s.robot!.state.moving = local < tr.duration;
-      s.robot!.state.progress = tr.duration > 0 ? Math.min(1, local / tr.duration) : 1;
-    }
-    this.updateAttachments();
+    poseAt(t, stepIdx);
     this.events.emit('tick', { t });
   }
 
@@ -446,6 +467,7 @@ export class ProgramSimulator {
   }
 
   play(): void {
+    if (!this.result?.ok) { this.playing = false; return; }
     if (this.time >= this.duration) this.seek(0);
     this.playing = true;
   }

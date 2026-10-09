@@ -34,6 +34,8 @@ export interface ConveyorBehaviour extends BehaviourBase {
 export interface ProcessBehaviour extends BehaviourBase {
   type: 'process';
   cycleTime: number; // s
+  /** Height of the product support plane above the component origin (mm). */
+  productHeight?: number;
   capacity: number;
   next: string | null;
   /** Signal raised while processing. */
@@ -234,7 +236,7 @@ export class ProcessSimulator {
       product.setPoseAbs(multiply(holder.poseAbs(), transl(col * pitch[0], row * pitch[1], layer * pitch[2])));
     } else if (b.type === 'sink') {
       /* consumed below */
-    } else product.setPoseAbs(multiply(holder.poseAbs(), transl(0, 0, 0)));
+    } else product.setPoseAbs(multiply(holder.poseAbs(), transl(0, 0, b.type === 'process' ? b.productHeight ?? 0 : 0)));
   }
 
   step(dt: number): void {
@@ -402,10 +404,13 @@ function mulberry32(a: number) {
 }
 
 /** Factory helpers */
-export const makeConveyor = (name: string, length: number, speed = 300, width = 400): Component =>
-  Object.assign(new Component(name, { type: 'conveyor', enabled: true, path: [[0, 0, 0], [length, 0, 0]], speed, spacing: 300, next: null }), {
-    geometry: [{ primitive: { kind: 'box', size: [length, width, 80] }, origin: Array.from(transl(length / 2, 0, -40)), color: '#555c66' } as GeometryRef],
-  });
+export const makeConveyor = (name: string, length: number, speed = 300, width = 400, supportHeight = 0): Component => {
+  const geometry: GeometryRef[] = [{ primitive: { kind: 'box', size: [length, width, 80] }, origin: Array.from(transl(length / 2, 0, -40)), color: '#555c66' }];
+  if (supportHeight > 80) for (const x of [Math.min(150, length / 4), length - Math.min(150, length / 4)]) {
+    for (const y of [-width * 0.35, width * 0.35]) geometry.push({ primitive: { kind: 'box', size: [50, 50, supportHeight - 80] }, origin: Array.from(transl(x, y, -(supportHeight + 80) / 2)), color: '#343a40' });
+  }
+  return Object.assign(new Component(name, { type: 'conveyor', enabled: true, path: [[0, 0, 0], [length, 0, 0]], speed, spacing: 300, next: null }), { geometry });
+};
 export const makeFeeder = (name: string, interval: number, product: FeederBehaviour['productTemplate']): Component =>
   new Component(name, { type: 'feeder', enabled: true, interval, productTemplate: product, limit: -1, next: null, created: 0 });
 export const makeProcess = (name: string, cycleTime: number, capacity = 1): Component =>
