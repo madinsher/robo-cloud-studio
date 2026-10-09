@@ -113,7 +113,7 @@ describe('studio in the browser', () => {
     await page.waitForTimeout(400);
     expect(await ev(() => (window as any).app.activeRobot?.name ?? null)).toMatch(/KR ?6/);
     await menu('Program', 'New program');
-    await ev(() => { const app = (window as any).app; app.activeRobot.setJoints([20, -80, 100, 15, 60, 10]); }); // a non-singular start (the library home of a 6R arm has an aligned wrist)
+    await ev(() => { const app = (window as any).app; app.activeRobot.setJoints([20, -30, 30, 15, 60, 10]); }); // a collision-free, non-singular start (the library home has an aligned wrist)
     await menu('Program', 'Teach MoveJ');
     await ev(() => { const app = (window as any).app; const r = app.activeRobot; r.setJoints(r.joints().map((j: number, i: number) => j + (i === 0 ? 30 : 0))); });
     await menu('Program', 'Teach MoveL');
