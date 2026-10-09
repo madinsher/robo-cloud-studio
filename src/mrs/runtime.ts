@@ -55,7 +55,7 @@ export class FleetRuntime {
     this.say(`fleet run "${this.driver.name}" on ${this.driver.robots.map((r) => r.name).join(', ')}`);
   }
   get robots(): MobileRobot[] { return this.driver.robots; }
-  tick(dt: number): void { if (this.done) return; this.beforeTick(dt); this.driver.tick(dt); this.time += dt; this.ticks++; if (this.driver.done() || this.time >= this.maxSeconds) { this.done = true; this.say(`finished after ${this.time.toFixed(1)} s: ${this.driver.status()}`); } }
+  tick(dt: number): void { if (this.done) return; this.beforeTick(dt); this.driver.tick(dt); this.time += dt; this.ticks++; if (this.driver.done() || this.time >= this.maxSeconds) { this.done = true; for (const r of this.driver.robots) { r.state.v = 0; r.state.status = 'idle'; } this.say(`finished after ${this.time.toFixed(1)} s: ${this.driver.status()}`); } }
   status(): string { return `${this.done ? '⏹' : '▶'} ${this.driver.name}: t=${this.time.toFixed(1)} s · ${this.driver.status()}`; }
   stop(): void { this.done = true; for (const r of this.driver.robots) { r.state.v = 0; r.state.status = 'idle'; } }
 }
@@ -173,6 +173,6 @@ export function buildWarehouseScene(station: Station, cfg: FleetConfig, kinds: R
   const map = new MapItem('Warehouse map'); const w = wh.cols * cellMm, h = wh.rows * cellMm; map.resize(Math.ceil(w / res) + 2, Math.ceil(h / res) + 2, res, -cellMm / 2 - res, -h + cellMm / 2 - res); station.addChild(map);
   wh.grid.forEach((row, r) => row.forEach((b, c) => { if (b) map.fillRect((c - 0.5) * cellMm, (-r - 0.5) * cellMm, (c + 0.5) * cellMm, (-r + 0.5) * cellMm); }));
   const zones: ZoneItem[] = []; for (const [name, c] of Object.entries(wh.stations)) { const z = station.addChild(new ZoneItem(name)); const [x, y] = wh.cellXY(c); const half = cellMm * 0.45; z.polygon = [[x * 1000 - half, y * 1000 - half], [x * 1000 + half, y * 1000 - half], [x * 1000 + half, y * 1000 + half], [x * 1000 - half, y * 1000 + half]]; z.kind = kinds[name] === 'home' ? 'parking' : kinds[name] === 'pickup' ? 'loading' : kinds[name] === 'drop' ? 'unloading' : 'work'; zones.push(z); }
-  const robots = cfg.robots.names.map((name, i) => { const r = station.addChild(new MobileRobot(name)); const [x, y] = wh.stationXY(cfg.robots.homes[i % cfg.robots.homes.length]); r.setPose2D(x * 1000, y * 1000, 0); r.kin.maxSpeed = cfg.robots.speed * 1000; r.kin.footprint = [cellMm * 0.7, cellMm * 0.6, 500]; r.home = { x: x * 1000, y: y * 1000, theta: 0 }; return r; });
+  const robots = cfg.robots.names.map((name, i) => { const r = station.find(name, ItemType.MOBILE_ROBOT) as MobileRobot | null ?? station.addChild(new MobileRobot(name)); const [x, y] = wh.stationXY(cfg.robots.homes[i % cfg.robots.homes.length]); r.setPose2D(x * 1000, y * 1000, 0); r.kin.maxSpeed = cfg.robots.speed * 1000; r.kin.footprint = [cellMm * 0.7, cellMm * 0.6, 500]; r.home = { x: x * 1000, y: y * 1000, theta: 0 }; return r; });
   return { map, zones, robots };
 }

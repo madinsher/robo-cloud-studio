@@ -13,7 +13,8 @@ import { FleetItem } from '../fleet/fleet';
 import { ControlModelItem, controlModels, addControlModel, CONTROL_KINDS, ControlKind, GROUP_LABELS } from '../ctl/model';
 import { isMrsKind, MrsKind } from '../mrs/model';
 import { MRS_EXAMPLES, MRS_PARTS } from '../mrs/examples';
-import { FleetRuntime, RUNNABLE_KINDS, buildWarehouseScene } from '../mrs/runtime';
+import { buildGroupScene } from '../mrs/scene';
+import { FleetRuntime, RUNNABLE_KINDS } from '../mrs/runtime';
 import { parseWarehouse } from '../mrs/dsl';
 import { renderPlot } from './plots';
 import { TEMPLATES, parseBt, parseDes, parsePetri, parseHybrid, detectKind } from '../ctl/dsl';
@@ -97,14 +98,26 @@ export async function groupExamplesDialog(app: App): Promise<void> {
   const list = r.id === '*' ? MRS_EXAMPLES : r.id.startsWith('part:') ? MRS_EXAMPLES.filter((e) => e.part === r.id.slice(5)) : MRS_EXAMPLES.filter((e) => e.id === r.id);
   let last: ControlModelItem | null = null;
   app.cmd(() => { for (const e of list) last = addControlModel(app.station, e.kind, e.name, e.source); });
+  if (last && list.length === 1 && RUNNABLE_KINDS.includes(list[0].kind)) buildGroupSceneFromModel(app, last);
   if (last) { app.select(last); openControl(app, last); }
   toast(`${list.length} model(s) added`, 'ok');
 }
 
-/** Build the station scene (map, station zones, robots at their homes) of a warehouse model. */
+/** Build or extend the scene of any runnable group-control model. */
+export function buildGroupSceneFromModel(app: App, m: ControlModelItem): void {
+  if (!isMrsKind(m.kind) || !RUNNABLE_KINDS.includes(m.kind)) return toast('Select a runnable group model first', 'warn');
+  try {
+    const robots = app.cmd(() => buildGroupScene(app.station, m.kind as MrsKind, m.source));
+    app.select(robots[0] ?? null); app.renderer?.fitAll();
+    app.log(`[fleet] scene of "${m.name}": ${robots.length} robots`);
+    toast(m.kind === 'warehouse' ? `Warehouse scene: ${app.station.itemsOfType(ItemType.ZONE).length} stations, ${robots.length} robots` : `Group scene: ${robots.length} robots`, 'ok');
+  } catch (e) { toast(`Cannot build the scene: ${(e as Error).message}`, 'error', 6000); }
+}
+
+/** Legacy menu entry restricted to warehouses. The Control tab builds every runnable kind. */
 export function buildWarehouseSceneFromModel(app: App, m: ControlModelItem): void {
   if (m.kind !== 'warehouse') return toast('Select a warehouse model (group control) first', 'warn');
-  try { const d = parseWarehouse(m.source); const existing = app.station.itemsOfType<MobileRobot>(ItemType.MOBILE_ROBOT).filter((r) => d.cfg.robots.names.includes(r.name)); if (existing.length) return toast(`Robots ${existing.map((r) => r.name).join(', ')} already exist — remove them or rename the fleet`, 'warn'); const built = app.cmd(() => buildWarehouseScene(app.station, d.cfg, d.stationKinds)); app.select(built.robots[0]); toast(`Warehouse scene: ${built.zones.length} stations, ${built.robots.length} robots`, 'ok'); app.log(`[fleet] built the scene of "${m.name}": map ${d.cfg.warehouse.map.split('\n').length} rows, stations ${Object.keys(d.cfg.warehouse.stations).join(' ')}`); } catch (e) { toast(`Cannot build the scene: ${(e as Error).message}`, 'error', 6000); }
+  buildGroupSceneFromModel(app, m);
 }
 
 export function analyseAll(app: App): void {
@@ -328,6 +341,7 @@ export interface ActiveRun { model: ControlModelItem; hook: (dt: number) => void
 export function startFleetRun(app: App, model: ControlModelItem, opts: { maxSeconds?: number } = {}): ActiveRun {
   if (!isMrsKind(model.kind)) throw new Error('not a group-control model');
   if (!RUNNABLE_KINDS.includes(model.kind)) throw new Error(`${kindLabel(model.kind)} is analysed, not executed; runnable kinds: ${RUNNABLE_KINDS.join(', ')}`);
+  if (!app.station.itemsOfType(ItemType.MOBILE_ROBOT).length) app.cmd(() => buildGroupScene(app.station, model.kind as MrsKind, model.source));
   const robots = app.station.itemsOfType<MobileRobot>(ItemType.MOBILE_ROBOT);
   const log = (m: string) => app.log(`[fleet ${model.name}] ${m}`, /FAULT|DOUBLE|CONFLICT|failed|only \d+ of/.test(m) ? 'warn' : 'info');
   // environment for the mode automaton / supervisor of a mission: the human position (an item named "Human", as in the mission runtime) and the e-stop flag
@@ -437,15 +451,15 @@ export function buildControlPanel(app: App): { el: HTMLElement; render: () => vo
   ]);
   const grpBtn = drop(h('button', { class: 'btn small', title: t('Course examples of the group-control module: practicum ПР1–ПР6, the warehouse homework and the chapter examples') }, t('Group examples') + ' ▾'), () => [
     { label: t('Add all group examples'), action: () => { app.cmd(() => { for (const e of MRS_EXAMPLES) addControlModel(app.station, e.kind, e.name, e.source); }); render(); toast(`${MRS_EXAMPLES.length} models added`, 'ok'); } },
-    ...MRS_PARTS.flatMap((part) => [{ separator: true }, { label: part, disabled: true }, ...MRS_EXAMPLES.filter((e) => e.part === part).map((e) => ({ label: e.name, action: () => { const m = app.cmd(() => addControlModel(app.station, e.kind, e.name, e.source)); open(m); doAnalyse(); } }))]),
+    ...MRS_PARTS.flatMap((part) => [{ separator: true }, { label: part, disabled: true }, ...MRS_EXAMPLES.filter((e) => e.part === part).map((e) => ({ label: e.name, action: () => { const m = app.cmd(() => addControlModel(app.station, e.kind, e.name, e.source)); if (RUNNABLE_KINDS.includes(e.kind)) buildGroupSceneFromModel(app, m); open(m); doAnalyse(); } }))]),
   ]);
-  const sceneBtn = h('button', { class: 'btn small', title: t('Build the map, the station zones and the robots of the selected warehouse model'), onClick: () => { if (selected) buildWarehouseSceneFromModel(app, selected); renderRobots(); } }, t('Build scene'));
+  const sceneBtn = h('button', { class: 'btn small', title: t('Build the robots and scene of the selected group model'), onClick: () => { if (selected) buildGroupSceneFromModel(app, selected); renderRobots(); } }, t('Build scene'));
   const delBtn = h('button', { class: 'btn small', onClick: () => { if (!selected) return; const m = selected; app.deleteItems([m]); selected = null; render(); } }, t('Delete'));
   const analyseBtn = h('button', { class: 'btn primary', onClick: () => doAnalyse() }, t('Analyse'));
   const allBtn = h('button', { class: 'btn', onClick: () => analyseAll(app) }, t('Analyse all'));
   const detectBtn = h('button', { class: 'btn small', title: 'Detect the kind from the first line of the document', onClick: () => { const k = detectKind(editor.value); if (k && selected) { app.cmd(() => { selected!.kind = k; selected!.notify('kind'); }); kindSel.value = k; toast(`Kind: ${kindLabel(k)}`, 'info'); } else toast('Unknown document kind', 'warn'); } }, t('Detect kind'));
   const runBtn = h('button', { class: 'btn primary', onClick: () => doRun() }, '▶ ' + t('Run mission'));
-  const runLabel = () => { runBtn.textContent = '▶ ' + t(selected && isMrsKind(selected.kind) ? 'Run on fleet' : selected && (selected.kind === 'des' || selected.kind === 'petri') ? 'Run on station' : 'Run mission'); sceneBtn.style.display = selected?.kind === 'warehouse' ? '' : 'none'; };
+  const runLabel = () => { runBtn.textContent = '▶ ' + t(selected && isMrsKind(selected.kind) ? 'Run on fleet' : selected && (selected.kind === 'des' || selected.kind === 'petri') ? 'Run on station' : 'Run mission'); sceneBtn.style.display = selected && isMrsKind(selected.kind) && RUNNABLE_KINDS.includes(selected.kind) ? '' : 'none'; };
   const stopBtn = h('button', { class: 'btn', onClick: () => { if (run) { run.stop(); app.log('[control] run stopped'); } refreshStatus(); } }, '⏹ ' + t('Stop'));
   const exportBtn = drop(h('button', { class: 'btn' }, t('Export') + ' ▾'), () => {
     const m = selected; if (!m) return [{ label: t('No model selected'), disabled: true }];
@@ -553,6 +567,6 @@ export function buildControlPanel(app: App): { el: HTMLElement; render: () => vo
   };
   let shownDone = false;
   setInterval(() => { if (run && (!run.done || !shownDone) && el.offsetParent !== null) { refreshStatus(); shownDone = run.done; } }, 300);
-  (app as any).controlPanel = { render, open: (m: ControlModelItem) => { open(m); }, current: () => selected, run: () => run, start: doRun, stop: () => { if (run) run.stop(); refreshStatus(); }, analyse: doAnalyse, setView, graph, btGraph, undo: undoEdit, redo: redoEdit, history: () => (selected ? histOf(selected) : null), graphSvgs: () => [...report.querySelectorAll<SVGSVGElement>('svg.ctl-graph')].map(standaloneSvg), buildScene: () => { if (selected) buildWarehouseSceneFromModel(app, selected); renderRobots(); } };
+  (app as any).controlPanel = { render, open: (m: ControlModelItem) => { open(m); }, current: () => selected, run: () => run, start: doRun, stop: () => { if (run) run.stop(); refreshStatus(); }, analyse: doAnalyse, setView, graph, btGraph, undo: undoEdit, redo: redoEdit, history: () => (selected ? histOf(selected) : null), graphSvgs: () => [...report.querySelectorAll<SVGSVGElement>('svg.ctl-graph')].map(standaloneSvg), buildScene: () => { if (selected) buildGroupSceneFromModel(app, selected); renderRobots(); } };
   return { el, render, open: (m) => { open(m); } };
 }

@@ -26,16 +26,17 @@ function pickPlaceCell(): Station {
   table.setPose(mul(transl(700, -300, 0), rotz(0)));
   const tableObj = table.addChild(new SceneObject('Table top'));
   tableObj.geometry = [{ primitive: { kind: 'box', size: [800, 1200, 40] }, origin: Array.from(transl(200, 400, 480)), color: '#868e96' }, { primitive: { kind: 'box', size: [60, 60, 460] }, origin: Array.from(transl(-150, 0, 230)), color: '#495057' }, { primitive: { kind: 'box', size: [60, 60, 460] }, origin: Array.from(transl(550, 800, 230)), color: '#495057' }];
-  const conv = st.addChild(makeConveyor('Out conveyor', 3000, 250));
-  conv.setPose(mul(transl(-600, 900, 700), rotz(90 * DEG)));
+  const conv = st.addChild(makeConveyor('Out conveyor', 1800, 250, 400, 700));
+  conv.setPose(transl(-600, 650, 700));
   robot.setFrame(table);
   const prog = st.addChild(new Program('PickPlace'));
   prog.setRobot(robot);
   prog.setSpeed(600, 120);
   prog.setRounding(5);
   const home = table.addChild(new Target('Home'));
-  home.setJoints([0, -100, 110, -100, -90, 0]);
+  home.setJoints([0, -60, -110, -100, -90, 0]);
   home.setAsJointTarget();
+  robot.setJoints(home.joints!);
   prog.addMoveJ(home);
   const boxes: SceneObject[] = [];
   for (let i = 0; i < 3; i++) {
@@ -49,9 +50,9 @@ function pickPlaceCell(): Station {
     const pick = table.addChild(new Target(`Pick ${i + 1}`));
     pick.setPose(mul(transl(100 + i * 220, 150, 622), rotx(180 * DEG)));
     const placeAbove = table.addChild(new Target(`Place above ${i + 1}`));
-    placeAbove.setPose(mul(transl(-450, 700, 950), rotz(90 * DEG), rotx(180 * DEG)));
+    placeAbove.setPose(mul(transl(-450 + i * 220, 950, 1100), rotz(90 * DEG), rotx(180 * DEG)));
     const place = table.addChild(new Target(`Place ${i + 1}`));
-    place.setPose(mul(transl(-450, 700, 700 + 120 * 0 + 1), rotz(90 * DEG), rotx(180 * DEG)));
+    place.setPose(mul(transl(-450 + i * 220, 950, 823), rotz(90 * DEG), rotx(180 * DEG)));
     prog.addMoveJ(above);
     prog.addMoveL(pick);
     prog.event('attach', box.id);
@@ -73,12 +74,13 @@ function pickPlaceCell(): Station {
 function packingLine(): Station {
   const st = new Station('Packing line (process flow)');
   const feeder = st.addChild(makeFeeder('Crate feeder', 6, { name: 'Crate', geometry: { primitive: { kind: 'box', size: [400, 300, 250] }, origin: Array.from(transl(0, 0, 125)), color: '#d9a066' }, massKg: 12 }));
-  const c1 = st.addChild(makeConveyor('Infeed conveyor', 5000, 400));
+  const c1 = st.addChild(makeConveyor('Infeed conveyor', 5000, 400, 400, 800));
   c1.setPose(transl(-6000, 0, 800));
   const grader = st.addChild(makeProcess('Optical grader', 4, 1));
   grader.setPose(transl(-800, 0, 0));
+  (grader.behaviour as any).productHeight = 800;
   (grader.behaviour as any).mtbf = 600; (grader.behaviour as any).mttr = 40;
-  const c2 = st.addChild(makeConveyor('Transfer conveyor', 3000, 400));
+  const c2 = st.addChild(makeConveyor('Transfer conveyor', 3000, 400, 400, 800));
   c2.setPose(transl(-400, 0, 800));
   const buffer = st.addChild(makeBuffer('Pallet', 12, { cols: 3, rows: 2, layers: 2, pitch: [420, 320, 260] }));
   buffer.setPose(transl(3200, -900, 150));

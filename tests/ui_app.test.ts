@@ -242,9 +242,9 @@ describe('App', () => {
     const app = makeApp('pickplace');
     const st = app.station; const r = app.activeRobot!;
     const home = st.find('Home') as Target; const pick = st.find('Pick 1') as Target;
-    app.moveRobotTo(home); expect(r.joints().map((v) => Math.round(v))).toEqual([0, -100, 110, -100, -90, 0]);
-    app.moveRobotTo(pick); expect(r.joints()).not.toEqual([0, -100, 110, -100, -90, 0]);
-    app.moveRobotTo(home, true); expect(r.joints().map((v) => Math.round(v))).toEqual([0, -100, 110, -100, -90, 0]);
+    app.moveRobotTo(home); expect(r.joints().map((v) => Math.round(v))).toEqual([0, -60, -110, -100, -90, 0]);
+    app.moveRobotTo(pick); expect(r.joints()).not.toEqual([0, -60, -110, -100, -90, 0]);
+    app.moveRobotTo(home, true); expect(r.joints().map((v) => Math.round(v))).toEqual([0, -60, -110, -100, -90, 0]);
     const far = st.addChild(new Target('Far')); far.setPose(transl(50000, 0, 0));
     app.moveRobotTo(far); expect(app.logs.at(-1)!.text).toBe('Far is unreachable');
     app.setActiveRobot(null); app.moveRobotTo(home); // no robot: nothing happens

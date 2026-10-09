@@ -55,21 +55,21 @@ export function trapezoid(d: number, v: number, a: number): { duration: number; 
 }
 
 /** Joint-space (MoveJ) trajectory: synchronised trapezoidal profile on the slowest joint. */
-export function planMoveJ(robot: Robot, q0: number[], q1: number[], speedJoints: number, accelJoints: number, dt = 0.02): Trajectory {
+export function planMoveJ(robot: Robot, q0: number[], q1: number[], speedJoints: number, accelJoints: number, dt = 0.02, tool: Mat4 = robot.poseTool()): Trajectory {
   const n = q0.length;
   const dq = q1.map((v, i) => v - q0[i]);
   const dmax = Math.max(...dq.map(Math.abs));
   const prof = trapezoid(dmax, speedJoints, accelJoints);
   const samples: TrajectorySample[] = [];
   let length = 0;
-  let prevPos = getPos(robot.solveFK(q0));
+  let prevPos = getPos(robot.solveFK(q0, tool));
   const steps = Math.max(1, Math.ceil(prof.duration / dt));
   for (let k = 0; k <= steps; k++) {
     const t = (k / steps) * prof.duration;
     const f = dmax > 1e-9 ? prof.s(t) / dmax : 1;
     const q = new Array(n);
     for (let i = 0; i < n; i++) q[i] = q0[i] + dq[i] * f;
-    const pose = robot.solveFK(q);
+    const pose = robot.solveFK(q, tool);
     const p = getPos(pose);
     length += distance(p, prevPos);
     prevPos = p;
@@ -80,8 +80,8 @@ export function planMoveJ(robot: Robot, q0: number[], q1: number[], speedJoints:
 }
 
 /** Cartesian linear (MoveL) trajectory with IK at each sample. Poses are TCP relative to the robot base. */
-export function planMoveL(robot: Robot, q0: number[], p1: Mat4, speedLinear: number, accelLinear: number, dt = 0.02, speedJoints = 180): Trajectory {
-  const p0 = robot.solveFK(q0);
+export function planMoveL(robot: Robot, q0: number[], p1: Mat4, speedLinear: number, accelLinear: number, dt = 0.02, speedJoints = 180, tool: Mat4 = robot.poseTool()): Trajectory {
+  const p0 = robot.solveFK(q0, tool);
   const d = distance(getPos(p0), getPos(p1));
   const ang = rotationAngle(p0, p1);
   // duration bounded by linear speed and by a nominal rotational speed (deg/s) ~ speedJoints
@@ -98,7 +98,7 @@ export function planMoveL(robot: Robot, q0: number[], p1: Mat4, speedLinear: num
     // use the dominant profile normalised to [0,1]
     const f = profLin.duration >= profRot.duration ? (d > 1e-9 ? profLin.s((t / duration) * profLin.duration) / d : k / steps) : (ang > 1e-9 ? profRot.s((t / duration) * profRot.duration) / (ang * RAD) : k / steps);
     const pose = slerpPose(p0, p1, f);
-    const r = robot.solveIK(pose, { seed: q, restarts: 2, maxIterations: 100, keepFirstSolution: true });
+    const r = robot.solveIK(pose, { seed: q, restarts: 2, maxIterations: 100, keepFirstSolution: true }, tool);
     if (!r.ok) {
       const near = r.posError < 1 && r.rotError < 0.01;
       return { samples, duration, length, ok: false, error: near ? `MoveL crosses a singularity at ${(f * 100).toFixed(1)}% (residual ${r.posError.toFixed(2)} mm) — start from a non-singular configuration or use MoveJ` : `MoveL unreachable at ${(f * 100).toFixed(1)}% (pos err ${r.posError.toFixed(2)} mm)` };
@@ -116,14 +116,14 @@ export function planMoveL(robot: Robot, q0: number[], p1: Mat4, speedLinear: num
 }
 
 /** Circular (MoveC) trajectory through a via pose to a final pose. */
-export function planMoveC(robot: Robot, q0: number[], pVia: Mat4, p1: Mat4, speedLinear: number, accelLinear: number, dt = 0.02): Trajectory {
-  const p0 = robot.solveFK(q0);
+export function planMoveC(robot: Robot, q0: number[], pVia: Mat4, p1: Mat4, speedLinear: number, accelLinear: number, dt = 0.02, tool: Mat4 = robot.poseTool()): Trajectory {
+  const p0 = robot.solveFK(q0, tool);
   const A = getPos(p0), B = getPos(pVia), C = getPos(p1);
   // circumcircle of A,B,C
   const a = sub(A, C), b = sub(B, C);
   const axb = cross(a, b);
   const denom = 2 * dot(axb, axb);
-  if (denom < 1e-9) return planMoveL(robot, q0, p1, speedLinear, accelLinear, dt); // collinear
+  if (denom < 1e-9) return planMoveL(robot, q0, p1, speedLinear, accelLinear, dt, 180, tool); // collinear
   const term = scale(cross(sub(scale(b, dot(a, a)), scale(a, dot(b, b))), axb), 1 / denom);
   const center = add(C, term);
   const radius = norm(term);
@@ -155,7 +155,7 @@ export function planMoveC(robot: Robot, q0: number[], pVia: Mat4, p1: Mat4, spee
     const pos = add(center, add(scale(u, radius * Math.cos(th)), scale(v, radius * Math.sin(th))));
     const pose = slerpPose(p0, p1, f);
     pose[12] = pos[0]; pose[13] = pos[1]; pose[14] = pos[2];
-    const r = robot.solveIK(pose, { seed: q, restarts: 2, maxIterations: 100, keepFirstSolution: true });
+    const r = robot.solveIK(pose, { seed: q, restarts: 2, maxIterations: 100, keepFirstSolution: true }, tool);
     if (!r.ok) return { samples, duration, length, ok: false, error: `MoveC unreachable at ${(f * 100).toFixed(0)}%` };
     q = r.joints;
     length += distance(pos, prevPos);

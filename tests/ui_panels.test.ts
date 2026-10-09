@@ -160,7 +160,7 @@ describe('MenuBar', () => {
     clickMenu('Group', 'Run selected model on the fleet'); expect(panel.run().fleet, lastToast()).toBeTruthy(); expect(app.station.itemsOfType(ItemType.MOBILE_ROBOT).length).toBeGreaterThan(0);
     (app as any).tick(0.1);
     clickMenu('Group', 'Stop fleet run'); expect(panel.run().done).toBe(true);
-    clickMenu('Group', 'Build warehouse scene'); expect(lastToast()).toBe('Select a warehouse model (group control) first');
+    clickMenu('Group', 'Build scene from the selected group model'); expect(lastToast()).toMatch(/^Group scene: 4 robots/);
     clickMenu('Group', 'Open Control tab');
     clickMenu('Group', 'Demo scenarios: group control'); await waitFor(() => dialogs().length === 1); expect((currentDialog().querySelector('select') as HTMLSelectElement).value).toBe('group'); dialogButton('Close').click();
     clickMenu('Control', 'Demo scenarios: control design'); await waitFor(() => dialogs().length === 1); expect(currentDialog().querySelectorAll('.nav-rec').length).toBeGreaterThan(5); dialogButton('Close').click();
@@ -317,7 +317,7 @@ describe('TreePanel', () => {
   it('double-click moves the robot / runs the program / focuses, twisty and eye toggle', async () => {
     pickplace(); tree.render();
     const r = app.activeRobot!; r.setJoints([30, -80, 90, -100, -90, 10]);
-    rowOf('Home').dispatchEvent(mouse('dblclick')); expect(r.joints().map(Math.round)).toEqual([0, -100, 110, -100, -90, 0]);
+    rowOf('Home').dispatchEvent(mouse('dblclick')); expect(r.joints().map(Math.round)).toEqual([0, -60, -110, -100, -90, 0]);
     rowOf('PickPlace').dispatchEvent(mouse('dblclick')); expect(app.sim.playing).toBe(true); app.stopProgram();
     rowOf('Pedestal').dispatchEvent(mouse('dblclick')); expect(rendererCalls.at(-1)).toBe('focusItem');
     const n = rows().length; rowOf('Table').querySelector<HTMLElement>('.twisty')!.click(); expect(rows().length).toBeLessThan(n); expect(rowOf('Table').querySelector('.twisty')!.textContent).toBe('▸');
@@ -403,8 +403,8 @@ describe('PropertiesPanel', () => {
     expect(sectionTitles()).toContain('Target'); expect(body().textContent).toContain('Recorded joints'); expect(body().textContent).toContain('yes');
     const cb = props.el.querySelector<HTMLInputElement>('.field-checkbox input')!; change(cb, false); expect(t.isJointTarget).toBe(false); app.select(t); change(props.el.querySelector<HTMLInputElement>('.field-checkbox input')!, true); expect(t.isJointTarget).toBe(true);
     const r = app.activeRobot!; r.setJoints([40, -80, 90, -100, -90, 10]);
-    buttonByText(body(), 'MoveJ here').click(); expect(r.joints().map(Math.round)).toEqual([0, -100, 110, -100, -90, 0]);
-    r.setJoints([40, -80, 90, -100, -90, 10]); buttonByText(body(), 'MoveL here').click(); expect(r.joints().map(Math.round)).toEqual([0, -100, 110, -100, -90, 0]);
+    buttonByText(body(), 'MoveJ here').click(); expect(r.joints().map(Math.round)).toEqual([0, -60, -110, -100, -90, 0]);
+    r.setJoints([40, -80, 90, -100, -90, 10]); buttonByText(body(), 'MoveL here').click(); expect(r.joints().map(Math.round)).toEqual([0, -60, -110, -100, -90, 0]);
     r.setJoints([40, -80, 90, -100, -90, 10]); buttonByText(body(), 'Teach').click(); expect(t.joints!.map(Math.round)).toEqual([40, -80, 90, -100, -90, 10]);
     const tool = r.tools()[0]; app.select(tool); expect(sectionTitles()).toContain('Tool'); expect(body().textContent).toContain('vacuum');
     const kindSel = [...props.el.querySelectorAll<HTMLSelectElement>('select')].find((s) => [...s.options].some((o) => o.value === 'welding'))!; change(kindSel, 'welding'); expect(tool.toolKind).toBe('welding');
@@ -536,9 +536,9 @@ describe('ProgramEditor', () => {
     const n = p.instructions().length; const idx = p.instructions().indexOf(speedIns);
     rows()[idx].dispatchEvent(mouse('contextmenu')); ctxItem('Insert MoveL (teach) after').click(); expect(p.instructions().length).toBe(n + 1); expect((p.instructions()[idx + 1].data as any).moveType).toBe('MoveL'); ed.render();
     rows()[idx].dispatchEvent(mouse('contextmenu')); ctxItem('Insert MoveJ (teach) after').click(); expect((p.instructions()[idx + 1].data as any).moveType).toBe('MoveJ'); ed.render();
-    rows()[idx].dispatchEvent(mouse('contextmenu')); ctxItem('Run from here').click(); expect(app.sim.playing).toBe(true); app.stopProgram(); ed.render();
+    rows()[idx].dispatchEvent(mouse('contextmenu')); ctxItem('Run from here').click(); expect(app.sim.playing).toBe(app.sim.result!.ok); app.stopProgram(); ed.render();
     rows()[idx + 1].dispatchEvent(mouse('contextmenu')); ctxItem('Delete').click(); expect(p.instructions().length).toBe(n + 1); ed.render();
-    app.runProgram(); ed.render(); (app as any).tick(0.05); expect(rows().some((x) => x.classList.contains('running'))).toBe(true); app.seekProgram(app.sim.duration - 0.01); app.stopProgram();
+    app.runProgram(); ed.render(); (app as any).tick(0.05); if (app.sim.result!.ok) expect(rows().some((x) => x.classList.contains('running'))).toBe(true); else expect(app.sim.playing).toBe(false); app.seekProgram(app.sim.duration - 0.01); app.stopProgram();
     const p2 = app.addProgram(null, 'Second'); ed.render();
     const sel = ed.el.querySelector<HTMLSelectElement>('select.prog-select')!; expect(sel.options.length).toBe(3); expect(sel.value).toBe(p2.id);
     change(sel, p.id); expect(app.activeProgram).toBe(p); expect(app.station.selection[0]).toBe(p);

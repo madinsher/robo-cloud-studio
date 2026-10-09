@@ -118,7 +118,7 @@ export class MenuBar {
         { separator: true },
         { label: 'Run selected model on the fleet (consensus, swarm, coverage, safety, MAPF, warehouse)', action: () => { (app as any).bottom?.show?.('control'); (app as any).controlPanel?.start?.(); } },
         { label: 'Stop fleet run', action: () => { (app as any).controlPanel?.stop?.(); } },
-        { label: 'Build warehouse scene from the selected model', action: () => { (app as any).controlPanel?.buildScene?.(); } },
+        { label: 'Build scene from the selected group model', action: () => { (app as any).controlPanel?.buildScene?.(); } },
         { separator: true },
         { label: 'Demo scenarios: group control…', action: async () => { const { scenariosDialog } = await import('./scenarios_ui'); scenariosDialog(app, 'group'); } },
       ]],

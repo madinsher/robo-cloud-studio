@@ -272,3 +272,27 @@ agent B evacuate
 agent C continue lies A=continue B=evacuate` },
 ];
 export const MRS_PARTS = ['ПР1', 'ПР2', 'ПР3', 'ПР4', 'ПР5', 'ПР6', 'ДЗ', 'architectures', 'ch. 4', 'ch. 7', 'ch. 9', 'ch. 12', 'ch. 13', 'ch. 16'];
+
+/** Dependencies of the station architecture example. */
+export const FLEET_SUPERVISOR = `des Fleet supervisor
+automaton Mission
+  initial P0
+  marked P0 P1 P2 P3 P4 P5 P6 P7 P8 P9 P10
+  P0 -form_start-> P1
+  P1 -form_done-> P2
+  P2 -goto_start-> P3
+  P3 -goto_done-> P4
+  P4 -allocate_start-> P5
+  P5 -allocate_done-> P6
+  P6 -gather_start-> P7
+  P7 -gather_done-> P8
+  P8 -home_start-> P9
+  P9 -home_done-> P10
+uncontrollable form_done goto_done allocate_done gather_done home_done`;
+export const FLEET_MODES = `hybrid Fleet modes
+var dist_human=10 phase=0
+initial NORMAL
+mode NORMAL vmax=0.6
+mode SLOW vmax=0.1
+NORMAL -> SLOW when dist_human < 2 dwell=0.2
+SLOW -> NORMAL when dist_human > 3 dwell=0.2`;

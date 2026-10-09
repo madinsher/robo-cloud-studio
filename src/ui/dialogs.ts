@@ -325,7 +325,7 @@ export async function componentDialog(app: App): Promise<void> {
     const name = r.name || r.type;
     switch (r.type) {
       case 'feeder': c = makeFeeder(name, r.p1 || 5, { name: 'Crate', geometry: { primitive: { kind: 'box', size: [400, 300, 250] }, origin: Array.from(transl(0, 0, 125)), color: '#d9a066' }, massKg: 12 }); break;
-      case 'conveyor': c = makeConveyor(name, r.p1 || 3000, r.p2 || 400); break;
+      case 'conveyor': c = makeConveyor(name, r.p1 || 3000, r.p2 || 400, 400, 800); break;
       case 'process': c = makeProcess(name, r.p1 || 5); break;
       case 'buffer': c = makeBuffer(name, r.p1 || 12, { cols: 3, rows: 2, layers: 4, pitch: [420, 320, 260] }); break;
       default: c = makeSink(name);

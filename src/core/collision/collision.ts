@@ -38,6 +38,8 @@ export interface CollisionPair {
 
 export interface CollisionOptions {
   assets?: AssetStore;
+  /** Joint vector for robot-link queries without mutating the station. */
+  joints?: number[];
   /** Safety margin added to all shapes (mm). */
   margin?: number;
   /** Check triangle meshes exactly (slower). */
@@ -46,6 +48,8 @@ export interface CollisionOptions {
   ignore?: Array<[string, string]>;
   /** Restrict to items that are (or belong to) robots vs everything else. */
   robotsOnly?: boolean;
+  /** Check only links/tools belonging to the same robot. */
+  selfOnly?: boolean;
 }
 
 // ---- shape builders -------------------------------------------------------------
@@ -64,7 +68,7 @@ function obbFromBox(pose: Mat4, size: [number, number, number], localCenter: [nu
 export function collidersOf(item: Item, opts: CollisionOptions = {}): Collider[] {
   const out: Collider[] = [];
   if (item instanceof Robot) {
-    const fk = item.fk();
+    const fk = item.fk(opts.joints);
     const base = item.poseAbs();
     const chain = item.chain;
     const reach = Math.max(300, item.reach);
@@ -334,7 +338,22 @@ export function checkColliders(colliders: Collider[], opts: CollisionOptions = {
       const A = colliders[i], B = colliders[j];
       if (A.item === B.item) {
         // same robot: skip the same link and neighbours (approximate capsules overlap at the shoulder/wrist)
-        if (A.linkIndex !== undefined && B.linkIndex !== undefined && Math.abs(A.linkIndex - B.linkIndex) <= (A.approx || B.approx ? 3 : 2)) continue;
+        if (A.linkIndex !== undefined && B.linkIndex !== undefined) {
+          const lo = Math.min(A.linkIndex, B.linkIndex), hi = Math.max(A.linkIndex, B.linkIndex);
+          if (hi - lo <= 1) continue;
+          // Procedural hubs separated only by short wrist spacers are mechanically connected.
+          // Long intervening links must still be tested, even when their indices differ by two.
+          if ((A.approx || B.approx) && A.item instanceof Robot) {
+            let gap = 0;
+            for (let k = lo; k < hi - 1; k++) {
+              const j = A.item.chain.joints[k], next = A.item.chain.joints[k + 1];
+              if (j?.post) gap += Math.hypot(j.post[12], j.post[13], j.post[14]);
+              if (next) gap += Math.hypot(next.origin[12], next.origin[13], next.origin[14]);
+            }
+            const radius = (c: Collider) => c.shape.kind === 'capsule' ? c.shape.r : 0;
+            if (gap <= radius(A) + radius(B)) continue;
+          }
+        }
         if (A.linkIndex === undefined || B.linkIndex === undefined) continue;
       }
       // tool vs its robot's last links; object attached to tool vs tool
@@ -344,6 +363,7 @@ export function checkColliders(colliders: Collider[], opts: CollisionOptions = {
       if (B.item instanceof Tool && B.item.attached.includes(A.item.id)) continue;
       // robot base link vs the item it is mounted on (mobile platform / pedestal parent)
       if ((A.linkIndex === 0 && A.item.parent === B.item) || (B.linkIndex === 0 && B.item.parent === A.item)) continue;
+      if (opts.selfOnly && (rootOf(A.item) !== rootOf(B.item) || !(rootOf(A.item) instanceof Robot))) continue;
       if (opts.robotsOnly && !(rootOf(A.item) instanceof Robot) && !(rootOf(B.item) instanceof Robot)) continue;
       if (ignore.has(`${A.item.id}|${B.item.id}`) || ignore.has(`${B.item.id}|${A.item.id}`)) continue;
       let d = shapeDistance(A.shape, B.shape) + margin;
@@ -361,7 +381,7 @@ export function checkColliders(colliders: Collider[], opts: CollisionOptions = {
 export function checkRobotCollisions(station: Station, robot: Robot, opts: CollisionOptions = {}): CollisionPair[] {
   const mine = new Set<Item>([...robot.walk()]);
   const colliders: Collider[] = [];
-  for (const it of station.walk()) {
+  for (const it of opts.selfOnly ? robot.walk() : station.walk()) {
     if (it === station || !it.visible) continue;
     if (it.type === ItemType.FIELD || it.type === ItemType.CROP_ROW || it.type === ItemType.MAP || it.type === ItemType.ZONE) continue;
     colliders.push(...collidersOf(it, opts));

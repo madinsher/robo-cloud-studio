@@ -113,6 +113,9 @@ export class App {
       const i = this.stations.indexOf(this.station);
       if (i >= 0) this.stations[i] = st; else this.stations.push(st);
     }
+    this.worldHooks.length = 0;
+    this.worldRunning = false;
+    this.worldTime = 0;
     this.station = st;
     st.events.on('selection', ({ items }) => this.onStationEvent?.('selection', items[0]?.id));
     st.events.on('changed', ({ item, what }) => { if (what === 'pose') this.onStationEvent?.('moved', item.id); else if (what === 'joints') this.onStationEvent?.('robotMoved', item.id); else if (what === 'name') this.onStationEvent?.('renamed', item.id); else if (what === 'visible') this.onStationEvent?.('visibility', item.id); });
@@ -170,6 +173,9 @@ export class App {
     const progId = this.activeProgram?.id, robId = this.activeRobot?.id;
     const i = this.stations.indexOf(this.station);
     if (i >= 0) this.stations[i] = st; else this.stations.push(st);
+    this.worldHooks.length = 0;
+    this.worldRunning = false;
+    this.worldTime = 0;
     this.station = st;
     this.sim = new ProgramSimulator(st);
     this.processSim = new ProcessSimulator(st);
@@ -327,7 +333,7 @@ export class App {
     const robot = p.robot();
     if (!(robot instanceof Robot)) { this.renderer?.showTrajectoryPreview(null, []); return; }
     const q0 = robot.joints();
-    this.sim.collisionOptions = { enabled: this.checkCollisions, assets: this.assets, sampleStep: 0.1 };
+    this.sim.collisionOptions = { enabled: true, selfOnly: !this.checkCollisions, assets: this.assets, sampleStep: 0.02 };
     const res = this.sim.compile(p);
     this.renderer?.setCollisionHighlight(this.sim.collisions.flatMap((c) => c.pairs.flatMap((pr) => [pr.a.item.id, pr.b.item.id])));
     const trajs = this.sim.steps.filter((s) => s.trajectory).map((s) => s.trajectory as Trajectory);
@@ -339,10 +345,14 @@ export class App {
 
   runProgram(p: Program | null = this.activeProgram): void {
     if (!p) return this.log('No program selected', 'warn');
-    this.sim.collisionOptions = { enabled: this.checkCollisions, assets: this.assets, sampleStep: 0.1 };
+    this.sim.collisionOptions = { enabled: true, selfOnly: !this.checkCollisions, assets: this.assets, sampleStep: 0.02 };
     const res = this.sim.compile(p);
     this.renderer?.setCollisionHighlight(this.sim.collisions.flatMap((c) => c.pairs.flatMap((pr) => [pr.a.item.id, pr.b.item.id])));
     for (const pr of res.problems) this.log(`${p.name}: ${pr.message}`, pr.severity === 'error' ? 'error' : 'warn');
+    if (!res.ok) {
+      this.events.emit('simulation', { playing: false, time: 0, duration: this.sim.duration });
+      return;
+    }
     this.sim.speedFactor = this.simSpeed;
     this.sim.play();
     this.events.emit('simulation', { playing: true, time: 0, duration: this.sim.duration });
@@ -385,6 +395,7 @@ export class App {
   resetWorld(): void {
     this.worldRunning = false;
     this.worldTime = 0;
+    this.worldHooks.length = 0;
     this.processSim.reset();
     for (const f of this.station.itemsOfType<FleetItem>(ItemType.FLEET)) { f.tasks = []; this.fleets.delete(f.id); }
     for (const m of this.station.itemsOfType<MobileRobot>(ItemType.MOBILE_ROBOT)) { m.state.path = null; m.state.taskId = null; m.state.status = 'idle'; m.state.v = 0; if (m.home) m.setPose2D(m.home.x, m.home.y, m.home.theta); }

@@ -53,7 +53,8 @@ describe('program simulation', () => {
     expect(res.distance).toBeGreaterThan(100);
     const boxBefore = getPos(box.poseAbs());
     // seek to the middle of the retreat move: box should have moved with the tool
-    const retreat = sim.steps.find((s) => s.instruction.name === 'MoveL' && s.t0 > 1)!;
+    const attach = sim.steps.find((s) => s.instruction.data.kind === 'event' && s.instruction.data.action === 'attach')!;
+    const retreat = sim.steps.find((s) => s.instruction.name === 'MoveL' && s.t0 >= attach.t0)!;
     sim.seek(retreat.t1);
     const boxAfter = getPos(box.poseAbs());
     expect(distance(boxBefore, boxAfter)).toBeGreaterThan(50);

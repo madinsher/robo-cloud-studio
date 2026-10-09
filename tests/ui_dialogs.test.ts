@@ -57,8 +57,8 @@ describe('itemContextMenu', () => {
     pickplace();
     const r = app.activeRobot!; const home = app.station.find('Home') as Target; const pick = app.station.find('Pick 2') as Target;
     expect(menuFor(home)).toEqual(['Add', 'Move robot here (MoveJ)', 'Move robot here (MoveL)', 'Teach current position', 'Set as Cartesian target', 'Add MoveJ to program', 'Add MoveL to program', 'Focus', 'Hide', 'Rename…', 'Delete']);
-    r.setJoints([30, -80, 90, -100, -90, 0]); ctxItem('Move robot here (MoveJ)').click(); expect(r.joints().map(Math.round)).toEqual([0, -100, 110, -100, -90, 0]);
-    r.setJoints([30, -80, 90, -100, -90, 0]); menuFor(home); ctxItem('Move robot here (MoveL)').click(); expect(r.joints().map(Math.round)).toEqual([0, -100, 110, -100, -90, 0]);
+    r.setJoints([30, -80, 90, -100, -90, 0]); ctxItem('Move robot here (MoveJ)').click(); expect(r.joints().map(Math.round)).toEqual([0, -60, -110, -100, -90, 0]);
+    r.setJoints([30, -80, 90, -100, -90, 0]); menuFor(home); ctxItem('Move robot here (MoveL)').click(); expect(r.joints().map(Math.round)).toEqual([0, -60, -110, -100, -90, 0]);
     r.setJoints([30, -80, 90, -100, -90, 0]); menuFor(pick); ctxItem('Teach current position').click(); expect(pick.joints!.map(Math.round)).toEqual([30, -80, 90, -100, -90, 0]);
     menuFor(home); ctxItem('Set as Cartesian target').click(); expect(home.isJointTarget).toBe(false); menuFor(home); ctxItem('Set as Joint target').click(); expect(home.isJointTarget).toBe(true);
     app.setActiveProgram(null); const np = app.station.itemsOfType(ItemType.PROGRAM).length;
