@@ -149,7 +149,10 @@ describe('App', () => {
     const s3 = new Station('Third'); app.setStation(s3); expect(app.stations).toContain(s3); expect(app.stations.length).toBe(2);
     app.closeStation(); expect(app.stations.length).toBe(1); expect(app.station).toBe(s2);
     app.closeStation(); expect(app.stations.length).toBe(1); expect(app.station.name).toBe('New station');
+    rendererCalls.length = 0;
     app.newStation(); expect(app.station.name).toBe('New station'); expect(app.stations.length).toBe(1);
+    expect(rendererCalls).toContain('showTrajectoryPreview');
+    expect(rendererCalls).toContain('setCollisionHighlight');
     expect(changed.length).toBeGreaterThanOrEqual(5);
     // item events are relayed to the API queue
     app.setStation(demos[0].build());

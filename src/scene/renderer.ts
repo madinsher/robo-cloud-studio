@@ -217,7 +217,16 @@ export class SceneRenderer {
 
   fitAll(): void {
     const box = new THREE.Box3();
-    for (const e of this.entries.values()) if (e.root.visible && e.item.type !== ItemType.MAP) box.expandByObject(e.root);
+    const one = new THREE.Box3();
+    for (const e of this.entries.values()) {
+      if (!e.root.visible || e.item.type === ItemType.MAP) continue;
+      one.setFromObject(e.root);
+      if (one.isEmpty()) continue;
+      const size = one.getSize(new THREE.Vector3());
+      const center = one.getCenter(new THREE.Vector3());
+      const sane = [size.x, size.y, size.z, center.x, center.y, center.z].every((v) => Number.isFinite(v)) && size.length() < 1e8 && center.length() < 1e8;
+      if (sane) box.union(one);
+    }
     if (box.isEmpty()) return;
     const c = box.getCenter(new THREE.Vector3());
     const size = Math.max(box.getSize(new THREE.Vector3()).length(), 1000);
@@ -354,20 +363,10 @@ export class SceneRenderer {
     if (item instanceof Robot) this.buildRobot(item, e);
     else if (item instanceof Tool) {
       const g = buildGeometry(item.geometry, this.assets, item.color ?? '#5b6470');
-      // geometry is defined in flange coordinates: root will be positioned at the flange
+      // Tool triangles are stored in flange coordinates; the TCP pose only places the tool frame triad.
+      // A TCP with no mesh is a frame (the Hand-E bodies are separate mechanisms). A solid stand-in
+      // from the flange to that TCP runs through those bodies.
       root.add(g);
-      if (!item.geometry.length) {
-        const tcp = getPos(item.pose());
-        const len = Math.hypot(tcp[0], tcp[1], tcp[2]);
-        if (len > 1) {
-          const cyl = new THREE.Mesh(new THREE.CylinderGeometry(25, 35, len, 16).rotateX(Math.PI / 2), materialFor(item.color ?? '#5b6470'));
-          cyl.position.set(tcp[0] / 2, tcp[1] / 2, tcp[2] / 2);
-          cyl.lookAt(new THREE.Vector3(tcp[0], tcp[1], tcp[2]));
-          root.add(cyl);
-        }
-        const flangeDisc = new THREE.Mesh(new THREE.CylinderGeometry(45, 45, 12, 24).rotateX(Math.PI / 2), materialFor('#3b4149'));
-        root.add(flangeDisc);
-      }
       const triad = makeTriad(this.frameSize * 0.8);
       triad.matrixAutoUpdate = false;
       triad.matrix.copy(mat4ToThree(item.pose()));

@@ -132,6 +132,8 @@ export class App {
     this.events.emit('stationChanged', { station: st });
     this.events.emit('activeProgram', { program: this.activeProgram });
     this.events.emit('activeRobot', { robot: this.activeRobot });
+    this.renderer?.showTrajectoryPreview(null, []);
+    this.renderer?.setCollisionHighlight([]);
     setTimeout(() => this.renderer?.fitAll(), 50);
   }
 
@@ -187,6 +189,8 @@ export class App {
     this.events.emit('activeProgram', { program: this.activeProgram });
     this.events.emit('activeRobot', { robot: this.activeRobot });
     this.events.emit('undo', { canUndo: this.undoStack.length > 0, canRedo: this.redoStack.length > 0 });
+    this.renderer?.showTrajectoryPreview(null, []);
+    this.renderer?.setCollisionHighlight([]);
   }
 
   // -- Selection -----------------------------------------------------------
@@ -329,9 +333,12 @@ export class App {
   /** Compile the active program and show its trajectory. */
   previewProgram(): void {
     const p = this.activeProgram;
-    if (!p) { this.renderer?.showTrajectoryPreview(null, []); return; }
-    const robot = p.robot();
-    if (!(robot instanceof Robot)) { this.renderer?.showTrajectoryPreview(null, []); return; }
+    if (!p || !(p.robot() instanceof Robot)) {
+      this.renderer?.showTrajectoryPreview(null, []);
+      this.renderer?.setCollisionHighlight([]);
+      return;
+    }
+    const robot = p.robot() as Robot;
     const q0 = robot.joints();
     this.sim.collisionOptions = { enabled: true, selfOnly: !this.checkCollisions, assets: this.assets, sampleStep: 0.02 };
     const res = this.sim.compile(p);
@@ -504,16 +511,24 @@ export class App {
           this.log(`Imported mesh ${name}`);
         } else if ((ext === 'rdk' || ext === 'robot' || ext === 'tool') && (await this.convertWithRoboDK(f))) {
           // converted losslessly by a RoboDK instance behind the studio server
-        } else if (ext === 'robot' || ext === 'tool') {
-          // proprietary RoboDK item files: best-effort scan for embedded meshes/poses, imported as objects
-          const { station, report } = await importRdkBestEffort(await f.arrayBuffer(), name.replace(/\.(robot|tool)$/i, ''));
-          this.cmd(() => { const folder = new Folder(name); this.station.addChild(folder); for (const c of [...station.children]) folder.addChild(c); this.select(folder); });
-          for (const n of report.notes) this.log(n, 'warn');
+        } else if (ext === 'robot' || ext === 'tool' || ext === 'sld') {
+          const { station, report } = await importRdkBestEffort(await f.arrayBuffer(), name.replace(/\.(robot|tool|sld)$/i, ''), this.assets);
+          const level = report.fidelity === 'full' ? 'info' : 'warn';
+          this.cmd(() => {
+            const kids = [...station.children];
+            for (const c of kids) this.station.addChild(c);
+            const robot = kids.find((c) => c instanceof Robot);
+            if (robot instanceof Robot) { this.select(robot); this.setActiveRobot(robot); }
+            else if (kids[0]) this.select(kids[0]);
+          });
+          for (const n of report.notes) this.log(n, level);
         } else if (ext === 'rdk') {
-          const { station, report } = await importRdkBestEffort(await f.arrayBuffer(), name.replace(/\.rdk$/i, ''));
+          const { station, report } = await importRdkBestEffort(await f.arrayBuffer(), name.replace(/\.rdk$/i, ''), this.assets);
           this.setStation(station);
-          for (const n of report.notes) this.log(n, 'warn');
-          this.log(`RoboDK .rdk best-effort import: ${report.strings.slice(0, 12).join(', ')}${report.strings.length > 12 ? '…' : ''}`);
+          const robot = station.itemsOfType<Robot>(ItemType.ROBOT)[0];
+          if (robot) this.setActiveRobot(robot);
+          for (const n of report.notes) this.log(n, report.fidelity === 'full' ? 'info' : 'warn');
+          if (report.fidelity !== 'full') this.log(`RoboDK .rdk scan: ${report.strings.slice(0, 12).join(', ')}${report.strings.length > 12 ? '…' : ''}`, 'warn');
         } else if (['src', 'mod', 'prg', 'ls', 'script', 'csv', 'txt'].includes(ext)) {
           const text = await f.text();
           const lang = detectLanguage(text, name);

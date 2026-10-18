@@ -5,11 +5,104 @@ import { LinkVisual } from '../core/kinematics/chain';
 import { AssetStore } from './assets';
 import { Mat4 } from '../core/math/pose';
 
+/** Faces meeting more steeply than this keep a hard edge. Shallower joins (cylinder sides) share a normal. */
+const CREASE_DEG = 50;
+
+function authoredSmoothNormals(m: MeshData): boolean {
+  if (m.normals.length !== m.positions.length || m.positions.length < 9) return false;
+  const tris = m.positions.length / 9;
+  const sample = Math.min(tris, 64);
+  for (let t = 0; t < sample; t++) {
+    const o = t * 9;
+    const ax = m.normals[o], ay = m.normals[o + 1], az = m.normals[o + 2];
+    if (ax === 0 && ay === 0 && az === 0) return false;
+    for (let k = 1; k < 3; k++) {
+      const p = o + k * 3;
+      if (Math.abs(m.normals[p] - ax) > 1e-4 || Math.abs(m.normals[p + 1] - ay) > 1e-4 || Math.abs(m.normals[p + 2] - az) > 1e-4) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Triangle soups store three private corners per face, so a plain normal pass leaves every face flat.
+ * Weld corners that share a position, then average normals inside a crease angle.
+ */
+export function smoothTriangleSoup(positions: Float32Array, creaseDeg = CREASE_DEG): THREE.BufferGeometry {
+  const corners = positions.length / 3;
+  const tris = corners / 3;
+  const faceN = new Float32Array(tris * 3);
+  const faceA = new Float32Array(tris);
+  for (let t = 0; t < tris; t++) {
+    const o = t * 9;
+    const ax = positions[o], ay = positions[o + 1], az = positions[o + 2];
+    const bx = positions[o + 3] - ax, by = positions[o + 4] - ay, bz = positions[o + 5] - az;
+    const cx = positions[o + 6] - ax, cy = positions[o + 7] - ay, cz = positions[o + 8] - az;
+    const nx = by * cz - bz * cy, ny = bz * cx - bx * cz, nz = bx * cy - by * cx;
+    const area = Math.hypot(nx, ny, nz);
+    faceA[t] = area;
+    if (area > 1e-12) { faceN[t * 3] = nx / area; faceN[t * 3 + 1] = ny / area; faceN[t * 3 + 2] = nz / area; }
+  }
+  const groups = new Map<string, number[]>();
+  for (let i = 0; i < corners; i++) {
+    const key = `${Math.round(positions[i * 3] * 20)},${Math.round(positions[i * 3 + 1] * 20)},${Math.round(positions[i * 3 + 2] * 20)}`;
+    const list = groups.get(key);
+    if (list) list.push(i);
+    else groups.set(key, [i]);
+  }
+  const cos = Math.cos(creaseDeg * Math.PI / 180);
+  const outPos: number[] = [];
+  const outNor: number[] = [];
+  const index = new Uint32Array(corners);
+  for (const group of groups.values()) {
+    const clusters: { rx: number; ry: number; rz: number; nx: number; ny: number; nz: number; oi: number }[] = [];
+    for (const vi of group) {
+      const t = Math.floor(vi / 3);
+      const nx = faceN[t * 3], ny = faceN[t * 3 + 1], nz = faceN[t * 3 + 2];
+      const w = faceA[t] || 1;
+      let placed = false;
+      if (faceA[t] > 1e-12) {
+        for (const c of clusters) {
+          if (nx * c.rx + ny * c.ry + nz * c.rz >= cos) {
+            c.nx += nx * w; c.ny += ny * w; c.nz += nz * w;
+            index[vi] = c.oi;
+            placed = true;
+            break;
+          }
+        }
+      } else if (clusters.length) {
+        index[vi] = clusters[0].oi;
+        placed = true;
+      }
+      if (!placed) {
+        const oi = outPos.length / 3;
+        outPos.push(positions[vi * 3], positions[vi * 3 + 1], positions[vi * 3 + 2]);
+        outNor.push(nx, ny, nz);
+        clusters.push({ rx: nx, ry: ny, rz: nz, nx: nx * w, ny: ny * w, nz: nz * w, oi });
+        index[vi] = oi;
+      }
+    }
+    for (const c of clusters) {
+      const len = Math.hypot(c.nx, c.ny, c.nz) || 1;
+      outNor[c.oi * 3] = c.nx / len;
+      outNor[c.oi * 3 + 1] = c.ny / len;
+      outNor[c.oi * 3 + 2] = c.nz / len;
+    }
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(outPos), 3));
+  g.setAttribute('normal', new THREE.BufferAttribute(new Float32Array(outNor), 3));
+  g.setIndex(new THREE.BufferAttribute(index, 1));
+  g.computeBoundingBox();
+  g.computeBoundingSphere();
+  return g;
+}
+
 export function meshDataToGeometry(m: MeshData): THREE.BufferGeometry {
+  if (!authoredSmoothNormals(m)) return smoothTriangleSoup(m.positions);
   const g = new THREE.BufferGeometry();
   g.setAttribute('position', new THREE.BufferAttribute(m.positions, 3));
-  if (m.normals.length === m.positions.length && m.normals.some((v) => v !== 0)) g.setAttribute('normal', new THREE.BufferAttribute(m.normals, 3));
-  else g.computeVertexNormals();
+  g.setAttribute('normal', new THREE.BufferAttribute(m.normals, 3));
   g.computeBoundingBox();
   g.computeBoundingSphere();
   return g;
@@ -41,7 +134,7 @@ export function primitiveGeometry(p: NonNullable<GeometryRef['primitive']> | Non
 }
 
 export function materialFor(color: string | undefined, opacity = 1, fallback = '#9aa3ad'): THREE.MeshStandardMaterial {
-  const m = new THREE.MeshStandardMaterial({ color: new THREE.Color(color ?? fallback), metalness: 0.2, roughness: 0.6 });
+  const m = new THREE.MeshStandardMaterial({ color: new THREE.Color(color ?? fallback), metalness: 0.22, roughness: 0.42, flatShading: false });
   if (opacity < 1) { m.transparent = true; m.opacity = opacity; }
   return m;
 }

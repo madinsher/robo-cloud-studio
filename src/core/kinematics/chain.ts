@@ -19,6 +19,12 @@ export interface JointDef {
   maxAcceleration?: number;
   /** Mimic another joint: q = multiplier * q_src + offset. */
   mimic?: { joint: string; multiplier: number; offset: number };
+  /**
+   * This joint's motion also depends on another actuated joint:
+   * angle = q + multiplier * q_src, then about `axis` (which may already carry the joint sense).
+   * Used for the Comau parallelogram, where joint 3 tracks joint 2.
+   */
+  couple?: { joint: string; multiplier: number };
   /** Home value (degrees / mm). */
   home?: number;
 }
@@ -147,12 +153,22 @@ export function forwardKinematics(chain: ChainDef, q: number[]): FKResult {
     const j = chain.joints[i];
     T = multiply(T, j.origin);
     jointFrames.push(clone(T));
-    T = multiply(T, jointMotion(j, full[i]));
+    T = multiply(T, jointMotion(j, coupledValue(chain, full, i)));
     if (j.post) T = multiply(T, j.post);
     linkPoses.push(clone(T));
   }
   const flange = multiply(T, chain.flange);
   return { linkPoses, jointFrames, flange };
+}
+
+/** Actuated value plus a parallelogram couple, in the joint's own units. */
+function coupledValue(chain: ChainDef, full: number[], i: number): number {
+  const j = chain.joints[i];
+  let v = full[i];
+  if (!j.couple) return v;
+  const src = chain.joints.findIndex((s) => s.name === j.couple!.joint);
+  if (src >= 0) v += j.couple.multiplier * full[src];
+  return v;
 }
 
 export function flangePose(chain: ChainDef, q: number[]): Mat4 {
@@ -180,6 +196,15 @@ export function jacobian(chain: ChainDef, q: number[]): number[][] {
       J[0][k] = lin[0]; J[1][k] = lin[1]; J[2][k] = lin[2];
       J[3][k] = axisW[0]; J[4][k] = axisW[1]; J[5][k] = axisW[2];
     }
+  });
+  // A coupled joint rotates when its source joint moves, so that screw is added to the source column.
+  chain.joints.forEach((j, ji) => {
+    if (!j.couple) return;
+    const src = chain.joints.findIndex((s) => s.name === j.couple!.joint);
+    const srcK = idx.indexOf(src);
+    const k = idx.indexOf(ji);
+    if (srcK < 0 || k < 0) return;
+    for (let r = 0; r < 6; r++) J[r][srcK] += j.couple.multiplier * J[r][k];
   });
   return J;
 }

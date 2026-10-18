@@ -1,19 +1,21 @@
 /**
  * Best-effort reader for RoboDK .rdk station files.
  *
- * The .rdk container is a proprietary binary format that is not publicly documented. This reader
- * does NOT claim full fidelity. It:
+ * .rdk / .robot / .tool / .sld open through `importRobodkBinary` (kinematics, link meshes, station
+ * tree, programs). This scanner remains the fallback for payloads that are not that container. It:
  *   1. detects and inflates zlib/gzip/zip wrapped payloads (via DecompressionStream when available),
  *   2. scans for item names (UTF-8 / UTF-16LE strings) and 4x4 pose matrices (runs of 16 doubles
  *      whose last row is 0 0 0 1),
  *   3. extracts embedded STL / mesh blobs, and
  *   4. returns a sketch station (frames + objects with recovered names/poses) plus a report.
  *
- * For full-fidelity import use `python/rdk_export.py` (runs inside RoboDK and writes our JSON),
- * or the RoboDK API bridge in the server.
+ * `python/rdk_export.py` and the studio server (`POST /convert/rdk`) remain the path that asks
+ * RoboDK itself to walk the station.
  */
 import { Station, Frame, SceneObject } from '../../core/items/item';
 import { fromRows } from '../../core/math/pose';
+import type { AssetStore } from '../../scene/assets';
+import { importRobodkBinary } from './rdk_binary';
 
 export interface RdkScanReport {
   bytes: number;
@@ -22,6 +24,8 @@ export interface RdkScanReport {
   poses: number;
   meshes: Array<{ offset: number; triangles: number }>;
   notes: string[];
+  /** `full` when the RoboDK container was parsed; `scan` is the legacy string/pose skim. */
+  fidelity?: 'full' | 'scan';
 }
 
 async function inflate(buf: Uint8Array, format: 'deflate' | 'gzip' | 'deflate-raw'): Promise<Uint8Array<ArrayBuffer> | null> {
@@ -132,9 +136,19 @@ export async function scanRdk(data: ArrayBuffer): Promise<{ payload: Uint8Array;
   return { payload: bytes, report };
 }
 
-/** Build a sketch station from the scan. Names are paired with poses in order of appearance. */
-export async function importRdkBestEffort(data: ArrayBuffer, name = 'RoboDK import'): Promise<{ station: Station; report: RdkScanReport }> {
+/** Load a RoboDK file. Real .rdk/.robot/.tool containers are parsed; anything else is skimmed for poses. */
+export async function importRdkBestEffort(data: ArrayBuffer, name = 'RoboDK import', assets?: AssetStore): Promise<{ station: Station; report: RdkScanReport }> {
+  try {
+    const full = await importRobodkBinary(data, name, assets);
+    if (full) {
+      full.station.params.rdkReport = JSON.parse(JSON.stringify(full.report));
+      return full;
+    }
+  } catch {
+    /* not a RoboDK container, or a variant this reader does not know yet */
+  }
   const { report } = await scanRdk(data);
+  report.fidelity = 'scan';
   const st = new Station(name);
   const poses: number[][][] = (report as any)._poses ?? [];
   const names = report.strings.filter((s) => !/^(Program|Target|Frame|Robot|Tool|Object)\d*$/i.test(s) && !s.includes('\\') && !s.includes('/'));

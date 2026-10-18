@@ -169,7 +169,8 @@ function visualColliders(item: Item, part: string, linkIndex: number | undefined
         }
         return [{ item, part, linkIndex, shape: { kind: 'mesh', positions, pose, obb } }];
       }
-      return [{ item, part, linkIndex, shape: obb }];
+      // A box around a CAD link is much fatter than the shell, so it is only an approximate self-check.
+      return [{ item, part, linkIndex, approx: true, shape: obb }];
     }
   }
   return [];
@@ -341,6 +342,9 @@ export function checkColliders(colliders: Collider[], opts: CollisionOptions = {
         if (A.linkIndex !== undefined && B.linkIndex !== undefined) {
           const lo = Math.min(A.linkIndex, B.linkIndex), hi = Math.max(A.linkIndex, B.linkIndex);
           if (hi - lo <= 1) continue;
+          // Bounding boxes of imported link shells are much fatter than the metal and overlap
+          // links further along the arm. Exact triangle meshes still test those pairs.
+          if (hi - lo >= 2 && A.approx && B.approx && A.shape.kind === 'obb' && B.shape.kind === 'obb') continue;
           // Procedural hubs separated only by short wrist spacers are mechanically connected.
           // Long intervening links must still be tested, even when their indices differ by two.
           if ((A.approx || B.approx) && A.item instanceof Robot) {
@@ -365,7 +369,12 @@ export function checkColliders(colliders: Collider[], opts: CollisionOptions = {
       if ((A.linkIndex === 0 && A.item.parent === B.item) || (B.linkIndex === 0 && B.item.parent === A.item)) continue;
       if (opts.selfOnly && (rootOf(A.item) !== rootOf(B.item) || !(rootOf(A.item) instanceof Robot))) continue;
       if (opts.robotsOnly && !(rootOf(A.item) instanceof Robot) && !(rootOf(B.item) instanceof Robot)) continue;
+      // A box around a tool, finger or part mounted on the robot overlaps the arm. The shell usually does not.
+      if ((A.approx || B.approx) && A.item !== B.item && rootOf(A.item) === rootOf(B.item) && rootOf(A.item) instanceof Robot) continue;
       if (ignore.has(`${A.item.id}|${B.item.id}`) || ignore.has(`${B.item.id}|${A.item.id}`)) continue;
+      // A box around an imported tool is fatter than the shell and crosses the forearm while the triangles do not.
+      const ownedTool = (A.item instanceof Tool && A.item.parent === B.item) || (B.item instanceof Tool && B.item.parent === A.item);
+      if (ownedTool && (A.approx || B.approx)) continue;
       let d = shapeDistance(A.shape, B.shape) + margin;
       // self-collision with approximate capsules: shrink both radii by 30% to avoid false positives at the wrist/shoulder
       if (A.item === B.item && A.shape.kind === 'capsule' && B.shape.kind === 'capsule') d -= 0.3 * (A.shape.r + B.shape.r);

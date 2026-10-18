@@ -83,9 +83,11 @@ export function postProcessRdkExport(station: Station): RdkImportReport {
     if (robot) p.setRobot(robot);
     const frame = robot instanceof Robot ? robot.activeFrame() ?? station : station;
     let n = 0;
+    // Current RoboDK (and rdk_export.py) numbers INS_TYPE_MOVE as 0. Older fixtures used 1 = move, 2 = movec, 3 = speed.
+    const official = ins.some((e) => Number(e.type) === 0);
+    const legacyType = (t: number) => (official ? ({ 0: 1, 1: 2, 2: 3, 3: 4, 4: 5, 6: 7, 7: 8, 8: 9, 9: 10 } as Record<number, number>)[t] ?? t : t);
     for (const e of ins) {
-      // RoboDK INS_TYPE: 0 invalid, 1 move, 2 movec, 3 changespeed, 4 changeframe, 5 changetool, 6 changerobot, 7 pause, 8 event, 9 code, 10 print
-      const type = Number(e.type);
+      const type = legacyType(Number(e.type));
       if (type === 1 || type === 2) {
         const t = new Target(e.name || `T${++n}`);
         if (e.pose) t.setPose(fromArray(e.pose));

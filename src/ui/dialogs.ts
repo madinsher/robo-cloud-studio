@@ -486,7 +486,7 @@ export async function exportDialog(app: App, program: Program | null = app.activ
 }
 
 export async function importDialog(app: App): Promise<void> {
-  const files = await pickFiles('.vbstation,.json,.geojson,.urdf,.xacro,.stl,.obj,.step,.stp,.iges,.igs,.brep,.dh,.rdk,.robot,.tool,.src,.mod,.prg,.ls,.script,.csv,.txt,.nc,.gcode,.ngc,.tap,.pcd,.ply,.glb,.gltf,.dae,.zip,.vcmx,.vcm', true);
+  const files = await pickFiles('.vbstation,.json,.geojson,.urdf,.xacro,.stl,.obj,.step,.stp,.iges,.igs,.brep,.dh,.rdk,.robot,.tool,.sld,.src,.mod,.prg,.ls,.script,.csv,.txt,.nc,.gcode,.ngc,.tap,.pcd,.ply,.glb,.gltf,.dae,.zip,.vcmx,.vcm', true);
   if (files.length) await app.openFiles(files);
 }
 

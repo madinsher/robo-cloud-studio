@@ -24,6 +24,17 @@ interface Step {
   apply?: () => void;
 }
 
+/** MoveJ follows the stored joint vector when it fits this mechanism. Extra zeros pad a 1-axis door or gripper. */
+function jointGoal(robot: Robot, target: Target): number[] | null {
+  const q = target.joints;
+  if (!q || q.length < robot.dof) return null;
+  const { lower, upper } = robot.jointLimits();
+  const prefix = q.slice(0, robot.dof);
+  if (!prefix.every((v, i) => Number.isFinite(v) && v >= lower[i] - 0.5 && v <= upper[i] + 0.5)) return null;
+  if (q.length !== robot.dof && !target.isJointTarget && !q.slice(robot.dof).every((v) => Math.abs(v) < 1e-3)) return null;
+  return prefix;
+}
+
 /**
  * Program simulator: compiles a Program into timed steps (trajectories + events) and plays them
  * on a simulation clock. Also used headless for cycle-time estimation and validation.
@@ -81,7 +92,7 @@ export class ProgramSimulator {
         problems.push({ instructionId: prog.id, message: 'Recursion too deep', severity: 'error' });
         return;
       }
-      if (visited.has(prog.id) && depth > 0) {
+      if (visited.has(prog.id)) {
         problems.push({ instructionId: prog.id, message: `Recursive call to ${prog.name}`, severity: 'error' });
         return;
       }
@@ -127,13 +138,18 @@ export class ProgramSimulator {
             if (d.moveType === 'MoveJ') {
               let q1: number[] | null = null;
               if (target) {
-                if (target.isJointTarget && target.joints) q1 = target.joints;
-                else {
+                const stored = jointGoal(robot, target);
+                if (stored) q1 = stored;
+                else if (target.joints && target.joints.length >= robot.dof && target.joints.slice(0, robot.dof).every((v) => Number.isFinite(v))) {
+                  const { lower, upper } = robot.jointLimits();
+                  q1 = target.joints.slice(0, robot.dof).map((v, i) => Math.min(upper[i], Math.max(lower[i], v)));
+                  problems.push({ instructionId: ins.id, message: `${target.name} joints clamped to limits`, severity: 'warning' });
+                } else {
                   const pInBase = multiply(invert(robot.poseAbs()), target.poseAbs());
                   const r = robot.solveIK(pInBase, { seed: target.joints ?? q0 }, tool);
                   q1 = r.ok ? r.joints : null;
                 }
-              } else if (d.joints) q1 = d.joints;
+              } else if (d.joints) q1 = d.joints.slice(0, robot.dof);
               else if (d.pose) {
                 const r = robot.solveIK(multiply(frame, fromArray(d.pose)), { seed: q0 }, tool);
                 q1 = r.ok ? r.joints : null;
@@ -227,7 +243,8 @@ export class ProgramSimulator {
             break;
           case 'event': {
             const capturedTool = toolId;
-            this.steps.push({ instruction: ins, robot, t0, t1: t, apply: () => this.applyEvent(robot, capturedTool, d.action, d.objectId ?? null) });
+            const label = d.name ?? null;
+            this.steps.push({ instruction: ins, robot, t0, t1: t, apply: () => this.applyEvent(robot, capturedTool, d.action, d.objectId ?? null, label) });
             break;
           }
           case 'code':
@@ -313,9 +330,9 @@ export class ProgramSimulator {
       for (const p of checkRobotCollisions(this.station, robot, this.collisionOptions)) {
         if (p.a.item === p.b.item || (p.a.item instanceof Tool && p.a.item.parent === p.b.item) || (p.b.item instanceof Tool && p.b.item.parent === p.a.item)) continue;
         const key = keyOf(p);
+        initialContacts.set(key, Math.max(initialContacts.get(key) ?? 0, p.depth));
         if (reported.has(key)) continue;
         reported.add(key);
-        initialContacts.set(key, p.depth);
         problems.push({ instructionId: '', message: `Initial contact ignored: ${p.a.item.name} × ${p.b.item.name} (${p.depth.toFixed(0)} mm)`, severity: 'warning' });
       }
     }
@@ -350,8 +367,12 @@ export class ProgramSimulator {
     return null;
   }
 
-  private applyEvent(robot: Robot | null, toolId: string | null, action: string, objectId: string | null) {
-    const tool = (toolId ? this.station.findById(toolId) : robot?.activeTool()) as Tool | null;
+  private applyEvent(robot: Robot | null, toolId: string | null, action: string, objectId: string | null, label: string | null = null) {
+    let tool = (toolId ? this.station.findById(toolId) : robot?.activeTool()) as Tool | null;
+    if (label) {
+      const named = this.station.find(label, ItemType.TOOL);
+      if (named instanceof Tool) tool = named;
+    }
     switch (action) {
       case 'attach':
       case 'gripper_close': {
@@ -377,9 +398,32 @@ export class ProgramSimulator {
       }
       case 'show':
       case 'hide': {
-        const obj = objectId ? this.station.findById(objectId) : null;
+        if (label === 'objects') {
+          this.setPartVisibility(action === 'show' ? 'show-raw' : 'hide-done');
+          break;
+        }
+        const obj = objectId ? this.station.findById(objectId) : (label ? this.station.find(label) : null);
         obj?.setVisible(action === 'show');
         break;
+      }
+      case 'custom': {
+        if (label === 'Replace objects') this.setPartVisibility('reset');
+        break;
+      }
+    }
+  }
+
+  /** Raw parts and their finished twins share a pose. Reset matches the cell before a cycle. */
+  private setPartVisibility(mode: 'show-raw' | 'hide-done' | 'reset') {
+    for (const it of this.station.walk()) {
+      if (!(it instanceof SceneObject) || it instanceof Tool) continue;
+      const done = /^Part Done\b/i.test(it.name);
+      const raw = /^Part \d+$/i.test(it.name);
+      if (mode === 'show-raw' && raw) it.setVisible(true);
+      else if (mode === 'hide-done' && done) it.setVisible(false);
+      else if (mode === 'reset') {
+        if (done) it.setVisible(false);
+        else if (raw) it.setVisible(true);
       }
     }
   }

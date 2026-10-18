@@ -78,10 +78,11 @@ export function buildMechanism(spec: MechanismSpec): Robot {
  * Modified (Craig) DH table -> chain:  T_i = Rx(alpha_{i-1}) · Tx(a_{i-1}) · Rz(theta_i) · Tz(d_i).
  * Rows: [alpha, a, theta, d] (RoboDK `setRobotParams` DHM order: alpha, a, theta, d).
  */
-export function chainFromDHM(name: string, dhm: number[][], lower?: number[], upper?: number[]): ChainDef {
+export function chainFromDHM(name: string, dhm: number[][], lower?: number[], upper?: number[], types?: Array<'revolute' | 'prismatic'>): ChainDef {
   const joints: JointDef[] = dhm.map((row, i) => {
     const [alpha, a, theta, d] = row;
-    return { name: `J${i + 1}`, type: 'revolute', origin: mul(rotx(alpha * DEG), transl(a, 0, 0), rotz(theta * DEG)), axis: [0, 0, 1], post: transl(0, 0, d), lower: lower?.[i] ?? -180, upper: upper?.[i] ?? 180, maxVelocity: 180, home: 0 };
+    const type = types?.[i] === 'prismatic' ? 'prismatic' : 'revolute';
+    return { name: `J${i + 1}`, type, origin: mul(rotx(alpha * DEG), transl(a, 0, 0), rotz(theta * DEG)), axis: [0, 0, 1], post: transl(0, 0, d), lower: lower?.[i] ?? (type === 'prismatic' ? 0 : -180), upper: upper?.[i] ?? (type === 'prismatic' ? 1000 : 180), maxVelocity: type === 'prismatic' ? 1000 : 180, home: 0 };
   });
   const links = [{ name: 'base', visuals: [] }, ...joints.map((j, i) => ({ name: `link_${i + 1}`, visuals: [] }))];
   return { name, joints, links, flange: identity(), dof: joints.length };
