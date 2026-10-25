@@ -112,7 +112,9 @@ describe('StationRuntime', () => {
     expect(a.joints()[0]).toBeCloseTo(30, 6); // the first move was played, the third never started
     expect(hq.status).toBe('done');
     expect(b.joints()[0]).toBeCloseTo(40, 6);
-    // the program simulator lists the error and plays up to it
+    // the program simulator lists the error and plays up to it (compiled from the home state)
+    rt.reset();
+    expect(a.joints()[0]).toBeCloseTo(0, 9);
     const sim = new ProgramSimulator(st);
     const res = sim.compile(p);
     expect(res.ok).toBe(false);
@@ -180,6 +182,27 @@ describe('StationRuntime', () => {
     expect(a.joints()).toEqual([0, -90, 90, -90, -90, 0]);
   });
 
+  it('RoboDK "Replace objects" restores the stored placements; two Attach events carry a hidden raw part and its visible twin', () => {
+    const { st, a } = cell();
+    const tool = a.addChild(new Tool('Gripper')); tool.setPoseTool(transl(0, 0, 100)); a.setTool(tool);
+    const input = st.addChild(new Frame('Input')), output = st.addChild(new Frame('Output'));
+    output.setPose(transl(0, -1500, 0));
+    const tcp = multiply(a.poseAbs(), a.solveFK(a.joints(), tool.poseTool()));
+    const raw = output.addChild(new SceneObject('Part 1')), done = output.addChild(new SceneObject('Part Done 1')), next = input.addChild(new SceneObject('Part 2'));
+    for (const o of [raw, done, next]) o.geometry = [{ primitive: { kind: 'box', size: [40, 40, 40] } }];
+    raw.setVisible(false); // the saved station shows the finished twin at the output (after a previous simulation)
+    next.setPose(transl(tcp[12], tcp[13] + 60, tcp[14]));
+    const at = Array.from(transl(tcp[12], tcp[13], tcp[14]));
+    const p = prog(st, 'Cycle', a);
+    p.addInstruction({ kind: 'event', action: 'custom', objectId: null, name: 'Replace objects', restore: [{ id: raw.id, parentId: input.id, pose: at }, { id: done.id, parentId: input.id, pose: at }] } as any);
+    p.event('attach'); p.event('attach');
+    const rt = new StationRuntime(st);
+    rt.start(p); rt.runFor(0.01);
+    expect(raw.parent).toBe(tool); expect(done.parent).toBe(tool); // both twins, not the visible neighbour 60 mm away
+    expect(next.parent).toBe(input);
+    expect(distance(getPos(raw.poseAbs()), getPos(tcp))).toBeLessThan(1e-6);
+  });
+
   it('calls a station Python program through the registered script runner (I5) and waits for it', async () => {
     const { st, a, jt } = cell();
     const py = new Item(ItemType.PROGRAM_PYTHON, 'SetRPM'); st.addChild(py);
@@ -209,15 +232,79 @@ describe('StationRuntime', () => {
     offG();
   });
 
+  it('a station Python program started as a thread runs through the script runner in live playback (not when compiling)', async () => {
+    const { st, a, jt } = cell();
+    const py = new Item(ItemType.PROGRAM_PYTHON, 'Conveyor'); st.addChild(py);
+    const main = prog(st, 'Main', a); main.addInstruction({ kind: 'thread', programId: py.id, programName: 'Conveyor' }); main.waitSignal('PartReady', 1); main.addMoveJ(jt('t', [20, -90, 90, -90, -90, 0]));
+    const sim = new ProgramSimulator(st);
+    let ran = 0;
+    const off = registerScriptRunner(async (ctx) => { ran++; ctx.runtime.signals.set('PartReady', 1); });
+    const res = sim.compile(main);
+    expect(ran).toBe(0); // compiling never executes scripts
+    expect(res.problems.filter((p) => p.severity === 'error')).toEqual([]);
+    expect(res.problems.some((p) => /Conveyor is a Python program/.test(p.message))).toBe(true);
+    const rt = new StationRuntime(st);
+    const h = rt.start(main);
+    await rt.runUntilDone(10);
+    off();
+    expect(ran).toBe(1);
+    expect(h.status).toBe('done');
+    expect(rt.runs.find((r) => r.program === py)?.parentId).toBe(h.id);
+    expect(a.joints()[0]).toBeCloseTo(20, 6);
+  });
+
+  it('script runners are chained: a runner resolving false passes the call to the next one', async () => {
+    const { st, a, jt } = cell();
+    const p = prog(st, 'Main', a); p.runInstruction('VisionDetect(cam)', true); p.runInstruction('SetRPM(70)', true); p.addMoveJ(jt('t', [10, -90, 90, -90, -90, 0]));
+    const seen: string[] = [];
+    const rt = new StationRuntime(st);
+    const offA = rt.registerScriptRunner(async (ctx) => { if (ctx.name !== 'VisionDetect') return false; seen.push(`vision:${ctx.args}`); });
+    const offB = registerScriptRunner(async (ctx) => { seen.push(`python:${ctx.name}`); });
+    const h = rt.start(p);
+    await rt.runUntilDone(10);
+    offA(); offB();
+    expect(h.status).toBe('done');
+    expect(seen).toEqual(['vision:cam', 'python:SetRPM']);
+  });
+
+  it('StartOptions.fromIndex starts at an instruction with the tool / speed set before it ("Run from here")', () => {
+    const { st, a, jt } = cell();
+    const t300 = a.addChild(new Tool('T300')); t300.setPoseTool(transl(0, 0, 300));
+    const p = prog(st, 'P', a); p.addMoveJ(jt('first', [60, -90, 90, -90, -90, 0])); p.setTool(t300); p.setSpeed(undefined, 30); p.addMoveJ(jt('second', [30, -90, 90, -90, -90, 0]));
+    const rt = new StationRuntime(st);
+    const h = rt.start(p, { fromIndex: 3 });
+    rt.runFor(0.5);
+    expect(a.activeTool()).toBe(t300);
+    expect(a.joints()[0]).toBeGreaterThan(0); // moving from 0 towards 30 (the first move was skipped)
+    rt.runFor(5);
+    expect(h.status).toBe('done');
+    expect(h.endTime! - h.startTime!).toBeGreaterThan(1); // 30 deg at 30 deg/s
+    expect(a.joints()[0]).toBeCloseTo(30, 6);
+  });
+
+  it('reset() restores robot IO set by a run', () => {
+    const { st, a } = cell();
+    a.state.io = { Gripper: 0 };
+    const p = prog(st, 'P', a); p.setDO('Gripper', 1);
+    const rt = new StationRuntime(st);
+    rt.start(p); rt.runFor(0.1);
+    expect(a.state.io.Gripper).toBe(1);
+    expect(rt.signals.get('Gripper')).toBe(1);
+    rt.reset();
+    expect(a.state.io.Gripper).toBe(0);
+    expect(rt.signals.get('Gripper')).toBeUndefined();
+  });
+
   it('a called program inherits the caller tool and speed (robot state persists like RoboDK: S4, S4b)', () => {
     const st = new Station();
     const robot = st.addChild(createRobotFromLibrary('UR5e', 'R'));
     robot.setJoints([0, -90, 90, -90, -90, 0]);
     const t150 = robot.addChild(new Tool('T150')); t150.setPoseTool(transl(0, 0, 150)); robot.setTool(t150);
     const t300 = robot.addChild(new Tool('T300')); t300.setPoseTool(transl(0, 0, 300));
-    const frame = st.addChild(new Frame('W')); frame.setPose(transl(400, -200, 0));
-    const t = frame.addChild(new Target('T')); t.setPose(mul(transl(0, 0, 300), rotx(180 * DEG)));
-    const t2 = frame.addChild(new Target('T2')); t2.setPose(mul(transl(200, 0, 300), rotx(180 * DEG)));
+    // well inside the reach (the old 400..600 mm / z 300 line with a 300 mm tool crossed the elbow singularity)
+    const frame = st.addChild(new Frame('W')); frame.setPose(transl(300, -200, 0));
+    const t = frame.addChild(new Target('T')); t.setPose(mul(transl(0, 0, 200), rotx(180 * DEG)));
+    const t2 = frame.addChild(new Target('T2')); t2.setPose(mul(transl(200, 0, 200), rotx(180 * DEG)));
     const sub = st.addChild(new Program('Sub')); sub.setRobot(robot); sub.addMoveL(t2);
     const main = st.addChild(new Program('Main')); main.setRobot(robot); main.setTool(t300); main.addMoveJ(t); main.setSpeed(50); main.callProgram(sub);
     const sim = new ProgramSimulator(st);
@@ -243,6 +330,7 @@ describe('StationRuntime', () => {
     expect(res.duration).toBeCloseTo(5000 / 500 + 53.13 / 90, 2);
     sim.runToEnd();
     expect(amr.state.x).toBeCloseTo(3000, 6); expect(amr.state.y).toBeCloseTo(4000, 6);
+    amr.setPose2D(0, 0, 0); // a compile starts from the current state: back to the origin
     const seen: string[] = [];
     setMobileMotionPlanner((station, mobile, ins, start) => { seen.push(`${mobile.name}:${ins.kind}:${start.x}`); return { ok: true, duration: 7, sample: (t) => ({ x: start.x + t, y: 0, heading: 0 }) }; });
     const sim2 = new ProgramSimulator(st);

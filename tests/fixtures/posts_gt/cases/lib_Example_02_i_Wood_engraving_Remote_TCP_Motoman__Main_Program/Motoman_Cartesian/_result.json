@@ -1,0 +1,16 @@
+{
+ "ok": true,
+ "error": null,
+ "log": "Program name \"TAKEPAR\" already exists! Consider renaming \"TakePart2\"\nProgram name \"DROPPAR\" already exists! Consider renaming \"DropPart2\"\nProgram name \"TAKEPAR\" already exists! Consider renaming \"TakePart3\"\nProgram name \"DROPPAR\" already exists! Consider renaming \"DropPart3\"\n",
+ "files": [
+  "APPROAC.JBI",
+  "CIRCLE.JBI",
+  "DROPPAR.JBI",
+  "MAINPRO.JBI",
+  "RETRACT.JBI",
+  "SQUARE.JBI",
+  "STAR.JBI",
+  "TAKEPAR.JBI",
+  "TRANSIT.JBI"
+ ]
+}

@@ -1,7 +1,12 @@
 /**
  * Minimal rosbridge (rosbridge_suite websocket) client: publish/subscribe/advertise/call service.
- * Used to mirror the simulation to ROS 2 (joint_states, cmd_vel, poses) and to drive the studio
- * from real robots (joint_states / odom feedback). Topics default to those used in this repository.
+ * Modes:
+ *  - 'sim': the studio is the simulator backend of a ROS 2 stack (./twin.ts RosTwin): /clock, /joint_states (every
+ *    joint, URDF names), /robot_description, /tf (odom -> base), <ns>/odom, <ns>/scan (sensor-relative), <ns>/imu,
+ *    ground truth; subscribes <ns>/cmd_vel and JointTrajectory topics — the webots_ros2 / MURKA topic set.
+ *  - 'publish': mirrors the simulation (the standard state topics of 'sim' without /clock and commands, plus the
+ *    repository's cmd_joint_state / tcp_pose / robot_pose / nav / vision topics).
+ *  - 'follow': applies incoming /joint_states (by joint name) and /odom to the sim; 'both' = follow + legacy publish.
  */
 import { App } from '../app';
 import { Robot } from '../core/items/robot';
@@ -12,13 +17,16 @@ import { publishNavRuntime, publishVisionOutput } from './publishers';
 import { visionRuntimeOf } from '../vision/pipeline';
 import { getVisionStack } from '../vision/stack';
 import { Camera as CameraItem } from '../core/items/item';
+import { RosTwin, RosTwinOptions } from './twin';
 
 export interface RosBridgeOptions {
   url: string;
   /** Publish rate (Hz). */
   rate?: number;
-  /** Mirror mode: 'publish' pushes sim state to ROS, 'follow' applies incoming joint_states to the sim. */
-  mode?: 'publish' | 'follow' | 'both';
+  /** Mirror mode: 'publish' pushes sim state to ROS, 'follow' applies incoming joint_states to the sim, 'sim' = digital twin backend. */
+  mode?: 'publish' | 'follow' | 'both' | 'sim';
+  /** Digital twin options ('sim' / 'publish'). */
+  twin?: RosTwinOptions;
 }
 
 export class RosBridge {
@@ -60,13 +68,14 @@ export class RosBridge {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(o));
   }
 
-  advertise(topic: string, type: string): void {
+  advertise(topic: string, type: string, latch = false): void {
     if (this.advertised.has(topic)) return;
     this.advertised.add(topic);
-    this.send({ op: 'advertise', topic, type });
+    // latch -> transient-local publisher in rosbridge_suite (/robot_description, /tf_static)
+    this.send(latch ? { op: 'advertise', topic, type, latch: true } : { op: 'advertise', topic, type });
   }
-  publish(topic: string, type: string, msg: any): void {
-    this.advertise(topic, type);
+  publish(topic: string, type: string, msg: any, opts?: { latch?: boolean }): void {
+    this.advertise(topic, type, !!opts?.latch);
     this.send({ op: 'publish', topic, msg });
   }
   subscribe(topic: string, type: string, cb: (msg: any) => void): void {
@@ -77,8 +86,28 @@ export class RosBridge {
     this.send({ op: 'call_service', service, args });
   }
 
+  /** The digital twin ('sim' and 'publish' modes). */
+  twin: RosTwin | null = null;
+  private lastTick = 0;
+
   private setup() {
     const mode = this.opts.mode ?? 'both';
+    if (mode === 'sim' || mode === 'publish') {
+      this.twin = new RosTwin(this.app.station, this, mode === 'sim' ? { ...this.opts.twin } : { commands: false, clock: false, scan: false, ...this.opts.twin });
+      this.twin.start(this.app.simTime ?? 0);
+      this.lastTick = Date.now();
+    }
+    if (mode === 'sim') {
+      // the twin owns the timing: step at `rate` Hz on the studio's sim time (wall time when the sim clock stands still)
+      const rate = this.opts.rate ?? 50;
+      this.timer = window.setInterval(() => {
+        const now = Date.now(), dt = (now - this.lastTick) / 1000;
+        this.lastTick = now;
+        const t = this.app.simTime ?? 0;
+        this.twin!.step(dt, t > this.twin!.time ? t : this.twin!.time + dt);
+      }, 1000 / rate);
+      return;
+    }
     if (mode !== 'publish') {
       // follow real robots: joint_states -> sim
       this.subscribe('/joint_states', 'sensor_msgs/msg/JointState', (msg) => {
@@ -116,6 +145,7 @@ export class RosBridge {
   private publishState() {
     const now = Date.now();
     const stamp = { sec: Math.floor(now / 1000), nanosec: (now % 1000) * 1e6 };
+    if (this.twin) { const dt = (now - this.lastTick) / 1000; this.lastTick = now; this.twin.step(dt, now / 1000); }
     for (const r of this.app.station.itemsOfType<Robot>(ItemType.ROBOT)) {
       const ns = r.connection.rosNamespace?.replace(/\/$/, '') ?? '';
       const names = r.jointNames();

@@ -14,6 +14,8 @@ export interface GcodeSegment {
   extrude?: boolean;
   /** Active tool number (T word / M6). */
   tool?: number;
+  /** 5-axis tool axis (APT GOTO i,j,k) per point, when the program has one. */
+  normals?: number[][];
 }
 
 export interface GcodeResult {
@@ -24,6 +26,7 @@ export interface GcodeResult {
 }
 
 export function parseGcode(text: string, opts: { arcStep?: number } = {}): GcodeResult {
+  if (isAptText(text)) return parseApt(text, opts);
   const arcStep = opts.arcStep ?? 2; // mm
   let units: 'mm' | 'inch' = 'mm';
   let absolute = true;
@@ -63,7 +66,8 @@ export function parseGcode(text: string, opts: { arcStep?: number } = {}): Gcode
     }
     for (const m of ms) { if (m === 3 || m === 4) spindle = true; else if (m === 5) spindle = false; else if (m === 82) eAbsolute = true; else if (m === 83) eAbsolute = false; }
     if (w.T !== undefined) tool = w.T;
-    if (w.F !== undefined) feed = w.F;
+    // feeds follow the units: inch/min in G20 programs, stored as mm/min
+    if (w.F !== undefined) feed = units === 'inch' ? w.F * 25.4 : w.F;
     // extrusion (3D printing): a move with increasing E extrudes; retractions (E decreasing without XYZ) do not create moves
     if (w.E !== undefined) {
       const eNew = eAbsolute ? w.E : e + w.E;
@@ -78,10 +82,16 @@ export function parseGcode(text: string, opts: { arcStep?: number } = {}): Gcode
     if (modal === 2 || modal === 3) {
       // arc in the active plane with I/J/K centre offsets (or R)
       const [a, b] = plane === 17 ? [0, 1] : plane === 18 ? [2, 0] : [1, 2];
-      const cx = pos[a] + ((plane === 17 ? w.I : plane === 18 ? w.K : w.J) ?? 0) * scale;
-      const cy = pos[b] + ((plane === 17 ? w.J : plane === 18 ? w.I : w.K) ?? 0) * scale;
-      let r = Math.hypot(pos[a] - cx, pos[b] - cy);
-      if (w.R !== undefined) r = Math.abs(w.R) * scale;
+      let cx = pos[a] + ((plane === 17 ? w.I : plane === 18 ? w.K : w.J) ?? 0) * scale;
+      let cy = pos[b] + ((plane === 17 ? w.J : plane === 18 ? w.I : w.K) ?? 0) * scale;
+      if (w.R !== undefined) {
+        // R format: centre on the chord's perpendicular bisector; R < 0 selects the arc longer than 180 deg
+        const R = w.R * scale, dx = target[a] - pos[a], dy = target[b] - pos[b], d = Math.hypot(dx, dy);
+        const h = Math.sqrt(Math.max(0, R * R - (d * d) / 4)) * (modal === 3 ? 1 : -1) * (R > 0 ? 1 : -1);
+        cx = (pos[a] + target[a]) / 2 - (h * dy) / (d || 1);
+        cy = (pos[b] + target[b]) / 2 + (h * dx) / (d || 1);
+      }
+      const r = Math.hypot(pos[a] - cx, pos[b] - cy);
       const a0 = Math.atan2(pos[b] - cy, pos[a] - cx);
       let a1 = Math.atan2(target[b] - cy, target[a] - cx);
       if (modal === 2) { if (a1 >= a0 - 1e-9) a1 -= 2 * Math.PI; } else { if (a1 <= a0 + 1e-9) a1 += 2 * Math.PI; }
@@ -109,28 +119,28 @@ export function parseGcode(text: string, opts: { arcStep?: number } = {}): Gcode
 }
 
 /** Convert parsed G-code into object curves: cutting moves only (rapids are skipped; the follow generator adds approach/retract). */
-export function gcodeToCurves(g: GcodeResult): Array<{ name: string; points: number[][] }> {
-  const curves: Array<{ name: string; points: number[][] }> = [];
+export function gcodeToCurves(g: GcodeResult): Array<{ name: string; points: number[][]; normals?: number[][] }> {
+  const curves: Array<{ name: string; points: number[][]; normals?: number[][] }> = [];
   let n = 0;
   let prevCut = false;
   for (const s of g.segments) {
     if (s.kind !== 'cut' || s.points.length < 2) { prevCut = false; continue; }
     // consecutive cuts (feed / spindle changes only) form one continuous curve
-    if (prevCut && curves.length) curves[curves.length - 1].points.push(...s.points.slice(1));
-    else curves.push({ name: `cut ${++n}${s.feed ? ` F${s.feed}` : ''}`, points: s.points.slice() });
+    if (prevCut && curves.length) { const c = curves[curves.length - 1]; c.points.push(...s.points.slice(1)); if (c.normals && s.normals) c.normals.push(...s.normals.slice(1)); }
+    else curves.push({ name: `cut ${++n}${s.feed ? ` F${s.feed}` : ''}`, points: s.points.slice(), ...(s.normals ? { normals: s.normals.slice() } : {}) });
     prevCut = true;
   }
   return curves;
 }
 
 /** All segments (rapids and cuts) as curves with machining metadata, for `generateMachining`. */
-export function gcodeToMachiningCurves(g: GcodeResult): Array<{ name: string; points: number[][]; kind: 'cut' | 'rapid'; feed?: number; spindle?: boolean; extrude?: boolean; tool?: number }> {
-  const out: Array<{ name: string; points: number[][]; kind: 'cut' | 'rapid'; feed?: number; spindle?: boolean; extrude?: boolean; tool?: number }> = [];
+export function gcodeToMachiningCurves(g: GcodeResult): Array<{ name: string; points: number[][]; normals?: number[][]; kind: 'cut' | 'rapid'; feed?: number; spindle?: boolean; extrude?: boolean; tool?: number }> {
+  const out: Array<{ name: string; points: number[][]; normals?: number[][]; kind: 'cut' | 'rapid'; feed?: number; spindle?: boolean; extrude?: boolean; tool?: number }> = [];
   let nc = 0, nr = 0;
   for (const s of g.segments) {
     if (s.points.length < 2) continue;
     const name = s.kind === 'cut' ? `cut ${++nc}${s.feed ? ` F${s.feed}` : ''}${s.extrude ? ' E' : ''}` : `rapid ${++nr}`;
-    out.push({ name, points: s.points, kind: s.kind, feed: s.feed, spindle: s.spindle, extrude: s.extrude, tool: s.tool });
+    out.push({ name, points: s.points, ...(s.normals ? { normals: s.normals } : {}), kind: s.kind, feed: s.feed, spindle: s.spindle, extrude: s.extrude, tool: s.tool });
   }
   return out;
 }
@@ -146,4 +156,103 @@ export function gcodeStats(g: GcodeResult): { cutLength: number; rapidLength: nu
     if (s.feed !== undefined && !st.feeds.includes(s.feed)) st.feeds.push(s.feed);
   }
   return st;
+}
+
+// ---- APT / CL data -------------------------------------------------------------------------------------------------
+/** APT / CL-data content (RoboDK accepts .apt and APT written in .nc files). */
+export function isAptText(text: string): boolean {
+  const head = text.slice(0, 20000);
+  return /^\s*GOTO\s*\/?\s*[-\d.]/im.test(head) && /^\s*(GOTO|FEDRAT|RAPID|SPINDL|UNITS|CUTTER|LOADTL|PARTNO|MULTAX|PPRINT|\$\$)/im.test(head);
+}
+/**
+ * APT / CL data: GOTO/x,y,z[,i,j,k] (5-axis tool axis kept as point normals), RAPID (next move), FEDRAT/f,MMPM|IPM,
+ * UNITS/MM|INCHES, SPINDL/ON|OFF|rpm, LOADTL/n, GODLTA/dx,dy,dz, CIRCLE/xc,yc,zc,i,j,k,r + GOTO (arc about the axis),
+ * "$" continuation lines and "$$" comments.
+ */
+export function parseApt(text: string, opts: { arcStep?: number } = {}): GcodeResult {
+  const arcStep = opts.arcStep ?? 2;
+  let units: 'mm' | 'inch' = 'mm';
+  let pos: number[] | null = null;
+  let axis: number[] | null = null;
+  let feed: number | undefined, spindle = false, tool: number | undefined, rapidNext = false;
+  let circle: { c: number[]; n: number[] } | null = null;
+  const segments: GcodeSegment[] = [];
+  let cur: GcodeSegment | null = null;
+  const min = [Infinity, Infinity, Infinity], max = [-Infinity, -Infinity, -Infinity];
+  let five = false;
+  const push = (kind: 'rapid' | 'cut', p: number[], n: number[] | null) => {
+    for (let i = 0; i < 3; i++) { min[i] = Math.min(min[i], p[i]); max[i] = Math.max(max[i], p[i]); }
+    if (!pos) { pos = p.slice(); axis = n; return; }
+    if (!cur || cur.kind !== kind || cur.spindle !== spindle || cur.tool !== tool || (kind === 'cut' && cur.feed !== feed)) {
+      cur = { kind, points: [pos.slice()], feed: kind === 'cut' ? feed : undefined, spindle, tool, ...(five ? { normals: [(axis ?? n ?? [0, 0, 1]).slice()] } : {}) };
+      segments.push(cur);
+    }
+    cur.points.push(p.slice());
+    if (cur.normals) cur.normals.push((n ?? axis ?? [0, 0, 1]).slice());
+    pos = p.slice();
+    if (n) axis = n;
+  };
+  // join continuation lines ending with "$" ("$$" starts a comment)
+  const stmts: string[] = [];
+  let acc = '';
+  for (const raw of text.split(/\r?\n/)) {
+    let l = raw.replace(/\$\$.*$/, '').trim();
+    if (!l) continue;
+    const cont = /\$\s*$/.test(l);
+    if (cont) l = l.replace(/\$\s*$/, '');
+    acc += (acc ? ' ' : '') + l;
+    if (!cont) { stmts.push(acc); acc = ''; }
+  }
+  if (acc) stmts.push(acc);
+  for (const st of stmts) {
+    const m = st.match(/^([A-Z_]+)\s*\/?\s*(.*)$/i);
+    if (!m) continue;
+    const word = m[1].toUpperCase();
+    const nums = m[2].split(/[,\s]+/).filter(Boolean).map(Number);
+    const scale = units === 'inch' ? 25.4 : 1;
+    switch (word) {
+      case 'UNITS': units = /INCH/i.test(m[2]) ? 'inch' : 'mm'; break;
+      case 'RAPID': rapidNext = true; break;
+      case 'FEDRAT': {
+        const f = nums.find((v) => Number.isFinite(v));
+        if (f !== undefined && !/MMPR|IPR/i.test(m[2])) feed = /IPM/i.test(m[2]) || (units === 'inch' && !/MMPM/i.test(m[2])) ? f * 25.4 : f;
+        break;
+      }
+      case 'SPINDL': spindle = !/OFF/i.test(m[2]); break;
+      case 'LOADTL': { const t = nums.find((v) => Number.isFinite(v)); if (t !== undefined) tool = t; break; }
+      case 'CIRCLE': { const v = nums.filter((x) => Number.isFinite(x)); if (v.length >= 6) circle = { c: v.slice(0, 3).map((x) => x * scale), n: v.slice(3, 6) }; break; }
+      case 'GOTO': case 'GODLTA': {
+        const v = nums.filter((x) => Number.isFinite(x));
+        if (v.length < 3) break;
+        let p = v.slice(0, 3).map((x) => x * scale);
+        if (word === 'GODLTA' && pos) { const q: number[] = pos; p = p.map((x, i) => x + q[i]); }
+        const n = v.length >= 6 ? v.slice(3, 6) : null;
+        if (n) five = true;
+        const kind = rapidNext ? 'rapid' : 'cut';
+        if (circle && pos && kind === 'cut') {
+          // arc about the CIRCLE axis (counter-clockwise about the axis, APT convention) from the current point to p
+          const { c, n: ax } = circle;
+          const nn = Math.hypot(ax[0], ax[1], ax[2]) || 1, k = ax.map((x) => x / nn);
+          const rel = (q: number[]) => { const d = q.map((x, i) => x - c[i]); const h = d[0] * k[0] + d[1] * k[1] + d[2] * k[2]; return { d: d.map((x, i) => x - h * k[i]), h }; };
+          const s0 = rel(pos), s1 = rel(p);
+          const r0 = Math.hypot(s0.d[0], s0.d[1], s0.d[2]) || 1, r1 = Math.hypot(s1.d[0], s1.d[1], s1.d[2]);
+          const u = s0.d.map((x) => x / r0), w = [k[1] * u[2] - k[2] * u[1], k[2] * u[0] - k[0] * u[2], k[0] * u[1] - k[1] * u[0]];
+          let ang = Math.atan2(s1.d[0] * w[0] + s1.d[1] * w[1] + s1.d[2] * w[2], s1.d[0] * u[0] + s1.d[1] * u[1] + s1.d[2] * u[2]);
+          if (ang <= 1e-9) ang += 2 * Math.PI;
+          const steps = Math.max(2, Math.ceil((ang * r0) / arcStep));
+          for (let i = 1; i <= steps; i++) {
+            const t = i / steps, a = ang * t, r = r0 + (r1 - r0) * t, h = s0.h + (s1.h - s0.h) * t;
+            push('cut', i === steps ? p : c.map((x, j) => x + r * (Math.cos(a) * u[j] + Math.sin(a) * w[j]) + h * k[j]), n);
+          }
+          circle = null;
+        } else push(kind, p, n);
+        rapidNext = false;
+        break;
+      }
+      default: break; // PPRINT, PARTNO, CUTTER, MULTAX, MCS, COOLNT ... carry no geometry
+    }
+  }
+  let length = 0;
+  for (const sg of segments) for (let i = 1; i < sg.points.length; i++) length += Math.hypot(sg.points[i][0] - sg.points[i - 1][0], sg.points[i][1] - sg.points[i - 1][1], sg.points[i][2] - sg.points[i - 1][2]);
+  return { segments, bounds: { min, max }, length, units };
 }

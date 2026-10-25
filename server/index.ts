@@ -20,7 +20,7 @@ import { execFile, execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { Station, ItemType, Item } from '../src/core/items/item.ts';
-import { RpcRequest, RpcResponse } from '../src/api/rpc.ts';
+import { RpcRequest, RpcResponse, READ_ONLY_METHODS } from '../src/api/rpc.ts';
 import { createNodeHost } from '../src/api/node_host.ts';
 import { findPython } from '../src/api/runner_cpython.ts';
 import { loadStation, saveStation } from '../src/io/station-file.ts';
@@ -28,6 +28,7 @@ import '../src/posts/index.ts';
 import { createDriver, drivers, RobotDriver } from './drivers/index.ts';
 import { Vda5050Service, mqttConnector } from './vda5050.ts';
 import { handleVisionHttp } from './vision.ts';
+import { handlePostsHttp } from './posts_native.ts';
 
 const PORT = Number(process.env.STUDIO_PORT ?? 20500);
 const STATION_FILE = process.env.STUDIO_STATION ?? '';
@@ -64,13 +65,11 @@ const special = (req: RpcRequest): Promise<RpcResponse> | undefined => {
   return driverCommand(req).then((result) => ({ id: req.id, result }), (e) => ({ id: req.id, error: String(e?.message ?? e) }));
 };
 
-const READ_ONLY = /^(Item|ItemList|Valid|Name|Type|Pose|PoseAbs|Joints|Busy|WaitMove|WaitFinished|getParam|Version)$/;
 const httpServer = http.createServer();
-await new Promise<void>((resolve) => httpServer.listen(PORT, () => resolve()));
 await new Promise<void>((resolve) => httpServer.listen(PORT, () => resolve()));
 const host = await createNodeHost({
   station: initial, server: httpServer, tcpPort: Number(process.env.STUDIO_TCP_PORT ?? PORT + 1), special,
-  afterHeadless: (req) => { if (STATION_FILE && !READ_ONLY.test(req.method)) { try { writeFileSync(STATION_FILE, JSON.stringify(saveStation(host.station(), host.rdk.assets))); } catch { /* ignore */ } } },
+  afterHeadless: (req) => { if (STATION_FILE && !READ_ONLY_METHODS.has(req.method)) { try { writeFileSync(STATION_FILE, JSON.stringify(saveStation(host.station(), host.rdk.assets))); } catch { /* ignore */ } } },
 });
 const station = () => host.station();
 
@@ -90,7 +89,9 @@ let converterStatus: { ok: boolean; detail: string } | null = null;
 function checkConverter(): { ok: boolean; detail: string } {
   if (converterStatus) return converterStatus;
   try {
-    const out = execFileSync(converterPython(), ['-I', '-c', 'import robodk.robolink as r, os; print(os.path.abspath(r.__file__))'], { encoding: 'utf8', timeout: 20000, windowsHide: true }).trim();
+    // same import path as python/rdk2vbs.py: RoboDK's own API folder first (<RoboDK>/Python), nothing from the studio
+    const api = path.join(process.env.ROBODK_PATH ?? 'C:/RoboDK', 'Python').split(path.sep).join('/');
+    const out = execFileSync(converterPython(), ['-I', '-B', '-c', `import sys, os; sys.path.insert(0, ${JSON.stringify(api)}); import robodk.robolink as r; print(os.path.abspath(r.__file__))`], { encoding: 'utf8', timeout: 20000, windowsHide: true }).trim();
     const dropIn = path.resolve(process.cwd(), 'python').toLowerCase();
     converterStatus = { ok: !!out && !out.toLowerCase().startsWith(dropIn), detail: out };
   } catch (e: any) { converterStatus = { ok: false, detail: String(e?.message ?? e).slice(0, 300) }; }
@@ -100,6 +101,7 @@ function checkConverter(): { ok: boolean; detail: string } {
 httpServer.on('request', async (req, res) => {
   if ((req.url ?? '').startsWith('/vda5050/') && (await vda.handleHttp(req, res, () => readJson(req)))) return;
   if ((req.url ?? '').startsWith('/vision/') && (await handleVisionHttp(req, res, () => readJson(req)))) return;
+  if ((req.url ?? '').startsWith('/posts/native') && (await handlePostsHttp(req, res, () => readJson(req)))) return;
   if (req.method === 'OPTIONS') { res.writeHead(204, { 'access-control-allow-origin': '*', 'access-control-allow-headers': '*', 'access-control-allow-methods': 'GET,POST,OPTIONS' }); res.end(); return; }
   res.setHeader('access-control-allow-origin', '*');
   const json = (code: number, body: any) => { res.writeHead(code, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); };
@@ -150,7 +152,7 @@ httpServer.on('request', async (req, res) => {
 
 // Official RoboDK binary protocol (opt-in: the official robodk package / RoboDK C#, C++, MATLAB clients)
 if (process.env.STUDIO_RDK_PORT) {
-  import('../src/api/rdk_protocol.ts').then(({ startRdkProtocolServer }) => startRdkProtocolServer({ port: Number(process.env.STUDIO_RDK_PORT), handle: (req) => host.api.handle(req) }))
+  import('../src/api/rdk_protocol.ts').then(({ startRdkProtocolServer }) => startRdkProtocolServer({ port: Number(process.env.STUDIO_RDK_PORT), handle: (req: RpcRequest) => host.api.handle(req) }))
     .then((s) => console.log(`[studio-server] RoboDK binary API protocol on port ${s.port}`))
     .catch((e) => console.warn(`[studio-server] RoboDK protocol unavailable: ${e.message}`));
 }

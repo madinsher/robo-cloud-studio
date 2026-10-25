@@ -47,10 +47,10 @@ $ADVANCE = 5
 export const kukaFrame = (m: Mat4): string => { const [x, y, z, a, b, c] = pose2Kuka(m); return `{FRAME: X ${fx(x)},Y ${fx(y)},Z ${fx(z)},A ${fx(a)},B ${fx(b)},C ${fx(c)}}`; };
 const AXES = ['A1', 'A2', 'A3', 'A4', 'A5', 'A6', 'E1', 'E2', 'E3', 'E4', 'E5', 'E6'];
 
-interface Part { name: string; lines: string[]; calls: string[]; first: boolean }
+interface Part { name: string; lines: string[]; calls: string[]; first: boolean; decls?: string[] }
 
 export class KukaPost extends RoboPost {
-  PROG_EXT = 'src';
+  override PROG_EXT = 'src';
   protected nameLen = 16;
   protected parts: Part[] = [];
   protected cur!: Part;
@@ -90,6 +90,7 @@ export class KukaPost extends RoboPost {
     for (const p of this.parts) {
       const L = ['&ACCESS RVP', '&REL 1', '&PARAM TEMPLATE = C:\\KRC\\Roboter\\Template\\vorgabe', '&PARAM EDITMASK = *', `DEF ${p.name} ( )`];
       if (this.krc <= 2 && p.calls.length) L.push('', '; External program calls:', ...p.calls.map((c) => `EXT ${c}()`), '');
+      if (p.decls?.length) L.push(...p.decls); // KRL declarations precede every executable statement
       if (p.first) {
         if (this.krc <= 2) L.push('EXT BAS (BAS_COMMAND :IN,REAL :IN )');
         L.push(...KUKA_HEADER.split('\n'));
@@ -183,7 +184,7 @@ export class KukaPost extends RoboPost {
     this.addCall(name);
     if (count <= 0) { this.addline('LOOP'); this.addline(`  ${name}()`); this.addline('ENDLOOP'); return; }
     const v = `I_LOOP${++this.loopVar}`;
-    this.addline(`DECL INT ${v}`);
+    (this.cur.decls ??= []).push(`DECL INT ${v}`);
     this.addline(`FOR ${v} = 1 TO ${Math.trunc(count)}`);
     this.addline(`  ${name}()`);
     this.addline('ENDFOR');

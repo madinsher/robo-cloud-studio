@@ -84,7 +84,7 @@ describe('itemContextMenu', () => {
     expect(menuFor(field)).toContain('Regenerate rows…'); ctxItem('Regenerate rows').click(); expect(dialogTitle()).toBe(`Regenerate ${field.name}`); clickCancel(); await tickMs(1);
     const nm = app.station.itemsOfType(ItemType.MAP).length, nz = app.station.itemsOfType(ItemType.ZONE).length;
     menuFor(field); ctxItem('Build navigation map').click(); expect(app.station.itemsOfType(ItemType.MAP).length).toBe(nm + 1); expect(app.station.itemsOfType(ItemType.ZONE).length).toBeGreaterThan(nz);
-    const mission = app.station.itemsOfType<MissionItem>(ItemType.MISSION)[1]; expect(mission.taskIds.length).toBe(0);
+    const mission = app.station.itemsOfType<MissionItem>(ItemType.MISSION)[1]; mission.taskIds = []; mission.status = 'draft'; // the demo plans its missions; re-plan from a draft
     expect(menuFor(mission)).toContain('Plan mission (create fleet tasks)'); ctxItem('Plan mission').click(); expect(mission.taskIds.length).toBeGreaterThan(0); expect(lastToast()).toMatch(/tasks over/);
     const m = app.station.itemsOfType<MobileRobot>(ItemType.MOBILE_ROBOT)[0];
     m.setPose2D(123, 456, 7); expect(menuFor(m)).toContain('Set home here'); ctxItem('Set home here').click(); expect(m.home).toEqual({ x: 123, y: 456, theta: 7 });
@@ -164,7 +164,12 @@ describe('creation dialogs', () => {
     const m = app.addMobileRobot('amr');
     p = navigateDialog(app, m); expect(Number(fieldInput('X (m)').value)).toBeCloseTo(m.state.x / 1000 + 10, 1); setField('X (m)', 2); setField('Y (m)', -3); clickOk(); await p;
     expect(m.state.path).toBeTruthy(); expect(app.worldRunning).toBe(true); app.pauseWorld();
-    app.deleteItems(app.station.itemsOfType(ItemType.MAP)); p = navigateDialog(app, m); setField('X (m)', 1); clickOk(); await p; expect(m.state.path!.length).toBe(2); app.pauseWorld();
+    app.deleteItems(app.station.itemsOfType(ItemType.MAP)); const s0 = [m.state.x, m.state.y]; p = navigateDialog(app, m); setField('X (m)', 1); clickOk(); await p;
+    // without a map the robot drives straight to the goal: every pose of the tracked path lies on the start-goal segment and it ends at the goal
+    const goal = [1000, s0[1]], path = m.state.path!, d = Math.hypot(goal[0] - s0[0], goal[1] - s0[1]);
+    expect(path.at(-1)![0]).toBeCloseTo(goal[0], 3); expect(path.at(-1)![1]).toBeCloseTo(goal[1], 3);
+    for (const q of path) expect(Math.abs((goal[0] - s0[0]) * (q[1] - s0[1]) - (goal[1] - s0[1]) * (q[0] - s0[0])) / d).toBeLessThan(1);
+    app.pauseWorld();
     p = navigateDialog(app, m); clickCancel(); await p;
   });
   it('harvest, machining, curve follow and rail IK generators', async () => {

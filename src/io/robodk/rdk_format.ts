@@ -84,15 +84,22 @@ export function rdkChunks(r: RdkBytes): RdkChunk[] {
   return out;
 }
 
-/** Character codes stored one per double (robot / object tables). Any Unicode code point. */
+const utf8 = typeof TextDecoder !== 'undefined' ? new TextDecoder('utf-8') : null;
+
+/**
+ * Name stored one char per double (robot table [1800], object / tool table [1440], post id [3800]): the UTF-8 bytes of
+ * the name as signed chars ("Инструмент" = -48,-104,...; verified with a RoboDK-made station, synthetic fixture).
+ */
 export function tableChars(t: (i: number) => number, index: number, max = 120): string {
-  let s = '';
+  const bytes: number[] = [];
   for (let i = 0; i < max; i++) {
     const v = t(index + i);
-    if (!Number.isFinite(v) || v !== Math.round(v) || v < 32 || v > 0x10ffff) break;
-    s += String.fromCodePoint(v);
+    if (!Number.isFinite(v) || v !== Math.round(v) || v < -128 || v > 255 || (v >= 0 && v < 32)) break;
+    bytes.push(v < 0 ? v + 256 : v);
   }
-  return s;
+  if (!bytes.some((b) => b >= 128)) return String.fromCharCode(...bytes);
+  if (utf8) return utf8.decode(Uint8Array.from(bytes));
+  return String.fromCharCode(...bytes);
 }
 
 /** xyz (mm) + rx, ry, rz (rad) applied as transl · rotx · roty · rotz (the order RoboDK uses in its tables). */

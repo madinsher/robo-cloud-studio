@@ -5,6 +5,7 @@
 import { Item, ItemType, SceneObject, SerializedItem, DeserializeContext, registerItemType, Station, GeometryRef } from '../core/items/item';
 import { Mat4, transl, multiply, identity, rotz, DEG, invert } from '../core/math/pose';
 import { EventBus } from '../core/events';
+import { StationRuntime } from '../core/motion/runtime';
 
 export type BehaviourType = 'feeder' | 'conveyor' | 'process' | 'sink' | 'buffer' | 'signal' | 'transfer' | 'sensor' | 'human';
 
@@ -147,11 +148,30 @@ export interface ProcessEvents extends Record<string, unknown> {
   signal: { name: string; value: boolean | number };
 }
 
+/**
+ * Process-component signals live in the station's single signal table (StationRuntime.signals, contract I1): robot
+ * programs can wait on a conveyor sensor or stop a conveyor, control models see the same values. This Map view keeps
+ * the old `signals.get / set / entries` API of the process simulator.
+ */
+class SignalTableView extends Map<string, boolean | number> {
+  constructor(private readonly table: () => { get(n: string): unknown; set(n: string, v: any): void; has(n: string): boolean; snapshot(): Record<string, unknown> }) { super(); }
+  override get(k: string): boolean | number | undefined { return this.table().get(k) as boolean | number | undefined; }
+  override set(k: string, v: boolean | number): this { this.table()?.set(k, v); return this; }
+  override has(k: string): boolean { return this.table().has(k); }
+  override get size(): number { return Object.keys(this.table().snapshot()).length; }
+  override entries(): MapIterator<[string, boolean | number]> { return (Object.entries(this.table().snapshot()) as Array<[string, boolean | number]>)[Symbol.iterator]() as MapIterator<[string, boolean | number]>; }
+  override keys(): MapIterator<string> { return Object.keys(this.table().snapshot())[Symbol.iterator]() as MapIterator<string>; }
+  override values(): MapIterator<boolean | number> { return (Object.values(this.table().snapshot()) as Array<boolean | number>)[Symbol.iterator]() as MapIterator<boolean | number>; }
+  override forEach(cb: (v: boolean | number, k: string, m: Map<string, boolean | number>) => void): void { for (const [k, v] of this.entries()) cb(v, k, this); }
+  override [Symbol.iterator](): MapIterator<[string, boolean | number]> { return this.entries(); }
+}
+
 /** Discrete-time process flow simulator for Component behaviours. */
 export class ProcessSimulator {
   readonly events = new EventBus<ProcessEvents>();
   time = 0;
-  signals = new Map<string, boolean | number>();
+  /** Signals of the station's runtime signal table (shared with robot programs and control models). */
+  signals: Map<string, boolean | number> = new SignalTableView(() => StationRuntime.of(this.station).signals);
   products = new Map<string, ProductState>();
   private productsFolder: Item | null = null;
   private rng = mulberry32(42);

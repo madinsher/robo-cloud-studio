@@ -4,7 +4,7 @@ import { Robot } from '../items/robot';
 import { Program, Instruction, ProgramRunResult } from '../items/program';
 import { Trajectory, sampleAt } from './trajectory';
 import { EventBus } from '../events';
-import { CollisionPair, CollisionOptions, robotCollisionChecker } from '../collision/collision';
+import { CollisionPair, CollisionOptions, Collider, robotCollisionChecker } from '../collision/collision';
 import { recordProgram, RecordedStep, StationSnapshot, StationRuntime } from './runtime';
 import type { MotionGroup } from './planner';
 import type { Pose2D } from './mobile_hook';
@@ -55,8 +55,13 @@ export class ProgramSimulator {
   /** Object -> tool attachment (object id -> tool and pose relative to the tool) during simulation. */
   attachments = new Map<string, { tool: Tool; local: Float64Array }>();
   /** Collision checking during compile (sampled along trajectories). */
-  collisionOptions: (CollisionOptions & { enabled: boolean; sampleStep?: number }) = { enabled: false, sampleStep: 0.02 };
+  collisionOptions: (CollisionOptions & { enabled: boolean; sampleStep?: number; /** Joint motion (deg / mm) between samples (default 2). */ jointStep?: number; /** Sample budget of one check (default 20000; the joint step grows for longer programs). */ maxSamples?: number; /** Colliding instructions listed before the check stops (default 20). */ maxCollisions?: number; /** Wall-clock budget of the check (ms, default 60000). */ timeBudgetMs?: number }) = { enabled: false, sampleStep: 0.02 };
   collisions: Array<{ instructionId: string; t: number; pairs: CollisionPair[] }> = [];
+  /**
+   * 'ignore' reproduces RoboDK's Item.Update() cycle-time estimate (Set speed instructions are not applied there;
+   * playback honours them). Default 'apply'.
+   */
+  speedInstructions: 'apply' | 'ignore' = 'apply';
   /** Asset store for mesh bounds (attach distance); collision uses collisionOptions.assets. */
   assets: StationRuntime['assets'] = null;
   private currentStep = -1;
@@ -87,7 +92,7 @@ export class ProgramSimulator {
       attach: (id: string, tool: Tool) => { if (!this.replaying) return; const o = this.station.findById(id); if (o) this.attachments.set(id, { tool, local: o.pose() }); this.version++; },
       detach: (id: string) => { if (this.replaying) { this.attachments.delete(id); this.version++; } },
     };
-    const rec = recordProgram(this.station, program, { startJoints, sink, assets: this.assets ?? (this.collisionOptions.assets as any) ?? null });
+    const rec = recordProgram(this.station, program, { startJoints, sink, assets: this.assets ?? (this.collisionOptions.assets as any) ?? null, ignoreSpeedInstructions: this.speedInstructions === 'ignore' });
     this.recRuntime = rec.runtime;
     this.snapshot = rec.snapshot;
     this.steps = rec.steps.map((s: RecordedStep): Step => {
@@ -263,21 +268,45 @@ export class ProgramSimulator {
         problems.push({ instructionId: '', message: `Initial contact ignored: ${p.a.item.name} × ${p.b.item.name} (${p.depth.toFixed(0)} mm)`, severity: 'warning' });
       }
     }
-    // sample times: knots and a regular grid per motion step (bounded per step)
+    // sample times adapted to the motion: a sample whenever a joint moved `jointStep` deg (mm for prismatic axes) since
+    // the last sample of that robot, at most every `sampleStep` s, plus every move end. Dense machining programs with
+    // thousands of sub-millimetre moves get one sample per few moves instead of several per move.
+    const dmax = (a: number[], b: number[]) => { let m = 0; for (let i = 0; i < Math.min(a.length, b.length); i++) m = Math.max(m, Math.abs(a[i] - b[i])); return m; };
+    // very long programs (15k-move 3D printing paths): coarser joint step so the check stays within maxSamples
+    let travel = 0;
+    for (const s of motionSteps) { const ks = s.trajectory!.samples; for (let k = 1; k < ks.length; k++) travel += dmax(ks[k - 1].joints, ks[k].joints); }
+    const jStep = Math.max(0.1, this.collisionOptions.jointStep ?? 2, travel / Math.max(1000, this.collisionOptions.maxSamples ?? 20000));
     const samples: Array<{ t: number; s: Step }> = [];
+    const lastQ = new Map<Robot, number[]>();
     for (const s of motionSteps) {
-      const tr = s.trajectory!;
-      const n = Math.min(400, Math.max(1, Math.ceil(tr.duration / step)));
-      for (let k = 0; k <= n; k++) samples.push({ t: s.t0 + (k / n) * tr.duration, s });
-      if (tr.samples.length <= 64) for (const smp of tr.samples) samples.push({ t: s.t0 + smp.t, s });
+      const tr = s.trajectory!, r = s.group?.robot ?? s.robot!;
+      const ks = tr.samples;
+      if (!lastQ.has(r)) samples.push({ t: s.t0, s }); // the start posture of every robot is checked too
+      let prev = lastQ.get(r) ?? ks[0].joints;
+      for (let k = 1; k < ks.length; k++) {
+        const a = ks[k - 1], b = ks[k];
+        const n = Math.min(400, Math.max(dmax(prev, b.joints) >= jStep ? 1 : 0, Math.ceil(dmax(a.joints, b.joints) / jStep), Math.ceil((b.t - a.t) / Math.max(step, 0.2))));
+        for (let i = 1; i <= n; i++) samples.push({ t: s.t0 + a.t + ((b.t - a.t) * i) / n, s });
+        if (n) prev = b.joints;
+      }
+      if (dmax(prev, ks[ks.length - 1].joints) > 1e-6) { samples.push({ t: s.t0 + tr.duration, s }); prev = ks[ks.length - 1].joints; }
+      lastQ.set(r, prev);
     }
     samples.sort((a, b) => a.t - b.t);
+    // mesh pairs touching at the start have a boolean depth: they can never be reported later, so do not re-test them
+    const initialMesh = new Set<string>();
+    for (const r of robots) for (const p of checkers.get(r)!.check(this.version)) if (initial.has(keyOf(p)) && (p.a.shape.kind === 'mesh' || p.b.shape.kind === 'mesh')) initialMesh.add(keyOf(p));
+    const skipInitial = initialMesh.size ? (a: Collider, b: Collider) => initialMesh.has(`${a.item.id}/${a.part}|${b.item.id}/${b.part}`) || initialMesh.has(`${b.item.id}/${b.part}|${a.item.id}/${a.part}`) : undefined;
     const hit = new Set<string>();
+    // RoboDK reports the first collision (the program is valid up to it): list a few, then stop; and bound the time
+    const maxHits = Math.max(1, opts.maxCollisions ?? 20), deadline = performance.now() + Math.max(1000, opts.timeBudgetMs ?? 60000);
     for (const { t, s } of samples) {
       if (hit.has(s.instruction.id)) continue;
+      if (hit.size >= maxHits) { problems.push({ instructionId: '', message: `Collision check stopped after ${maxHits} colliding instructions`, severity: 'warning' }); break; }
+      if (performance.now() > deadline) { problems.push({ instructionId: s.instruction.id, message: `Collision check stopped at ${t.toFixed(1)} s (time budget ${(opts.timeBudgetMs ?? 60000) / 1000} s): the rest of the program was not checked`, severity: 'warning' }); break; }
       this.seek(t);
       const r = s.group?.robot ?? s.robot!;
-      const pairs = checkers.get(r)!.check(this.version).filter((p) => p.depth > (initial.get(keyOf(p)) ?? -Infinity) + 0.5);
+      const pairs = checkers.get(r)!.check(this.version, skipInitial).filter((p) => p.depth > (initial.get(keyOf(p)) ?? -Infinity) + 0.5);
       if (!pairs.length) continue;
       hit.add(s.instruction.id);
       this.collisions.push({ instructionId: s.instruction.id, t, pairs });
@@ -290,9 +319,13 @@ export class ProgramSimulator {
   }
 }
 
-/** Convenience: estimate cycle time & validity without touching robot state. */
-export function estimateProgram(station: Station, program: Program): ProgramRunResult {
+/**
+ * Convenience: estimate cycle time & validity without touching robot state. `roboDKUpdate` reproduces RoboDK's
+ * Item.Update() numbers (programmed Set speed instructions ignored, see ProgramSimulator.speedInstructions).
+ */
+export function estimateProgram(station: Station, program: Program, opts: { roboDKUpdate?: boolean } = {}): ProgramRunResult {
   const sim = new ProgramSimulator(station);
+  if (opts.roboDKUpdate) sim.speedInstructions = 'ignore';
   return sim.compile(program);
 }
 

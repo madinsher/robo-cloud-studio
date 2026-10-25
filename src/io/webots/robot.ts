@@ -16,7 +16,7 @@ import { BuildCtx, poseOf, rigidOf, walkShapes, boundingRefs, warnOnce, M2MM } f
 /** Studio camera axes (X right, Y down, Z view) expressed in a Webots device frame (X forward, Y left, Z up). */
 export const WEBOTS_DEVICE_TO_STUDIO_CAMERA: Mat4 = fromArray([0, -1, 0, 0, 0, 0, -1, 0, 1, 0, 0, 0, 0, 0, 0, 1]);
 
-const DEVICE_TYPES = new Set(['Camera', 'RangeFinder', 'Lidar', 'GPS', 'InertialUnit', 'Gyro', 'Accelerometer', 'Compass', 'DistanceSensor', 'TouchSensor', 'LightSensor', 'Radar', 'Receiver', 'Emitter', 'Display', 'LED', 'Speaker', 'Pen', 'Connector', 'VacuumGripper', 'Altimeter', 'Microphone', 'Radio', 'Charger']);
+export const DEVICE_TYPES = new Set(['Camera', 'RangeFinder', 'Lidar', 'GPS', 'InertialUnit', 'Gyro', 'Accelerometer', 'Compass', 'DistanceSensor', 'TouchSensor', 'LightSensor', 'Radar', 'Receiver', 'Emitter', 'Display', 'LED', 'Speaker', 'Pen', 'Connector', 'VacuumGripper', 'Altimeter', 'Microphone', 'Radio', 'Charger']);
 const DEFAULT_NAMES: Record<string, string> = { Camera: 'camera', RangeFinder: 'range-finder', Lidar: 'lidar', GPS: 'gps', InertialUnit: 'inertial unit', Gyro: 'gyro', Accelerometer: 'accelerometer', Compass: 'compass', DistanceSensor: 'distance sensor', TouchSensor: 'touch sensor' };
 
 export interface RobotInfo {
@@ -161,7 +161,8 @@ export function robotToKinTree(robot: WNode, ctx: BuildCtx): { tree: KinTree; in
 
   const addJoint = (parent: KinLink, j: WNode, T: Mat4) => {
     const epRaw = fNode(j, 'endPoint');
-    const ep = epRaw ? ctx.reg.resolve(epRaw) : null;
+    let ep = epRaw ? ctx.reg.resolve(epRaw) : null;
+    for (let k = 0; ep?.type === 'Slot' && k < 8; k++) { const e2 = fNode(ep, 'endPoint'); ep = e2 ? ctx.reg.resolve(e2) : null; } // a Slot plugs the real endPoint
     if (!ep) return;
     if (ep.type === 'SolidReference') { warnOnce(ctx, `${name}: closed kinematic loop (SolidReference) ignored`); return; }
     const Te = multiply(T, poseOf(ep));

@@ -7,14 +7,16 @@
  * Every firing / outcome is printed as `TRACE<TAB>time<TAB>kind<TAB>label` so runs can be compared.
  * Python 3.6+ (RoboDK ships 3.7), no dependency besides robodk.
  */
-export const PY_RUNTIME = String.raw`
-import json, math, sys, time
-
+/** robolink import of the RoboDK station script (the ROS 2 package replaces it by its own link, see ros2.ts). */
+export const PY_ROBODK_IMPORT = String.raw`
 try:
     from robodk.robolink import Robolink, ITEM_TYPE_PROGRAM, ITEM_TYPE_ROBOT, ITEM_TYPE_TARGET
 except ImportError:  # RoboDK < 5.4
     from robolink import Robolink, ITEM_TYPE_PROGRAM, ITEM_TYPE_ROBOT, ITEM_TYPE_TARGET
-
+`;
+export const PY_RUNTIME = String.raw`
+import json, math, sys, time
+` + PY_ROBODK_IMPORT + String.raw`
 DT = 0.05
 T0 = None
 
@@ -98,8 +100,14 @@ class World(object):
 _seq = [0]
 
 
+def _sub(v, bb):
+    return str(bb[v[1:]]) if isinstance(v, str) and v.startswith('$') and v[1:] in bb else v
+
+
 class Action(object):
     def __init__(self, world, b, t):
+        if str(b.get('value', '')).startswith('$') or any(isinstance(v, str) and v.startswith('$') for v in b.get('args', {}).values()):
+            b = dict(b, value=_sub(b['value'], world.bb), args=dict((k, _sub(v, world.bb)) for k, v in b.get('args', {}).items()))  # $name = blackboard value
         _seq[0] += 1
         self.w, self.b, self.key, self.t0, self.state = world, b, 'a%d' % _seq[0], t, 'init'
         self.result = None
@@ -132,7 +140,8 @@ class Action(object):
             if self.item.Busy():
                 return 'running'
             w.release(self.key)
-            return 'success'
+            failed = getattr(self.item, 'Failed', None)
+            return 'failure' if failed is not None and failed() else 'success'
         if k == 'target':
             if self.state == 'init':
                 self.target = w.rdk.Item(b['value'], ITEM_TYPE_TARGET)
@@ -154,7 +163,8 @@ class Action(object):
             if self.robot.Busy():
                 return 'running'
             w.release(self.key)
-            return 'success'
+            failed = getattr(self.robot, 'Failed', None)
+            return 'failure' if failed is not None and failed() else 'success'
         if k == 'signal':
             v = b['args'].get('value', True)
             w.set_signal(b['value'], v)
@@ -338,9 +348,9 @@ class AutomatonRun(object):
             self.fire(evs[0], 'auto')
         self.time += dt
         self.ticks += 1
-        if not self.running and not self.enabled_auto() and not self.waiting_for_world():
+        marked = all(self.state[c['name']] in c['marked'] for c in self.m['comps']) and (not self.sup or self.sup.marked())
+        if not self.running and not self.enabled_auto() and (not self.waiting_for_world() or (self.m.get('terminate') == 'marked' and marked and self.last and not self.blocked)):
             self.status = 'idle'
-            marked = all(self.state[c['name']] in c['marked'] for c in self.m['comps']) and (not self.sup or self.sup.marked())
             self.verdict = 'failed' if self.blocked else ('done' if marked else 'deadlock')
 
     def where(self):

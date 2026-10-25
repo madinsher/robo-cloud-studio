@@ -1,20 +1,24 @@
-"""Run this script INSIDE RoboDK (Tools > Run Script, or `python rdk_export.py` with RoboDK open).
+"""Export the open RoboDK station to a VerticalBot Studio station file (.vbstation JSON) through the official API.
 
-It walks the open RoboDK station through the official RoboDK API and writes a VerticalBot Studio
-station file (.vbstation JSON) next to the .rdk, plus STL meshes for objects/tools. Open the
-result in the studio (File > Open) — this is the lossless path for RoboDK projects, since the
-.rdk container itself is proprietary.
+Run it INSIDE RoboDK (Tools > Run Script, or `python rdk_export.py` while RoboDK is open), or let the studio
+server call it through rdk2vbs.py (POST /convert/rdk, a hidden RoboDK on a free port).
 
-Exported: frames, robots (name, pose, joints, limits — kinematics matched from the studio library
-by name, or DH parameters if available via robot.setParam('JointsDH')), tools (TCP pose, mesh),
-targets (pose, joints, cartesian/joint), programs (moves, speeds, frames, tools, pauses, IO, code,
-plus the exact joint path from InstructionListJoints for replay), objects (pose + STL + curves and
-points used by machining projects), machining projects (curve/point follow, 3D printing, milling:
-robot, part, generated program, update status), Python programs (name; source when RoboDK exposes it).
+Lossless part: RoboDK saves the station again with its own writer and the file is embedded (base64) as
+`station.params.rdkFile`; the studio decodes it with its binary reader (src/io/robodk), which reproduces RoboDK's
+tree, robot kinematics and meshes, targets, programs (by item reference), Python programs, curves and points.
+API walk (always written, used for the cross-check and by studios without the binary reader): frames, robots (base
+pose relative to the parent - not the TCP that Robot.Pose() returns -, exact name, joints, home, limits, active
+frame / tool), tools (TCP), objects, targets (pose, joints, joint flag), programs (robot, raw Instruction() tuples
+with the official INS_TYPE numbering in `insType`), machining projects (links), Python programs (names).
+VBS_EXPORT_STL=1 additionally embeds object / tool meshes as STL assets; VBS_JOINT_PATH=1 adds RoboDK's simulated
+joint path (InstructionListJoints) per program.
 """
+import base64
 import json
 import os
+import shutil
 import sys
+import tempfile
 
 try:
     from robodk.robolink import *  # noqa
@@ -23,51 +27,21 @@ except ImportError:  # RoboDK < 5.4
     from robolink import *  # type: ignore # noqa
     from robodk import *  # type: ignore # noqa
 
-RDK = Robolink()
-station = RDK.ActiveStation()
-out_dir = os.path.dirname(RDK.getParam("PATH_OPENSTATION") or ".") or "."
-base_name = os.path.splitext(os.path.basename(RDK.getParam("PATH_OPENSTATION") or "station.rdk"))[0]
-mesh_dir = os.path.join(out_dir, base_name + "_meshes")
-os.makedirs(mesh_dir, exist_ok=True)
-
 TYPE_MAP = {ITEM_TYPE_FRAME: 3, ITEM_TYPE_ROBOT: 2, ITEM_TYPE_TOOL: 4, ITEM_TYPE_OBJECT: 5, ITEM_TYPE_TARGET: 6, ITEM_TYPE_PROGRAM: 8, ITEM_TYPE_FOLDER: 17,
             ITEM_TYPE_PROGRAM_PYTHON: 10, ITEM_TYPE_MACHINING: 11, ITEM_TYPE_NOTES: 22}
-JOINT_PATH_STEP_MM = float(os.environ.get("VBS_JOINTS_STEP_MM", "10"))
-JOINT_PATH_MAX_ROWS = int(os.environ.get("VBS_JOINTS_MAX_ROWS", "20000"))
 
 
-def mat_rows(m):
-    """Mat -> list of rows (python lists)."""
+def pose_cols(m):
+    """RoboDK Mat (rows) -> column-major list of 16 (the studio's Mat4 layout)."""
+    rows = m.rows if hasattr(m, 'rows') else m
+    return [float(rows[r][c]) for c in range(4) for r in range(4)]
+
+
+def as_list(v):
     try:
-        return [list(r) for r in m.rows]
+        return [float(x) for x in (v.list() if hasattr(v, 'list') else v)]
     except Exception:
-        try:
-            return m.tolist()
-        except Exception:
-            return []
-
-
-def object_features(item):
-    """Curves and points stored on an object (used by curve/point follow and 3D printing projects)."""
-    curves, points = [], []
-    for i in range(256):
-        try:
-            pts, name = item.GetPoints(FEATURE_CURVE, i)
-        except Exception:
-            break
-        if not pts:
-            break
-        curves.append({"name": name or ("Curve %d" % (i + 1)), "points": [[float(v) for v in p[:6]] for p in pts]})
-    for i in range(1024):
-        try:
-            pts, name = item.GetPoints(FEATURE_POINT, i)
-        except Exception:
-            break
-        if not pts:
-            break
-        for p in pts:
-            points.append({"name": name or ("Point %d" % (len(points) + 1)), "point": [float(v) for v in p[:6]]})
-    return curves, points
+        return []
 
 
 def link_name(item, t):
@@ -76,131 +50,120 @@ def link_name(item, t):
         return l.Name() if l.Valid() else None
     except Exception:
         return None
-counter = [0]
 
 
-def pose_cols(m):
-    """RoboDK Mat (rows) -> column-major 16 list."""
-    rows = m.rows if hasattr(m, "rows") else m
-    return [rows[r][c] for c in range(4) for r in range(4)]
-
-
-def new_id(prefix):
-    counter[0] += 1
-    return "%s_%d" % (prefix, counter[0])
-
-
-def export_mesh(item, name):
-    try:
-        path = os.path.join(mesh_dir, name + ".stl")
-        RDK.Save(path, item)
-        if os.path.exists(path):
-            return os.path.relpath(path, out_dir)
-    except Exception:
-        pass
-    return None
-
-
-def export_item(item, parent_frame=None):
+def rel_pose(item):
+    """Pose of an item in its parent's frame. Robots: the base (Robot.Pose() would be the TCP)."""
     t = item.Type()
-    node = {"id": new_id("rdk"), "type": TYPE_MAP.get(t, 20), "name": item.Name(), "pose": pose_cols(item.Pose() if t != ITEM_TYPE_ROBOT else item.PoseAbs()), "visible": bool(item.Visible()), "params": {"rdk_type": t}, "children": []}
-    if t == ITEM_TYPE_ROBOT:
-        node["pose"] = pose_cols(item.Pose()) if item.Parent().Type() != ITEM_TYPE_STATION else pose_cols(item.PoseAbs())
-        lower, upper = item.JointLimits()
-        node["params"].update({"joints": list(item.Joints().list()) if hasattr(item.Joints(), "list") else list(item.Joints()), "lower": list(lower.list()) if hasattr(lower, "list") else list(lower), "upper": list(upper.list()) if hasattr(upper, "list") else list(upper), "library_hint": item.Name()})
-        try:
-            node["params"]["dh"] = item.setParam("JointsDH")  # available on recent RoboDK versions
-        except Exception:
-            pass
-        node["params"]["activeFrame"] = item.getLink(ITEM_TYPE_FRAME).Name() if item.getLink(ITEM_TYPE_FRAME).Valid() else None
-        node["params"]["activeTool"] = item.getLink(ITEM_TYPE_TOOL).Name() if item.getLink(ITEM_TYPE_TOOL).Valid() else None
-    elif t == ITEM_TYPE_TOOL:
-        node["pose"] = pose_cols(item.PoseTool())
-        mesh = export_mesh(item, node["id"])
-        if mesh:
-            node["geometry"] = [{"mesh": mesh, "origin": pose_cols(eye()), "color": "#8ca0b3"}]
-    elif t == ITEM_TYPE_OBJECT:
-        mesh = export_mesh(item, node["id"])
-        if mesh:
-            node["geometry"] = [{"mesh": mesh, "origin": pose_cols(eye()), "color": "#9aa3ad"}]
-        curves, points = object_features(item)
-        if curves:
-            node["curves"] = [{"name": c["name"], "points": [p[:3] for p in c["points"]], "normals": [p[3:6] for p in c["points"] if len(p) >= 6]} for c in curves]
-        if points:
-            node["points"] = [{"name": p["name"], "point": p["point"][:3], "normal": p["point"][3:6]} for p in points]
-    elif t == ITEM_TYPE_TARGET:
-        j = item.Joints()
-        node["joints"] = list(j.list()) if hasattr(j, "list") else list(j)
-        node["isJointTarget"] = bool(item.isJointTarget())
-    elif t == ITEM_TYPE_PROGRAM:
-        robot = item.getLink(ITEM_TYPE_ROBOT)
-        node["params"]["robotName"] = robot.Name() if robot.Valid() else None
-        ins = []
-        n = item.InstructionCount()
-        for i in range(n):
-            name, ins_type, move_type, isjoint, pose, joints = item.Instruction(i)
-            entry = {"name": name, "type": ins_type, "moveType": move_type, "isJointTarget": bool(isjoint)}
-            if ins_type in (INS_TYPE_MOVE, INS_TYPE_MOVEC):
-                entry["pose"] = pose_cols(pose)
-                entry["joints"] = list(joints.list()) if hasattr(joints, "list") else list(joints)
-            ins.append(entry)
-        node["params"]["instructions"] = ins
-        node["params"]["frameName"] = link_name(item, ITEM_TYPE_FRAME)
-        node["params"]["toolName"] = link_name(item, ITEM_TYPE_TOOL)
-        # exact joint path as simulated by RoboDK (works for any robot, even ones the studio cannot solve)
-        try:
-            msg, joints_mat, status = item.InstructionListJoints(JOINT_PATH_STEP_MM, 5, None, COLLISION_OFF, 0, 0.05)
-            rows = mat_rows(joints_mat.tr()) if hasattr(joints_mat, "tr") else []
-            if rows:
-                nj = robot.Joints().list().__len__() if robot.Valid() else len(rows[0])
-                node["params"]["jointsList"] = [[float(v) for v in r[:nj]] for r in rows[:JOINT_PATH_MAX_ROWS]]
-                node["params"]["jointsListStatus"] = int(status)
-                node["params"]["jointsListStepMm"] = JOINT_PATH_STEP_MM
-        except Exception as e:  # older RoboDK builds / invalid programs
-            node["params"]["jointsListError"] = str(e)
-    elif t == ITEM_TYPE_MACHINING:
-        node["params"]["robotName"] = link_name(item, ITEM_TYPE_ROBOT)
-        node["params"]["partName"] = link_name(item, ITEM_TYPE_OBJECT)
-        node["params"]["programName"] = link_name(item, ITEM_TYPE_PROGRAM)
-        node["params"]["toolName"] = link_name(item, ITEM_TYPE_TOOL)
-        node["params"]["frameName"] = link_name(item, ITEM_TYPE_FRAME)
-        for key in ("Machining", "MachiningSettings", "Settings", "NCFile", "PathInput"):
-            try:
-                val = item.setParam(key)
-                if val and isinstance(val, (str, bytes)) and len(val) < 200000:
-                    node["params"]["rdk_" + key] = val.decode("utf-8", "ignore") if isinstance(val, bytes) else val
-            except Exception:
-                pass
-        try:
-            res = item.Update()
-            node["params"]["updateValidRatio"] = float(res[0]) if isinstance(res, (list, tuple)) else float(res)
-        except Exception:
-            pass
-    elif t == ITEM_TYPE_PROGRAM_PYTHON:
-        for key in ("Script", "ScriptSource", "Source"):
-            try:
-                val = item.setParam(key)
-                if val and isinstance(val, (str, bytes)) and "def " in (val if isinstance(val, str) else val.decode("utf-8", "ignore")):
-                    node["params"]["source"] = val if isinstance(val, str) else val.decode("utf-8", "ignore")
-                    break
-            except Exception:
-                pass
-        if "source" not in node["params"]:
-            # RoboDK keeps macros as files next to the station or embedded; try the station folder
-            for cand in (os.path.join(out_dir, item.Name() + ".py"), os.path.join(out_dir, "Macros", item.Name() + ".py")):
-                if os.path.exists(cand):
-                    with open(cand, "r", encoding="utf-8", errors="ignore") as f:
-                        node["params"]["source"] = f.read()
-                    break
-    for child in item.Childs():
-        node["children"].append(export_item(child))
-    return node
+    if t == ITEM_TYPE_TOOL:
+        return item.PoseTool()
+    if t != ITEM_TYPE_ROBOT:
+        return item.Pose()
+    par = item.Parent()
+    if not par.Valid() or par.Type() == ITEM_TYPE_STATION:
+        ref = eye()
+    elif par.Type() == ITEM_TYPE_ROBOT:  # carried on the flange of another robot
+        ref = par.PoseAbs() * par.SolveFK(par.Joints())
+    else:
+        ref = par.PoseAbs()
+    return invH(ref) * item.PoseAbs()
 
 
-root = {"id": "station", "type": 1, "name": station.Name(), "pose": pose_cols(eye()), "visible": True, "params": {"source": "rdk_export.py"}, "children": [export_item(c) for c in station.Childs()], "settings": {"units": "mm"}, "format": "vbs-station", "version": 1}
-out = {"format": "vbstation", "version": 1, "savedAt": "", "app": "rdk_export.py", "station": root, "assets": {}}
-out_path = os.path.join(out_dir, base_name + ".vbstation")
-with open(out_path, "w", encoding="utf-8") as f:
-    json.dump(out, f, indent=1)
-print("Exported %s (%d top-level items). Meshes in %s" % (out_path, len(root["children"]), mesh_dir))
-sys.exit(0)
+class Exporter:
+    def __init__(self, rdk, out_dir, stl=False, joint_path=False):
+        self.rdk, self.out_dir, self.stl, self.joint_path = rdk, out_dir, stl, joint_path
+        self.assets, self.n = {}, 0
+        self.tmp = tempfile.mkdtemp(prefix='vbs-rdk-')
+
+    def new_id(self, prefix):
+        self.n += 1
+        return '%s_%d' % (prefix, self.n)
+
+    def mesh(self, item, node_id):
+        if not self.stl:
+            return None
+        path = os.path.join(self.tmp, node_id + '.stl')
+        try:
+            self.rdk.Save(path, item)
+            with open(path, 'rb') as f:
+                self.assets[node_id] = {'type': 'stl', 'data': base64.b64encode(f.read()).decode('ascii'), 'name': item.Name()}
+            return node_id
+        except Exception:
+            return None
+
+    def item(self, item):
+        t = item.Type()
+        node = {'id': self.new_id('rdk'), 'type': TYPE_MAP.get(t, 20), 'name': item.Name(), 'pose': pose_cols(rel_pose(item)),
+                'visible': bool(item.Visible()), 'params': {'rdk_type': t}, 'children': []}
+        p = node['params']
+        if t == ITEM_TYPE_ROBOT:
+            lower, upper, jtype = (list(item.JointLimits()) + [None])[:3]
+            p.update({'joints': as_list(item.Joints()), 'home': as_list(item.JointsHome()), 'lower': as_list(lower), 'upper': as_list(upper),
+                      'jointsType': jtype, 'library_hint': item.Name(), 'activeFrame': link_name(item, ITEM_TYPE_FRAME), 'activeTool': link_name(item, ITEM_TYPE_TOOL)})
+        elif t in (ITEM_TYPE_TOOL, ITEM_TYPE_OBJECT):
+            m = self.mesh(item, node['id'])
+            if m:
+                node['geometry'] = [{'mesh': m, 'origin': pose_cols(eye()), 'color': '#9aa3ad'}]
+        elif t == ITEM_TYPE_TARGET:
+            node['joints'] = as_list(item.Joints())
+            node['isJointTarget'] = bool(item.isJointTarget())
+            p['robotName'] = link_name(item, ITEM_TYPE_ROBOT)
+        elif t == ITEM_TYPE_PROGRAM:
+            p['robotName'] = link_name(item, ITEM_TYPE_ROBOT)
+            ins = []
+            for i in range(item.InstructionCount()):
+                name, ins_type, move_type, isjoint, pose, joints = item.Instruction(i)
+                e = {'name': name, 'insType': ins_type, 'moveType': move_type, 'isJointTarget': bool(isjoint)}
+                if pose is not None:
+                    e['pose'] = pose_cols(pose)
+                if joints is not None:
+                    e['joints'] = as_list(joints)
+                ins.append(e)
+            p['instructions'] = ins
+            if self.joint_path:
+                try:
+                    msg, mat, status = item.InstructionListJoints(10, 5, None, COLLISION_OFF, 0, 0.05)
+                    rows = [list(r) for r in mat.tr().rows] if hasattr(mat, 'tr') else []
+                    robot = item.getLink(ITEM_TYPE_ROBOT)
+                    nj = len(as_list(robot.Joints())) if robot.Valid() else (len(rows[0]) if rows else 0)
+                    p['jointsList'] = [[float(v) for v in r[:nj]] for r in rows[:20000]]
+                    p['jointsListStatus'] = int(status)
+                    p['jointsListStepMm'] = 10
+                except Exception as e:
+                    p['jointsListError'] = str(e)
+        elif t == ITEM_TYPE_MACHINING:
+            for k, lt in (('robotName', ITEM_TYPE_ROBOT), ('partName', ITEM_TYPE_OBJECT), ('programName', ITEM_TYPE_PROGRAM), ('toolName', ITEM_TYPE_TOOL), ('frameName', ITEM_TYPE_FRAME)):
+                p[k] = link_name(item, lt)
+        for child in item.Childs():
+            node['children'].append(self.item(child))
+        return node
+
+
+def export_station(rdk, station, out_dir, embed_rdk=True, source_name=None):
+    ex = Exporter(rdk, out_dir, stl=os.environ.get('VBS_EXPORT_STL') == '1' or not embed_rdk, joint_path=os.environ.get('VBS_JOINT_PATH') == '1')
+    root = {'id': 'station', 'type': 1, 'name': station.Name(), 'pose': pose_cols(eye()), 'visible': True, 'params': {'source': 'rdk_export.py'},
+            'children': [ex.item(c) for c in station.Childs()], 'settings': {'units': 'mm'}, 'format': 'vbs-station', 'version': 1}
+    if embed_rdk:
+        path = os.path.join(ex.tmp, 'station.rdk')
+        rdk.Save(path, station)
+        with open(path, 'rb') as f:
+            raw = f.read()
+        name = source_name if source_name and source_name.lower().endswith('.rdk') else station.Name() + '.rdk'
+        root['params']['rdkFile'] = {'name': name, 'bytes': len(raw), 'data': base64.b64encode(raw).decode('ascii')}
+    shutil.rmtree(ex.tmp, ignore_errors=True)
+    return {'format': 'vbstation', 'version': 1, 'savedAt': '', 'app': 'rdk_export.py', 'station': root, 'assets': ex.assets}
+
+
+def write_json(data, out_path):
+    with open(out_path, 'w', encoding='utf-8') as f:
+        json.dump(data, f)
+
+
+if __name__ == '__main__':
+    RDK = Robolink()
+    station = RDK.ActiveStation()
+    file = RDK.getParam('FILE_OPENSTATION') or ''
+    folder = RDK.getParam('PATH_OPENSTATION') or (os.path.dirname(file) if file else '.')
+    out = os.environ.get('VBS_EXPORT_OUT') or os.path.join(folder, (os.path.splitext(os.path.basename(file))[0] if file else station.Name()) + '.vbstation')
+    write_json(export_station(RDK, station, folder, embed_rdk=True, source_name=os.path.basename(file) if file else None), out)
+    print('Exported %s' % out)

@@ -48,7 +48,7 @@ export interface XacroResult {
 }
 
 export class XacroError extends Error {
-  constructor(message: string, readonly file?: string, readonly cause?: unknown) { super(message); this.name = 'XacroError'; }
+  constructor(message: string, readonly file?: string, override readonly cause?: unknown) { super(message); this.name = 'XacroError'; }
 }
 
 const PY_KEYWORDS = new Set(['False', 'None', 'True', 'and', 'as', 'assert', 'async', 'await', 'break', 'class', 'continue', 'def', 'del', 'elif', 'else', 'except', 'finally', 'for', 'from', 'global', 'if', 'import', 'in', 'is', 'lambda', 'nonlocal', 'not', 'or', 'pass', 'raise', 'return', 'try', 'while', 'with', 'yield']);
@@ -109,7 +109,7 @@ class Table {
 
 /** Namespace of an `ns=` include: dotted access forwards to the table (with fallback to the parent chain). */
 class NameSpaceTable extends Table {
-  get typeName() { return 'NameSpace'; }
+  override get typeName() { return 'NameSpace'; }
   getAttr(name: string) {
     try { return this.get(name); } catch (e) { if (e instanceof KeyMiss) throw new PyError('NameError', `name '${name}' is not defined`); throw e; }
   }

@@ -1,6 +1,11 @@
 {
- "ok": false,
- "error": "RuntimeError: RuntimeError: robodk.robolink.Robolink is not available while generating code from VerticalBot Studio",
- "log": "",
- "files": []
+ "ok": true,
+ "error": null,
+ "log": "ProgSave: files written; the post then needed the RoboDK API (robodk.robolink.Robolink is not available while generating code from VerticalBot Studio)\nProgSave: files written; the post then needed the RoboDK API (robodk.robolink.Robolink is not available while generating code from VerticalBot Studio)",
+ "files": [
+  "FeatureTest/main.aubo",
+  "FeatureTest/main.xml",
+  "SubPick/main.aubo",
+  "SubPick/main.xml"
+ ]
 }

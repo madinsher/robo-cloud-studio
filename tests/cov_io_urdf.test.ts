@@ -188,7 +188,8 @@ describe('URDF export', () => {
     const { robot, assets } = cell();
     const res = exportRobotURDF(robot, assets, { packageName: 'kr6 pkg' });
     expect(res.packageName).toBe('kr6_pkg');
-    expect(Object.keys(res.files).sort()).toEqual(['CMakeLists.txt', 'README.md', 'meshes/KR_6_link_1.stl', 'package.xml', 'urdf/KR_6.urdf']);
+    // T5: the package is runnable (display launch file) and carries a basic SRDF
+    expect(Object.keys(res.files).sort()).toEqual(['CMakeLists.txt', 'README.md', 'config/KR_6.srdf', 'launch/display.launch.py', 'meshes/KR_6_link_1.stl', 'package.xml', 'urdf/KR_6.urdf']);
     expect(res.warnings).toEqual(['Mesh missing.stl not loaded — visual skipped']);
     const stl = parseSTL((res.files['meshes/KR_6_link_1.stl'] as Uint8Array).buffer as ArrayBuffer);
     expect(stl.max[0]).toBeCloseTo(0.1, 6); // 100 mm -> 0.1 m (float32)

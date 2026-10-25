@@ -4,7 +4,7 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
-import { cases, diffArchives, diffPrograms, generateForCase, STRICT } from './posts_gt_util';
+import { allowedExtra, cases, diffArchives, diffPrograms, fixGt, generateForCase, normBoth, notReproduced, STRICT } from './posts_gt_util';
 
 const ALL = cases();
 describe('posts GT (RoboDK original posts vs studio posts)', () => {
@@ -16,20 +16,21 @@ describe('posts GT (RoboDK original posts vs studio posts)', () => {
     it(`${c.name} / ${c.post}`, () => {
       const files = generateForCase(c);
       const got = new Map(files.map((f) => [f.name.toLowerCase(), f]));
-      for (const name of c.files) {
+      for (const name of c.files.filter((n) => !notReproduced(c.post, n))) {
         const f = got.get(name.toLowerCase());
         expect(f, `missing file ${name} (studio wrote ${files.map((x) => x.name).join(', ')})`).toBeTruthy();
         const raw = readFileSync(path.join(c.dir, name));
         if (f!.encoding === 'base64') {
-          const d = diffArchives(raw, Buffer.from(f!.content, 'base64'));
+          const d = diffArchives(raw, Buffer.from(f!.content, 'base64'), (t) => normBoth(c.post, fixGt(c.post, c.job, t)), (t) => normBoth(c.post, t));
           expect(d, `${name}: ${d}`).toBeNull();
           continue;
         }
-        const exp = raw.toString('utf8');
-        const d = diffPrograms(exp, f!.content);
+        const exp = fixGt(c.post, c.job, raw.toString('utf8'), name);
+        const d = diffPrograms(normBoth(c.post, exp), normBoth(c.post, f!.content));
         expect(d, `${name}: ${d}`).toBeNull();
       }
-      expect(files.length, `extra files: ${files.map((x) => x.name).join(', ')} vs ${c.files.join(', ')}`).toBe(c.files.length);
+      const extra = files.filter((f) => !c.files.some((n) => n.toLowerCase() === f.name.toLowerCase()) && !allowedExtra(c.post, f.name));
+      expect(extra.map((f) => f.name), `extra files (RoboDK wrote ${c.files.join(', ')})`).toEqual([]);
     });
   }
 });

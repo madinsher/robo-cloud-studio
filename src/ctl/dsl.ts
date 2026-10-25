@@ -52,7 +52,7 @@ export function detectKind(src: string): ControlKind | null {
 // DES
 // ---------------------------------------------------------------------------------------------
 
-export interface DesDoc { name: string; plant: AutomatonSpec[]; specs: AutomatonSpec[]; uncontrollable: string[]; unobservable: string[]; faults: string[]; checks: Array<{ kind: 'ltl' | 'ctl'; formula: string; name?: string }>; supervisorName?: string; /** Diagram positions per automaton (graphical editor). */ layout?: Record<string, Record<string, [number, number]>>; /** Robot actions bound to states (`Automaton.state`). */ actions: ActionBinding[]; /** `guard <event> "<expr>"`: the controllable event is issued only while the expression over the blackboard / station signals holds. */ guards?: Record<string, string>; /** `sensor <event> "<expr>"`: the world raises the (uncontrollable) event on each rising edge of the expression. */ sensors?: SensorSpec[]; /** `blackboard k=v …`: initial blackboard values of the executor. */ blackboard?: Record<string, string | number | boolean> }
+export interface DesDoc { name: string; plant: AutomatonSpec[]; specs: AutomatonSpec[]; uncontrollable: string[]; unobservable: string[]; faults: string[]; checks: Array<{ kind: 'ltl' | 'ctl'; formula: string; name?: string }>; supervisorName?: string; /** Diagram positions per automaton (graphical editor). */ layout?: Record<string, Record<string, [number, number]>>; /** Robot actions bound to states (`Automaton.state`). */ actions: ActionBinding[]; /** `guard <event> "<expr>"`: the controllable event is issued only while the expression over the blackboard / station signals holds. */ guards?: Record<string, string>; /** `sensor <event> "<expr>"`: the world raises the (uncontrollable) event on each rising edge of the expression. */ sensors?: SensorSpec[]; /** `blackboard k=v …`: initial blackboard values of the executor. */ blackboard?: Record<string, string | number | boolean>; /** `terminate marked`: the run ends (done) as soon as every automaton and the supervisor are marked and idle, even though uncontrollable events could still come */ terminate?: 'marked' }
 /** A sensor-driven event: raised on every rising edge of a blackboard / signal expression (`sensor part_in "part_present"`). */
 export interface SensorSpec { event: string; expr: string }
 
@@ -96,6 +96,7 @@ export function parseDes(src: string): DesDoc {
     if (kw === 'action') { doc.actions.push(parseAction(words, opts, l.n)); continue; }
     if (kw === 'guard') { const ev = words[1]; if (!ev) throw new DslError('guard <event> "<expression>"', l.n); (doc.guards ??= {})[ev] = exprOf(t, kw, ev, quoted); continue; }
     if (kw === 'blackboard' || kw === 'bb') { Object.assign((doc.blackboard ??= {}), opts); continue; }
+    if (kw === 'terminate') { if ((words[1] ?? 'marked') !== 'marked') throw new DslError('terminate marked', l.n); doc.terminate = 'marked'; continue; }
     if (kw === 'sensor') { const ev = words[1]; if (!ev) throw new DslError('sensor <event> "<expression>"', l.n); (doc.sensors ??= []).push({ event: ev, expr: exprOf(t, kw, ev, quoted) }); continue; }
     if (!cur) throw new DslError(`expected 'automaton <name>' before '${t}'`, l.n);
     if (kw === 'events') { cur.events.push(...words.slice(1)); continue; }

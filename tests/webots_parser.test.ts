@@ -101,8 +101,8 @@ describe('JavaScript template engine', () => {
   });
 
   it('gives access to context and the template module shims', () => {
-    const body = `%< import * as wbvector3 from 'wbvector3.js'; import { circle } from 'wbgeometry.js'; >%%<= context.coordinate_system >% %<= wbvector3.norm(wbvector3.add({x:1,y:2,z:0},{x:2,y:2,z:0})) >% %<= circle(1, 6).length >%`;
-    expect(expandTemplate(body, {}, ctx)).toBe('ENU 5 6');
+    const body = `%< import * as wbvector3 from 'wbvector3.js'; import { circle } from 'wbgeometry.js'; >%%<= context.coordinate_system >% %<= wbvector3.norm(wbvector3.add({x:1,y:2,z:0},{x:2,y:2,z:0})) >% %<= circle(1, 6, {x: 0, y: 0}, 0).length >%`;
+    expect(expandTemplate(body, {}, ctx)).toBe('ENU 5 7'); // Webots' circle is closed: div + 1 points
     expect(compileTemplate('%< import * as R from "wbrotation.js"; >%')).toContain('__imports("wbrotation.js")');
   });
 
@@ -140,6 +140,24 @@ PROTO Bar [ field SFFloat len 1 field SFString name "bar" field SFColor color 1 
     expect(floor.type).toBe('Solid');
     expect(floor.meta?.builtin).toBe('Floor');
     expect(reg.report).toEqual([]);
+  });
+
+  it('built-ins reset non-positive sizes like Webots (RectangleArena wallHeight 0 -> 0.1 m walls) and resolve their own default appearances', () => {
+    const reg = new ProtoRegistry(mapSource(new Map()));
+    reg.registerScope('w.wbt', [{ url: 'webots://projects/objects/floors/protos/RectangleArena.proto', importable: false }]);
+    const [inst] = parseNodes('RectangleArena { floorSize 4 2 wallHeight 0.0 wallThickness -1 }', 'w.wbt');
+    const n = reg.resolve(inst)!;
+    const walls = fNodes(n, 'children').filter((c) => c.type === 'Pose');
+    expect(walls.map((w) => [...fNum(w, 'translation', []), ...fNum(fNode(fNodes(w, 'children')[0], 'geometry'), 'size', [])].map((v) => Math.round(v * 1e4) / 1e4))).toEqual([
+      [2.005, 0, 0.05, 0.01, 2, 0.1], [-2.005, 0, 0.05, 0.01, 2, 0.1], [0, 1.005, 0.05, 4.02, 0.01, 0.1], [0, -1.005, 0.05, 4.02, 0.01, 0.1],
+    ]);
+    // the default wall appearance (BrushedAluminium, created by the built-in itself) resolves instead of being reported as a cycle
+    const app = reg.resolve(fNode(fNodes(walls[0], 'children')[0], 'appearance')!)!;
+    expect(app.type).toBe('PBRAppearance');
+    expect(reg.report).toEqual([
+      "RectangleArena: 'wallThickness' must be strictly positive, reset to 0.01 (as Webots does)",
+      "RectangleArena: 'wallHeight' must be strictly positive, reset to 0.1 (as Webots does)",
+    ]);
   });
 
   it('reports Lua templates, recursive PROTOs and unknown fields without throwing', () => {

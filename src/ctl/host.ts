@@ -40,7 +40,7 @@ export interface ProgramBackend {
 
 /** The I1 StationRuntime as seen from here (structural, so this file compiles before the runtime lands). */
 export interface StationRuntimeLike {
-  start(program: Program, opts?: { robot?: Robot; startJoints?: number[]; args?: string[] }): { id: string; program: Program; robot: Robot | null; status: RunStatus; error?: { message: string; instructionIndex: number } };
+  start(program: Program, opts?: { robot?: Robot; startJoints?: number[]; args?: string[] }): { id: string; status: RunStatus; error?: { message: string; instructionIndex?: number } };
   tick(dt: number): void;
   stop(id?: string): void;
   signals: SignalTableLike;
@@ -61,19 +61,36 @@ export function mapSignals(map: Map<string, unknown>, write?: (name: string, v: 
   };
 }
 
+/**
+ * One view over two signal tables (the station runtime's table and the process-component signals while they are kept
+ * apart): a signal the component table has is read from and written to it, every other one goes to `primary`; the
+ * snapshot merges both. Executors guard / sense on the merged view.
+ */
+export function mergeSignals(primary: SignalTableLike, secondary: SignalTableLike): SignalTableLike {
+  const own = (n: string) => secondary.snapshot()[n] !== undefined; // a component signal: the component's table is authoritative
+  return {
+    get: (n) => (own(n) ? secondary.get(n) : primary.get(n)),
+    set: (n, v) => { if (own(n)) secondary.set(n, v); else primary.set(n, v); },
+    on: (n, cb) => { const a = primary.on?.(n, cb); const b = secondary.on?.(n, cb); return () => { if (typeof a === 'function') a(); if (typeof b === 'function') b(); }; },
+    snapshot: () => ({ ...primary.snapshot(), ...secondary.snapshot() }),
+  };
+}
+/** The same backend with another signal table (e.g. a merged view). */
+export function withSignals(b: ProgramBackend, signals: SignalTableLike): ProgramBackend { return { kind: b.kind, signals, start: (p, o) => b.start(p, o), stop: (h) => b.stop(h), tick: (dt) => b.tick(dt), active: () => b.active(), stopAll: () => b.stopAll() }; }
+
 /** Adapter for the I1 station runtime. `drive`: tick the runtime from the executor (false when the app already steps it). */
 export function stationRuntimeBackend(rt: StationRuntimeLike, opts: { drive?: boolean } = {}): ProgramBackend {
   const runs = new Set<ProgramRunHandle>();
-  let lastTime = rt.time;
+  // the executor clock: the runtime is advanced up to it; when something else (the app playing a program) already
+  // advanced the runtime further, it is not ticked again (no double speed with the app's sub-steps)
+  let target = rt.time ?? 0;
   return {
     kind: 'station-runtime', signals: rt.signals,
-    start: (p, o = {}) => { const h = rt.start(p, o.robot ? { robot: o.robot } : {}); runs.add(h); return h; },
+    start: (p, o = {}) => { const h = rt.start(p, o.robot ? { robot: o.robot } : {}) as unknown as ProgramRunHandle; runs.add(h); return h; },
     stop: (h) => { if (h.status === 'queued' || h.status === 'running') rt.stop(h.id); },
     tick: (dt) => {
-      // drive the runtime unless something else advanced its clock since our last tick
-      const external = rt.time !== undefined && lastTime !== undefined && rt.time !== lastTime;
-      if (opts.drive !== false && !external) rt.tick(dt);
-      lastTime = rt.time;
+      target += dt;
+      if (opts.drive !== false) { if (rt.time === undefined) rt.tick(dt); else if (rt.time < target - 1e-9) rt.tick(target - rt.time); else target = rt.time; }
       for (const h of runs) if (h.status !== 'queued' && h.status !== 'running') runs.delete(h);
     },
     active: () => [...runs].filter((h) => h.status === 'queued' || h.status === 'running'),
@@ -168,6 +185,34 @@ export function simulatedBackend(durations: Record<string, number>, opts: { robo
     active: () => [...all].filter((h) => h.status === 'queued' || h.status === 'running') as ProgramRunHandle[],
     stopAll: () => { busy.clear(); queue.clear(); },
   });
+}
+
+const truthy = (v: unknown) => v === true || v === 1 || v === '1' || v === 'true';
+/**
+ * The executor as the cell controller of handshake programs (codegen/vendor.ts): the program of an operation is not
+ * started directly — START_x is raised in the signal table once DONE_x is low, and the run is done when the robot's
+ * operation server answers DONE_x (START_x then falls). `inner` runs the servers (the station runtime) and every
+ * program that is not an operation. Stopping a run drops START_x.
+ */
+export function handshakeBackend(inner: ProgramBackend, ops: Array<{ program: string; start: string; done: string }>): ProgramBackend & { log: Array<{ t: number; op: string; event: 'start' | 'done' }> } {
+  interface HsRun extends ProgramRunHandle { status: RunStatus; phase: 'wait-low' | 'raised'; op: { program: string; start: string; done: string } }
+  const runs = new Set<HsRun>(); const sig = inner.signals; let clock = 0; const log: Array<{ t: number; op: string; event: 'start' | 'done' }> = [];
+  const step = (h: HsRun) => {
+    if (h.status !== 'queued' && h.status !== 'running') return;
+    if (h.phase === 'wait-low' && !truthy(sig.get(h.op.done))) { sig.set(h.op.start, 1); h.phase = 'raised'; h.status = 'running'; h.startedAt = clock; log.push({ t: clock, op: h.op.program, event: 'start' }); }
+    else if (h.phase === 'raised' && truthy(sig.get(h.op.done))) { sig.set(h.op.start, 0); h.status = 'done'; h.endedAt = clock; log.push({ t: clock, op: h.op.program, event: 'done' }); }
+  };
+  return {
+    kind: inner.kind, signals: sig, log,
+    start: (p, o = {}) => {
+      const op = ops.find((x) => x.program === p.name); if (!op) return inner.start(p, o);
+      const h: HsRun = { id: `hs${++rid}`, program: p, robot: o.robot ?? null, status: 'queued', phase: 'wait-low', op }; runs.add(h); step(h); return h;
+    },
+    stop: (h0) => { const h = h0 as HsRun; if (runs.has(h)) { if (h.phase === 'raised') sig.set(h.op.start, 0); if (h.status === 'queued' || h.status === 'running') { h.status = 'stopped'; h.endedAt = clock; } runs.delete(h); } else inner.stop(h0); },
+    tick: (dt) => { clock += dt; inner.tick(dt); for (const h of [...runs]) { step(h); if (h.status !== 'queued' && h.status !== 'running') runs.delete(h); } },
+    active: () => [...[...runs].filter((h) => h.status === 'queued' || h.status === 'running'), ...inner.active()],
+    stopAll: () => { for (const h of runs) { if (h.phase === 'raised') sig.set(h.op.start, 0); h.status = 'stopped'; } runs.clear(); inner.stopAll(); },
+  };
 }
 
 // ---------------------------------------------------------------------------------------------

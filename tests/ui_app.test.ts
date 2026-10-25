@@ -7,6 +7,7 @@ import { Station, Tool } from '../src/core/items/item';
 import { demos } from '../src/demos';
 import { loadStation } from '../src/io/station-file';
 import { transl } from '../src/core/math/pose';
+import { unzipSync as fflateUnzip } from 'fflate';
 import { t, setLang, getLang, onLangChange } from '../src/ui/i18n';
 import { h, append, clear, icon, formField, dialog, confirmDialog, toast, contextMenu, downloadText, downloadBlob, pickFiles, fmt } from '../src/ui/dom';
 import { StationTabs, collisionMapDialog, measureDialog, cameraDialog, VideoRecorder, exportHtml3D, exportGlb, exportAnimationGltf, exportUrdfPackage, importRoboDKPosts, saveForBlender } from '../src/ui/tools';
@@ -352,8 +353,16 @@ describe('App', () => {
     const app = makeApp('pickplace');
     const { exportStationURDF, packageZip } = await import('../src/io/urdf/urdf_export');
     const zip = packageZip(exportStationURDF(app.station, app.assets, {}));
+    // a zip holding a ROS package (package.xml) goes to the ROS package importer (I7) and adds its robot(s)
+    const n0 = app.station.children.length;
     await app.openFiles([new File([zip as BlobPart], 'pkg.zip')]);
-    expect(app.logs.some((l) => /^Archive pkg\.zip: \d+ meshes, \d+ metadata files/.test(l.text))).toBe(true); expect(app.station.selection[0]).toBeInstanceOf(Folder); expect(app.station.selection[0].name).toBe('pkg');
+    expect(app.logs.some((l) => /^Imported ROS package: \S/.test(l.text))).toBe(true); expect(app.station.children.length).toBeGreaterThan(n0);
+    // any other zip is a generic container: its meshes land in a folder
+    const { zipSync } = await import('fflate');
+    expect(Object.keys(fflateUnzip(zip as Uint8Array)).some((k) => /(^|\/)package\.xml$/.test(k))).toBe(true);
+    const stl = new Uint8Array(134); new DataView(stl.buffer).setUint32(80, 1, true); [0, 0, 0, 10, 0, 0, 0, 10, 0].forEach((v, k) => new DataView(stl.buffer).setFloat32(96 + k * 4, v, true));
+    await app.openFiles([new File([zipSync({ 'parts/bracket.stl': stl, 'parts/info.json': new TextEncoder().encode('{"name":"bracket"}') }) as BlobPart], 'parts.zip')]);
+    expect(app.logs.some((l) => /^Archive parts\.zip: \d+ meshes, \d+ metadata files/.test(l.text))).toBe(true); expect(app.station.selection[0]).toBeInstanceOf(Folder); expect(app.station.selection[0].name).toBe('parts');
     const pcd = ['# .PCD v0.7', 'VERSION 0.7', 'FIELDS x y z', 'SIZE 4 4 4', 'TYPE F F F', 'COUNT 1 1 1', 'WIDTH 3', 'HEIGHT 1', 'POINTS 3', 'DATA ascii', '0 0 0', '1 0 0.5', '0 1 1'].join('\n');
     await app.openFiles([textFile('cloud.pcd', pcd)]);
     expect(app.logs.at(-1)!.text).toMatch(/^cloud\.pcd: 3 points, extent 1\.0 × 1\.0 × 1\.0 m/); expect((app.station.find('cloud') as SceneObject).points.length).toBe(3);

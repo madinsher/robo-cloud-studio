@@ -12,7 +12,7 @@ import { MobileRobot, MapItem, ZoneItem } from '../mobile/items';
 import { pathLength, planForRobot } from '../mobile/planner';
 import { followPath, stepMobile, estimateTravelTime, integrate, isPosePath, toPosePath } from '../mobile/controller';
 import { stepNavRuntime, getNavStack, NavRuntime } from '../mobile/navstack';
-import { CollisionWorld, CircleObstacle, Rect2, rectsOverlap, rectIntersectsPolygon, footprintRect, coveringCircles } from '../mobile/footprint';
+import { CollisionWorld, CircleObstacle, Rect2, rectsOverlap, rectSeparation, rectIntersectsPolygon, pointInPolygon, footprintRect, coveringCircles } from '../mobile/footprint';
 import { stationWorld } from '../mobile/world';
 import { EventBus } from '../core/events';
 
@@ -94,16 +94,19 @@ export class FleetItem extends Item {
   tasks: FleetTask[] = [];
   /** Max tasks queued per robot by queueing allocators (auction / CBBA / contract net). */
   queueLimit = 2;
+  /** Fleet simulation clock (s), persisted so a station saved mid-mission resumes its timed work (picks, holds). */
+  simTime = 0;
   constructor(name = 'Fleet', id?: string) {
     super(ItemType.FLEET, name, id);
   }
   protected override serializeExtra() {
-    return { robotIds: this.robotIds, mapId: this.mapId, allocation: this.allocation, chargingZoneIds: this.chargingZoneIds, segmentCapacity: this.segmentCapacity, tasks: this.tasks, queueLimit: this.queueLimit };
+    return { robotIds: this.robotIds, mapId: this.mapId, allocation: this.allocation, chargingZoneIds: this.chargingZoneIds, segmentCapacity: this.segmentCapacity, tasks: this.tasks, queueLimit: this.queueLimit, simTime: this.simTime };
   }
   override deserializeExtra(d: SerializedItem) {
     this.robotIds = (d.robotIds as string[]) ?? []; this.mapId = (d.mapId as string | null) ?? null; this.allocation = (d.allocation as any) ?? 'auction';
     this.chargingZoneIds = (d.chargingZoneIds as string[]) ?? []; this.segmentCapacity = (d.segmentCapacity as number) ?? 1; this.tasks = (d.tasks as FleetTask[]) ?? [];
     this.queueLimit = (d.queueLimit as number) ?? 2;
+    this.simTime = (d.simTime as number) ?? 0;
   }
 }
 registerItemType(ItemType.FLEET, (n, id) => new FleetItem(n, id));
@@ -153,12 +156,28 @@ export interface AllocationContext {
   /** Where/when a robot becomes free (end of its current and queued tasks). */
   queueEnd(robot: MobileRobot): { x: number; y: number; t: number; n: number };
   queueLimit: number;
+  /** Record a tentative award (segments busy until `until`) so later bids in the same round see the conflict. */
+  claim(task: FleetTask, robot: MobileRobot, until: number): void;
 }
 export interface Assignment { task: FleetTask; robot: MobileRobot }
+/** Segment id -> robot and sim time until which it is claimed by an award of the current allocation round. */
+export type SegmentClaims = Map<string, { robotId: string; until: number }>;
 export type Allocator = (ctx: AllocationContext) => Assignment[];
 const allocators = new Map<string, Allocator>();
 export function registerAllocator(name: string, fn: Allocator): void { allocators.set(name, fn); }
 export function allocatorNames(): string[] { return [...allocators.keys()]; }
+
+/**
+ * Reconfiguration (modular equipment): when a robot lacks a task's capabilities, a reconfigurer may offer to swap its
+ * equipment at a depot: location, duration, and the recipe applied when the swap is done (MURKA agromarca).
+ */
+export interface ReconfigPlan { location: [number, number]; seconds: number; recipe: string; depotId?: string; capacity?: number }
+export interface Reconfigurer {
+  plan(fm: FleetManager, robot: MobileRobot, caps: string[]): ReconfigPlan | null;
+  apply(fm: FleetManager, robot: MobileRobot, recipe: string): void;
+}
+let reconfigurer: Reconfigurer | null = null;
+export function registerReconfigurer(r: Reconfigurer | null): void { reconfigurer = r; }
 
 /** Plugins run for every new FleetManager (the agri module installs its hooks here, so the app's manager has them). */
 export const fleetPlugins: Array<(fm: FleetManager) => void> = [];
@@ -166,16 +185,17 @@ export const fleetPlugins: Array<(fm: FleetManager) => void> = [];
 // ---------------------------------------------------------------------------------------------------------------
 
 interface TaskRuntime {
-  phase: 'travel' | 'work' | 'service' | 'return' | 'serviceWait';
+  phase: 'travel' | 'work' | 'service' | 'return' | 'serviceWait' | 'reconfig' | 'reconfigWait';
+  reconfig?: ReconfigPlan & { left?: number; recipeApplied?: boolean };
   hold?: number;
-  service?: { kind: string; location: [number, number]; duration: number; left?: number };
+  service?: { kind: string; location: [number, number]; duration: number; left?: number; serviced?: boolean };
   resumeS?: number;
   workT?: number;
   noPath?: number;
   retryAt?: number;
 }
 
-interface RobotTraffic { waitSince: number | null; by: string | null; seg: string | null; replanAt: number; yield?: { waitFor: string; resume: { x: number; y: number; theta?: number } | null; arrived: boolean; t0: number } }
+interface RobotTraffic { waitSince: number | null; by: string | null; seg: string | null; replanAt: number; noYieldUntil?: number; yield?: { waitFor: string; resume: { x: number; y: number; theta?: number } | null; arrived: boolean; t0: number } }
 
 const wrap180 = (a: number) => ((((a + 180) % 360) + 360) % 360) - 180;
 
@@ -215,7 +235,12 @@ export class FleetManager {
   private segCacheT = -1;
   private queueSeq = 0;
 
+  /** Clock value when this manager started (KPI rates are measured from here). */
+  private t0 = 0;
+
   constructor(readonly station: Station, readonly fleet: FleetItem) {
+    // resume the fleet clock of a station saved mid-mission (pending picks / holds are timed on it)
+    if (fleet.tasks.some((t) => t.status === 'working' || t.status === 'travelling' || t.status === 'assigned')) this.time = this.t0 = fleet.simTime || 0;
     for (const r of this.robots()) {
       this.distance0.set(r.id, r.state.odometer);
       this.energy0.set(r.id, r.battery.levelWh);
@@ -257,7 +282,8 @@ export class FleetManager {
     if (this.segCache && this.segCacheT === this.time) return this.segCache.segs;
     this.segCacheT = this.time;
     const rows = this.station.itemsOfType<Item & { start: number[] }>(ItemType.CROP_ROW);
-    const key = `${segmentProviders.size}:${rows.length}:${rows.reduce((a, r) => a + r.start[0] + 3 * r.start[1], 0).toFixed(0)}`;
+    const lanes = this.zones().filter((z) => z.kind === 'lane');
+    const key = `${segmentProviders.size}:${rows.length}:${rows.reduce((a, r) => a + r.start[0] + 3 * r.start[1], 0).toFixed(0)}:${lanes.map((z) => `${z.id}${z.capacity}${z.worldPolygon().flat().reduce((a, v) => a + v, 0).toFixed(0)}`).join(',')}`;
     if (this.segCache && this.segCache.key === key) return this.segCache.segs;
     const segs: TrafficSegment[] = [];
     for (const fn of segmentProviders.values()) segs.push(...fn(this.station));
@@ -306,29 +332,83 @@ export class FleetManager {
    * Plan a footprint-aware, drive-aware pose path from the robot's pose to `goal` (straight line when the station has
    * neither a map nor obstacles). Returns null when no collision-free path exists.
    */
-  planTo(robot: MobileRobot, goal: [number, number], opts: { goalHeading?: number; blocked?: number[][][]; extra?: CircleObstacle[]; from?: { x: number; y: number; theta: number } } = {}): number[][] | null {
+  planTo(robot: MobileRobot, goal: [number, number], opts: { goalHeading?: number; blocked?: number[][][]; extra?: CircleObstacle[]; from?: { x: number; y: number; theta: number }; quiet?: boolean; maxExpand?: number } = {}): number[][] | null {
     const world = this.world();
     const from = opts.from ?? { x: robot.state.x, y: robot.state.y, theta: robot.state.theta };
-    if (!world.map && !world.circles.length && !opts.blocked?.length && !opts.extra?.length) return toPosePath(robot, [[from.x, from.y], goal], { goalHeading: opts.goalHeading, start: from });
+    if (!world.map && !world.circles.length && !opts.blocked?.length && !opts.extra?.length && !this.zones().some((z) => z.kind === 'nogo')) return toPosePath(robot, [[from.x, from.y], goal], { goalHeading: opts.goalHeading, start: from });
     if (Math.hypot(goal[0] - from.x, goal[1] - from.y) < 30 && (opts.goalHeading === undefined || Math.abs(wrap180(opts.goalHeading - from.theta)) < 2)) return [[from.x, from.y, from.theta, 1], [goal[0], goal[1], from.theta, 1]];
-    const res = planForRobot(robot, from, { x: goal[0], y: goal[1] }, { world, margin: this.planMargin, goalHeading: opts.goalHeading, blocked: opts.blocked, extra: opts.extra });
-    if (!res.ok) this.logMsg(`Plan for ${robot.name} to (${goal[0].toFixed(0)}, ${goal[1].toFixed(0)}) failed: ${res.error}`, 'warn');
+    // dynamic obstacles already touching the start footprint cannot be avoided by planning: ignore them
+    const startRect = footprintRect(from, robot.kin.footprint);
+    const extra = opts.extra?.filter((c) => pointRectDistanceSafe(c.x, c.y, startRect) >= c.r + this.planMargin);
+    // no-go zones are never entered (unless the robot already stands in one)
+    const nogo = this.zones().filter((z) => z.kind === 'nogo' && z.polygon.length > 2).map((z) => z.worldPolygon());
+    const blocked = [...(opts.blocked ?? []), ...nogo].filter((p) => !rectIntersectsPolygon({ ...startRect, L: startRect.L + 2 * this.planMargin, W: startRect.W + 2 * this.planMargin }, p));
+    const res = planForRobot(robot, from, { x: goal[0], y: goal[1] }, { world, margin: this.planMargin, goalHeading: opts.goalHeading, blocked, extra, maxExpand: opts.maxExpand });
+    if (!res.ok && !opts.quiet) this.logMsg(`Plan for ${robot.name} to (${goal[0].toFixed(0)}, ${goal[1].toFixed(0)}) failed: ${res.error}`, 'warn');
     return res.ok ? res.path : null;
   }
 
   /** Cost (s) for a robot to execute a task from a start point: travel + work, battery feasibility, capabilities. */
-  taskCost(robot: MobileRobot, task: FleetTask, from?: { x: number; y: number; t: number }): number {
-    if (task.requiredCapabilities.some((c) => !robot.capabilities.includes(c))) return Infinity;
+  taskCost(robot: MobileRobot, task: FleetTask, from?: { x: number; y: number; t: number }, claims?: SegmentClaims): number {
     if (robot.state.status === 'error') return Infinity;
-    const f = from ?? { x: robot.state.x, y: robot.state.y, t: this.time };
+    let f = from ?? { x: robot.state.x, y: robot.state.y, t: this.time };
+    const missing = task.requiredCapabilities.filter((c) => !robot.capabilities.includes(c));
+    if (missing.length) {
+      // only an idle robot (nothing queued) is reconfigured: drive to the depot, wait for a slot, swap, continue
+      const rc = !robot.state.taskId && !this.queued(robot).length ? reconfigurer?.plan(this, robot, task.requiredCapabilities) : null;
+      if (!rc) return Infinity;
+      const toDepot = estimateTravelTime(robot, [[f.x, f.y], rc.location]) + Math.hypot(rc.location[0] - f.x, rc.location[1] - f.y) * 0.3 / Math.max(1, robot.kin.maxSpeed);
+      f = { x: rc.location[0], y: rc.location[1], t: f.t + toDepot + rc.seconds + this.depotWait(rc) };
+    }
     const straight = Math.hypot(task.location[0] - f.x, task.location[1] - f.y);
     const travel = estimateTravelTime(robot, [[f.x, f.y], task.location]) + (robot.kin.drive === 'ackermann' ? 10 : 0) + straight * 0.3 / Math.max(1, robot.kin.maxSpeed);
     const work = task.workPath ? pathLength(task.workPath) / (task.workSpeed ?? robot.kin.maxSpeed * 0.3) + (task.meta?.expectedWorkSeconds ?? 0) : task.duration ?? 0;
     const energyNeeded = ((robot.battery.drivePerMps + robot.battery.idleW) * (travel + work)) / 3600;
     if (energyNeeded > robot.battery.levelWh * 0.9) return Infinity;
-    // a work segment held by another robot means waiting at its mouth
-    const busySeg = task.segments?.some((sg) => this.holders(sg, robot.id).length >= this.fleet.segmentCapacity) ? 1800 : 0;
-    return (f.t - this.time) + travel + work + busySeg + (1 - robot.batteryLevel()) * 60;
+    // a work segment used by another robot's task (held, in progress, queued or claimed in this allocation round)
+    // means waiting at its mouth until that task is over
+    const arrive = (f.t - this.time) + travel;
+    const busySeg = task.segments?.length ? Math.max(0, this.segmentBusyUntil(task.segments, robot.id, claims) - this.time - arrive) : 0;
+    return arrive + work + busySeg + (1 - robot.batteryLevel()) * 60;
+  }
+
+  /** Expected wait (s) for a free slot at a depot: robots already reconfiguring there beyond its capacity. */
+  private depotWait(rc: ReconfigPlan): number {
+    const busy = this.fleet.tasks.filter((t) => { const r = t.meta?._rt as TaskRuntime | undefined; return r?.reconfig && (r.phase === 'reconfig' || r.phase === 'reconfigWait') && r.reconfig.depotId === rc.depotId; });
+    return busy.length >= Math.max(1, rc.capacity ?? 1) ? rc.seconds : 0;
+  }
+
+  /** Nominal work time (s) of a task, scaled by the remaining fraction when it is being worked. */
+  workSeconds(task: FleetTask, robot?: MobileRobot): number {
+    const speed = task.workSpeed ?? (robot ? robot.kin.maxSpeed * 0.3 : 400);
+    if (!task.workPath || task.workPath.length < 2) return task.duration ?? 0;
+    const len = pathLength(task.workPath);
+    let frac = 1;
+    if (task.status === 'working' && robot) frac = Math.max(0, 1 - this.progressOnWork(robot, task) / Math.max(1, len));
+    return frac * (len / Math.max(1, speed) + (task.meta?.expectedWorkSeconds ?? 0));
+  }
+
+  /** Sim time until which the given segments are used by tasks of robots other than `robotId` (held, active, queued, claimed). */
+  segmentBusyUntil(segs: string[], robotId: string, claims?: SegmentClaims): number {
+    let until = this.time;
+    for (const sg of segs) {
+      const c = claims?.get(sg);
+      if (c && c.robotId !== robotId) until = Math.max(until, c.until);
+      for (const h of this.holders(sg, robotId)) if (this.taskHolds.get(h)?.has(sg)) until = Math.max(until, this.time + 600);
+    }
+    for (const r of this.robots()) {
+      if (r.id === robotId) continue;
+      let t = this.time;
+      const list = [r.state.taskId ? this.fleet.tasks.find((k) => k.id === r.state.taskId) : undefined, ...this.queued(r)];
+      for (const k of list) {
+        if (!k || k.type === 'charge') continue;
+        const w = this.workSeconds(k, r);
+        const start = k.status === 'working' ? t : t + (k.status === 'travelling' ? 30 : 60);
+        t = start + w;
+        if (k.segments?.some((x) => segs.includes(x))) until = Math.max(until, t);
+      }
+    }
+    return until;
   }
 
   /** Where and when a robot is free again (after its current task and its queue). */
@@ -359,7 +439,11 @@ export class FleetManager {
     const pending = this.fleet.tasks.filter((t) => t.status === 'pending' && !(t.meta?._rt?.retryAt > this.time)).sort((a, b) => b.priority - a.priority || a.createdAt - b.createdAt);
     if (!pending.length) return;
     const alloc = allocators.get(this.fleet.allocation) ?? allocators.get('auction')!;
-    const ctx: AllocationContext = { fm: this, robots: robots.filter((r) => r.state.status !== 'error'), tasks: pending, cost: (r, t, f) => this.taskCost(r, t, f), queueEnd: (r) => this.queueEnd(r), queueLimit: this.fleet.queueLimit };
+    const claims: SegmentClaims = new Map();
+    const ctx: AllocationContext = {
+      fm: this, robots: robots.filter((r) => r.state.status !== 'error'), tasks: pending, cost: (r, t, f) => this.taskCost(r, t, f, claims), queueEnd: (r) => this.queueEnd(r), queueLimit: this.fleet.queueLimit,
+      claim: (t, r, until) => { for (const sg of t.segments ?? []) { const c = claims.get(sg); if (!c || c.until < until) claims.set(sg, { robotId: r.id, until }); } },
+    };
     for (const a of alloc(ctx)) {
       if (a.task.status !== 'pending') continue;
       if (free(a.robot) && !this.queued(a.robot).length) this.startTask(a.robot, a.task);
@@ -376,9 +460,23 @@ export class FleetManager {
   startTask(robot: MobileRobot, task: FleetTask): boolean {
     const proc = taskProcess(task.meta.process ?? task.type);
     if (task.robotId !== robot.id) proc?.onAssign?.(this, task, robot);
-    const heading = task.goalHeading ?? (task.workPath && task.workPath.length > 1 ? Math.atan2(task.workPath[1][1] - task.workPath[0][1], task.workPath[1][0] - task.workPath[0][0]) * 180 / Math.PI : undefined);
-    const path = this.planTo(robot, task.location, { goalHeading: heading });
     const rt = this.rt(task);
+    const missing = task.requiredCapabilities.filter((c) => !robot.capabilities.includes(c));
+    if (missing.length) {
+      const rc = reconfigurer?.plan(this, robot, task.requiredCapabilities);
+      const dpath = rc ? this.planTo(robot, rc.location) : null;
+      if (!rc || !dpath) { if (task.status === 'assigned') { task.status = 'pending'; task.robotId = null; } rt.retryAt = this.time + 20; return false; }
+      task.robotId = robot.id; task.status = 'travelling'; task.startedAt = this.time;
+      rt.phase = 'reconfig'; rt.reconfig = { ...rc };
+      this.waits.push(this.time - task.createdAt);
+      robot.state.taskId = task.id;
+      followPath(robot, dpath);
+      this.logMsg(`Task ${task.id} -> ${robot.name}: reconfiguring to ${rc.recipe} at the depot first (${rc.seconds.toFixed(0)} s)`);
+      this.events.emit('taskUpdated', { task });
+      return true;
+    }
+    const heading = this.taskHeading(task);
+    const path = this.planTo(robot, task.location, { goalHeading: heading });
     if (!path) {
       rt.noPath = (rt.noPath ?? 0) + 1;
       rt.retryAt = this.time + 20;
@@ -397,6 +495,39 @@ export class FleetManager {
     this.logMsg(`Task ${task.id} -> ${robot.name} (ETA ${estimateTravelTime(robot, path).toFixed(0)} s)`);
     this.events.emit('taskUpdated', { task });
     return true;
+  }
+
+  private taskHeading(task: FleetTask): number | undefined {
+    return task.goalHeading ?? (task.workPath && task.workPath.length > 1 ? Math.atan2(task.workPath[1][1] - task.workPath[0][1], task.workPath[1][0] - task.workPath[0][0]) * 180 / Math.PI : undefined);
+  }
+
+  /** Reconfiguration phases: drive to the depot, wait for a free slot, swap the equipment, then travel to the task. */
+  private stepReconfig(r: MobileRobot, task: FleetTask, rt: TaskRuntime, dt: number, robots: MobileRobot[]): void {
+    const rc = rt.reconfig!;
+    if (rt.phase === 'reconfig') {
+      if (r.state.path) { this.drive(r, dt, robots, undefined); return; }
+      const inUse = this.fleet.tasks.filter((t) => t !== task && (t.meta?._rt as TaskRuntime | undefined)?.phase === 'reconfigWait' && (t.meta._rt as TaskRuntime).reconfig?.depotId === rc.depotId).length;
+      if (inUse >= Math.max(1, rc.capacity ?? 1)) { this.setWaiting(r, dt, null, null); integrateStop(r, dt); return; }
+      rt.phase = 'reconfigWait'; rc.left = rc.seconds; r.state.status = 'working';
+    }
+    rc.left = (rc.left ?? rc.seconds) - dt;
+    integrateStop(r, dt);
+    this.addBusy(r, dt);
+    if (rc.left > 0) return;
+    if (!rc.recipeApplied) {
+      reconfigurer?.apply(this, r, rc.recipe);
+      rc.recipeApplied = true;
+      this.bookStat('equipment', 'reconfigurations', 1);
+      this.bookStat('equipment', 'reconfigSeconds', rc.seconds);
+      this.logMsg(`${r.name} reconfigured to ${rc.recipe}`);
+    }
+    if ((rt.retryAt ?? -1) > this.time) return;
+    const path = this.planTo(r, task.location, { goalHeading: this.taskHeading(task) });
+    if (!path) { rt.retryAt = this.time + 15; return; }
+    rt.reconfig = undefined;
+    rt.phase = 'travel';
+    r.state.status = 'moving';
+    followPath(r, path);
   }
 
   private rt(task: FleetTask): TaskRuntime {
@@ -452,9 +583,11 @@ export class FleetManager {
   /** Advance the fleet simulation by dt seconds. */
   step(dt: number): void {
     this.time += dt;
+    this.fleet.simTime = this.time;
     this.manageCharging();
     this.allocate();
     const robots = this.robots();
+    if (this.segments().length) for (const r of robots) this.clearSegments(r, robots);
     for (const r of robots) this.stepRobot(r, dt, robots);
     this.resolveDeadlocks(robots);
     if (this.checkContacts) this.measureContacts(robots);
@@ -469,6 +602,7 @@ export class FleetManager {
     if (!task || task.status === 'done' || task.status === 'cancelled' || task.status === 'failed') { this.drive(r, dt, robots, undefined); return; }
     const rt = this.rt(task);
     const proc = taskProcess(task.meta.process ?? task.type);
+    if (rt.phase === 'reconfig' || rt.phase === 'reconfigWait') { this.stepReconfig(r, task, rt, dt, robots); return; }
     // arrival at the task location
     if (task.status === 'travelling' && !r.state.path) {
       if (task.type === 'charge') {
@@ -477,7 +611,7 @@ export class FleetManager {
         return;
       }
       if (task.workPath && task.workPath.length > 1) {
-        if (task.segments?.length && !this.holdSegments(r.id, task.segments)) { this.setWaiting(r, dt, null, task.segments[0]); integrateStop(r, dt); return; }
+        if (task.segments?.length && r.kin.drive !== 'aerial' && !this.holdSegments(r.id, task.segments)) { this.setWaiting(r, dt, null, task.segments[0]); integrateStop(r, dt); return; }
         task.status = 'working';
         rt.phase = 'work';
         followPath(r, task.workPath);
@@ -535,7 +669,9 @@ export class FleetManager {
         return;
       }
       if (d.hold && d.hold > 0) { rt.hold = d.hold; integrateStop(r, dt); return; }
-      const speed = d.speed ?? task.workSpeed ?? r.kin.maxSpeed * 0.3;
+      let speed = d.speed ?? task.workSpeed ?? r.kin.maxSpeed * 0.3;
+      // catching up to the point where a service trip interrupted the work
+      if (rt.resumeS !== undefined) { if (s < rt.resumeS - 300) speed = Math.max(speed, r.kin.maxSpeed * 0.6); else rt.resumeS = undefined; }
       const moving = this.drive(r, dt, robots, speed);
       if (!moving && r.state.path === null) this.finishTask(r, task);
       return;
@@ -570,21 +706,22 @@ export class FleetManager {
       integrateStop(r, dt);
       this.addBusy(r, dt);
       if (sv.left > 0) return;
-      proc?.onService?.(this, task, r, sv.kind);
+      if (!sv.serviced) { proc?.onService?.(this, task, r, sv.kind); sv.serviced = true; }
       if (!task.workPath || task.workPath.length < 2) { this.finishTask(r, task); return; }
-      // back to the work path where it was interrupted
+      if ((rt.retryAt ?? -1) > this.time) return;
+      // back to the work line: re-enter it at its start (alleys are entered from their mouth, aligned) and catch up
+      // to where the work was interrupted (the process models skip what was already done)
       const w = task.workPath!;
-      const at = pointAtS(w, rt.resumeS ?? 0);
-      const path = this.planTo(r, [at[0], at[1]], { goalHeading: at[2] });
-      if (!path) { this.logMsg(`${r.name}: no path back to ${task.id}`, 'warn'); return; }
+      const path = this.planTo(r, [w[0][0], w[0][1]], { goalHeading: Math.atan2(w[1][1] - w[0][1], w[1][0] - w[0][0]) * 180 / Math.PI });
+      if (!path) { rt.retryAt = this.time + 15; this.logMsg(`${r.name}: no path back to ${task.id}, retrying`, 'warn'); return; }
       followPath(r, path);
       rt.phase = 'return';
       return;
     }
     if (rt.phase === 'return') {
       if (r.state.path) { this.drive(r, dt, robots, undefined); return; }
-      if (task.segments?.length && !this.holdSegments(r.id, task.segments)) { this.setWaiting(r, dt, null, task.segments[0]); integrateStop(r, dt); return; }
-      followPath(r, remainderOf(task.workPath!, rt.resumeS ?? 0));
+      if (task.segments?.length && r.kin.drive !== 'aerial' && !this.holdSegments(r.id, task.segments)) { this.setWaiting(r, dt, null, task.segments[0]); integrateStop(r, dt); return; }
+      followPath(r, task.workPath!);
       rt.phase = 'work';
       r.state.status = 'working';
     }
@@ -607,6 +744,13 @@ export class FleetManager {
     this.trafficKpi.waitSeconds += dt;
   }
 
+  /** True when two robots fly / drive at altitudes whose height bands do not overlap (UAV above ground robots). */
+  layerSeparated(a: MobileRobot, b: MobileRobot): boolean {
+    if (a.kin.drive !== 'aerial' && b.kin.drive !== 'aerial') return false;
+    const za = a.kin.drive === 'aerial' ? a.state.z ?? 0 : 0, zb = b.kin.drive === 'aerial' ? b.state.z ?? 0 : 0;
+    return za >= zb + b.kin.footprint[2] + 300 || zb >= za + a.kin.footprint[2] + 300;
+  }
+
   /** Rectangle of a robot's footprint at its current pose. */
   rectOf(r: MobileRobot): Rect2 { return footprintRect(r.state, r.kin.footprint); }
 
@@ -622,59 +766,70 @@ export class FleetManager {
     const v = Math.abs(r.state.v);
     const brake = (v * v) / (2 * Math.max(100, k.maxAccel * 0.8));
     const horizon = brake + this.safetyGap + 1500;
-    const others = robots.filter((o) => o !== r && Math.hypot(o.state.x - r.state.x, o.state.y - r.state.y) < horizon + (Math.hypot(o.kin.footprint[0], o.kin.footprint[1]) + Math.hypot(k.footprint[0], k.footprint[1])) / 2 + 3000);
+    const others = robots.filter((o) => o !== r && !this.layerSeparated(r, o) && Math.hypot(o.state.x - r.state.x, o.state.y - r.state.y) < horizon + (Math.hypot(o.kin.footprint[0], o.kin.footprint[1]) + Math.hypot(k.footprint[0], k.footprint[1])) / 2 + 3000);
+    // other robots: current footprint plus the footprints swept until they could stop (along their own path)
     const orects: Array<{ id: string; rects: Rect2[] }> = others.map((o) => {
       const rects = [this.rectOf(o)];
       const ov = Math.hypot(o.state.v, o.state.vy ?? 0);
       if (ov > 50) {
         const ob = (ov * ov) / (2 * Math.max(100, o.kin.maxAccel * 0.8)) + 200;
-        const th = (o.state.theta * Math.PI) / 180, sgn = Math.sign(o.state.v) || 1;
-        rects.push({ ...rects[0], x: o.state.x + Math.cos(th) * ob * sgn, y: o.state.y + Math.sin(th) * ob * sgn });
-        rects.push({ ...rects[0], x: o.state.x + Math.cos(th) * ob * 0.5 * sgn, y: o.state.y + Math.sin(th) * ob * 0.5 * sgn });
+        const op = o.state.path && isPosePath(o.state.path) ? o.state.path : null;
+        if (op) for (const s of pathSamples(o, op, ob, 300)) rects.push({ x: s.x, y: s.y, theta: s.th, L: o.kin.footprint[0], W: o.kin.footprint[1] });
+        else {
+          const th = (o.state.theta * Math.PI) / 180, sgn = Math.sign(o.state.v) || 1;
+          for (const f of [0.5, 1]) rects.push({ ...rects[0], x: o.state.x + Math.cos(th) * ob * f * sgn, y: o.state.y + Math.sin(th) * ob * f * sgn });
+        }
       }
       return { id: o.id, rects };
     });
     const segs = this.segments();
-    const segHorizon = horizon + k.footprint[0];
+    const segHorizon = horizon + k.footprint[0] + Math.max(...robots.map((o) => o.kin.footprint[0])) + 1500;
     const L = k.footprint[0], W = k.footprint[1];
     const mine: Rect2 = this.rectOf(r);
-    // samples along the remaining path (current pose first)
-    let dist = 0;
-    let prev: number[] = [r.state.x, r.state.y];
-    const samples: Array<{ x: number; y: number; th: number; d: number; rot: boolean }> = [{ x: r.state.x, y: r.state.y, th: r.state.theta, d: 0, rot: false }];
-    for (let i = Math.max(1, r.state.pathIndex); i < path.length && dist < segHorizon; i++) {
-      const p = path[i];
-      const step = Math.hypot(p[0] - prev[0], p[1] - prev[1]);
-      dist += step;
-      prev = p;
-      if (p[3] !== 0 && dist - samples[samples.length - 1].d < 250 && i + 1 < path.length) continue;
-      if (p[3] === 0 && samples[samples.length - 1].rot) continue;
-      samples.push({ x: p[0], y: p[1], th: p[2], d: dist, rot: p[3] === 0 });
-    }
+    // samples along the remaining path by arc length from the robot's projection (current pose first)
+    const samples = pathSamples(r, path, segHorizon, 150);
     let dFree = Infinity, by: string | null = null, seg: string | null = null;
-    for (const s of samples) {
+    // a sample conflicts when its footprint comes within safetyGap of another robot's (current or stopping) footprint
+    // and closer than the robot already is (a robot that is already too close may still move away)
+    const gap = this.safetyGap;
+    const reach = Math.hypot(L, W) / 2 + gap;
+    const sep0 = orects.map((o) => o.rects.map((q) => rectSeparation(mine, q)));
+    let lastFree = 0;
+    for (let si = 1; si < samples.length; si++) {
+      const s = samples[si];
       if (s.d > horizon) break;
-      const rect: Rect2 = s.rot ? { x: s.x, y: s.y, theta: 0, L: Math.hypot(L, W), W: Math.hypot(L, W) } : { x: s.x, y: s.y, theta: s.th, L, W };
-      for (const o of orects) for (const q of o.rects) {
-        if (!rectsOverlap(rect, q, this.safetyGap)) continue;
-        // already overlapping at the current pose: only block motion that does not increase the separation
-        if (s.d === 0 && !s.rot) { if (this.separating(r, robots.find((x) => x.id === o.id)!, samples[1])) continue; }
-        if (s.d < dFree) { dFree = s.d; by = o.id; }
+      const rect: Rect2 = { x: s.x, y: s.y, theta: s.th, L, W };
+      let hit: string | null = null;
+      for (let oi = 0; oi < orects.length && !hit; oi++) {
+        const o = orects[oi];
+        for (let qi = 0; qi < o.rects.length; qi++) {
+          const q = o.rects[qi];
+          if (Math.hypot(q.x - s.x, q.y - s.y) > reach + Math.hypot(q.L, q.W) / 2) continue;
+          const sp = rectSeparation(rect, q);
+          if (sp < gap && sp <= sep0[oi][qi] + 1) { hit = o.id; break; }
+        }
       }
-      if (dFree <= s.d) break;
+      if (hit) { dFree = lastFree; by = hit; break; }
+      lastFree = s.d;
     }
     // transit reservations
     const rad = Math.hypot(L, W) / 2;
+    const standoff = Math.max(...robots.map((o) => o.kin.footprint[0])) + 1500;
     const nearSeg = (sg: TrafficSegment, x: number, y: number) => { const b = (sg as any)._bb; return !b || (x + rad >= b.x0 && x - rad <= b.x1 && y + rad >= b.y0 && y - rad <= b.y1); };
-    for (const sg of segs) {
+    for (const sg of k.drive === 'aerial' ? [] : segs) {
       if (this.reservations.get(sg.id)?.has(r.id)) continue;
+      // a robot already overlapping a segment it cannot reserve (standing at the mouth) may move out or along its edge
+      const inside0 = nearSeg(sg, mine.x, mine.y) && rectIntersectsPolygon(mine, sg.polygon);
+      const depth0 = inside0 ? polygonDepth(mine.x, mine.y, sg.polygon) : -Infinity;
       for (const s of samples) {
         if (s.d > segHorizon || s.d >= dFree) break;
         if (!nearSeg(sg, s.x, s.y)) continue;
         const rect: Rect2 = { x: s.x, y: s.y, theta: s.th, L, W };
         if (!rectIntersectsPolygon(rect, sg.polygon)) continue;
-        if (this.canReserve(r.id, sg.id, sg.capacity ?? this.fleet.segmentCapacity)) this.reserve(r.id, sg.id);
-        else if (s.d - 50 < dFree) { dFree = Math.max(0, s.d - 50); seg = sg.id; by = this.holders(sg.id, r.id)[0] ?? null; }
+        if (this.canReserve(r.id, sg.id, sg.capacity ?? this.fleet.segmentCapacity)) { this.reserve(r.id, sg.id); break; }
+        if (inside0 && polygonDepth(s.x, s.y, sg.polygon) <= depth0 + 1) continue;
+        // wait well before the mouth: the robot leaving the segment must be able to get out and turn away
+        if (s.d - standoff < dFree) { dFree = Math.max(0, s.d - standoff); seg = sg.id; by = this.holders(sg.id, r.id)[0] ?? null; }
         break;
       }
     }
@@ -688,12 +843,6 @@ export class FleetManager {
       set.delete(r.id);
     }
     return { d: dFree, by, seg };
-  }
-
-  /** True when the robot's next path sample increases its centre distance to `o` (allowed even if already too close). */
-  private separating(r: MobileRobot, o: MobileRobot, next?: { x: number; y: number }): boolean {
-    if (!next) return false;
-    return Math.hypot(next.x - o.state.x, next.y - o.state.y) > Math.hypot(r.state.x - o.state.x, r.state.y - o.state.y) + 1;
   }
 
   /** Move a robot along its path with the traffic speed cap. Returns true while it moves. */
@@ -720,7 +869,18 @@ export class FleetManager {
     const rtn = nav?.simulate ? ((r as any)._nav as NavRuntime | undefined) : undefined;
     if (rtn?.estimator.state.lost) { integrateStop(r, dt); this.setWaiting(r, dt, null, null); stepNavRuntime(r, dt, this.map(), this.zones()); return true; }
     const pose = rtn ? { x: rtn.estimator.state.x, y: rtn.estimator.state.y, theta: rtn.estimator.state.theta } : undefined;
-    const speed = cap !== undefined ? Math.min(cap, desired ?? r.kin.maxSpeed) : desired;
+    let speed = cap !== undefined ? Math.min(cap, desired ?? r.kin.maxSpeed) : desired;
+    // speed-limit zones: the speed inside is capped, and the robot brakes before entering (footprint front reaches it)
+    const slz = this.zones().filter((z) => z.kind === 'speed_limit' && z.speedLimit > 0 && z.polygon.length > 2);
+    if (slz.length && r.state.path) {
+      const a = Math.max(100, r.kin.maxAccel * 0.8), v = Math.abs(r.state.v);
+      const ahead = pathSamples(r, r.state.path, (v * v) / (2 * a) + r.kin.footprint[0], 100);
+      for (const z of slz) {
+        const poly = z.worldPolygon();
+        const hit = ahead.find((p) => rectIntersectsPolygon({ x: p.x, y: p.y, theta: p.th, L: r.kin.footprint[0], W: r.kin.footprint[1] }, poly));
+        if (hit) speed = Math.min(speed ?? r.kin.maxSpeed, Math.sqrt(z.speedLimit * z.speedLimit + 2 * a * hit.d));
+      }
+    }
     const moving = stepMobile(r, dt, { speed, pose });
     if (nav?.simulate) stepNavRuntime(r, dt, this.map(), this.zones());
     if (moving) this.addBusy(r, dt);
@@ -741,10 +901,10 @@ export class FleetManager {
     const task = r.state.taskId ? this.fleet.tasks.find((t) => t.id === r.state.taskId) : null;
     if (task?.status === 'working' && (this.rt(task).phase === 'work')) return; // stay on the work line
     const blocked = this.segments().filter((s) => this.holders(s.id, r.id).length >= (s.capacity ?? this.fleet.segmentCapacity) && !this.reservations.get(s.id)?.has(r.id)).map((s) => s.polygon);
-    const blocker = fd.by ? this.robots().find((o) => o.id === fd.by) : null;
-    const extra = blocker && !blocker.state.path ? robotCircles(blocker, this.safetyGap) : [];
+    // robots that stand still (idle, waiting, working at a stop) near the robot are static obstacles for the new plan
+    const extra = this.robots().filter((o) => o !== r && Math.abs(o.state.v) < 50 && Math.hypot(o.state.x - r.state.x, o.state.y - r.state.y) < 15000).flatMap((o) => robotCircles(o, this.safetyGap));
     if (!blocked.length && !extra.length) return;
-    const np = this.planTo(r, [goal[0], goal[1]], { goalHeading: goal[2], blocked, extra });
+    const np = this.planTo(r, [goal[0], goal[1]], { goalHeading: goal[2], blocked, extra, quiet: true });
     if (!np) return;
     const oldLen = remainingLength(path, r.state.pathIndex);
     if (pathLength(np) > oldLen * 3 + 20000) return;
@@ -784,13 +944,17 @@ export class FleetManager {
       if (!cycle && !lastIdle) continue;
       if (lastIdle && this.time - t.waitSince < 5) continue;
       // choose who yields: not working on its work line, not inside a held segment; prefer the idle robot, then the waiting-for-segment robot
-      const cands = (lastIdle ? [last] : chain).filter((x) => this.canYield(x));
+      const cands = (lastIdle ? [last] : chain).filter((x) => this.canYield(x) && !((this.traffic.get(x.id)?.noYieldUntil ?? -1) > this.time));
       if (!cands.length) continue;
       cands.sort((a, b) => this.yieldScore(a) - this.yieldScore(b));
-      const y = cands[0];
-      const pass = robots.find((x) => x !== y && this.traffic.get(x.id)?.by === y.id && this.traffic.get(x.id)?.waitSince !== null) ?? byId.get(this.traffic.get(y.id)?.by ?? '') ?? chain.find((x) => x !== y);
-      if (!pass) continue;
-      if (this.startYield(y, pass, robots)) { this.trafficKpi.deadlocks++; break; }
+      let done = false;
+      for (const y of cands) {
+        const pass = robots.find((x) => x !== y && this.traffic.get(x.id)?.by === y.id && this.traffic.get(x.id)?.waitSince !== null) ?? byId.get(this.traffic.get(y.id)?.by ?? '') ?? chain.find((x) => x !== y);
+        if (!pass) continue;
+        if (this.startYield(y, pass, robots)) { this.trafficKpi.deadlocks++; done = true; break; }
+        this.trafficOf(y).noYieldUntil = this.time + 5; // no way out found now: retry later (planning is expensive)
+      }
+      if (done) break;
     }
   }
 
@@ -809,34 +973,28 @@ export class FleetManager {
   /** Move `y` out of the way of `pass`: nearest free pose whose footprint keeps clear of pass's remaining path. */
   private startYield(y: MobileRobot, pass: MobileRobot, robots: MobileRobot[]): boolean {
     const world = this.world();
-    const P = pass.state.path && isPosePath(pass.state.path) ? pass.state.path.slice(pass.state.pathIndex) : [[pass.state.x, pass.state.y]];
+    // where the passing robot is going: its remaining path, then its task location and work path, densified
+    const ptask = pass.state.taskId ? this.fleet.tasks.find((t) => t.id === pass.state.taskId) : null;
+    const route: number[][] = [[pass.state.x, pass.state.y], ...(pass.state.path && isPosePath(pass.state.path) ? pass.state.path.slice(pass.state.pathIndex) : [])];
+    if (ptask && ptask.status !== 'working') { route.push(ptask.location); for (const q of ptask.workPath ?? []) route.push(q); }
+    const P: number[][] = [route[0]];
+    for (let i = 1; i < route.length; i++) { const a = route[i - 1], b = route[i], n = Math.max(1, Math.ceil(Math.hypot(b[0] - a[0], b[1] - a[1]) / 400)); for (let k = 1; k <= n; k++) P.push([a[0] + ((b[0] - a[0]) * k) / n, a[1] + ((b[1] - a[1]) * k) / n]); }
+    const passSegs = this.segments().filter((sg) => ptask?.segments?.includes(sg.id)).map((sg) => sg.polygon);
     const needP = Math.hypot(y.kin.footprint[0], y.kin.footprint[1]) / 2 + pass.kin.footprint[1] / 2 + this.safetyGap + 200;
-    const nearPath = (x: number, yy: number) => {
+    const nearPath = (x: number, yy: number, th = y.state.theta) => {
+      if (passSegs.some((poly) => rectIntersectsPolygon({ x, y: yy, theta: th, L: y.kin.footprint[0], W: y.kin.footprint[1] }, poly))) return true;
       let acc = 0;
       for (let i = 0; i < P.length; i++) {
         if (i > 0) acc += Math.hypot(P[i][0] - P[i - 1][0], P[i][1] - P[i - 1][1]);
-        if (acc > 40000) break;
+        if (acc > 60000) break;
         if (Math.hypot(P[i][0] - x, P[i][1] - yy) < needP) return true;
       }
       return false;
     };
     const L = y.kin.footprint[0], W = y.kin.footprint[1], H = y.kin.footprint[2];
     const others = robots.filter((o) => o !== y);
-    const cands: Array<{ x: number; y: number; th: number; d: number }> = [];
-    for (const rad of [1500, 2500, 3500, 5000, 7000, 9000]) for (let a = 0; a < 360; a += 30) for (const dth of [0, 90, -90, 180]) {
-      const x = y.state.x + rad * Math.cos((a * Math.PI) / 180), yy = y.state.y + rad * Math.sin((a * Math.PI) / 180);
-      const th = wrap180(y.state.theta + dth);
-      if (nearPath(x, yy)) continue;
-      if (world.clearance(x, yy, th, L, W, H, this.planMargin) < this.planMargin) continue;
-      if (others.some((o) => rectsOverlap({ x, y: yy, theta: th, L, W }, this.rectOf(o), this.safetyGap * 2))) continue;
-      cands.push({ x, y: yy, th, d: rad + Math.abs(dth) * 5 });
-    }
-    cands.sort((a, b) => a.d - b.d);
-    const extra = robotCircles(pass, this.safetyGap);
-    for (const c of cands.slice(0, 12)) {
-      const path = this.planTo(y, [c.x, c.y], { goalHeading: c.th, extra });
-      if (!path) continue;
-      const tr = this.trafficOf(y);
+    const tr = this.trafficOf(y);
+    const begin = (path: number[][]) => {
       const resume = y.state.path && isPosePath(y.state.path) ? (() => { const g = y.state.path![y.state.path!.length - 1]; return { x: g[0], y: g[1], theta: g[2] }; })() : null;
       tr.yield = { waitFor: pass.id, resume, arrived: false, t0: this.time };
       tr.waitSince = null; tr.by = null; tr.seg = null;
@@ -848,8 +1006,75 @@ export class FleetManager {
       this.trafficKpi.yields++;
       this.logMsg(`${y.name} yields to ${pass.name}`);
       return true;
+    };
+    // 1) straight retreat along the robot's own axis (backing out of a crossing or an alley mouth): no planner needed
+    const dirs = y.kin.drive === 'aerial' ? [1] : [-1, 1];
+    for (const D of [1500, 2500, 3500, 5000, 7000]) for (const sgn of dirs) {
+      const th = (y.state.theta * Math.PI) / 180;
+      if (nearPath(y.state.x + Math.cos(th) * D * sgn, y.state.y + Math.sin(th) * D * sgn)) continue;
+      const path = this.straightMove(y, sgn, D, robots);
+      if (path) return begin(path);
+    }
+    // 2) a free parking pose off the passing robot's path, reached with the planner
+    const cands: Array<{ x: number; y: number; th: number; d: number }> = [];
+    for (const rad of [1500, 2500, 3500, 5000, 7000, 9000]) for (let a = 0; a < 360; a += 30) for (const dth of [0, 90, -90, 180]) {
+      const x = y.state.x + rad * Math.cos((a * Math.PI) / 180), yy = y.state.y + rad * Math.sin((a * Math.PI) / 180);
+      const th = wrap180(y.state.theta + dth);
+      if (nearPath(x, yy, th)) continue;
+      if (world.clearance(x, yy, th, L, W, H, this.planMargin) < this.planMargin) continue;
+      if (others.some((o) => rectsOverlap({ x, y: yy, theta: th, L, W }, this.rectOf(o), this.safetyGap * 2))) continue;
+      cands.push({ x, y: yy, th, d: rad + Math.abs(dth) * 5 });
+    }
+    cands.sort((a, b) => a.d - b.d);
+    const extra = robotCircles(pass, this.safetyGap);
+    for (const c of cands.slice(0, 4)) {
+      const path = this.planTo(y, [c.x, c.y], { goalHeading: c.th, extra, quiet: true, maxExpand: 8000 });
+      if (path) return begin(path);
     }
     return false;
+  }
+
+  /**
+   * Straight move along the robot's axis (sgn 1 forward, -1 backward) over D mm as a pose path, or null when the swept
+   * footprints hit an obstacle or come closer to another robot than they already are.
+   */
+  straightMove(r: MobileRobot, sgn: number, D: number, robots: MobileRobot[]): number[][] | null {
+    const world = this.world();
+    const [L, W, H] = r.kin.footprint;
+    const others = robots.filter((o) => o !== r);
+    const sep0 = new Map(others.map((o) => [o.id, rectSeparation(this.rectOf(r), this.rectOf(o))]));
+    const th = (r.state.theta * Math.PI) / 180;
+    const n = Math.max(1, Math.ceil(D / 150));
+    const path: number[][] = [[r.state.x, r.state.y, r.state.theta, sgn]];
+    for (let i = 1; i <= n; i++) {
+      const s = (D * i) / n;
+      const x = r.state.x + Math.cos(th) * s * sgn, yy = r.state.y + Math.sin(th) * s * sgn;
+      if (world.clearance(x, yy, r.state.theta, L, W, H, this.planMargin * 0.5) < this.planMargin * 0.5) return null;
+      const rect: Rect2 = { x, y: yy, theta: r.state.theta, L, W };
+      for (const o of others) { const sp = rectSeparation(rect, this.rectOf(o)); if (sp < this.safetyGap && sp <= (sep0.get(o.id) ?? 0) + 1) return null; }
+      path.push([x, yy, r.state.theta, sgn]);
+    }
+    return path;
+  }
+
+  /** An idle robot left standing in a traffic segment (alley mouth after its last row) drives out of it. */
+  private clearSegments(r: MobileRobot, robots: MobileRobot[]): void {
+    if (r.state.taskId || r.state.path || r.state.status !== 'idle' || this.traffic.get(r.id)?.yield) return;
+    const tr = this.trafficOf(r);
+    if ((tr.noYieldUntil ?? -1) > this.time) return;
+    const segs = this.segments().filter((sg) => rectIntersectsPolygon(this.rectOf(r), sg.polygon));
+    if (!segs.length) return;
+    const th = (r.state.theta * Math.PI) / 180;
+    for (const sgn of r.kin.drive === 'aerial' ? [1] : [1, -1]) for (const D of [r.kin.footprint[0] + 500, r.kin.footprint[0] + 1500, 2 * r.kin.footprint[0] + 2000]) {
+      const ex = r.state.x + Math.cos(th) * D * sgn, ey = r.state.y + Math.sin(th) * D * sgn;
+      if (this.segments().some((sg) => rectIntersectsPolygon({ x: ex, y: ey, theta: r.state.theta, L: r.kin.footprint[0], W: r.kin.footprint[1] }, sg.polygon))) continue;
+      const path = this.straightMove(r, sgn, D, robots);
+      if (!path) continue;
+      followPath(r, path);
+      this.logMsg(`${r.name} clears ${segs[0].id}`);
+      return;
+    }
+    tr.noYieldUntil = this.time + 10;
   }
 
   private stepYield(r: MobileRobot, dt: number, robots: MobileRobot[]): void {
@@ -984,8 +1209,8 @@ export class FleetManager {
       tasksDone: done.length,
       tasksFailed: this.fleet.tasks.filter((t) => t.status === 'failed').length,
       tasksPending: this.fleet.tasks.filter((t) => t.status === 'pending' || t.status === 'assigned').length,
-      throughputPerHour: this.time > 0 ? (done.length * 3600) / this.time : 0,
-      utilization: robots.length && this.time > 0 ? busySum / (robots.length * this.time) : 0,
+      throughputPerHour: this.time - this.t0 > 0 ? (done.filter((t) => (t.finishedAt ?? 0) >= this.t0).length * 3600) / (this.time - this.t0) : 0,
+      utilization: robots.length && this.time - this.t0 > 0 ? busySum / (robots.length * (this.time - this.t0)) : 0,
       distanceTravelled: dist,
       energyUsedWh: energy,
       meanWaitTime: this.waits.length ? this.waits.reduce((a, b) => a + b, 0) / this.waits.length : 0,
@@ -1024,6 +1249,47 @@ export function robotCircles(r: MobileRobot, grow = 0): CircleObstacle[] {
   return offsets.map((o) => ({ x: r.state.x + Math.cos(th) * o, y: r.state.y + Math.sin(th) * o, r: rad + grow, zMin: 0, zMax: r.kin.footprint[2], kind: 'robot', ref: { itemId: r.id } }));
 }
 
+/** Signed depth of a point in a polygon (mm): distance to the boundary, positive inside, negative outside. */
+export function polygonDepth(x: number, y: number, poly: number[][]): number {
+  let d = Infinity;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const a = poly[j], b = poly[i];
+    const dx = b[0] - a[0], dy = b[1] - a[1], l2 = dx * dx + dy * dy;
+    const t = l2 > 0 ? Math.max(0, Math.min(1, ((x - a[0]) * dx + (y - a[1]) * dy) / l2)) : 0;
+    d = Math.min(d, Math.hypot(x - a[0] - t * dx, y - a[1] - t * dy));
+  }
+  return pointInPolygon(x, y, poly) ? d : -d;
+}
+
+/**
+ * Footprint samples along a robot's remaining pose path: the current pose (d = 0), then path points ahead of the
+ * robot's projection on its current segment with their arc length d (mm), at most every `step` mm, up to `maxD`.
+ * Rotate-in-place points are kept (rot = true) without adding distance.
+ */
+export function pathSamples(r: MobileRobot, path: number[][], maxD: number, step = 150): Array<{ x: number; y: number; th: number; d: number; rot: boolean }> {
+  const out = [{ x: r.state.x, y: r.state.y, th: r.state.theta, d: 0, rot: false }];
+  const i0 = Math.max(0, Math.min(path.length - 1, r.state.pathIndex));
+  let dist = 0, px = r.state.x, py = r.state.y, lastD = 0, hd = r.state.theta;
+  for (let i = i0 + 1; i < path.length; i++) {
+    const p = path[i];
+    dist += Math.hypot(p[0] - px, p[1] - py);
+    px = p[0]; py = p[1];
+    if (dist > maxD) break;
+    if (p[3] === 0) {
+      // rotation in place: the swept footprints at intermediate headings (every 15 deg)
+      const dth = wrap180(p[2] - hd), n = Math.max(1, Math.ceil(Math.abs(dth) / 15));
+      for (let k = 1; k <= n; k++) out.push({ x: p[0], y: p[1], th: hd + (dth * k) / n, d: dist, rot: true });
+      hd = p[2];
+      continue;
+    }
+    hd = p[2];
+    if (dist - lastD < step && i + 1 < path.length) continue;
+    out.push({ x: p[0], y: p[1], th: p[2], d: dist, rot: false });
+    lastD = dist;
+  }
+  return out;
+}
+
 function remainingLength(path: number[][], from: number): number {
   let l = 0;
   for (let i = Math.max(1, from); i < path.length; i++) l += Math.hypot(path[i][0] - path[i - 1][0], path[i][1] - path[i - 1][1]);
@@ -1057,6 +1323,9 @@ export function remainderOf(w: number[][], s: number): number[][] {
   if (out.length < 2) out.push([w[w.length - 1][0], w[w.length - 1][1]]);
   return out;
 }
+
+/** Lane zones are traffic segments: at most `capacity` robots inside (single-lane corridors, gates, bridges). */
+registerSegmentProvider('zones.lanes', (station) => station.itemsOfType<ZoneItem>(ItemType.ZONE).filter((z) => z.kind === 'lane' && z.polygon.length > 2).map((z) => ({ id: z.id, polygon: z.worldPolygon(), capacity: Math.max(1, z.capacity || 1) })));
 
 // ---------------------------------------------------------------------------------------------------------------
 // Built-in allocators
@@ -1111,6 +1380,7 @@ registerAllocator('auction', (ctx) => {
     const e = ends.get(best.id)!;
     const end = t.workPath?.length ? t.workPath[t.workPath.length - 1] : t.location;
     ends.set(best.id, { x: end[0], y: end[1], t: ctx.fm.time + bid, n: e.n + 1 });
+    ctx.claim(t, best, ctx.fm.time + bid);
   }
   return out;
 });
@@ -1188,7 +1458,9 @@ registerAllocator('contract_net', (ctx) => {
       out.push({ task: b.t, robot: b.r });
       const e = ends.get(b.r.id)!;
       const end = b.t.workPath?.length ? b.t.workPath[b.t.workPath.length - 1] : b.t.location;
-      ends.set(b.r.id, { x: end[0], y: end[1], t: ctx.fm.time + ctx.cost(b.r, b.t, e), n: e.n + 1 });
+      const until = ctx.fm.time + ctx.cost(b.r, b.t, e);
+      ends.set(b.r.id, { x: end[0], y: end[1], t: until, n: e.n + 1 });
+      ctx.claim(b.t, b.r, until);
     }
   }
   return out;

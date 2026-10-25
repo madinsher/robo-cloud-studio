@@ -199,9 +199,12 @@ export class AutomatonExecutor {
     if (this.opts.auto !== false) { const evs = this.enabledAuto(true); if (evs.length) { const pick = evs.slice().sort((a, b) => (this.lastFired.get(a) ?? -1) - (this.lastFired.get(b) ?? -1))[0]; this.fire(pick, 'auto'); } }
     w.step?.(dt);
     this.time += dt; this.ticks++;
-    if (!this.running.size && !this.enabledAuto().length && !this.waitingForWorld()) this.finish();
+    // ends when nothing can happen any more; with `terminate marked` also when the task is complete: every automaton (and
+    // the supervisor) marked after at least one event, no action running, no controllable event enabled
+    if (!this.running.size && !this.enabledAuto().length && (!this.waitingForWorld() || (this.opts.doc.terminate === 'marked' && this.fired > 0 && this.allMarked()))) this.finish();
     return this.status;
   }
+  private allMarked(): boolean { return !this.blocked.size && this.comps.every((c) => c.xm.has(this.state.get(c.name)!)) && (!this.supervisor || this.supervisor.marked()); }
   private finish(): void {
     this.status = 'idle';
     const marked = this.comps.every((c) => c.xm.has(this.state.get(c.name)!)) && (!this.supervisor || this.supervisor.marked());
@@ -217,7 +220,7 @@ export class AutomatonExecutor {
 // Petri nets as cell controllers
 // ---------------------------------------------------------------------------------------------
 
-export interface PetriExecOptions { doc: PetriDoc; world: ExecutorWorld; log?: (m: string) => void; /** max firings per tick (zero-delay loops) */ maxPerTick?: number; /** seed of the exponential delays of `rate=` transitions */ seed?: number }
+export interface PetriExecOptions { doc: PetriDoc; world: ExecutorWorld; log?: (m: string) => void; /** max firings per tick (zero-delay loops) */ maxPerTick?: number; /** seed of the exponential delays of `rate=` transitions */ seed?: number; /** end the run on a partial deadlock (some processes blocked for ever while others still cycle), default true */ stopOnPartialDeadlock?: boolean }
 
 /**
  * Interpreted Petri net: a transition starts when it is enabled by the marking (capacities respected), its `guard`
@@ -301,7 +304,29 @@ export class PetriExecutor {
     this.time += dt; this.ticks++;
     const waitsForEvent = this.net.transitions.some((tr, j) => !this.faulted.has(j) && (tr.on || tr.guard) && this.net.isEnabled(this.marking, j) && this.inProgress(j) < (tr.servers ?? 1));
     if (!this.active.length && !this.candidates().length && !waitsForEvent) this.finish();
+    else if (this.opts.stopOnPartialDeadlock !== false) this.checkPartialDeadlock();
     return this.status;
+  }
+  private lastChecked = ''; private noDeadlockCheck = false;
+  /**
+   * Partial deadlock: from the marking the running firings lead to, some token-holding activity places can never be left
+   * (all their output transitions are dead in the reachability set from there — structure only, so guards / events /
+   * timing cannot revive them) while other transitions still cycle. Exact for bounded nets; skipped for large ones.
+   */
+  private checkPartialDeadlock(): void {
+    if (this.noDeadlockCheck) return;
+    const m = this.marking.map((v, i) => v + this.active.reduce((s, a) => s + this.net.post[a.t][i], 0));
+    const key = `${m.join(',')}|${this.marking.join(',')}`; if (key === this.lastChecked) return; this.lastChecked = key;
+    const spec = this.opts.doc.spec; const sub = new PetriNet({ ...spec, places: spec.places.map((p, i) => ({ ...p, tokens: m[i] })) });
+    const rg = sub.reachability({ limit: 3000 }); if (rg.truncated) { this.noDeadlockCheck = true; return; }
+    const live = new Set(rg.edges.map((e) => e.t));
+    const dead = (j: number) => !live.has(j) && !this.faulted.has(j);
+    const blocked = this.net.places.map((p, i) => i).filter((i) => m[i] > 0 && !['resource', 'idle', 'monitor'].includes(this.net.places[i].kind ?? '') && this.net.placeOut(i).length > 0 && this.net.placeOut(i).every(dead));
+    // reported when it has happened: every blocked place holds its tokens now (no running firing still produces into it)
+    if (!blocked.length || blocked.some((i) => this.marking[i] < m[i])) return;
+    const deadT = this.net.transitions.map((_, j) => j).filter(dead).map((j) => this.net.transitionId(j));
+    this.stop('deadlock'); this.status = 'idle';
+    this.say(`DEADLOCK (partial) at marking {${this.where()}}: ${blocked.map((i) => this.net.places[i].id).join(', ')} can never be left; dead transitions ${deadT.join(', ')}`);
   }
   /** Final marking reached: a declared `final` marking (≤ for the places listed), else tokens only in sink places or resource / idle / monitor places. */
   isFinal(): boolean {

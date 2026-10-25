@@ -173,7 +173,8 @@ for p in RDK.ItemList(ITEM_TYPE_PROGRAM):
     pd['instructions'] = ins
     t1 = time.time()
     pd['update'] = safe(lambda: list(p.Update(COLLISION_OFF, 600)), None, 'update ' + name)
-    pd['updateCollision'] = safe(lambda: list(p.Update(COLLISION_ON, 600)), None, 'updateC ' + name)
+    # DUMP_NO_COLLISION=1: skip the collision-checked update (hours for the long machining programs of 02.f turntable)
+    pd['updateCollision'] = None if os.environ.get('DUMP_NO_COLLISION') else safe(lambda: list(p.Update(COLLISION_ON, 600)), None, 'updateC ' + name)
     msg_code = safe(lambda: p.InstructionListJoints(5, 5, None, COLLISION_OFF, 1, 0.1), None, 'joints ' + name)
     if msg_code:
         msg, mat, status = msg_code
@@ -200,7 +201,8 @@ for p in RDK.ItemList(ITEM_TYPE_PROGRAM):
     # generated code with the robot post processor
     pdir = os.path.join(codedir, ''.join(ch if ch.isalnum() or ch in '-_' else '_' for ch in name))
     os.makedirs(pdir, exist_ok=True)
-    mk = safe(lambda: p.MakeProgram(pdir), None, 'make ' + name)
+    # DUMP_NO_MAKE=1: skip code generation (the hidden Fanuc post of 03.g blocks RoboDK until the API times out)
+    mk = None if os.environ.get('DUMP_NO_MAKE') else safe(lambda: p.MakeProgram(pdir), None, 'make ' + name)
     pd['make'] = list(mk) if mk else None
     pd['codeFiles'] = sorted(os.listdir(pdir)) if os.path.isdir(pdir) else []
     progs.append(pd)

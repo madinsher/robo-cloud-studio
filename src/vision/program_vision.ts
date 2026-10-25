@@ -13,6 +13,7 @@ import { Station, Camera as CameraItem, ItemType, Item } from '../core/items/ite
 import { Robot } from '../core/items/robot';
 import { getVisionStack } from './stack';
 import { runVisionOnce, VisionRunResult, ModelContext } from './pipeline';
+import { registerScriptRunner, type ScriptRunner } from '../core/motion/runtime';
 
 export const VISION_CALL = /^(VisionDetect|Vision_Run|VisionRun|DetectParts)$/i;
 
@@ -54,7 +55,24 @@ export async function visionScriptRunner(ctx: { station: Station; runtime: { sig
   return true;
 }
 
+/** Adapter for StationRuntime.registerScriptRunner: vision calls run the pipeline; any other name keeps the runtime's usual
+ *  diagnostic (the call is not executed in simulation) — StationRuntime calls only its first runner (see impl_T9.md). */
+function adapter(): ScriptRunner {
+  return async (ctx) => {
+    if (await visionScriptRunner(ctx as any)) return;
+    ctx.runtime.events?.emit('message', { text: `Call ${ctx.name}: no program or script named ${ctx.name} in the station (ignored in simulation)`, level: 'warn' });
+  };
+}
+
 /** Register the vision runner on one runtime (returns the unregister function). */
-export function installVisionRunner(runtime: { registerScriptRunner(fn: (ctx: any) => Promise<void>): () => void }): () => void {
-  return runtime.registerScriptRunner(async (ctx) => { await visionScriptRunner(ctx); });
+export function installVisionRunner(runtime: { registerScriptRunner(fn: ScriptRunner): (() => void) | void }): () => void {
+  const off = runtime.registerScriptRunner(adapter());
+  return typeof off === 'function' ? off : () => undefined;
+}
+
+let globalOff: (() => void) | null = null;
+/** Register the vision runner for every StationRuntime (browser app start, server, headless API). Idempotent. */
+export function installVisionRunnerGlobal(): () => void {
+  if (!globalOff) { const off = registerScriptRunner(adapter()); globalOff = () => { off(); globalOff = null; }; }
+  return globalOff;
 }

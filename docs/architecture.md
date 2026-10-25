@@ -37,8 +37,17 @@
   restarts, optional position-only / free-tool-Z relaxation.
 - **Motion** (`src/core/motion`): trapezoidal profiles; MoveJ synchronises joints on the slowest axis; MoveL/MoveC
   interpolate pose (slerp) and solve IK per sample, detecting unreachable segments and configuration jumps.
-  `ProgramSimulator.compile` turns a program into timed steps (trajectories + discrete events) so the timeline can
-  seek in both directions; `tick`/`seek` apply joints and attachments.
+  `ProgramSimulator.compile` turns a program into timed steps (trajectories + discrete events) for previews,
+  validation and cycle-time estimates. Playback in the app runs on the station's `StationRuntime` (one shared clock;
+  programs on different robots run concurrently, a busy robot queues): `App.runProgram / pauseProgram /
+  resumeProgram / stopProgram / resetSimulation` (Reset restores the home state captured at the first Play: object
+  poses, attachments, joints, IO — RoboDK "Replace objects"), `seekProgram` is deterministic (backwards = reset +
+  replay of the session's starts), a run stops at its first error and the program editor marks that instruction.
+  Previews use a separate simulator and are deferred while a simulation plays, so they never disturb playback.
+- **App scalability** (`src/app.ts`, `src/scene/worker.ts`, `src/ui/vlist.ts`): `.rdk` import and the compile of
+  programs above 400 instructions run in a module Web Worker with a progress indicator; the tree and the program
+  editor are virtualised and update rows incrementally (joint / pose events never rebuild them); no collision check
+  runs on load or selection (only on explicit Validate).
 - **Posts** (`src/posts`): `compileForPost` resolves targets into poses in the active reference frame and joint
   values, producing a flat `PostEvent[]` that each vendor emitter renders.
 - **Mobile/fleet** (`src/mobile`, `src/fleet`): 2D state on the ground plane synchronised with the 3D pose;

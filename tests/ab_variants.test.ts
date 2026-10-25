@@ -36,7 +36,8 @@ function cell() {
   const robot = st.addChild(createRobotFromLibrary('UR10e', 'UR10e'));
   const tool = robot.addChild(new Tool('Gripper')); tool.setPoseTool(transl(0, 0, 120)); robot.setTool(tool);
   const frame = st.addChild(new Frame('Table')); frame.setPose(transl(600, 0, 0)); robot.setFrame(frame);
-  const home = frame.addChild(new Target('Home')); home.setJoints([0, -90, 90, -90, -90, 0]); home.setAsJointTarget();
+  // Home above the table: the MoveL to A / B stays on the same side of the base axis (no 180 deg swing of J1)
+  const home = frame.addChild(new Target('Home')); home.setJoints([180, -90, 90, -90, -90, 0]); home.setAsJointTarget();
   const a = frame.addChild(new Target('A')); a.setPose(mul(transl(100, 200, 300), rotx(180 * DEG)));
   const b = frame.addChild(new Target('B')); b.setPose(mul(transl(100, -200, 300), rotx(180 * DEG)));
   return { st, robot, frame, home, a, b };
@@ -52,7 +53,7 @@ describe('A/B — persistence and exchange formats', () => {
     }
   });
   it('A: a program compiled for the simulator · B: the same program compiled for every post processor — the same motion count reaches every dialect', () => {
-    const { st, robot, home, a, b } = cell(); const prog = st.addChild(new Program('P')); prog.setRobot(robot); prog.addMoveJ(home); prog.addMoveL(a); prog.addMoveL(b); prog.addMoveJ(home);
+    const { st, robot, home, a, b } = cell(); robot.setJoints([170, -80, 80, -90, -90, 0]); const prog = st.addChild(new Program('P')); prog.setRobot(robot); prog.addMoveJ(home); prog.addMoveL(a); prog.addMoveL(b); prog.addMoveJ(home);
     const simA = new ProgramSimulator(st); simA.compile(prog); const moves = simA.steps.filter((s) => s.trajectory).length;
     expect(moves).toBe(4);
     for (const p of listPosts()) {

@@ -251,8 +251,9 @@ export function toPosePath(robot: MobileRobot, path: number[][], opts: FollowOpt
   const k = robot.kin;
   const pts = path.map((p) => [p[0], p[1]]);
   if (!pts.length) return [];
-  // drop leading points on top of the robot
-  if (Math.hypot(pts[0][0] - st.x, pts[0][1] - st.y) > 1) pts.unshift([st.x, st.y]);
+  // drop leading points on top of the robot (within the arrival tolerance: never turn around to reach them)
+  if (pts.length > 1 && Math.hypot(pts[0][0] - st.x, pts[0][1] - st.y) < 300) pts[0] = [st.x, st.y];
+  else if (Math.hypot(pts[0][0] - st.x, pts[0][1] - st.y) > 1) pts.unshift([st.x, st.y]);
   else pts[0] = [st.x, st.y];
   const dedup: number[][] = [pts[0]];
   for (const p of pts.slice(1)) if (Math.hypot(p[0] - dedup[dedup.length - 1][0], p[1] - dedup[dedup.length - 1][1]) > 1) dedup.push(p);

@@ -5,7 +5,7 @@
  * the registry; DEF names, PROTO names and controllers are kept in item params.
  */
 import { Item, Station, SceneObject, Frame, Notes, GeometryRef, ParamValue } from '../../core/items/item';
-import { Mat4, identity, multiply, transformDir, normalize } from '../../core/math/pose';
+import { Mat4, identity, multiply, transformDir, transformPoint, normalize } from '../../core/math/pose';
 import { buildStationItemsFromTree, KinDriveOverride, KinBuildResult } from '../kintree';
 import { MobileRobot } from '../../mobile/items';
 import { WNode, WFile, parseWorld, fNum, fNum1, fStr, fStrs, fNode, fNodes, fBool, newScope } from './vrml';
@@ -35,6 +35,9 @@ export interface WebotsBuildResult {
 function setColliders(item: Item, refs: GeometryRef[]): void {
   (item as unknown as { colliders?: GeometryRef[] }).colliders = refs;
 }
+/** Solid-derived nodes built like a Solid outside robots (devices keep their geometry and boundingObject; Fluid volume). */
+const SOLID_LIKE = new Set(['Charger', 'Connector', 'Display', 'DistanceSensor', 'Emitter', 'Receiver', 'LED', 'LightSensor', 'TouchSensor', 'Pen', 'Speaker', 'Camera', 'RangeFinder', 'Lidar', 'GPS', 'Compass', 'InertialUnit', 'Gyro', 'Accelerometer', 'Altimeter', 'Radar', 'VacuumGripper', 'Fluid']);
+const LIGHTS = new Set(['PointLight', 'SpotLight', 'DirectionalLight']);
 const colliders = (item: Item): GeometryRef[] => (item as unknown as { colliders?: GeometryRef[] }).colliders ?? [];
 
 function protoParams(n: WNode, out: Record<string, ParamValue>): void {
@@ -58,7 +61,7 @@ export class WebotsSceneBuilder {
     station.settings.webots = webots;
     station.settings.units = 'mm';
     station.settings.upAxis = 'z';
-    const lights: ParamValue[] = [];
+    const lights: ParamValue[] = (this.lights = []);
     for (const raw of world.nodes) {
       const n = this.reg.resolve(raw);
       if (!n) { this.ctx.report.push(`${raw.type}${raw.def ? ` (DEF ${raw.def})` : ''}: skipped (cannot be resolved)`); continue; }
@@ -90,15 +93,7 @@ export class WebotsSceneBuilder {
           station.settings.background = { skyColor: fNum(n, 'skyColor', [0, 0, 0]).slice(0, 3), luminosity: fNum1(n, 'luminosity', 1), ...(n.meta?.texture ? { texture: String(n.meta.texture) } : {}) };
           break;
         }
-        case 'DirectionalLight': case 'PointLight': case 'SpotLight': {
-          const l: Record<string, ParamValue> = { type: n.type, intensity: fNum1(n, 'intensity', 1), color: fNum(n, 'color', [1, 1, 1]), ambientIntensity: fNum1(n, 'ambientIntensity', 0), castShadows: fBool(n, 'castShadows', false) };
-          if (n.type === 'DirectionalLight') l.direction = normalize(fNum(n, 'direction', [0, 0, -1]) as [number, number, number]);
-          else l.location = fNum(n, 'location', [0, 0, 0]).map((v) => v * M2MM);
-          if (n.type === 'SpotLight') l.direction = fNum(n, 'direction', [0, 0, -1]);
-          if (n.meta?.texture) l.texture = String(n.meta.texture);
-          lights.push(l);
-          break;
-        }
+        case 'DirectionalLight': case 'PointLight': case 'SpotLight': this.addLight(n, identity()); break;
         case 'Fog': station.settings.fog = { color: fNum(n, 'color', [1, 1, 1]), visibilityRange: fNum1(n, 'visibilityRange', 0) * M2MM }; break;
         default: this.buildNode(n, station, identity());
       }
@@ -107,11 +102,25 @@ export class WebotsSceneBuilder {
     return station;
   }
 
+  private lights: ParamValue[] = [];
+  /** A light (world level or inside a Solid / Robot) -> station.settings.lights, location / direction in station coordinates. */
+  addLight(n: WNode, abs: Mat4): void {
+    const l: Record<string, ParamValue> = { type: n.type, intensity: fNum1(n, 'intensity', 1), color: fNum(n, 'color', [1, 1, 1]), ambientIntensity: fNum1(n, 'ambientIntensity', 0), castShadows: fBool(n, 'castShadows', false) };
+    if (n.type !== 'PointLight') l.direction = normalize(transformDir(abs, fNum(n, 'direction', [0, 0, -1]) as [number, number, number]));
+    if (n.type !== 'DirectionalLight') l.location = transformPoint(abs, fNum(n, 'location', [0, 0, 0]).map((v) => v * M2MM) as [number, number, number]);
+    if (n.meta?.texture) l.texture = String(n.meta.texture);
+    if (abs[12] || abs[13] || abs[14] || abs[0] !== 1 || abs[5] !== 1) l.attached = true;
+    this.lights.push(l);
+  }
+
   /** Build a non-world node under `parent` (M: rigid transform from parent frame to the node's containing frame). */
   buildNode(n: WNode, parent: Item, M: Mat4): Item | null {
+    if (SOLID_LIKE.has(n.type)) return this.buildSolid(n, parent, M); // Solid-derived devices (Charger, Connector, ...) and Fluid
     switch (n.type) {
       case 'Solid': return this.buildSolid(n, parent, M);
       case 'Robot': return this.buildRobot(n, parent, M);
+      case 'Slot': { const ep = fNode(n, 'endPoint'); const e = ep ? this.reg.resolve(ep) : null; return e ? this.buildNode(e, parent, M) : null; }
+      case 'PointLight': case 'SpotLight': case 'DirectionalLight': this.addLight(n, multiply(parent.poseAbs(), M)); return null;
       case 'Pose': case 'Transform': case 'Group': return this.buildGroup(n, parent, M);
       case 'Shape': case 'CadShape': {
         const so = new SceneObject(n.def ?? (n.type === 'CadShape' ? baseName(fStrs(n, 'url')[0] ?? 'cad') : 'shape'));
@@ -147,7 +156,7 @@ export class WebotsSceneBuilder {
     const shapes: GeometryRef[] = [];
     walkShapes(fNodes(n, 'children'), S, this.ctx, shapes, {
       other: (c, Mc) => {
-        if (c.type === 'Solid' || c.type === 'Robot' || c.type === 'Pose' || c.type === 'Transform' || c.type === 'Group') {
+        if (c.type === 'Solid' || c.type === 'Robot' || c.type === 'Pose' || c.type === 'Transform' || c.type === 'Group' || SOLID_LIKE.has(c.type) || LIGHTS.has(c.type)) {
           if (decompose(Mc).scale.some((v) => Math.abs(Math.abs(v) - 1) > 1e-6)) warnOnce(this.ctx, `${c.type} under a scaled Transform: scale ignored for the Solid`);
           this.buildNode(c, fr, rigidOf(Mc));
           return true;
@@ -165,9 +174,9 @@ export class WebotsSceneBuilder {
   }
 
   buildSolid(n: WNode, parent: Item, M: Mat4): SceneObject {
-    const name = fStr(n, 'name', n.def ?? 'solid');
+    const name = fStr(n, 'name', n.def ?? (n.type === 'Solid' ? 'solid' : n.type.toLowerCase()));
     const so = new SceneObject(name);
-    so.params.webotsType = 'Solid';
+    so.params.webotsType = n.type;
     protoParams(n, so.params);
     if (fBool(n, 'locked', false)) so.params.locked = true;
     const cm = fStr(n, 'contactMaterial', 'default');
@@ -179,12 +188,13 @@ export class WebotsSceneBuilder {
     so.setPose(multiply(M, poseOf(n)));
     walkShapes(fNodes(n, 'children'), identity(), this.ctx, so.geometry, {
       other: (c, Mc) => {
-        if (c.type === 'Solid' || c.type === 'Robot' || ['HingeJoint', 'SliderJoint', 'Hinge2Joint', 'BallJoint'].includes(c.type)) { this.buildNode(c, so, rigidOf(Mc)); return true; }
+        if (c.type === 'Solid' || c.type === 'Robot' || SOLID_LIKE.has(c.type) || LIGHTS.has(c.type) || ['HingeJoint', 'SliderJoint', 'Hinge2Joint', 'BallJoint'].includes(c.type)) { this.buildNode(c, so, rigidOf(Mc)); return true; }
         return false;
       },
     });
     const ground = { plane: false };
-    const bo = fNode(n, 'boundingObject');
+    const bo = n.type === 'Fluid' ? null : fNode(n, 'boundingObject'); // a Fluid's boundingObject is its immersion volume, not a collider
+    if (n.type === 'Fluid') { so.params.fluid = true; so.params.density = fNum1(n, 'density', 1000); }
     setColliders(so, bo ? boundingRefs(bo, identity(), this.ctx, ground) : []);
     if (ground.plane || n.meta?.ground) so.params.ground = true;
     else {

@@ -94,7 +94,10 @@ export function captureTruth(station: Station, cam: CameraItem, opts: TruthOptio
   const out: TruthObject[] = [];
   if (opts.fruit !== false) {
     for (const d of detectFruit(station, cam, { onlyRipe: false, maxRange })) {
-      out.push({ id: `fruit:${d.rowId}:${d.p.map((v) => v.toFixed(0)).join(',')}`, cls: cropClass(station, d.rowId), box: { x: d.u - d.w / 2, y: d.v - d.h / 2, w: d.w, h: d.h }, p: d.p, z: d.range, size: d.fruit.d, visible: true, attrs: { ripe: d.ripe >= 0.5 ? 1 : 0, ripeness: Number(d.ripe.toFixed(2)) }, keypoints: [[d.u, d.v - d.h / 2]] });
+      // the box is clipped to the image like every detector output (and the ID-buffer boxes of objects)
+      const x0 = Math.max(0, d.u - d.w / 2), y0 = Math.max(0, d.v - d.h / 2), x1 = Math.min(K.width, d.u + d.w / 2), y1 = Math.min(K.height, d.v + d.h / 2);
+      if (x1 <= x0 || y1 <= y0) continue;
+      out.push({ id: `fruit:${d.rowId}:${d.p.map((v) => v.toFixed(0)).join(',')}`, cls: cropClass(station, d.rowId), box: { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }, p: d.p, z: d.range, size: d.fruit.d, visible: true, attrs: { ripe: d.ripe >= 0.5 ? 1 : 0, ripeness: Number(d.ripe.toFixed(2)) }, keypoints: [[d.u, d.v - d.h / 2]] });
     }
   }
   if (opts.trunks !== false) {
@@ -339,10 +342,11 @@ export class VisionRuntime {
       // object model: truth box (simulation), the configured class model, or a size prior (sphere-like: fruit)
       const prior = t?.size ?? cfg.objectSizeMm;
       const dims: Vec3 | null = t?.dims ?? cfg.objectDims?.[b.cls] ?? (prior ? [prior, prior, prior] : null);
+      const round = !t?.dims && !cfg.objectDims?.[b.cls] && !!prior; // only a size prior: a round object (fruit)
       let est: SurfaceEstimate | null = null;
       // sensor path: the depth image (unless a model-based 6D estimator is simulated from truth)
       if (frame.depth && !(modelBased6D && t?.pose)) {
-        est = localizeFromDepth({ depth: frame.depth, width: frame.width, height: frame.height, K: frame.K, camWorld: frame.camWorld }, b, { mask: b.mask ?? null, dims, sigma: noise ? sigma : undefined, refAxis, seed: (cfg.seed ?? 1) + this.stats.frames });
+        est = localizeFromDepth({ depth: frame.depth, width: frame.width, height: frame.height, K: frame.K, camWorld: frame.camWorld }, b, { mask: b.mask ?? null, dims, round, sigma: noise ? sigma : undefined, refAxis, seed: (cfg.seed ?? 1) + this.stats.frames });
         if (est) { b.surface = { point: est.point, normal: est.normal, xAxis: est.xAxis, size: est.size, symmetryDeg: est.symmetryDeg, points: est.points, source: 'depth' }; b.p = est.centroid ?? est.point; }
       }
       // truth + noise: model-based 6D estimators, or sensors without depth in simulation
@@ -483,11 +487,13 @@ export function analyseCloud(cloud: PointCloud, opts: { voxel?: number; tol?: nu
 // Acting on results
 // ---------------------------------------------------------------------------------------------
 
-/** Station object under a grasp point (within `tol` mm of its world AABB), for targets without a truth id. */
-function objectNear(station: Station, p: Vec3, tol = 25): string | undefined {
+/** Station object of the detected class under a grasp point (within `tol` mm of its world AABB), for targets without a truth id (never the table under a false positive). */
+function objectNear(station: Station, p: Vec3, cls: string, tol = 25): string | undefined {
   let best: string | undefined, bd = tol;
   for (const m of sceneMeshes(station, { fields: false })) {
     if (m.kind !== 'object') continue;
+    const it = station.findById(m.itemId);
+    if (!it || objectClass(it) !== cls.toLowerCase()) continue;
     const d = Math.hypot(Math.max(m.min[0] - p[0], 0, p[0] - m.max[0]), Math.max(m.min[1] - p[1], 0, p[1] - m.max[1]), Math.max(m.min[2] - p[2], 0, p[2] - m.max[2]));
     if (d <= bd) { bd = d; best = m.itemId; }
   }
@@ -516,7 +522,7 @@ export function detectionsToPickTargets(station: Station, robot: Robot, targets:
   try {
     for (const t of targets.slice(0, opts.max ?? 50)) {
       const graspBase = multiply(baseInv, t.grasp), approachBase = multiply(baseInv, t.approach);
-      const objectId = t.objectId ?? objectNear(station, t.surface?.point ?? t.p);
+      const objectId = t.objectId ?? objectNear(station, t.surface?.point ?? t.p, t.cls);
       const ikG = robot.solveIK(graspBase, { seed: q0 });
       const ikA = ikG.ok ? robot.solveIK(approachBase, { seed: ikG.joints }) : ikG;
       const pt: PickTarget = { name: t.name, cls: t.cls, grasp: t.grasp, approach: t.approach, graspBase, approachBase, joints: ikG.ok ? ikG.joints : undefined, approachJoints: ikA.ok ? ikA.joints : undefined, reachable: ikG.ok && ikA.ok, collisionFree: false, objectId, trackId: t.trackId };
@@ -548,12 +554,16 @@ export function detectionsToPickTargets(station: Station, robot: Robot, targets:
  * robot reaches without collision are kept, unless `keepInfeasible`.
  */
 export function createTargetsFromOutput(station: Station, cam: CameraItem, out: PipelineOutput, opts: { parent?: Item; max?: number; robotId?: string | null; frameName?: string; keepInfeasible?: boolean; checkCollision?: boolean; pickTargets?: boolean } = {}): Target[] {
-  const parent = opts.parent ?? station;
+  const robot = opts.robotId ? station.findById(opts.robotId) : null;
+  // with a robot the frame lives in the robot's active reference frame (identity pose): a program on that robot moves to
+  // the targets without a frame change (RoboDK applies a target's pose in the active reference frame)
+  const robotFrame = robot instanceof Robot ? robot.activeFrame() : null;
+  const parent = opts.parent ?? (robotFrame && robotFrame !== robot ? robotFrame : station);
   const name = opts.frameName ?? `Vision ${cam.name}`;
-  let frame = parent.children.find((c) => c instanceof Frame && c.name === name) as Frame | undefined;
+  let frame = (parent.children.find((c) => c instanceof Frame && c.name === name) ?? station.find(name, ItemType.FRAME)) as Frame | undefined;
+  if (frame && frame.parent !== parent) { parent.addChild(frame); frame.setPose(transl(0, 0, 0)); } // targets are recomputed below
   if (!frame) { frame = parent.addChild(new Frame(name)); frame.setPose(transl(0, 0, 0)); }
   const inv = invert(frame.poseAbs());
-  const robot = opts.robotId ? station.findById(opts.robotId) : null;
   const list = out.targets.slice(0, opts.max ?? 50);
   const feas = robot instanceof Robot ? detectionsToPickTargets(station, robot, list, { checkCollision: opts.checkCollision }) : null;
   const old = new Map(frame.children.filter((c): c is Target => c instanceof Target).map((t) => [t.name, t]));

@@ -421,8 +421,13 @@ class Robolink(RobolinkAPI):
         return [list(p) for p in self._call("getParams")]
 
     def setParam(self, param, value):
+        # RoboDK stores station parameters as text (str(value)); bytes as binary data
         if isinstance(value, dict):
             value = json.dumps(value)
+        elif isinstance(value, Item):
+            value = str(value.item)
+        elif not isinstance(value, (str, bytes, bytearray)):
+            value = str(value).replace(chr(10), ' ')
         return self._call("setParam", [param, value])
 
     def Command(self, cmd, value='', skip_result=False):
@@ -1016,6 +1021,7 @@ class Item(ItemAPI):
         res = self._rpc_item("setParam", [param, value, skip_result], timeout=3600)
         if skip_result:
             return None
+        # official client: a query (empty value) answered with a JSON object is returned decoded (instruction dicts, ...)
         if isinstance(value, str) and len(value) == 0 and isinstance(res, str) and res.startswith('{'):
             return json.loads(res)
         return res

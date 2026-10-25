@@ -240,4 +240,114 @@ out(busy=busy, done=done, dz=dz, dx=dx, reach=reach, reach2=reach2, t=time.time(
     expect(r.json.reach2).toBe('TargetReachError');
     expect(r.json.simt).toBeGreaterThan(0.5);   // simulated time advanced by the motions
   });
+
+  it('offline programming (RUNMODE_MAKE_ROBOTPROG + ProgramStart + Finish) and MakeProgram write robot files through the posts', async () => {
+    fresh((st) => ur(st));
+    const dir = mkdtempSync(path.join(tmpdir(), 'vbs-olp-')).replace(/\\/g, '/');
+    const r = await runPy(host, `${HEAD}
+robot = RDK.Item('', ITEM_TYPE_ROBOT)
+q0 = robot.Joints().list()
+RDK.setRunMode(RUNMODE_MAKE_ROBOTPROG)
+RDK.ProgramStart('Prog1', ${JSON.stringify(dir)}, 'KUKA_KRC4', robot)
+robot.MoveJ([0, -90, 90, -90, -90, 0])
+robot.MoveL(robot.SolveFK([0, -90, 90, -90, -90, 0]) * transl(0, 0, 50))
+moved = robot.Joints().list()
+RDK.Finish()
+RDK = Robolink()
+prog = RDK.AddProgram('Prog2', RDK.Item('', ITEM_TYPE_ROBOT))
+prog.MoveJ([5, -90, 90, -90, -90, 0])
+robot = RDK.Item('', ITEM_TYPE_ROBOT)
+robot.setParam('PostProcessor', 'ABB_RAPID_IRC5')
+ok, log, transfer = prog.MakeProgram(${JSON.stringify(dir)})
+try:
+    prog.MakeProgram(${JSON.stringify(dir)}, RUNMODE_MAKE_ROBOTPROG, 'No_Such_Post'); bad = 'generated'
+except Exception as e:
+    bad = str(e)
+out(q0=q0, moved=moved, ok=ok, log=log, transfer=transfer, bad=bad, mode=RDK.RunMode())
+`);
+    expect(r.status, r.err).toBe(0);
+    // RUNMODE_MAKE_ROBOTPROG: the robot moves are recorded into Prog1 and Finish() posts it with KUKA_KRC4
+    const src = readFileSync(path.join(dir, 'Prog1.src'), 'utf8');
+    expect(src).toMatch(/PTP/);
+    expect(src).toMatch(/LIN/);
+    expect(r.json.ok).toBe(true);
+    expect(r.json.transfer).toBe(false);
+    expect(readdirSync(dir).some((f) => /^Prog2\.mod$/i.test(f))).toBe(true);
+    expect(readFileSync(path.join(dir, readdirSync(dir).find((f) => /^Prog2\.mod$/i.test(f))!), 'utf8')).toMatch(/MoveAbsJ|MoveJ/);
+    expect(r.json.bad).toMatch(/unknown post processor No_Such_Post/);
+    expect(r.json.mode).toBe(1);
+  });
+
+  it('files and paths: AddFile through the importers, Save, PATH_* parameters', async () => {
+    fresh((st) => ur(st));
+    const dir = mkdtempSync(path.join(tmpdir(), 'vbs-files-')).replace(/\\/g, '/');
+    const stl = path.join(dir, 'tri.stl').replace(/\\/g, '/');
+    // a binary STL with one triangle
+    const b = Buffer.alloc(84 + 50); b.writeUInt32LE(1, 80); [0, 0, 1, 0, 0, 0, 100, 0, 0, 0, 100, 0].forEach((v, i) => b.writeFloatLE(v, 84 + 4 * i)); writeFileSync(stl, b);
+    const r = await runPy(host, `${HEAD}
+import os
+obj = RDK.AddFile(${JSON.stringify(stl)})
+RDK.Save(${JSON.stringify(dir + '/saved.vbstation')})
+out(valid=obj.Valid(), type=obj.Type(), name=obj.Name(), lib=RDK.getParam('PATH_LIBRARY'), desk=RDK.getParam('PATH_DESKTOP'),
+    opened=RDK.getParam('PATH_OPENSTATION'), file=RDK.getParam('FILE_OPENSTATION'), exists=os.path.exists(${JSON.stringify(dir + '/saved.vbstation')}))
+`);
+    expect(r.status, r.err).toBe(0);
+    expect(r.json.valid).toBe(true);
+    expect(r.json.type).toBe(ItemType.OBJECT);
+    expect(r.json.exists).toBe(true);
+    expect(existsSync(r.json.desk)).toBe(true);
+    expect(existsSync(r.json.lib)).toBe(true);
+    expect(r.json.file).toBe(dir + '/saved.vbstation');           // Save() makes the file the open station
+    expect(r.json.opened).toBe(dir);
+    expect(JSON.parse(readFileSync(path.join(dir, 'saved.vbstation'), 'utf8')).station).toBeTruthy();
+  });
+
+  it('instruction formats, RunInstruction call, headless RunProgram with Busy/WaitFinished, machining projects', async () => {
+    fresh((st) => ur(st));
+    const r = await runPy(host, `${HEAD}
+robot = RDK.Item('', ITEM_TYPE_ROBOT)
+sub = RDK.AddProgram('Sub', robot)
+sub.MoveJ([0, -90, 90, -90, -90, 0])
+sub.MoveJ([40, -90, 90, -90, -90, 0])
+main = RDK.AddProgram('Main', robot)
+main.MoveJ([20, -80, 100, -110, -90, 20])
+main.RunInstruction('Sub', INSTRUCTION_CALL_PROGRAM)
+last = main.Instruction(-1)
+first = main.Instruction(0)
+insmat, errs = main.InstructionList()
+msg, jl, nvalid = main.InstructionListJoints(5, 5)
+tsub = sub.Update()[1]
+tmain = main.Update()[1]
+main.RunProgram()
+busy = main.Busy()
+main.WaitFinished()
+final = robot.Joints().list()
+pts = [[500 + 10 * i, 100, 300, 0, 0, -1] for i in range(5)]
+curve = RDK.AddCurve(pts)
+mp = RDK.AddMachiningProject('MP', robot)
+mpprog, status = mp.setMachiningParameters(part=curve)
+upd = mp.Update()
+out(lastname=last[0], lasttype=last[1], firsttype=first[1], firstmove=first[2], insmat=insmat.size(), errs=errs, msg=msg,
+    jlrows=jl.size(0), jlcols=jl.size(1), nvalid=nvalid, tsub=tsub, tmain=tmain, busy=busy, final=final,
+    mpvalid=mpprog.Valid(), status=status, upd=len(upd), linked=mp.getLink(ITEM_TYPE_PROGRAM).Valid())
+`);
+    expect(r.status, r.err).toBe(0);
+    const j = r.json;
+    expect(j.lasttype).toBe(8);                    // INS_TYPE_CODE: the call to Sub (Instruction(-1) = last)
+    expect(j.lastname).toMatch(/Sub/);
+    expect(j.firsttype).toBe(0);
+    expect(j.firstmove).toBe(1);                   // MOVE_TYPE_JOINT
+    expect(j.insmat).toEqual([7, 1]);              // InstructionList: one column per move, rows j1..j6 + move type
+    expect(j.errs).toBe(0);
+    expect(j.msg).toBe('Success');
+    expect(j.jlrows).toBeGreaterThanOrEqual(6 + 4);   // J1..J6, ERROR, MM_STEP, DEG_STEP, MOVE_ID, TIME, ...
+    expect(j.jlcols).toBeGreaterThan(2);
+    expect(j.tmain).toBeGreaterThan(j.tsub);       // the call is simulated: Main includes Sub's motion
+    expect(j.busy).toBe(1);
+    j.final.forEach((v: number, i: number) => expect(v).toBeCloseTo([40, -90, 90, -90, -90, 0][i], 4));   // played to the end of Sub
+    expect(j.mpvalid).toBe(true);
+    expect(j.status).toBe(0);
+    expect(j.upd).toBe(5);
+    expect(j.linked).toBe(true);
+  });
 });

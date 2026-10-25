@@ -60,11 +60,11 @@ describe('RoboDK API — extended surface', () => {
     const part = RDK.AddCurve([[0, 0, 0], [100, 0, 0], [150, 50, 0]]);
     part.setPose(robomath.transl(650, 0, 300));
     const proj = RDK.AddMachiningProject('Weld', r);
-    // RoboDK returns (program, status); status = ratio of reachable points
+    // RoboDK returns (program, status); status 0 = the whole path is reachable (Library scripts test `status == 0`)
     const [mprog, mstatus] = proj.setMachiningParameters('', part, 'Step=10 Approach=30 FreeZ');
     expect(mprog.Type()).toBe(ITEM_TYPE_PROGRAM);
     expect(mprog.InstructionCount()).toBeGreaterThan(10);
-    expect(mstatus).toBe(1);
+    expect(mstatus).toBe(0);
     expect(RDK.ItemList(ITEM_TYPE_PROGRAM, true)).toContain('Weld');
     const tool = r.AddTool(robomath.transl(0, 0, 120), 'Gun');
     const panel = RDK.Item('Curve');

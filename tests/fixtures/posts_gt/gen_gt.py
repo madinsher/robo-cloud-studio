@@ -21,7 +21,7 @@ POSTS = 'C:/RoboDK/Posts'
 # Posts that do not declare INCLUDE_SUB_PROGRAMS and overwrite the main program when they receive several programs:
 # generate every program with its own instance (what RoboDK does when it generates programs one by one).
 SEPARATE = {'Staubli_VAL3', 'Techman_TMscript', 'Kawasaki', 'Mecademic', 'Denso_RC8', 'Epson_RC', 'Dobot_V3', 'JAKA', 'Kinova',
-            'Mitsubishi', 'Nachi_AX_FD', 'HCR', 'AUBO', 'CSV', 'Doosan_Robotics', 'Omron', 'Techman'}
+            'Mitsubishi', 'Nachi_AX_FD', 'HCR', 'AUBO', 'CSV', 'Doosan_Robotics', 'Omron', 'Techman', 'Elite_Robots_EC_V3'}
 
 
 def main():

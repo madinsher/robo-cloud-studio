@@ -1,5 +1,6 @@
 /** Shared helpers of the Webots import tests: a directory-backed WebotsSource and the MURKA paths. */
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import path from 'node:path';
 import type { WebotsSource } from '../src/io/webots';
 
@@ -56,4 +57,19 @@ export function murkaWebotsFiles(): string[] {
   };
   if (HAS_MURKA) walk(MURKA);
   return out.sort();
+}
+
+/** Local Webots installation (sample worlds under projects/) and its asset cache (files named sha1(URL)). */
+export const WEBOTS_HOME = process.env.WEBOTS_HOME ?? 'C:/Program Files/Webots';
+export const WEBOTS_CACHE = process.env.WEBOTS_CACHE ?? path.join(process.env.LOCALAPPDATA ?? '', 'Cyberbotics/Webots/cache/assets');
+export const HAS_WEBOTS_CACHE = fs.existsSync(WEBOTS_CACHE) && fs.existsSync(path.join(WEBOTS_HOME, 'projects'));
+
+/** Remote fetcher over the Webots asset cache (what the Webots GUI downloaded): raw GitHub URL -> sha1(URL) file. */
+export function webotsCacheFetcher(dir = WEBOTS_CACHE): ((url: string) => Uint8Array | undefined) & { hits: string[]; misses: string[] } {
+  const hits: string[] = [], misses: string[] = [];
+  const f = (url: string) => {
+    const file = path.join(dir, crypto.createHash('sha1').update(url).digest('hex'));
+    try { const b = fs.readFileSync(file); hits.push(url); return new Uint8Array(b.buffer, b.byteOffset, b.byteLength); } catch { misses.push(url); return undefined; }
+  };
+  return Object.assign(f, { hits, misses });
 }

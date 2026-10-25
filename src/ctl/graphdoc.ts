@@ -79,6 +79,7 @@ export function desToDsl(doc: DesDoc): string {
   for (const [ev, g] of Object.entries(doc.guards ?? {})) out.push(`guard ${ev} ${qe(g)}`);
   for (const s of doc.sensors ?? []) out.push(`sensor ${s.event} ${qe(s.expr)}`);
   if (doc.blackboard && Object.keys(doc.blackboard).length) out.push(`blackboard ${Object.entries(doc.blackboard).map(([k, v]) => `${k}=${qv(v)}`).join(' ')}`);
+  if (doc.terminate) out.push(`terminate ${doc.terminate}`);
   for (const [auto, L] of Object.entries(doc.layout ?? {})) { const entries = Object.entries(L); if (entries.length) out.push(`layout ${q(auto)} ${entries.map(([s, p]) => `${s}=${fmtNum(p[0])},${fmtNum(p[1])}`).join(' ')}`); }
   return out.join('\n');
 }

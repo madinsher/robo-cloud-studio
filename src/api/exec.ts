@@ -36,7 +36,7 @@ export interface StationRuntimeLike {
   runFor?(seconds: number): void;
   stop(id?: string | number): void;
   signals?: SignalTableLike;
-  registerScriptRunner?(fn: ScriptRunner): void;
+  registerScriptRunner?(fn: ScriptRunner): void | (() => void);
   captureHome?(): void;
   reset?(): void;
   station?: Station;
@@ -73,6 +73,14 @@ export function scriptCallOf(station: Station, ins: Instruction): { item: Item; 
   if (!name) return null;
   const it = station.find(name, ItemType.PROGRAM_PYTHON);
   return it ? { item: it, args } : null;
+}
+
+/** Source text of the station Python program a script context names (params.pythonCode from the RoboDK import), or null. */
+export function pythonSource(ctx: { station: Station; name: string; program: Item | null }): string | null {
+  const it = ctx.program?.type === ItemType.PROGRAM_PYTHON ? ctx.program : ctx.station.find(parseCall(ctx.name).name, ItemType.PROGRAM_PYTHON);
+  const p: any = it?.params ?? {};
+  const code = p.pythonCode ?? p.source ?? p.code;
+  return typeof code === 'string' && code.length ? code : null;
 }
 
 class SimpleSignals implements SignalTableLike {
@@ -215,15 +223,28 @@ export class ApiExec {
 
   /** Attach the shared station runtime (I1). external=true: the app ticks it; mode realtime makes waits asynchronous. */
   attach(runtime: StationRuntimeLike, opts: { external?: boolean; mode?: 'virtual' | 'realtime' } = {}): void {
+    this.unregister?.();
+    this.unregister = null;
     this.runtime = runtime;
     this.attachedRuntime = true;
     this.external = !!opts.external;
     if (opts.mode) this.mode = opts.mode;
-    if (this.scriptRunner) runtime.registerScriptRunner?.(this.scriptRunner);
+    this.registerOn(runtime);
   }
+  /** Replace the station Python runner (one registration on the runtime at a time). */
   setScriptRunner(fn: ScriptRunner | null): void {
+    this.unregister?.();
+    this.unregister = null;
     this.scriptRunner = fn;
-    if (fn) this.rt().registerScriptRunner?.(fn);
+    this.registerOn(this.rt());
+  }
+  /** The current station Python runner. */
+  getScriptRunner(): ScriptRunner | null { return this.scriptRunner; }
+  private unregister: (() => void) | null = null;
+  private registerOn(rt: StationRuntimeLike): void {
+    if (!this.scriptRunner) return;
+    const off = rt.registerScriptRunner?.(this.scriptRunner);
+    this.unregister = typeof off === 'function' ? off : null;
   }
   hasScriptRunner(): boolean { return !!this.scriptRunner; }
 
@@ -232,15 +253,15 @@ export class ApiExec {
     if (this.runtime instanceof FallbackRuntime && this.runtime.station !== this.owner.station) {
       this.runtime.stop();
       this.runtime = new FallbackRuntime(this.owner.station);
-      if (this.scriptRunner) this.runtime.registerScriptRunner?.(this.scriptRunner);
+      this.registerOn(this.runtime);
       this.handles = [];
     }
     return this.runtime;
   }
   private get virtual(): boolean { return this.mode === 'virtual' || this.syncDepth > 0; }
 
-  start(program: Item, opts: { robot?: Item | null; startJoints?: number[]; args?: string[] } = {}): RunHandleLike {
-    const h = this.rt().start(program, opts);
+  start(program: Item, opts: { robot?: Item | null; startJoints?: number[]; args?: string[] } = {}, rt: StationRuntimeLike = this.rt()): RunHandleLike {
+    const h = rt.start(program, opts);
     this.handles.push(h);
     h.done.then(() => { this.handles = this.handles.filter((x) => x !== h); });
     this.ensureTicker();
@@ -249,14 +270,24 @@ export class ApiExec {
 
   /** Busy = a run that is queued/running on this robot or for this program (or a program of this robot). */
   busy(item: Item | null): boolean {
+    if (item instanceof Robot) return this.robotRuns(item).length > 0;
+    const rt: any = this.runtime;
+    // runs started elsewhere on the shared runtime (the app's Play, threads started by a program) count too
+    if (this.attachedRuntime && typeof rt.busy === 'function' && rt.busy(item ?? undefined)) return true;
     if (!item) return this.handles.some((h) => h.status === 'running' || h.status === 'queued');
     return this.handles.some((h) => (h.status === 'running' || h.status === 'queued') && (h.program === item || h.robot === item || (h.program instanceof Program && h.program.robot() === item)));
+  }
+  /** Something is still running on the runtime (own handles, threads, script runs): the ticker keeps going. */
+  private anyActive(): boolean {
+    const rt: any = this.runtime;
+    if (this.handles.some((h) => h.status === 'running' || h.status === 'queued')) return true;
+    return this.attachedRuntime && typeof rt.active === 'function' ? rt.active().length > 0 : false;
   }
   handlesOf(item: Item | null): RunHandleLike[] { return this.handles.filter((h) => !item || h.program === item || h.robot === item); }
 
   /** Wait until `item` is idle (or the given handles are done). Synchronous in virtual mode, a promise in realtime mode. */
   wait(item: Item | null, timeoutS = 3600, handles?: RunHandleLike[]): void | Promise<void> {
-    const pending = () => (handles ?? this.handles.filter((h) => !item || h.program === item || h.robot === item || (h.program instanceof Program && h.program.robot() === item))).filter((h) => h.status === 'running' || h.status === 'queued');
+    const pending = () => (handles ?? (item instanceof Robot ? this.robotRuns(item) : this.handles.filter((h) => !item || h.program === item || h.robot === item || (h.program instanceof Program && h.program.robot() === item)))).filter((h) => h.status === 'running' || h.status === 'queued');
     if (!pending().length) return;
     if (this.ticking) return;
     if (this.virtual) {
@@ -283,7 +314,7 @@ export class ApiExec {
   /** One simulation step of dt seconds (runtime + per-step hooks). */
   step(dt: number): void {
     this.ticking++;
-    try { this.rt().tick(dt); this.onTick?.(dt); } finally { this.ticking--; }
+    try { this.rt().tick(dt); if (this.side) this.side.tick(dt); this.onTick?.(dt); } finally { this.ticking--; }
   }
 
   stop(item?: Item | null): void {
@@ -299,6 +330,13 @@ export class ApiExec {
     const prog = new Program(`__api_move_${robot.name}`);
     prog.parent = this.owner.station;          // resolves station lookups without adding the program to the tree
     prog.setRobot(robot);
+    // the robot's current API state (setPoseFrame/setPoseTool/setSpeed/setRounding) applies to this move: the shared
+    // runtime keeps per-robot state from earlier programs, so state it explicitly
+    const st = this.owner.station;
+    prog.setFrame(robot.activeFrameId ? st.findById(robot.activeFrameId) : null);
+    prog.setTool(robot.activeToolId ? st.findById(robot.activeToolId) : null);
+    prog.setSpeed(robot.motion.speedLinear, robot.motion.speedJoints, robot.motion.accelLinear, robot.motion.accelJoints);
+    prog.setRounding(robot.motion.rounding);
     build(prog);
     // validate first (RoboDK raises before moving)
     const check = new ProgramSimulator(this.owner.station).compile(prog);
@@ -310,10 +348,41 @@ export class ApiExec {
       return;
     }
     // a robot finishes its previous motion first (RoboDK _moveX calls WaitMove)
-    const prev = this.handles.filter((h) => h.robot === robot && (h.status === 'running' || h.status === 'queued'));
-    const h = this.start(prog, { robot });
+    const prev = this.handles.filter((h) => h.robot === robot && h.program.name.startsWith('__api_move_') && (h.status === 'running' || h.status === 'queued'));
+    // a program of this robot waiting for a station script (the script is the caller: PartsToPallet moving robot B
+    // while MainSimulation on robot B waits in 'Call PartsToPallet') does not hold the robot, like in RoboDK
+    const h = this.blockedByScript(robot) ? this.start(prog, { robot }, this.sideRuntime()) : this.start(prog, { robot });
     if (!blocking) return;
     return this.wait(robot, 3600 * 24 * 7, [...prev, h]);
+  }
+
+  /**
+   * Runs that hold a robot (RoboDK robot Busy/WaitMove): API moves of the robot and programs moving it, on this layer
+   * and on the shared runtime; a program blocked in a station-script call does not hold its robot.
+   */
+  robotRuns(robot: Robot): RunHandleLike[] {
+    const act = (h: RunHandleLike) => h.status === 'running' || h.status === 'queued';
+    const own = this.handles.filter((h) => act(h) && (h.robot === robot || (h.program instanceof Program && h.program.robot() === robot)));
+    const rt: any = this.runtime;
+    const shared: RunHandleLike[] = this.attachedRuntime && typeof rt.active === 'function' ? rt.active().filter((h: RunHandleLike) => act(h) && h.robot === robot) : [];
+    return [...new Set([...own, ...shared])].filter((h) => !this.inScript(h));
+  }
+  private inScript(h: RunHandleLike): boolean {
+    const ctxs: any[] | undefined = (this.runtime as any).ctxs;
+    return Array.isArray(ctxs) && ctxs.some((c) => c.handle === h && c.block?.kind === 'script');
+  }
+  /** Second runtime for API moves of a robot whose program is blocked in a script call (ticked with the main one). */
+  private side: StationRuntimeLike | null = null;
+  private sideRuntime(): StationRuntimeLike {
+    if (!this.side || this.side.station !== this.owner.station) this.side = new FallbackRuntime(this.owner.station);
+    return this.side;
+  }
+  /** The robot's runs on the shared runtime are all waiting for a station script (StationRuntime internals, feature-detected). */
+  private blockedByScript(robot: Robot): boolean {
+    const ctxs: any[] | undefined = (this.runtime as any).ctxs;
+    if (!this.attachedRuntime || !Array.isArray(ctxs)) return false;
+    const mine = ctxs.filter((c) => c.robot === robot && c.handle?.status === 'running');
+    return mine.length > 0 && mine.every((c) => c.block?.kind === 'script');
   }
 
   /** Run a station Python program (PROGRAM_PYTHON item) with arguments through the registered runner. */
@@ -330,7 +399,7 @@ export class ApiExec {
       const dt = Math.min(0.2, (now - this.last) / 1000) * this.speed;
       this.last = now;
       this.step(dt);
-      if (!this.handles.some((h) => h.status === 'running' || h.status === 'queued')) { clearInterval(this.timer); this.timer = null; }
+      if (!this.anyActive()) { clearInterval(this.timer); this.timer = null; }
     }, 16);
     (this.timer as any)?.unref?.();
   }

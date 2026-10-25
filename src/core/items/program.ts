@@ -55,7 +55,7 @@ export interface EventInstruction { kind: 'event'; action: 'attach' | 'detach' |
 export interface CodeInstruction { kind: 'code'; code: string; asFunctionCall: boolean }
 export interface PrintInstruction { kind: 'print'; message: string; isComment: boolean }
 export interface RoundingInstruction { kind: 'rounding'; radius: number }
-export interface IOInstruction { kind: 'io'; io: string; value: number | boolean; wait: boolean; timeoutMs?: number }
+export interface IOInstruction { kind: 'io'; io: string; value: number | boolean; wait: boolean; timeoutMs?: number; /** Analog output / input (RoboDK setAO / waitAI). */ analog?: boolean }
 export interface CallInstruction { kind: 'call'; programId: string | null; programName?: string }
 export interface MobileMoveInstruction { kind: 'mobile_move'; x: number; y: number; heading?: number; speed?: number; tolerance?: number; label?: string }
 export interface MobileFollowInstruction { kind: 'mobile_follow'; pathId: string | null; speed?: number; reverse?: boolean }

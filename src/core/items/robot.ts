@@ -1,6 +1,6 @@
 import { Mat4, identity, multiply, invert, clone, fromArray } from '../math/pose';
 import { Item, ItemType, Frame, Tool, Target, SerializedItem, DeserializeContext, registerItemType } from './item';
-import { ChainDef, forwardKinematics, flangePose, homeJoints, jointLimits, actuatedIndices, withinLimits, FKResult } from '../kinematics/chain';
+import { ChainDef, forwardKinematics, flangePose, homeJoints, jointLimits, actuatedIndices, withinLimits, FKResult, deltaPlatformPosition } from '../kinematics/chain';
 import { IKOptions, IKResult, closestConfiguration, solveIKBest, ikAll } from '../kinematics/ik';
 import { configFlags as analyticConfigFlags, analyzeChain } from '../kinematics/ik_analytic';
 
@@ -447,6 +447,16 @@ export function deserializeChain(d: any): ChainDef {
  */
 export function estimateReach(chain: ChainDef): number {
   const idx = actuatedIndices(chain);
+  if (chain.parallel?.kind === 'delta') {
+    // largest radial distance of the platform centre from the motor-plane axis over the motor ranges
+    const d = chain.parallel, { lower, upper } = jointLimits(chain), N = 20;
+    let best = 0;
+    for (let a = 0; a <= N; a++) for (let b = 0; b <= N; b++) for (let c = 0; c <= N; c++) {
+      const p = deltaPlatformPosition(d, [lower[0] + ((upper[0] - lower[0]) * a) / N, lower[1] + ((upper[1] - lower[1]) * b) / N, lower[2] + ((upper[2] - lower[2]) * c) / N]);
+      if (p) best = Math.max(best, Math.hypot(p[0], p[1]));
+    }
+    if (best > 1) return best;
+  }
   if (!chain.parallel && idx.length >= 3 && chain.joints[idx[0]]?.type !== 'prismatic') {
     try {
       const { lower, upper } = jointLimits(chain);

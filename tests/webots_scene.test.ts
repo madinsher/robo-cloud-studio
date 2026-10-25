@@ -5,7 +5,7 @@
  * Expected values are computed by hand from the fixture text (metres -> mm, radians -> degrees).
  */
 import { describe, it, expect, beforeAll } from 'vitest';
-import { importWebotsWorld, importWebotsFiles, WebotsBuildResult } from '../src/io/webots';
+import { importWebotsWorld, importWebotsFiles, WebotsBuildResult, parseShots, applyShot, viewpointLook } from '../src/io/webots';
 import { AssetStore } from '../src/scene/assets';
 import { Item, SceneObject, Camera, Frame, Notes, GeometryRef } from '../src/core/items/item';
 import { Robot } from '../src/core/items/robot';
@@ -214,5 +214,52 @@ describe('importWebotsFiles (I7)', () => {
   it('throws a located syntax error for a broken world', async () => {
     const files = new Map<string, Uint8Array>([['w.wbt', enc('#VRML_SIM R2025a utf8\nSolid {\n  translation 0 0\n  children [ Shape { ]\n}\n')]]);
     await expect(importWebotsFiles(files)).rejects.toThrow(/w\.wbt:4/);
+  });
+});
+
+describe('viewpoints and shots (synthetic)', () => {
+  it('a Webots viewpoint looks along its +X with +Z up; shots park every DYN_ group but the selected one', async () => {
+    const look = viewpointLook({ position: [1000, 0, 500], orientation: [0, 0, 1, Math.PI / 2], fieldOfView: Math.PI / 3 });
+    expect(look.target.map((v) => Math.round(v))).toEqual([1000, 1000, 500]);
+    expect(look.up.map((v) => Math.round(v * 1e9) / 1e9)).toEqual([0, 0, 1]);
+    expect(look.fovDeg).toBeCloseTo(60, 12);
+    const world = `#VRML_SIM R2025a utf8
+Viewpoint { orientation 0 0 1 0 position -3 0 1 }
+DEF DYN_A Transform { translation 1 2 -1000 children [ Shape { geometry Box { size 1 1 1 } } ] }
+DEF DYN_B Transform { translation 3 4 -1000 children [ Shape { geometry Box { size 1 1 1 } } ] }
+`;
+    const { station } = await importWebotsFiles(new Map([['w.wbt', new TextEncoder().encode(world)]]), new AssetStore());
+    const shots = parseShots({ shots: [{ key: 'b', position: [0, 0, 2], orientation: [0, 1, 0, 0.5], fov: 1.1 }] });
+    const { shown, parked } = applyShot(station, shots[0]);
+    expect(shown!.name).toBe('DYN_B');
+    expect(Array.from(shown!.poseAbs()).slice(12, 15)).toEqual([3000, 4000, 0]);
+    expect(parked.map((p) => [p.name, p.poseAbs()[14]])).toEqual([['DYN_A', -1000000]]);
+    expect(station.settings.viewpoint).toMatchObject({ position: [0, 0, 2000], orientation: [0, 1, 0, 0.5], fieldOfView: 1.1, shot: 'b' });
+    expect(() => parseShots({ shots: [{ key: 'x', position: [0, 0] }] })).toThrow(/position/);
+  });
+});
+
+describe('pass-through and Solid-derived nodes (synthetic)', () => {
+  it('Slot plugs its endPoint, Charger / Connector are Solids, a Fluid volume never collides, nested lights become station lights', async () => {
+    const world = `#VRML_SIM R2025a utf8
+Solid { name "cabinet" translation 1 0 0 children [
+  Slot { type "door" endPoint Solid { name "door" translation 0 0.5 0 children [ Shape { geometry Box { size 0.1 1 2 } } ] boundingObject Box { size 0.1 1 2 } } }
+  PointLight { location 0 0 2 intensity 3 }
+] }
+Charger { name "dock" translation 0 2 0 children [ Shape { geometry Cylinder { radius 0.2 height 0.1 } } ] boundingObject Cylinder { radius 0.2 height 0.1 } }
+Fluid { name "pool" translation 5 0 -1 children [ Shape { geometry Box { size 4 4 2 } } ] boundingObject Box { size 4 4 2 } density 1025 }
+`;
+    const { station, report } = await importWebotsFiles(new Map([['w.wbt', new TextEncoder().encode(world)]]), new AssetStore());
+    const door = station.find('door') as SceneObject;
+    expect(door.parent!.name).toBe('cabinet');
+    expect(Array.from(door.poseAbs()).slice(12, 15)).toEqual([1000, 500, 0]);
+    expect(colliders(door)![0].primitive).toEqual({ kind: 'box', size: [100, 1000, 2000] });
+    const dock = station.find('dock') as SceneObject;
+    expect([dock.params.webotsType, colliders(dock)!.length]).toEqual(['Charger', 1]);
+    const pool = station.find('pool') as SceneObject;
+    expect([pool.params.fluid, pool.params.density, colliders(pool)]).toEqual([true, 1025, []]);
+    expect(pool.geometry[0].primitive).toEqual({ kind: 'box', size: [4000, 4000, 2000] });
+    expect(station.settings.lights).toEqual([{ type: 'PointLight', intensity: 3, color: [1, 1, 1], ambientIntensity: 0, castShadows: false, location: [1000, 0, 2000], attached: true }]);
+    expect(report.filter((l) => /ignored|not supported/.test(l))).toEqual([]);
   });
 });

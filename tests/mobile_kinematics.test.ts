@@ -156,3 +156,70 @@ describe('mobile: Ackermann bicycle model (acceptance 4)', () => {
     expect(res.maxLat).toBeLessThan(5);
   });
 });
+
+describe('mobile: Ackermann planning in an orchard and around walls (acceptance 4)', () => {
+  const ack = { wheelBase: 1800, maxSteer: 30, minTurnRadius: 3000, maxSteerRate: 40, maxSpeed: 2000, maxReverseSpeed: 800, footprint: [3000, 1500, 1500] as [number, number, number] };
+  it('turns from one 3.5 m alley into the next (spacing < 2 R_min) and tracks the new alley within 300 mm without touching a tree', async () => {
+    const { FieldItem, cropParams } = await import('../src/agri/items');
+    const { generateOrchard } = await import('../src/agri/orchard');
+    await import('../src/agri/collision_world');
+    const { planAndFollow } = await import('../src/mobile/navigate');
+    const { plantDisks, cropClearance } = await import('./agri_helpers');
+    const st = new Station('alleys');
+    const f = st.addChild(new FieldItem('Block'));
+    f.polygon = [[0, 0], [40000, 0], [40000, 20000], [0, 20000]];
+    f.crop = cropParams('apple', { rowHeading: 0, headland: 6000 });
+    generateOrchard(f, 5);
+    const ys = f.rows().map((r) => r.start[1]);
+    expect(ys.slice(0, 3)).toEqual([6000, 9500, 13000]);
+    const xEnd = f.rows()[0].end[0];
+    const r = st.addChild(new MobileRobot('Sprayer'));
+    Object.assign(r.kin, { drive: 'ackermann', ...ack });
+    const yA = (ys[1] + ys[0]) / 2, yB = (ys[2] + ys[1]) / 2;
+    r.setPose2D(xEnd - 4000, yA, 0);
+    expect(2 * minTurnRadius(r.kin)).toBeGreaterThan(yB - yA); // no plain U turn fits: Ω / fish-tail needed
+    const res = planAndFollow(st, r, { x: xEnd - 6000, y: yB, heading: 180 });
+    expect(res.ok).toBe(true);
+    const plants = plantDisks(st);
+    let worstDev = 0, minClear = Infinity, inAlley = 0;
+    for (let t = 0; t <= res.duration; t += 0.1) {
+      const p = res.sample(t);
+      r.state.x = p.x; r.state.y = p.y; r.state.theta = p.heading;
+      minClear = Math.min(minClear, cropClearance(r, plants).canopy);
+      // back inside the rows (front of the footprint left of the last tree) heading into alley B
+      if (p.x < xEnd - ack.footprint[0] / 2 && Math.abs(p.y - yB) < 1750) { worstDev = Math.max(worstDev, Math.abs(p.y - yB)); inAlley++; }
+    }
+    expect(inAlley).toBeGreaterThan(5);
+    expect(worstDev).toBeLessThanOrEqual(300);
+    expect(minClear).toBeGreaterThan(0);
+    const end = res.sample(res.duration);
+    expect(Math.hypot(end.x - (xEnd - 6000), end.y - yB)).toBeLessThan(100);
+  });
+  it('completes a detour around a wall on the map (curvature-feasible, collision-free)', async () => {
+    const { planAndFollow } = await import('../src/mobile/navigate');
+    const { stationWorld } = await import('../src/mobile/world');
+    const st = new Station('wall');
+    const map = st.addChild(new MapItem('map'));
+    map.resize(240, 140, 100, 0, 0);
+    map.fillRect(11000, 0, 11500, 9000);
+    const r = st.addChild(new MobileRobot('Car'));
+    Object.assign(r.kin, { drive: 'ackermann', ...ack });
+    r.setPose2D(3000, 4000, 0);
+    const res = planAndFollow(st, r, { x: 20000, y: 4000, heading: 0 });
+    expect(res.ok).toBe(true);
+    const w = stationWorld(st);
+    let minClear = Infinity, maxCurv = 0, prev: { x: number; y: number; heading: number } | null = null, maxY = 0;
+    for (let t = 0; t <= res.duration; t += 0.1) {
+      const p = res.sample(t);
+      minClear = Math.min(minClear, w.clearance(p.x, p.y, p.heading, 3000, 1500));
+      maxY = Math.max(maxY, p.y);
+      if (prev) { const ds = Math.hypot(p.x - prev.x, p.y - prev.y); const dth = Math.abs(((p.heading - prev.heading + 540) % 360) - 180) * Math.PI / 180; if (ds > 20) maxCurv = Math.max(maxCurv, dth / ds); }
+      prev = p;
+    }
+    expect(maxY).toBeGreaterThan(9000); // went around the end of the wall
+    expect(minClear).toBeGreaterThan(0);
+    expect(maxCurv).toBeLessThan(1.15 / minTurnRadius(r.kin));
+    const end = res.sample(res.duration);
+    expect(Math.hypot(end.x - 20000, end.y - 4000)).toBeLessThan(100);
+  });
+});

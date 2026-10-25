@@ -22,7 +22,7 @@ import { gunzipSync } from 'node:zlib';
 import { importRdkBestEffort } from '../src/io/robodk/rdk_container';
 import { AssetStore } from '../src/scene/assets';
 import { Robot } from '../src/core/items/robot';
-import { Program } from '../src/core/items/program';
+import { Program, Instruction } from '../src/core/items/program';
 import type { MoveInstruction } from '../src/core/items/program';
 import { Item, ItemType, Station, Tool, Target } from '../src/core/items/item';
 import { fromRows, getPos, multiply, invert, identity } from '../src/core/math/pose';
@@ -56,6 +56,8 @@ const jdiff = (a: number[] | null | undefined, b: number[] | null | undefined) =
   if (a.length !== b.length) return Infinity;
   return a.reduce((m, v, i) => Math.max(m, Math.abs(v - b[i])), 0);
 };
+/** Joint vectors of a target / move: RoboDK pads to 6 values with zeros, the studio keeps the robot's own axes. */
+const jdiffAxes = (ours: number[] | null | undefined, gt: number[] | null | undefined) => (ours && gt && gt.length > ours.length && gt.slice(ours.length).every((v) => v === 0) ? jdiff(ours, gt.slice(0, ours.length)) : jdiff(ours, gt));
 const limit = (list: string[], n = 8) => `${list.slice(0, n).join('; ')}${list.length > n ? ` (+${list.length - n})` : ''}`;
 
 /** RoboDK INS_TYPE -> studio instruction kinds. */
@@ -94,7 +96,13 @@ async function compareFile(file: string): Promise<GtResult> {
 
   // ---- item tree: RoboDK lists called programs again under the caller; those are references, not items
   // items come in depth-first order: the parent of item k is the closest preceding item with the parent's name
-  const parentIdx: number[] = gt.items.map((i: any, k: number) => { for (let j = k - 1; j >= 0; j--) if (gt.items[j].name === i.parent) return j; return -1; });
+  // (a program is only the parent of the programs it calls: a folder "Pick" may hold a program "Pick" and its siblings)
+  const calls = new Map<string, Set<string>>();
+  for (const p of gt.programs ?? []) if (!calls.has(p.name)) calls.set(p.name, new Set((p.instructions ?? []).filter((x: any) => x && x.type === 8).map((x: any) => x.name)));
+  const parentIdx: number[] = gt.items.map((i: any, k: number) => {
+    for (let j = k - 1; j >= 0; j--) if (gt.items[j].name === i.parent && (gt.items[j].type !== 8 || i.type !== 8 || !calls.has(i.parent) || calls.get(i.parent)!.has(i.name))) return j;
+    return -1;
+  });
   const underProgram = (k: number): boolean => { for (let j = parentIdx[k]; j >= 0; j = parentIdx[j]) if (gt.items[j].type === 8) return true; return false; };
   const gtItems: any[] = gt.items.filter((i: any, k: number) => i.type !== 9 && !underProgram(k));
   const ours = [...station.walk()].filter((i) => i !== station && i.type !== ItemType.INSTRUCTION);
@@ -111,9 +119,9 @@ async function compareFile(file: string): Promise<GtResult> {
     else missing.push(`${ItemType[g.type] ?? g.type} "${g.name}" under "${par}"`);
   }
   if (missing.length) issues.push(`items missing or misplaced (${missing.length}): ${limit(missing)}`);
-  const extra = [...pool.values()].flat().filter((i) => !(i instanceof Tool && i.params.rdkFromInstruction));
+  const extra = [...pool.values()].flat().filter((i) => !i.params.rdkFromInstruction);
   if (extra.length) issues.push(`items not in RoboDK (${extra.length}): ${limit(extra.map((i) => `${ItemType[i.type]} "${i.name}"`))}`);
-  const byName = (type: number, nm: string): Item | undefined => { for (const [g, it] of matched) if (g.type === type && g.name === nm) return it; return undefined; };
+  const byName = (type: number, nm: string, k = 0): Item | undefined => { for (const [g, it] of matched) if (g.type === type && g.name === nm && k-- === 0) return it; return undefined; };
 
   // ---- absolute poses
   const poseBad: string[] = [];
@@ -170,16 +178,16 @@ async function compareFile(file: string): Promise<GtResult> {
     if (worst > TOL_MM) issues.push(`robot ${gr.name}: FK error ${worst.toFixed(3)} (mm + mrad)`);
     const tcp = m16(gr.poseTool);
     if (tcp && bad(err(r.poseTool(), tcp))) issues.push(`robot ${gr.name}: active tool ${fmt(err(r.poseTool(), tcp))}${r.activeTool() ? ` (${r.activeTool()!.name})` : ' (none)'}`);
-    // PoseFrame: the active frame in the positioner flange (synchronised turntable), else in the base of the robot
-    // carrying this one (rail / gantry / arm holding a mechanism), else in the robot base
+    // PoseFrame: the active frame in the positioner flange (synchronised turntable), else in the base of the
+    // synchronised carrier (rail / gantry), else in the robot's own base (also for a gripper mounted on an arm)
     const frm = m16(gr.poseFrame);
     const fr = r.activeFrame();
     if (frm && fr) {
       const positioner = mech.find((m) => m.role === 'positioner' && m.robot)?.robot;
-      let carrier: Item | null = r.parent;
-      while (carrier && !(carrier instanceof Robot)) carrier = carrier.parent;
-      const ref = positioner ? multiply(positioner.poseAbs(), positioner.solveFKFlange()) : carrier instanceof Robot ? carrier.poseAbs() : r.poseAbs();
-      const got = multiply(invert(ref), fr instanceof Robot ? fr.poseAbs() : fr.poseAbs());
+      const carrier = mech.find((m) => m.role === 'carrier' && m.robot)?.robot;
+      const ref = positioner ? multiply(positioner.poseAbs(), positioner.solveFKFlange()) : carrier ? carrier.poseAbs() : r.poseAbs();
+      // a robot used as reference frame stands for its flange (where the items it carries are attached)
+      const got = multiply(invert(ref), fr instanceof Robot ? multiply(fr.poseAbs(), fr.solveFKFlange()) : fr.poseAbs());
       if (bad(err(got, frm))) issues.push(`robot ${gr.name}: active frame ${fmt(err(got, frm))} (${fr.name})`);
     } else if (frm && bad(err(identity(), frm))) issues.push(`robot ${gr.name}: no active frame, RoboDK has one`);
   }
@@ -201,7 +209,7 @@ async function compareFile(file: string): Promise<GtResult> {
     if (!(t instanceof Target)) continue;
     const want = m16(gtt.pose);
     if (want && bad(err(t.pose(), want))) tBad.push(`${gtt.name} pose ${fmt(err(t.pose(), want))}`);
-    if (gtt.joints && jdiff(t.joints, gtt.joints) > TOL_DEG) tBad.push(`${gtt.name} joints ${t.joints} != ${gtt.joints}`);
+    if (gtt.joints && jdiffAxes(t.joints, gtt.joints) > TOL_DEG) tBad.push(`${gtt.name} joints ${t.joints} != ${gtt.joints}`);
     if (gtt.isJoint != null && !!gtt.isJoint !== t.isJointTarget) tBad.push(`${gtt.name} joint-target flag`);
     const rb = t.robotId ? station.findById(t.robotId)?.name ?? '' : '';
     if ((gtt.robot ?? '') !== rb) tBad.push(`${gtt.name} robot link "${rb}" != "${gtt.robot}"`);
@@ -209,8 +217,14 @@ async function compareFile(file: string): Promise<GtResult> {
   if (tBad.length) issues.push(`targets (${tBad.length}): ${limit(tBad)}`);
 
   // ---- programs
+  const progSeen = new Map<string, number>();
   for (const gp of gt.programs) {
-    const prog = byName(8, gp.name);
+    // Item.Update() of a machining project without a linked program (called by the dump) creates a new program with
+    // the same name after the items were listed: it is not part of the file
+    const k = progSeen.get(gp.name) ?? 0;
+    progSeen.set(gp.name, k + 1);
+    if (k >= gtItems.filter((i) => i.type === 8 && i.name === gp.name).length) { res.notes.push(`program ${gp.name}: created by RoboDK during the ground-truth dump (machining project update), not stored in the file`); continue; }
+    const prog = byName(8, gp.name, k);
     if (prog instanceof Program && prog.params.machiningId) { compareGenerated(gp, prog, station, issues, res); continue; }
     const pr = { name: gp.name, gtCount: gp.count, ourCount: 0, gtValid: gp.update?.[3], gtTime: gp.update?.[1] } as GtResult['programs'][number];
     res.programs.push(pr);
@@ -237,6 +251,7 @@ async function compareFile(file: string): Promise<GtResult> {
     }
     if (seq.length) issues.push(`program ${gp.name}: ${seq.length} instruction mismatches: ${limit(seq, 5)}`);
   }
+  for (const g of gtItems) if (g.type === 8 && !gt.programs.some((p: any) => p.name === g.name)) res.notes.push(`program ${g.name}: the RoboDK dump has no instruction data for it (not compared)`);
   // ---- Python programs and machining projects
   const py = [...station.walk()].filter((i) => i.type === ItemType.PROGRAM_PYTHON);
   const gpy = (gt.python ?? []).map((p: any) => p.name).sort();
@@ -266,7 +281,7 @@ function moveMismatch(i: number, g: any, m: MoveInstruction, station: Station): 
   const tgt = m.targetId ? station.findById(m.targetId) as Target | null : null;
   const isJoint = tgt ? tgt.isJointTarget : !m.pose;
   const q = tgt ? tgt.joints : m.joints;
-  if (isJoint && g.joints && jdiff(q, g.joints) > TOL_DEG) out.push(`#${i} "${g.name}" joints ${q?.map((v) => +v.toFixed(3))} != ${g.joints}`);
+  if (isJoint && g.joints && jdiffAxes(q, g.joints) > TOL_DEG) out.push(`#${i} "${g.name}" joints ${q?.map((v) => +v.toFixed(3))} != ${g.joints}`);
   if (!!g.isJoint !== isJoint) out.push(`#${i} "${g.name}" joint-target flag ${isJoint} != ${!!g.isJoint}`);
   const want = m16(g.pose);
   const pose = tgt ? tgt.pose() : m.pose ? Float64Array.from(m.pose) : null;
@@ -299,14 +314,39 @@ function compareGenerated(gp: any, prog: Program, station: Station, issues: stri
     for (const s of moveMismatch(i, g, m, station)) {
       // same flange pose with another robot configuration
       const q = m.targetId ? (station.findById(m.targetId) as Target | null)?.joints : m.joints;
-      if (robot instanceof Robot && q && g.joints && / joints /.test(s)) {
-        const e = err(robot.solveFKFlange(q.slice(0, robot.dof)), robot.solveFKFlange(g.joints.slice(0, robot.dof)));
-        if (!bad(e) && jdiff(q.slice(robot.dof), g.joints.slice(robot.dof)) <= TOL_DEG) { res.notes.push(`program ${gp.name} move ${i}: RoboDK picked another configuration for the same pose`); continue; }
+      if (robot instanceof Robot && q && g.joints && / joints /.test(s) && jdiff(q.slice(robot.dof), g.joints.slice(robot.dof)) <= TOL_DEG) {
+        const fa = robot.solveFKFlange(q.slice(0, robot.dof)), fb = robot.solveFKFlange(g.joints.slice(0, robot.dof));
+        if (!bad(err(fa, fb))) { res.notes.push(`program ${gp.name} move ${i}: RoboDK picked another configuration for the same pose`); continue; }
+        // the machining optimiser may also turn the tool about its own axis (free rotation of a milling / laser path)
+        const tool = toolBefore(ins, ours[i], station) ?? robot.poseTool();
+        if (sameToolAxis(multiply(fa, tool), multiply(fb, tool))) { res.notes.push(`program ${gp.name} move ${i}: RoboDK re-optimised the tool rotation about its axis`); continue; }
+      }
+      if (/ pose /.test(s)) {
+        const pose = m.targetId ? (station.findById(m.targetId) as Target | null)?.pose() : m.pose ? Float64Array.from(m.pose) : null;
+        const want = m16(g.pose);
+        if (pose && want && sameToolAxis(pose, want)) { res.notes.push(`program ${gp.name} move ${i}: RoboDK re-optimised the tool rotation about its axis`); continue; }
       }
       seq.push(s);
     }
   }
   if (seq.length) issues.push(`program ${gp.name} (machining): ${seq.length} move mismatches: ${limit(seq, 5)}`);
+}
+
+/** Same TCP position and tool Z axis (rotation about the tool axis is a free parameter of machining paths). */
+function sameToolAxis(a: Mat4, b: Mat4): boolean {
+  const dz = Math.hypot(a[8] - b[8], a[9] - b[9], a[10] - b[10]);
+  return err(a, b).mm <= TOL_MM && dz <= TOL_RAD;
+}
+
+/** TCP of the last tool instruction before `ins` in the program. */
+function toolBefore(all: Instruction[], ins: Instruction, station: Station): Mat4 | null {
+  let tool: Mat4 | null = null;
+  for (const x of all) {
+    if (x === ins) break;
+    const d = x.data;
+    if (d?.kind === 'tool' && d.toolId) { const t = station.findById(d.toolId); if (t instanceof Tool) tool = t.poseTool(); }
+  }
+  return tool;
 }
 
 /** Simulation checks against Item.Update() and InstructionListJoints(). */
@@ -327,27 +367,55 @@ async function simulate(gt: GT, station: Station, assets: AssetStore, res: GtRes
     if (gp.update?.[1] > 0.2 && out.duration > 0) pr.timeRatio = +(out.duration / gp.update[1]).toFixed(3);
     const robotG = gt.robots.find((x: any) => x.name === gp.robot);
     const dof = robotG?.lower?.length ?? 6;
+    // a machining program RoboDK regenerated at load (other number of instructions) is not the program in the file
+    if (prog.params.machiningId && gp.count !== prog.instructions().length) {
+      res.notes.push(`sim ${pr.name}: regenerated by RoboDK at load (${gp.count} instructions, ${prog.instructions().length} stored), joints not compared`);
+      pr.worstJointDeg = -1;
+      continue;
+    }
+    // MOVE_ID numbers the moves of RoboDK's expanded instruction list; the dump keeps only the last row of each id, so a
+    // program that calls others (the same ids repeat per call) cannot be compared move by move: validity + time only
+    if (prog.instructions().some((i) => i.data.kind === 'call' || i.data.kind === 'thread' || (i.data.kind === 'code' && i.data.asFunctionCall))) {
+      res.notes.push(`sim ${pr.name}: calls other programs, joints not compared move by move (MOVE_ID repeats per call)`);
+      pr.worstJointDeg = -1;
+      continue;
+    }
+    // jl rows: [J.., ERROR, MM_STEP, DEG_STEP, MOVE_ID, TIME, X, Y, Z]; the last row of a MOVE_ID is the end of that move.
+    // When RoboDK stops early (status < 0, e.g. "Path is not continuous") only the moves before the failing one are complete.
     const ends = new Map<number, number[]>();
-    for (const row of gp.jl ?? []) ends.set(row[row.length - 5], row.slice(0, row.length - 8));
-    const gtEnds = [...ends.entries()].sort((a, b) => a[0] - b[0]).map((e) => e[1]);
+    let failedAt = Infinity;
+    for (const row of gp.jl ?? []) {
+      const L = row.length, id = row[L - 5];
+      if (row[L - 8] !== 0) { failedAt = Math.min(failedAt, id); continue; }
+      ends.set(id, row.slice(0, L - 8));
+    }
+    const partial = (gp.jlStatus ?? 0) < 0 || Number.isFinite(failedAt);
+    const gtEnds = [...ends.entries()].filter((e) => e[0] < failedAt && (!partial || e[0] < Math.max(...ends.keys()))).sort((a, b) => a[0] - b[0]).map((e) => e[1]);
+    // a stopped list was computed from the state Update() left behind (robot at the program end, last frame / tool):
+    // its joints are not comparable, only the validity and cycle time from Update() are
+    if (partial) { res.notes.push(`sim ${pr.name}: RoboDK InstructionListJoints stopped (${gp.jlMsg ?? 'error'}); joints not compared`); pr.worstJointDeg = -1; continue; }
     const ourEnds = sim.steps.filter((s) => s.trajectory && s.trajectory.samples.length && (s.robot?.name === gp.robot)).map((s) => sampleAt(s.trajectory!, s.trajectory!.duration).joints.slice(0, dof));
     let worst = 0;
     for (let i = 0; i < Math.min(gtEnds.length, ourEnds.length); i++) worst = Math.max(worst, jdiff(ourEnds[i].slice(0, gtEnds[i].length), gtEnds[i].slice(0, ourEnds[i].length)));
     pr.worstJointDeg = Number.isFinite(worst) ? +worst.toFixed(3) : -1;
-    if (gtEnds.length && gtEnds.length !== ourEnds.length) res.issues.push(`sim ${pr.name}: ${ourEnds.length} moves, RoboDK ${gtEnds.length}`);
+    if (!partial && gtEnds.length && gtEnds.length !== ourEnds.length) res.issues.push(`sim ${pr.name}: ${ourEnds.length} moves, RoboDK ${gtEnds.length}`);
     if (worst > 0.1) res.issues.push(`sim ${pr.name}: joints differ from RoboDK by ${worst.toFixed(2)}°`);
   }
 }
 
-const fixtures = existsSync(GT_DIR) ? readdirSync(GT_DIR).filter((f) => f.endsWith('.json.gz') && (!ONLY || f.includes(ONLY))).sort() : [];
+// Library fixtures (need C:/RoboDK/Library) + synthetic stations made by RoboDK itself and stored in the repo
+// (tests/fixtures/robodk_gt/synthetic, built by make_synthetic.py: IO, waits, pauses, rounding, every call variant,
+// inline moves, Cyrillic names)
+const list = (dir: string) => (existsSync(`${GT_DIR}/${dir}`) ? readdirSync(`${GT_DIR}/${dir}`).filter((f) => f.endsWith('.json.gz')).map((f) => dir + f) : []);
+const fixtures = [...list(''), ...list('synthetic/')].filter((f) => !ONLY || f.includes(ONLY)).sort();
 const haveLib = existsSync(LIB);
 
 describe('RoboDK Library vs RoboDK ground truth', () => {
   it('has ground truth fixtures', () => { expect(fixtures.length).toBeGreaterThan(ONLY ? 0 : 90); });
   for (const f of fixtures) {
-    it.skipIf(!haveLib)(`${f.replace(/_\.json\.gz$/, '')} imports like RoboDK`, async () => {
+    it.skipIf(!haveLib && !f.startsWith('synthetic/'))(`${f.replace(/_\.json\.gz$/, '')} imports like RoboDK`, async () => {
       const res = await compareFile(f);
-      if (OUT) { mkdirSync(OUT, { recursive: true }); writeFileSync(`${OUT}/${f.replace(/\.json\.gz$/, '')}.json`, JSON.stringify(res, null, 1)); }
+      if (OUT) { mkdirSync(OUT, { recursive: true }); writeFileSync(`${OUT}/${f.replace(/\.json\.gz$/, '').replace(/\//g, '_')}.json`, JSON.stringify(res, null, 1)); }
       expect(res.issues).toEqual([]);
     }, SIM ? 3_600_000 : 600_000);
   }

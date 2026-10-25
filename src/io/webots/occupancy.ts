@@ -91,7 +91,7 @@ export function rasterizeOccupancy(station: Station, opts: OccupancyOptions = {}
         half = [0, 1, 2].map((a) => Math.max(Math.abs(m.min[a] * s[a]), Math.abs(m.max[a] * s[a]))) as [number, number, number];
       } else {
         const pr = g.primitive!;
-        half = pr.kind === 'box' ? [pr.size[0] / 2, pr.size[1] / 2, pr.size[2] / 2] : pr.kind === 'sphere' ? [pr.radius, pr.radius, pr.radius] : pr.kind === 'plane' ? [0, 0, 0] : [pr.radius, pr.radius, pr.length / 2];
+        half = pr.kind === 'box' ? [pr.size[0] / 2, pr.size[1] / 2, pr.size[2] / 2] : pr.kind === 'sphere' ? [pr.radius, pr.radius, pr.radius] : [pr.radius, pr.radius, pr.length / 2];
       }
       const p: Prim = { T, inv: invert(T), g, half, kind: g.mesh ? 'mesh' : g.primitive!.kind, mesh };
       // world-space bounds of the primitive (box corners)

@@ -21,6 +21,7 @@ import { Robot } from '../../core/items/robot';
 import { Program, Instruction } from '../../core/items/program';
 import type { InstructionData, MoveInstruction } from '../../core/items/program';
 import type { Mat4 } from '../../core/math/pose';
+import { multiply } from '../../core/math/pose';
 import type { AssetStore } from '../../scene/assets';
 import { RdkBytes, RdkChunk, rdkChunks } from './rdk_format';
 import { decodeRobotTable, decodeObjectTable, externalJointInfo } from './rdk_robot';
@@ -46,7 +47,7 @@ function findMarker(r: RdkBytes, from: number, end: number, marker: number): num
   return -1;
 }
 
-/** Station parameters: the only run of `u32 n, n × (key, value)` strings that ends right before `u32 0, f64 200`. */
+/** Station parameters: the run of `u32 n, n × (key, value)` strings that ends right before `[u32 0,] f64 200`. */
 function stationParams(r: RdkBytes, from: number, end: number): Array<[string, string]> {
   for (let p = from; p + 8 < end; p++) {
     const n = r.u32(p);
@@ -59,7 +60,8 @@ function stationParams(r: RdkBytes, from: number, end: number): Array<[string, s
       if (!a || !b || !a.text) { ok = false; break; }
       kv.push([a.text, b.text]); q = b.next;
     }
-    if (ok && q + 12 <= end && r.u32(q) === 0 && r.f64(q + 4) === 200) return kv;
+    // RoboDK 5.9 writes `f64 200` right after the pairs; older files (Example 05.b) have an extra `u32 0` first
+    if (ok && q + 12 <= end && (r.f64(q) === 200 || (r.u32(q) === 0 && r.f64(q + 4) === 200))) return kv;
   }
   return [];
 }
@@ -72,6 +74,7 @@ export function decodeStation(r: RdkBytes, fallbackName: string, assets?: AssetS
   const items: Array<Item | null> = new Array(chunks.length).fill(null);
   const parentOf: number[] = new Array(chunks.length).fill(-1);
   const pending: Pending = { robots: [], targets: [], programs: [], machining: [] };
+  let collision: { n: number; flags: Uint8Array } | null = null;
   const stack: number[] = [];
   const count = (k: string, n = 1) => { report.counts[k] = (report.counts[k] ?? 0) + n; };
   const drop = (msg: string) => { if (report.dropped.length < 400) report.dropped.push(msg); };
@@ -91,6 +94,12 @@ export function decodeStation(r: RdkBytes, fallbackName: string, assets?: AssetS
           const nm = r.str(p + 1, 4096);
           if (nm?.text) station.setName(nm.text);
           if (nm) {
+            // collision map: u32 n entities | u32 0 | n(n-1)/2 u8 flags, upper triangle row-major (pair i<j checked = 1).
+            // Entities = robots (one per mesh link), objects and tools in file order. Found by diffing stations RoboDK
+            // saved around setCollisionActivePair; the entity count matches all 57 Library stations.
+            const n = r.ok(nm.next, 8) ? r.u32(nm.next) : 0;
+            const size = (n * (n - 1)) / 2;
+            if (n > 0 && n <= 4096 && r.u32(nm.next + 4) === 0 && r.ok(nm.next + 8, size) && r.b.subarray(nm.next + 8, nm.next + 8 + size).every((v) => v <= 1)) collision = { n, flags: r.b.subarray(nm.next + 8, nm.next + 8 + size) };
             const kv = stationParams(r, nm.next, c.end);
             for (const [k, v] of kv) station.params[k] = v;
             if (kv.length) { station.params.rdkStationParams = kv.map(([k]) => k); count('station parameters', kv.length); }
@@ -112,7 +121,7 @@ export function decodeStation(r: RdkBytes, fallbackName: string, assets?: AssetS
           const at = findMarker(r, p, c.end, 4000);
           const dec = at >= 0 ? decodeRobotTable(r, at, c.end, 'Robot', assets) : null;
           if (!dec) { drop(`robot chunk #${c.index}: parameter table not readable`); break; }
-          for (const n of dec.notes) report.notes.push(n);
+          for (const n of dec.notes) drop(n);
           let o = dec.meshEnd + 16;
           let frameRef = -1, toolRef = -1;
           const sync: number[] = [];
@@ -230,6 +239,21 @@ export function decodeStation(r: RdkBytes, fallbackName: string, assets?: AssetS
 
   const at = (ref: number): Item | null => (ref >= 0 && ref < items.length ? items[ref] : null);
 
+  // ---- collision map -> station.params.collisionMap = { entities: [{ id, link? }], pairs: [[i, j], ...] (checked pairs) }
+  if (collision) {
+    const entities: Array<{ id: string; name: string; link?: number }> = [];
+    for (const it of items) {
+      if (it instanceof Robot) for (let k = 0; k < Number(it.params.rdkMeshLinks ?? 0); k++) entities.push({ id: it.id, name: it.name, link: k });
+      else if ((it instanceof SceneObject || it instanceof Tool) && !it.params.rdkFromInstruction) entities.push({ id: it.id, name: it.name });
+    }
+    if (entities.length === collision.n) {
+      const pairs: Array<[number, number]> = [];
+      for (let i = 0, k = 0; i < collision.n; i++) for (let j = i + 1; j < collision.n; j++, k++) if (collision.flags[k]) pairs.push([i, j]);
+      station.params.collisionMap = { entities, pairs };
+      report.notes.push(`collision map: ${pairs.length} checked pairs among ${entities.length} entities (station.params.collisionMap)`);
+    } else drop(`collision map: ${collision.n} entities stored, ${entities.length} collision items imported; map not applied`);
+  }
+
   // ---- robots: active tool / frame, synchronised external axes
   for (const pr of pending.robots) {
     const { robot } = pr;
@@ -254,13 +278,18 @@ export function decodeStation(r: RdkBytes, fallbackName: string, assets?: AssetS
       count('synchronised external axes', n);
     }
   }
-  for (const pt of pending.targets) { const rb = at(pt.robotRef); if (rb instanceof Robot) pt.target.robotId = rb.id; }
-  const programsByName = new Map<string, Item>();
-  for (const it of items) if (it instanceof Program && !programsByName.has(it.name)) programsByName.set(it.name, it);
+  // RoboDK stores at least 6 joint values per target; only the robot's own axes (+ synchronised ones) are meaningful
+  for (const pt of pending.targets) {
+    const rb = at(pt.robotRef);
+    if (!(rb instanceof Robot)) continue;
+    pt.target.robotId = rb.id;
+    const n = axesOf(rb), q = pt.target.joints;
+    if (q && q.length > n && q.slice(n).every((v) => v === 0)) pt.target.setJoints(q.slice(0, n));
+  }
   for (const pm of pending.machining) {
     const [robot, frame, tool, part, linked] = pm.refs.map(at);
-    // without a stored link RoboDK (re)generates the program named after the project
-    const program = linked instanceof Program ? linked : programsByName.get(pm.item.name.replace(/\s+settings$/i, '')) ?? null;
+    // only the stored link counts: a project without one generates a new program on its next update (RoboDK)
+    const program = linked instanceof Program ? linked : null;
     const link: Record<string, string> = {};
     if (robot) link.robotId = robot.id;
     if (frame) link.frameId = frame.id;
@@ -274,12 +303,19 @@ export function decodeStation(r: RdkBytes, fallbackName: string, assets?: AssetS
   const robots = items.filter((i): i is Robot => i instanceof Robot);
   const callables = new Map<string, Item>();
   for (const it of items) if (it && (it.type === ItemType.PROGRAM || it.type === ItemType.PROGRAM_PYTHON) && !callables.has(it.name)) callables.set(it.name, it);
-  for (const pp of pending.programs) decodeProgram(r, pp, at, robots, callables, report);
+  const frames = new Map<string, Item[]>();
+  for (const it of items) if (it && (it.type === ItemType.FRAME || it instanceof Robot)) { const l = frames.get(it.name); if (l) l.push(it); else frames.set(it.name, [it]); }
+  for (const pp of pending.programs) decodeProgram(r, pp, at, robots, callables, frames, report);
   if (report.counts.instruction) delete report.counts.instruction;
   return { station, report };
 }
 
 const MOVE: Record<number, MoveInstruction['moveType']> = { 1: 'MoveJ', 2: 'MoveL', 3: 'MoveC' };
+
+/** Joint values a target of this robot carries: its axes plus the synchronised external axes. */
+function axesOf(rb: Robot): number {
+  return rb.dof + ((rb.params.syncAxes as Array<{ joints: number[] }> | undefined)?.reduce((s, a) => s + a.joints.length, 0) ?? 0);
+}
 
 /** One move point: link 1 = target reference, link 2 = inline joints + pose (relative to the active frame). */
 function movePoint(r: RdkBytes, o: number, at: (ref: number) => Item | null): { next: number; target: Target | null; ref: number; joints?: number[]; pose?: number[]; isJoint?: boolean } | null {
@@ -297,7 +333,7 @@ function movePoint(r: RdkBytes, o: number, at: (ref: number) => Item | null): { 
   return null;
 }
 
-function decodeProgram(r: RdkBytes, pp: Pending['programs'][number], at: (ref: number) => Item | null, robots: Robot[], callables: Map<string, Item>, report: StationDecodeReport): void {
+function decodeProgram(r: RdkBytes, pp: Pending['programs'][number], at: (ref: number) => Item | null, robots: Robot[], callables: Map<string, Item>, frames: Map<string, Item[]>, report: StationDecodeReport): void {
   const { program, chunk } = pp;
   const end = chunk.end;
   const robotItem = at(pp.robotRef);
@@ -333,13 +369,13 @@ function decodeProgram(r: RdkBytes, pp: Pending['programs'][number], at: (ref: n
         break;
       }
       case 2: {
-        // u16 mask (1 linear speed, 2 linear accel, 4 joint speed, 8 joint accel) | f64 vL | f64 aL | i32 | f64 vJ | f64 aJ
-        const mask = r.u16(d);
+        // u8 useVL | u8 useAL | f64 vL | f64 aL | i32 -1 | u8 useVJ | u8 useAJ | f64 vJ | f64 aJ (each value applies only
+        // when its flag is set; verified with setSpeed / setSpeedJoints / setAcceleration* in the synthetic fixture)
         const s: InstructionData = { kind: 'speed' };
-        if (mask & 1) s.speedLinear = r.f64(d + 2);
-        if (mask & 2) s.accelLinear = r.f64(d + 10);
-        if (mask & 4) s.speedJoints = r.f64(d + 22);
-        if (mask & 8) s.accelJoints = r.f64(d + 30);
+        if (r.u8(d)) s.speedLinear = r.f64(d + 2);
+        if (r.u8(d + 1)) s.accelLinear = r.f64(d + 10);
+        if (r.u8(d + 22)) s.speedJoints = r.f64(d + 24);
+        if (r.u8(d + 23)) s.accelJoints = r.f64(d + 32);
         data = s;
         break;
       }
@@ -349,6 +385,28 @@ function decodeProgram(r: RdkBytes, pp: Pending['programs'][number], at: (ref: n
         if (type === 3) {
           if (it) data = { kind: 'frame', frameId: it.id };
           else if (ref === -1 && /^Set (Ref|Frame)/i.test(label) && !label.includes(':')) data = { kind: 'frame', frameId: null };
+          else {
+            // unlinked reference (copied program, deleted frame): RoboDK keeps the frame pose relative to the robot base
+            const owner = robotItem instanceof Robot ? robotItem : robots.length === 1 ? robots[0] : null;
+            const name = label.replace(/^Set (Ref\.?|Reference|Frame)\s*:?\s*/i, '') || 'Frame';
+            const stored = r.pose(d + 5) as Mat4;
+            const base = owner ? owner.poseAbs() : null;
+            const want = base ? multiply(base, stored) : stored;
+            const close = (f: Item) => { const g = f instanceof Robot ? f.poseAbs() : f.poseAbs(); let e = 0; for (let i = 0; i < 16; i++) e = Math.max(e, Math.abs(g[i] - want[i]) * (i >= 12 ? 1 : 1000)); return e < 0.01; };
+            let frame = (frames.get(name) ?? []).find(close) ?? null;
+            if (!frame) {
+              frame = new Frame(name);
+              frame.setPose(want);
+              frame.params.rdkFromInstruction = true;
+              // the pose is absolute (robot base · stored pose): recreate the frame at the station root
+              let root: Item | null = owner ?? robots[0] ?? null;
+              while (root?.parent) root = root.parent;
+              root?.addChild(frame);
+              if (!frame.parent) frame = null;
+              else { frames.set(name, [...(frames.get(name) ?? []), frame]); report.notes.push(`${program.name}: "${label}" refers to a deleted frame; recreated from the pose stored in the instruction`); }
+            }
+            if (frame) data = { kind: 'frame', frameId: frame.id };
+          }
         } else if (it instanceof Tool) data = { kind: 'tool', toolId: it.id };
         else {
           // the tool item no longer exists: RoboDK keeps the TCP in the instruction, so keep it as a tool on the robot
@@ -382,6 +440,22 @@ function decodeProgram(r: RdkBytes, pp: Pending['programs'][number], at: (ref: n
       }
       case 9: { const s = r.str(d, 1 << 20); data = { kind: 'print', message: s?.text ?? label.replace(/^Print:\s*/i, ''), isComment: false }; break; }
       case 10: data = { kind: 'rounding', radius: r.f64(d) }; break;
+      case 11: {
+        // u32 action (0 set DO, 1 wait DI, 2 set AO, 3 wait AI) | str variable | str value | f64 timeout ms (-1 none)
+        const act = r.u32(d);
+        const io = r.str(d + 4, 4096), val = io ? r.str(io.next, 4096) : null;
+        if (!io || !val) break;
+        const num = Number(val.text);
+        const timeout = r.ok(val.next, 8) ? r.f64(val.next) : -1;
+        const wait = act === 1 || act === 3;
+        if (Number.isFinite(num) && val.text.trim() !== '') {
+          const ins: Record<string, unknown> = { kind: 'io', io: io.text, value: num, wait };
+          if (wait && timeout >= 0) ins.timeoutMs = timeout;
+          if (act === 2 || act === 3) ins.analog = true;
+          data = ins as unknown as InstructionData;
+        } else data = wait ? { kind: 'wait', what: 'signal', signal: io.text, value: val.text, ...(timeout >= 0 ? { timeMs: timeout } : {}) } : { kind: 'signal', signal: io.text, value: val.text, wait: false };
+        break;
+      }
     }
     if (!data) { data = { kind: 'print', message: label, isComment: true }; unknown.push(`${label} (type ${type})`); }
     program.addChild(new Instruction(data, label));
@@ -389,7 +463,11 @@ function decodeProgram(r: RdkBytes, pp: Pending['programs'][number], at: (ref: n
   if (unknown.length) report.dropped.push(`program ${program.name}: ${unknown.length} instruction(s) kept as comments: ${unknown.slice(0, 4).join('; ')}${unknown.length > 4 ? '…' : ''}`);
   // program robot: the stored reference; RoboDK leaves it unset for programs that only call others
   const rb = robotItem instanceof Robot ? robotItem : (firstTargetRobot ? robots.find((x) => x.id === firstTargetRobot) : null) ?? (robots.length === 1 ? robots[0] : null);
-  if (rb) program.setRobot(rb);
+  if (rb) {
+    program.setRobot(rb);
+    const n = axesOf(rb);
+    for (const ins of program.instructions()) { const m = ins.data; if (m.kind === 'move' && m.joints && m.joints.length > n && m.joints.slice(n).every((v) => v === 0)) m.joints = m.joints.slice(0, n); }
+  }
 }
 
 /**

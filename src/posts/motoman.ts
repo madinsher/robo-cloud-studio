@@ -13,7 +13,7 @@ import { pose2Motoman } from './euler';
 interface Job { name: string; pos: string[]; ins: string[]; nPos: number; posType: '' | 'pulse' | 'rectan'; posTool: number; rconf: string; tool0: number | null; first: boolean }
 
 export class MotomanPost extends RoboPost {
-  PROG_EXT = 'JBI';
+  override PROG_EXT = 'JBI';
   protected jobs: Job[] = [];
   protected progJobs: Job[] = [];
   protected cur!: Job;
@@ -58,7 +58,13 @@ export class MotomanPost extends RoboPost {
   protected comment(t: string) { for (let i = 0; i < t.length || i === 0; i += 29) { this.addline(`'${t.slice(i, i + 29)}`); if (!t.length) break; } }
   override ProgSave(): PostFile[] {
     const d = this.ctx.date, p2 = (n: number) => String(n).padStart(2, '0');
-    return this.jobs.map((j) => {
+    // RoboDK writes the last program's jobs first, then the others in order: when truncated names clash
+    // (DropPart1..3 -> DROPPAR) the file left on disk is the last one written. Same result, main job listed first.
+    const written = new Map<string, Job>();
+    for (const j of [...this.progJobs, ...this.jobs.filter((x) => !this.progJobs.includes(x))]) written.set(j.name, j);
+    const jobs = this.jobs.filter((j) => written.get(j.name) === j);
+    if (jobs.length < this.jobs.length) this.ctx.warn(`Motoman: job names clash after truncation to ${this.nameLen} characters (${[...new Set(this.jobs.filter((j) => !jobs.includes(j)).map((j) => j.name))].join(', ')}): only one job per name is written, rename the programs`);
+    return jobs.map((j) => {
       const L = ['/JOB', `//NAME ${j.name}`, '//POS', `///NPOS ${j.nPos},0,0,0,0,0`, ...j.pos, '//INST', `///DATE ${d.getFullYear()}/${p2(d.getMonth() + 1)}/${p2(d.getDate())} ${p2(d.getHours())}:${p2(d.getMinutes())}`,
         '///COMM Generated using VerticalBot Studio', `///ATTR SC,RW${this.cartesian ? ',RJ' : ''}`, '///GROUP1 RB1', 'NOP', ...j.ins, 'END'];
       return { name: `${j.name}.JBI`, content: L.join('\r\n') + '\r\n' };
@@ -94,22 +100,26 @@ export class MotomanPost extends RoboPost {
     this.splitIfNeeded();
     const c = this.pulse(joints);
     this.addline(`MOVJ ${this.cName(c)} VJ=${this.vj}${this.jointAccMode ? this.accStrJ : this.pl}`);
-    this.lastJoints = joints; this.lastPose = pose;
+    this.lastJoints = joints; this.lastPose = pose; this.lastWasCirc = false;
   }
   MoveL(pose: Mat4 | null, joints: number[], conf: number[]): void {
     this.splitIfNeeded();
     const c = this.point(pose, joints, conf);
     this.addline(`MOVL ${this.cName(c)} V=${this.v}${this.linAccMode ? this.accStrL : this.pl}`);
-    this.lastJoints = joints; this.lastPose = pose; this.lastConf = conf;
+    this.lastJoints = joints; this.lastPose = pose; this.lastConf = conf; this.lastWasCirc = false;
   }
   override MoveC(pose1: Mat4 | null, joints1: number[], pose2: Mat4 | null, joints2: number[], conf1: number[], conf2: number[]): void {
     this.splitIfNeeded();
-    // INFORM circles need 3 MOVC points: start (current position), via, end
-    const start = this.lastJoints ? this.point(this.lastPose, this.lastJoints, this.lastConf) : this.point(pose1, joints1, conf1);
-    const a = this.point(pose1, joints1, conf1), b = this.point(pose2, joints2, conf2);
-    for (const c of [start, a, b]) this.addline(`MOVC ${this.cName(c)} V=${this.v}${this.pl}`);
+    // INFORM circles need 3 MOVC points: start (current position), via, end; a circle that continues a circle reuses
+    // the previous end point as its start (RoboDK writes only via + end then)
+    const pts = [];
+    if (!this.lastWasCirc) pts.push(this.lastJoints ? this.point(this.lastPose, this.lastJoints, this.lastConf) : this.point(pose1, joints1, conf1));
+    pts.push(this.point(pose1, joints1, conf1), this.point(pose2, joints2, conf2));
+    for (const c of pts) this.addline(`MOVC ${this.cName(c)} V=${this.v}${this.pl}`);
     this.lastJoints = joints2; this.lastPose = pose2; this.lastConf = conf2;
+    this.lastWasCirc = true;
   }
+  protected lastWasCirc = false;
   override setFrame(pose: Mat4, _id: number, name: string): void {
     this.frame = pose;
     this.comment(`Using ${name} (targets wrt base):`);
@@ -142,7 +152,11 @@ export class MotomanPost extends RoboPost {
     this.addline(`WAIT ${typeof io === 'number' ? `IN#(${io})` : io}=${this.onoff(v)}${timeoutMs > 0 ? ` T=${fx(timeoutMs / 1000, 2)}` : ''}`);
   }
   override RunCode(code: string, isCall = false): void { this.addline(isCall ? `CALL JOB:${code.toUpperCase().slice(0, this.nameLen)}` : code); }
-  override RunMessage(msg: string, isComment = false): void { if (isComment) this.comment(msg); else this.addline(`MSG "${msg}"`); }
+  /** MSG texts are limited to 25 characters on the pendant: RoboDK writes one MSG per 25-character chunk. */
+  override RunMessage(msg: string, isComment = false): void {
+    if (isComment) { this.comment(msg); return; }
+    for (let i = 0; i < msg.length || i === 0; i += 25) { this.addline(`MSG "${msg.slice(i, i + 25)}"`); if (!msg.length) break; }
+  }
   // ---- control flow (INFORM) ----
   override ctlLoop(count: number, body: string): void {
     const k = ++this.lbl, b = this.jobName(body);

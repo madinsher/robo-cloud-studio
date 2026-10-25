@@ -6,7 +6,7 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
-import { importWebotsWorld, buildWebotsProto, WebotsBuildResult, parseWorld, parseProtoFile, countTypesInText, ProtoRegistry } from '../src/io/webots';
+import { importWebotsWorld, buildWebotsProto, WebotsBuildResult, parseWorld, parseProtoFile, countTypesInText, ProtoRegistry, parseShots, applyShot, viewpointLook } from '../src/io/webots';
 import { parseNodes } from '../src/io/webots/vrml';
 import { AssetStore } from '../src/scene/assets';
 import { Item, SceneObject, Camera, Frame, GeometryRef } from '../src/core/items/item';
@@ -347,11 +347,20 @@ describe.skipIf(!HAS_MURKA)('MURKA orchard Mission B world (AT-W2, AT-W3, AT-W7)
 });
 
 describe.skipIf(!HAS_MURKA)('MURKA legacy agro worlds (AT-W3, AT-W4)', () => {
-  it('murca_garden.wbt: RectangleArena 40 x 30 m without walls', () => {
+  // `wallHeight 0.0` does NOT remove the walls: Webots resets a non-positive wallHeight to its default 0.1 m (console
+  // error) — verified by the Webots R2025a pose dump (tests/fixtures/webots/gt/murca_garden.json.gz: 4 wall SolidBoxes
+  // 0.01 x 30 / 40.02 x 0.1 m at z = 0.05). The report's AT-W3 "no walls" expectation was wrong.
+  it('murca_garden.wbt: RectangleArena 40 x 30 m; wallHeight 0 is reset to 0.1 m like Webots does', () => {
     const r = importWebotsWorld('src/murca_webots/worlds/murca_garden.wbt', dirSource(path.join(MURKA, AGRO_ROOT)), { assets: new AssetStore() });
     const arena = r.station.children.find((c) => c.params.webotsBuiltin === 'RectangleArena') as SceneObject;
-    expect(arena.geometry.map((g) => g.primitive)).toEqual([{ kind: 'plane', size: [40000, 30000] }]);
-    expect(colliders(arena)).toEqual([]);
+    expect(arena.geometry[0].primitive).toEqual({ kind: 'plane', size: [40000, 30000] });
+    const walls = arena.geometry.slice(1).map((g) => ({ size: (g.primitive as { size: number[] }).size.map((v) => Math.round(v * 1000) / 1000), at: g.origin!.slice(12, 15).map((v) => Math.round(v * 1000) / 1000) }));
+    expect(walls).toEqual([
+      { size: [10, 30000, 100], at: [20005, 0, 50] }, { size: [10, 30000, 100], at: [-20005, 0, 50] },
+      { size: [40020, 10, 100], at: [0, 15005, 50] }, { size: [40020, 10, 100], at: [0, -15005, 50] },
+    ]);
+    expect(colliders(arena)).toHaveLength(4);
+    expect(r.report.some((l) => l.includes("RectangleArena: 'wallHeight' must be strictly positive, reset to 0.1"))).toBe(true);
     expect(errorsOf(r.report)).toEqual([]);
   });
 
@@ -384,6 +393,22 @@ describe.skipIf(!HAS_MURKA)('MURKA orchard trellis stills (AT-W16)', () => {
     const dyn = r.station.children.filter((c) => c instanceof Frame && /^DYN_/.test(c.name));
     expect(dyn.length).toBe(4);
     for (const d of dyn) expect(d.pose()[14]).toBeCloseTo(-1000000, 3);
+    // shots player: each shot of orchard_trellis_stills_shots.json shows its DYN_<KEY> group at z = 0 and sets the viewpoint
+    const shots = parseShots(fs.readFileSync(path.join(MURKA, AGRO_ROOT, 'src/murca_webots/worlds/orchard_trellis_stills_shots.json'), 'utf8'));
+    expect(shots.map((s) => s.key)).toEqual(['overview', 'pick', 'battery', 'crate_swap']);
+    for (const s of shots) {
+      const { shown, parked } = applyShot(r.station, s);
+      expect(shown?.name).toBe(`DYN_${s.key.toUpperCase()}`);
+      expect(shown!.poseAbs()[14]).toBe(0);
+      expect(parked.map((p) => p.poseAbs()[14])).toEqual([-1000000, -1000000, -1000000]);
+      const vp = r.station.settings.viewpoint as { position: number[]; orientation: number[]; fieldOfView: number };
+      expect(vp.position.map((v) => Math.round(v))).toEqual(s.position.map((v) => Math.round(v)));
+      expect(vp.fieldOfView).toBe(s.fieldOfView);
+    }
+    // the overview shot is the world's own Viewpoint, and it looks down onto the orchard (+X of the viewpoint, Z up)
+    const look = viewpointLook(shots[0]);
+    expect(look.target[2]).toBeLessThan(look.eye[2]);
+    expect(Math.hypot(look.eye[0] - look.target[0], look.eye[1] - look.target[1], look.eye[2] - look.target[2])).toBeCloseTo(1000, 6);
   }, 180000);
 });
 

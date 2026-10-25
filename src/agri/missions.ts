@@ -17,6 +17,7 @@ import { transl, add, scale } from '../core/math/pose';
 import { armOf, armMount, armReach } from './harvest';
 import './process';
 import './collision_world';
+import './equipment';
 
 export { generateHarvestProgram, bindHarvestEvents, matchDetections, armReach, fruitByRef, fruitTargets } from './harvest';
 export type { HarvestProgramOptions } from './harvest';

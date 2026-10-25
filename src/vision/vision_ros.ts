@@ -149,10 +149,15 @@ function b64(u8: Uint8Array): string {
   let s = ''; for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode(...u8.subarray(i, i + 0x8000));
   return btoa(s);
 }
-/** sensor_msgs/CameraInfo with the same K the studio renders with (plumb_bob, no distortion). */
+/**
+ * sensor_msgs/CameraInfo with the same K the studio renders with (plumb_bob, no distortion). ROS puts pixel centres at
+ * integer coordinates while the studio model (and OpenGL) puts them at +0.5, so the published principal point is
+ * (W/2 − 0.5, H/2 − 0.5): u = fx·x/z + cx lands exactly on the rendered pixel. (webots_ros2 publishes W/2, H/2.)
+ */
 export function cameraInfoMsg(cam: CameraItem, frameId: string, timeS = 0, width = cam.width, height = cam.height) {
   const K = cameraIntrinsics(cam, width, height);
-  return { header: header(frameId, timeS), height, width, distortion_model: 'plumb_bob', d: [0, 0, 0, 0, 0], k: [K.fx, 0, K.cx, 0, K.fy, K.cy, 0, 0, 1], r: [1, 0, 0, 0, 1, 0, 0, 0, 1], p: [K.fx, 0, K.cx, 0, 0, K.fy, K.cy, 0, 0, 0, 1, 0], binning_x: 0, binning_y: 0, roi: { x_offset: 0, y_offset: 0, height: 0, width: 0, do_rectify: false } };
+  const cx = K.cx - 0.5, cy = K.cy - 0.5;
+  return { header: header(frameId, timeS), height, width, distortion_model: 'plumb_bob', d: [0, 0, 0, 0, 0], k: [K.fx, 0, cx, 0, K.fy, cy, 0, 0, 1], r: [1, 0, 0, 0, 1, 0, 0, 0, 1], p: [K.fx, 0, cx, 0, 0, K.fy, cy, 0, 0, 0, 1, 0], binning_x: 0, binning_y: 0, roi: { x_offset: 0, y_offset: 0, height: 0, width: 0, do_rectify: false } };
 }
 /** sensor_msgs/Image from RGBA pixels (row 0 = top); `data` is base64 (rosbridge uint8[]). */
 export function imageMsg(rgba: Uint8Array | Uint8ClampedArray, width: number, height: number, frameId: string, timeS = 0, encoding: 'rgb8' | 'bgr8' | 'rgba8' | 'bgra8' = 'rgb8') {

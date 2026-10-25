@@ -57,9 +57,9 @@ function rotV(w: Vec3, t: number, v: Vec3): Vec3 {
 function rotP(s: Screw, t: number, x: Vec3): Vec3 { return add3(s.p, rotV(s.w, t, sub3(x, s.p))); }
 
 /** 4x4 rigid motion e^{ξθ} (rotation about a line). */
-function screwMat(s: Screw, t: number): Mat4 {
+function screwMat(s: Screw, t: number, m: Mat4 = new Float64Array(16)): Mat4 {
   const [x, y, z] = s.w, c = Math.cos(t), sn = Math.sin(t), k = 1 - c;
-  const m = new Float64Array(16);
+  m[3] = m[7] = m[11] = 0;
   m[0] = k * x * x + c; m[4] = k * x * y - sn * z; m[8] = k * x * z + sn * y;
   m[1] = k * x * y + sn * z; m[5] = k * y * y + c; m[9] = k * y * z - sn * x;
   m[2] = k * x * z - sn * y; m[6] = k * y * z + sn * x; m[10] = k * z * z + c;
@@ -236,9 +236,11 @@ export function wrapDeg(v: number): number {
  * All closed-form solutions for a flange pose (relative to the robot base frame), or null when the chain has no
  * closed form. The result may be empty (unreachable). `seed` (deg) resolves free joints at singularities.
  */
-export function solveAnalytic(chain: ChainDef, flange: Mat4, seed?: number[]): AnalyticSolution[] | null {
+export function solveAnalytic(chain: ChainDef, flangeIn: Mat4, seed?: number[]): AnalyticSolution[] | null {
   const a = analyzeChain(chain);
   if (!a.kind) return null;
+  // poses read from files carry rounded rotations (6 decimals): solve for the nearest proper rotation
+  const flange = orthonormalized(flangeIn);
   if (a.kind === 'delta') return solveDelta(chain, flange, seed);
   const seedTh = seed && seed.length >= 6 ? toMotion(a, seed) : [0, 0, 0, 0, 0, 0];
   const raw = a.kind === 'spherical6' ? solveSpherical(a, flange, seedTh) : solveUR(a, flange, seedTh);
@@ -250,7 +252,7 @@ export function solveAnalytic(chain: ChainDef, flange: Mat4, seed?: number[]): A
     flangePoseInto(chain, q, chk);
     let pe = 0, re = 0;
     for (let k = 12; k < 15; k++) pe = Math.max(pe, Math.abs(chk[k] - flange[k]));
-    for (const k of [0, 1, 2, 4, 5, 6, 8, 9, 10]) re = Math.max(re, Math.abs(chk[k] - flange[k]));
+    for (const k of ROT_IDX) re = Math.max(re, Math.abs(chk[k] - flange[k]));
     if (pe > 1e-6 * a.scale + 1e-6 || re > 1e-7) continue;
     if (out.some((o) => o.q.every((v, i) => Math.abs(wrapDeg(v - q[i])) < 1e-6))) continue;
     out.push({ q, singular: r.singular });
@@ -258,7 +260,26 @@ export function solveAnalytic(chain: ChainDef, flange: Mat4, seed?: number[]): A
   return out;
 }
 
+/**
+ * The pose with its rotation replaced by the nearest orthonormal one (Z kept, X re-orthogonalised), or the same object
+ * when it already is orthonormal to 1e-12.
+ */
+export function orthonormalized(m: Mat4): Mat4 {
+  const x: Vec3 = [m[0], m[1], m[2]], y: Vec3 = [m[4], m[5], m[6]], z: Vec3 = [m[8], m[9], m[10]];
+  const dev = Math.max(Math.abs(dot(x, x) - 1), Math.abs(dot(y, y) - 1), Math.abs(dot(z, z) - 1), Math.abs(dot(x, y)), Math.abs(dot(y, z)), Math.abs(dot(x, z)));
+  if (dev < 1e-12) return m;
+  const zn = unit(z);
+  const xn = unit(sub3(x, scl3(zn, dot(x, zn))));
+  const yn = crs(zn, xn);
+  const out = new Float64Array(m);
+  out[0] = xn[0]; out[1] = xn[1]; out[2] = xn[2];
+  out[4] = yn[0]; out[5] = yn[1]; out[6] = yn[2];
+  out[8] = zn[0]; out[9] = zn[1]; out[10] = zn[2];
+  return out;
+}
+
 interface RawSol { th: number[]; singular: boolean }
+const ROT_IDX = [0, 1, 2, 4, 5, 6, 8, 9, 10];
 
 function solveSpherical(a: ChainAnalysis, gt: Mat4, seedTh: number[]): RawSol[] {
   const [s1, s2, s3, s4, s5, s6] = a.screws;
@@ -272,15 +293,17 @@ function solveSpherical(a: ChainAnalysis, gt: Mat4, seedTh: number[]): RawSol[] 
   const upar = scl3(s1.w, dot(u, s1.w)), uperp = sub3(u, upar), uxw = crs(s1.w, u);
   const t1s = trig(dot(uperp, d), dot(uxw, d), dot(u, sub3(a.wA, s1.p)) - dot(upar, d), tol);
   if (!t1s.length && Math.hypot(dot(uperp, d), dot(uxw, d)) < tol) t1s.push(seedTh[0]); // wrist on axis 1
+  const pk = linesClosest(s2, s3).pa; // a point on axis 2
+  const m1 = new Float64Array(16), m2 = new Float64Array(16), m3 = new Float64Array(16);
   for (const t1 of uniqAngles(t1s)) {
     const V = rotP(s1, -t1, W);
-    const pk = linesClosest(s2, s3).pa; // a point on axis 2
     const delta = nrm3(sub3(V, pk));
+    const G1 = multiply(screwMat(s1, -t1), G); // e^{-ξ1θ1} G
     for (const t3 of uniqAngles(pk3(s3, a.wA, pk, delta, tol))) {
       const x = rotP(s3, t3, a.wA);
       const t2 = pk1(s2, x, V);
-      const M = multiply(multiply(screwMat(s1, t1), screwMat(s2, t2)), screwMat(s3, t3));
-      const R = multiply(invert(M), G); // e^{ξ4θ4}e^{ξ5θ5}e^{ξ6θ6}, a rotation about wA
+      // e^{ξ4θ4}e^{ξ5θ5}e^{ξ6θ6} = e^{-ξ3θ3} e^{-ξ2θ2} e^{-ξ1θ1} G, a rotation about wA
+      const R = multiply(screwMat(s3, -t3, m1), multiply(screwMat(s2, -t2, m2), G1, m3), new Float64Array(16));
       for (const w of wristSolutions(s4, s5, s6, R, a.wA, seedTh)) out.push({ th: [t1, t2, t3, w[0], w[1], w[2]], singular: w[3] === 1 });
     }
   }
@@ -330,6 +353,7 @@ function solveUR(a: ChainAnalysis, gt: Mat4, seedTh: number[]): RawSol[] {
   const t1s = trig(dot(uperp, d), dot(uxw, d), dot(u, sub3(a.wB, s1.p)) - dot(upar, d), tol);
   if (!t1s.length && Math.hypot(dot(uperp, d), dot(uxw, d)) < tol) t1s.push(seedTh[0]);
   const w6t = xfD(G, s6.w); // axis 6 direction at the target
+  const Ginv = invert(G);
   const sgn = (s: Screw) => (dot(s.w, u) >= 0 ? 1 : -1);
   for (const t1 of uniqAngles(t1s)) {
     const u1 = rotV(s1.w, t1, u);
@@ -338,7 +362,7 @@ function solveUR(a: ChainAnalysis, gt: Mat4, seedTh: number[]): RawSol[] {
     const t5s = trig(dot(u, w6perp), dot(u, w5x6), dot(u1, w6t) - dot(u, w6par), 1e-9);
     for (const t5 of uniqAngles(t5s)) {
       // θ6: R6 (Gᵀ u1) = R5ᵀ u
-      const sv = xfD(invert(G), u1);
+      const sv = xfD(Ginv, u1);
       const target = rotV(s5.w, -t5, u);
       let t6 = pk1v(s6.w, sv, target);
       let singular = false;

@@ -24,7 +24,8 @@ const GT = 'tests/fixtures/robodk_gt';
 const RES = join(tmpdir(), `robodk-gt-${process.pid}`);
 mkdirSync(RES, { recursive: true });
 
-const fixtures = readdirSync(GT).filter((f) => f.endsWith('.json.gz') && (!ONLY || f.includes(ONLY))).sort();
+const list = (dir) => (existsSync(join(GT, dir)) ? readdirSync(join(GT, dir)).filter((f) => f.endsWith('.json.gz')).map((f) => (dir ? `${dir}/${f}` : f)) : []);
+const fixtures = [...list(''), ...list('synthetic')].filter((f) => !ONLY || f.includes(ONLY)).sort();
 const vitest = join('node_modules', 'vitest', 'vitest.mjs');
 const status = new Map();
 
@@ -50,7 +51,7 @@ const queue = [...fixtures];
 await Promise.all(Array.from({ length: Math.max(1, JOBS) }, async () => { while (queue.length) await runOne(queue.shift()); }));
 
 const rows = fixtures.map((f) => {
-  const p = join(RES, f.replace(/\.json\.gz$/, '') + '.json');
+  const p = join(RES, f.replace(/\.json\.gz$/, '').replace(/\//g, '_') + '.json');
   const r = existsSync(p) ? JSON.parse(readFileSync(p, 'utf8')) : null;
   return { f, s: status.get(f) ?? { state: 'missing' }, r };
 });

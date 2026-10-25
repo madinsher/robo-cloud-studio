@@ -8,7 +8,7 @@ import { Station, SceneObject, Frame, Target } from '../items/item';
 import { Robot } from '../items/robot';
 import { Program } from '../items/program';
 import { Mat4, poseFromZ, multiply, invert, transl, mul, normalize, sub, cross, norm, Vec3, transformPoint, transformDir, rotz, DEG } from '../math/pose';
-import { solveIKWithCarrier, applyCombined } from '../kinematics/combined';
+import { solveIKWithCarrier, applyCombined, carrierOf } from '../kinematics/combined';
 
 export interface FollowOptions {
   /** Approach/retract distance along -Z of the tool (mm). */
@@ -115,6 +115,14 @@ export function generateCurveFollow(station: Station, robot: Robot, object: Scen
   const spins = opts.optimizeToolZ ? Array.from({ length: Math.round(360 / spinStep) }, (_, i) => -180 + i * spinStep) : [0];
   const carrier = opts.carrier ?? null;
   const carrierBase = carrier ? carrier.poseAbs() : null;
+  /** Absolute TCP pose reached by a combined carrier + robot solution (robot state restored afterwards). */
+  const reachedWithCarrier = (sol: { carrierJoints: number[]; robotJoints: number[] }): Mat4 => {
+    const qc = carrier!.joints(), qr = robot.joints();
+    applyCombined(carrier!, robot, sol);
+    const abs = robot.poseTCPAbs();
+    applyCombined(carrier!, robot, { carrierJoints: qc, robotJoints: qr });
+    return abs;
+  };
   /** Solve IK for an absolute pose, optionally over spin candidates and with the carrier. Returns joints or null. */
   const solve = (absPose: Mat4, seed: number[], first: boolean): { q: number[]; abs: Mat4; carrierQ?: number[] } | null => {
     let best: { q: number[]; abs: Mat4; carrierQ?: number[]; cost: number } | null = null;
@@ -124,20 +132,33 @@ export function generateCurveFollow(station: Station, robot: Robot, object: Scen
         const sol = solveIKWithCarrier(carrier, robot, multiply(invert(carrierBase), cand), { seed: [...carrier.joints(), ...seed], restarts: first ? 2 : 0, maxIterations: first ? 200 : 100, freeToolZ: ikOpts.freeToolZ });
         if (!sol.ok) continue;
         const cost = sol.robotJoints.reduce((a, v, i) => a + Math.abs(v - seed[i]), 0) + sol.carrierJoints.reduce((a, v, i) => a + Math.abs(v - carrier.joints()[i]) * 0.05, 0);
-        if (!best || cost < best.cost) best = { q: sol.robotJoints, abs: cand, carrierQ: sol.carrierJoints, cost };
+        if (!best || cost < best.cost) best = { q: sol.robotJoints, abs: ikOpts.freeToolZ ? reachedWithCarrier(sol) : cand, carrierQ: sol.carrierJoints, cost };
       } else {
         const r = robot.solveIK(multiply(invert(base), cand), { seed, ...ikOpts, ...(first ? { restarts: 6, maxIterations: 200 } : {}), keepFirstSolution: !(opts.preferredConfig ?? true) });
         if (!r.ok) continue;
         const cost = r.joints.reduce((a, v, i) => a + Math.abs(v - seed[i]), 0);
-        if (!best || cost < best.cost) best = { q: r.joints, abs: cand, cost };
+        // tool-axis freedom: store the pose the robot reaches (optimised rotation about tool Z), like RoboDK
+        if (!best || cost < best.cost) best = { q: r.joints, abs: ikOpts.freeToolZ ? multiply(base, robot.solveFK(r.joints)) : cand, cost };
       }
       if (!opts.optimizeToolZ) break;
     }
     return best;
   };
+  // targets carry the carrier joints as synchronised external axes (6+N joints, RoboDK convention) so the simulator
+  // moves the carrier with the arm; only when the carrier is the robot's synchronised axis (its mount)
+  const syncCarrier = !!carrier && carrierOf(robot) === carrier;
+  const withExt = (q: number[], carrierQ?: number[]): number[] => (syncCarrier && carrierQ ? [...q, ...carrierQ] : q);
   const applyCarrier = (carrierQ?: number[]) => { if (carrier && carrierQ) applyCombined(carrier, robot, { carrierJoints: carrierQ, robotJoints: robot.joints() }); };
+  // tool-axis freedom: aim each target's X axis like the last reached pose (no needless rotation about the tool axis,
+  // so the wrist does not wind up along closed curves and run into its joint limit)
+  let lastReached: Mat4 | null = null;
+  const aimed = (abs: Mat4): Mat4 => {
+    if (!ikOpts.freeToolZ || !lastReached || opts.optimizeToolZ) return abs;
+    const z: Vec3 = [abs[8], abs[9], abs[10]], lx: Vec3 = [lastReached[0], lastReached[1], lastReached[2]];
+    return norm(cross(lx, z)) > 0.2 ? poseFromZ([abs[12], abs[13], abs[14]], z, lx) : abs;
+  };
   for (let i = 0; i < poses.length; i++) {
-    const { abs } = poses[i];
+    const abs = aimed(poses[i].abs);
     if (i === 0) {
       const app = mul(abs, transl(0, 0, -approach));
       const r0 = solve(app, q, true);
@@ -145,10 +166,11 @@ export function generateCurveFollow(station: Station, robot: Robot, object: Scen
         applyCarrier(r0.carrierQ);
         const t = frame.addChild(new Target('Approach'));
         t.setPose(multiply(invert(frame.poseAbs()), r0.abs));
-        t.setJoints(r0.q);
-        if (carrier) { t.setJoints(r0.q); t.setParam('carrierJoints', r0.carrierQ ?? []); }
+        t.setJoints(withExt(r0.q, r0.carrierQ));
+        if (carrier) t.setParam('carrierJoints', r0.carrierQ ?? []);
         prog.addMoveJ(t);
         q = r0.q;
+        lastReached = r0.abs;
       }
       if (opts.io) prog.setDO(opts.io, true);
     }
@@ -156,10 +178,11 @@ export function generateCurveFollow(station: Station, robot: Robot, object: Scen
     if (!r) { unreachable++; continue; }
     applyCarrier(r.carrierQ);
     q = r.q;
+    lastReached = r.abs;
     n++;
     const t = frame.addChild(new Target(`P${n}`));
     t.setPose(multiply(invert(frame.poseAbs()), r.abs));
-    t.setJoints(r.q);
+    t.setJoints(withExt(r.q, r.carrierQ));
     if (carrier) t.setParam('carrierJoints', r.carrierQ ?? []);
     if (opts.linear === false) prog.addMoveJ(t); else prog.addMoveL(t);
   }
@@ -200,8 +223,11 @@ export function generatePointFollow(station: Station, robot: Robot, object: Scen
     if (!rA.ok || !rP.ok) { unreachable++; continue; }
     n++;
     const local = multiply(invert(objAbs), abs);
-    const tA = frame.addChild(new Target(`Approach ${n}`)); tA.setPose(mul(local, transl(0, 0, -approach))); tA.setJoints(rA.joints);
-    const tP = frame.addChild(new Target(`Point ${n}`)); tP.setPose(local); tP.setJoints(rP.joints);
+    // tool-axis freedom: store the poses the robot reaches (rotation about tool Z chosen by the solver)
+    const free = opts.freeToolZ ?? true;
+    const reached = (q: number[]) => multiply(invert(objAbs), multiply(base, robot.solveFK(q)));
+    const tA = frame.addChild(new Target(`Approach ${n}`)); tA.setPose(free ? reached(rA.joints) : mul(local, transl(0, 0, -approach))); tA.setJoints(rA.joints);
+    const tP = frame.addChild(new Target(`Point ${n}`)); tP.setPose(free ? reached(rP.joints) : local); tP.setJoints(rP.joints);
     prog.addMoveJ(tA);
     prog.addMoveL(tP);
     if (opts.io) { prog.setDO(opts.io, true); prog.pause(200); prog.setDO(opts.io, false); }

@@ -1,5 +1,5 @@
 import { Mat4, poseToQuat, RAD, DEG, multiply, invert } from '../math/pose';
-import { ChainDef, flangePoseInto, jacobian, jointLimits, actuatedIndices, homeJoints, chainInfo } from './chain';
+import { ChainDef, flangePoseInto, jacobianInto, jointLimits, actuatedIndices, homeJoints, chainInfo } from './chain';
 import { solveAnalytic, analyzeChain, configFlags, wristSingularity } from './ik_analytic';
 import { wrap180 } from '../units';
 
@@ -137,6 +137,8 @@ export function inverseKinematics(chain: ChainDef, target: Mat4, opts: IKOptions
   const wRot = chainScale(chain); // 1 rad of orientation error ~ one arm length
   const nE = opts.positionOnly ? 3 : 6;
   const A: number[][] = Array.from({ length: n }, () => new Array(n + 1).fill(0));
+  const Jfull: number[][] = Array.from({ length: 6 }, () => new Array(n).fill(0));
+  const J3 = Jfull.slice(0, 3); // shares the rows of Jfull
   const fk = new Float64Array(16);
   const dr = [0, 0, 0];
   const e = new Array(6).fill(0);
@@ -170,9 +172,9 @@ export function inverseKinematics(chain: ChainDef, target: Mat4, opts: IKOptions
     let it = 0, stall = 0, minPivot = 1;
     for (; it < maxIt; it++) {
       if (err.pos < posTol && err.rot < rotTol) return { ok: true, joints: q, iterations: it, posError: err.pos, rotError: err.rot, method: 'numeric' };
-      let J = jacobian(chain, q);
-      if (opts.positionOnly) J = J.slice(0, 3);
-      else J = J.map((row, r) => (r >= 3 ? row.map((v) => v * wRot) : row));
+      jacobianInto(chain, q, Jfull);
+      if (!opts.positionOnly) for (let r = 3; r < 6; r++) for (let k = 0; k < n; k++) Jfull[r][k] *= wRot;
+      const J = opts.positionOnly ? J3 : Jfull;
       if (opts.freeToolZ && !opts.positionOnly) {
         // project the angular rows: no motion is required about the tool Z axis
         const z = [target[8], target[9], target[10]];

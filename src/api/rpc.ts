@@ -7,6 +7,7 @@
  *   {"$pose": [[r0],[r1],[r2],[r3]]}  4x4 pose, row-major rows (16-element arrays are column-major Mat4)
  *   {"$mat": [[...],...]}             general matrix, rows
  *   {"$bytes": base64}                binary data
+ *   (x_item / x_pose are accepted for $item / $pose: MATLAB's jsonencode cannot write '$' field names)
  * A request without "target" is a Robolink call; "target": null is a call on an invalid item (raises, like RoboDK),
  * "target": id a call on that item.
  */
@@ -56,8 +57,9 @@ function bytesToB64(b: Uint8Array): string {
 export function decodeValue(RDK: Robolink, v: any): any {
   if (Array.isArray(v)) return v.map((x) => decodeValue(RDK, x));
   if (v && typeof v === 'object') {
-    if ('$item' in v) return new RobolinkItem(RDK, v.$item ? RDK.station.findById(String(v.$item)) : null);
-    if ('$pose' in v) return new Mat(Array.isArray(v.$pose[0]) ? fromRows(v.$pose) : Float64Array.from(v.$pose));
+    // x_item / x_pose: the same markers as MATLAB's jsonencode/jsondecode spell them ('$' is not a valid field name)
+    if ('$item' in v || 'x_item' in v) { const id = v.$item ?? v.x_item; return new RobolinkItem(RDK, id ? RDK.station.findById(String(id)) : null); }
+    if ('$pose' in v || 'x_pose' in v) { const p = v.$pose ?? v.x_pose; return new Mat(Array.isArray(p[0]) ? fromRows(p) : Float64Array.from(p)); }
     if ('$mat' in v) return (v.$mat as any[]).map((r) => (Array.isArray(r) ? r.map(Number) : [Number(r)]));
     if ('$bytes' in v) return b64ToBytes(v.$bytes);
     const o: any = {}; for (const [k, x] of Object.entries(v)) o[k] = decodeValue(RDK, x); return o;

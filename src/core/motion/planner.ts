@@ -19,6 +19,7 @@ import { Item, Target } from '../items/item';
 import type { MoveInstruction } from '../items/program';
 import { carrierOf, solveIKWithCarrier } from '../kinematics/combined';
 import { actuatedIndices } from '../kinematics/chain';
+import { wristSingularity } from '../kinematics/ik_analytic';
 import type { Trajectory, TrajectorySample } from './trajectory';
 
 export interface MotionSettings { speedLinear: number; speedJoints: number; accelLinear: number; accelJoints: number; rounding: number }
@@ -170,7 +171,8 @@ export class MotionGroup {
         if (k >= 0 && k !== this.carrierIdx) info = { k, rel: multiply(invert(multiply(this.extAbs[k], this.ext[k].solveFKFlange())), item.poseAbs()) };
       }
       this.refs.set(item, info);
-      if (!info) this.absCache.set(item, item.poseAbs());
+      // a robot used as reference frame means its flange (RoboDK "Set Ref.: <robot>", a part held by another robot)
+      if (!info) this.absCache.set(item, item instanceof Robot && item !== this.robot ? multiply(item.poseAbs(), item.solveFKFlange()) : item.poseAbs());
     }
     if (!info) return this.absCache.get(item)!;
     return multiply(multiply(this.extAbs[info.k], this.ext[info.k].solveFKFlange(this.extJoints(e, info.k))), info.rel);
@@ -186,8 +188,10 @@ export function motionGroupFor(robot: Robot, refs: Iterable<Item | null> = []): 
   const st = robot.station;
   const ext: Robot[] = [];
   for (const id of robot.externalAxes ?? []) { const m = st?.findById(id); if (m instanceof Robot && m !== robot && !ext.includes(m)) ext.push(m); }
+  // a rail / gantry / turntable carrying an arm moves with it; a tool mechanism (gun, gripper) carried by an arm does not
+  // make the arm its external axis
   const c = carrierOf(robot);
-  if (c && !ext.includes(c)) ext.unshift(c);
+  if (c && !ext.includes(c) && robot.dof >= 5 && c.dof <= 3) ext.unshift(c);
   let n = robot.dof + ext.reduce((a, m) => a + m.dof, 0);
   for (const r of refs) {
     const q = r instanceof Target ? r.joints : null;
@@ -226,6 +230,12 @@ export interface ChainMoveSpec {
   tool: Mat4;
   /** Active reference frame (inline poses are relative to it; null = robot base). */
   frame: Item | null;
+  /**
+   * Reference frame set explicitly (Set Ref. instruction, program frame or the robot's active frame): Cartesian targets
+   * are taken relative to it like RoboDK (target pose in its own frame, applied to the active frame), so one program
+   * serves several parts by changing the reference. Null: targets at their absolute pose.
+   */
+  targetFrame?: Item | null;
   settings: MotionSettings;
 }
 
@@ -237,10 +247,15 @@ const posOf = (m: Mat4): Vec3 => [m[12], m[13], m[14]];
 class GeomBuilder {
   constructor(readonly g: MotionGroup) {}
   get robot() { return this.g.robot; }
-  ik(P: Mat4, seed: number[], tool: Mat4): { ok: boolean; q: number[]; posError: number; rotError: number } {
+  private analytic?: boolean;
+  /** IK seeded by the previous knot. Closed-form robots: `precise` = false keeps the numeric residual estimate of a failure short (bisection probes). */
+  ik(P: Mat4, seed: number[], tool: Mat4, precise = false): { ok: boolean; q: number[]; posError: number; rotError: number } {
     const dof = this.g.dof;
-    let r = this.robot.solveIK(P, { seed: seed.slice(0, dof), keepFirstSolution: true, restarts: 0, maxIterations: 60 }, tool);
-    if (!r.ok) r = this.robot.solveIK(P, { seed: seed.slice(0, dof), keepFirstSolution: true, restarts: 2, maxIterations: 150 }, tool);
+    this.analytic ??= this.robot.hasAnalyticIK();
+    let r = this.robot.solveIK(P, { seed: seed.slice(0, dof), keepFirstSolution: true, restarts: 0, maxIterations: this.analytic && !precise ? 1 : 60 }, tool);
+    // numeric chains, and closed-form ones on the final (precise) attempt, get restarts: next to a singularity the
+    // closed form can reject a reachable point by rounding and the damped solver still lands on it
+    if (!r.ok && (!this.analytic || precise)) r = this.robot.solveIK(P, { seed: seed.slice(0, dof), keepFirstSolution: true, restarts: 2, maxIterations: 150 }, tool);
     // near a wrist singularity the numeric solver can stall a few microns short of its 1e-3 mm tolerance:
     // such a point is on the path within half the path tolerance, accept it
     const ok = r.ok || (r.posError <= TOL_P / 2 && r.rotError <= TOL_R / 2);
@@ -277,7 +292,7 @@ class GeomBuilder {
   }
 
   /** Cartesian path: march with continuous IK, then refine adaptively. */
-  cartGeom(at: (s: number) => CartPoint, q0: number[], tool: Mat4, settings: MotionSettings, label: string, approxLen: number, evenN = false): Geom {
+  cartGeom(at: (s: number) => CartPoint, q0: number[], tool: Mat4, settings: MotionSettings, label: string, approxLen: number, evenN = false, qEnd?: number[]): Geom {
     const g = this.g, dof = g.dof;
     const p0 = at(0), p1 = at(1);
     const ang = rotationAngle(p0.P, p1.P) * RAD;
@@ -286,6 +301,12 @@ class GeomBuilder {
     if (evenN) N = Math.max(2, N + (N % 2));
     const knots: Knot[] = [{ s: 0, q: g.full(q0, q0), pose: p0.disp, x: p0.x }];
     const geom: Geom = { cart: true, knots, ok: true, warnings: [], at, tool, settings, pathLen: 0 };
+    // RoboDK rejects a linear / circular move that starts exactly at a wrist singularity (axes 4 and 6 aligned, e.g. the
+    // KUKA home posture with J5 = 0): the wrist split of J4/J6 is undefined there (01.d InspectA / RetractInspectA)
+    if (label !== 'Blend' && (approxLen > 1e-3 || ang > 1e-4)) {
+      const ws = wristSingularity(this.robot.chain, q0.slice(0, dof));
+      if (ws !== null && ws < 1e-5) { geom.ok = false; geom.error = `${label} starts at a wrist singularity (axes 4 and 6 aligned): use a joint move first`; return geom; }
+    }
     // adaptive march: the IK of each knot is seeded by the previous one and the step shrinks until the joints move
     // less than MAX_STEP, so fast wrist rotations near a singularity stay on the same branch (RoboDK keeps the config)
     let prev = knots[0];
@@ -294,15 +315,30 @@ class GeomBuilder {
     while (prev.s < 1 - 1e-12) {
       let sn = Math.min(1, prev.s + step);
       let p = sn === 1 ? p1 : at(sn);
-      let r = this.ik(p.P, prev.q, tool);
+      // a known end configuration (blend zones end on a solved knot) saves the IK of the last knot
+      let r = sn === 1 && qEnd ? { ok: true, q: qEnd.slice(0, dof), posError: 0, rotError: 0 } : this.ik(p.P, prev.q, tool);
       while ((!r.ok || maxDelta(r.q, prev.q, dof) > MAX_STEP) && sn - prev.s > 1e-5) {
         sn = (prev.s + sn) / 2;
         p = at(sn);
         r = this.ik(p.P, prev.q, tool);
       }
-      if (!r.ok) { geom.ok = false; geom.error = this.failMsg(label, sn, r.posError, r.rotError); break; }
+      if (!r.ok) r = this.ik(p.P, prev.q, tool, true);
+      if (!r.ok) {
+        geom.ok = false;
+        // the path leaves the workspace towards an unreachable end pose: "unreachable" (a start in a singular posture
+        // keeps the singularity wording)
+        const endR = sn > 0.01 && r.posError < 1 ? this.ik(p1.P, prev.q, tool, true) : null;
+        geom.error = endR && !endR.ok && endR.posError >= 1 ? `${label} unreachable at ${(sn * 100).toFixed(1)}% (target out of reach by ${endR.posError.toFixed(1)} mm)` : this.failMsg(label, sn, r.posError, r.rotError);
+        break;
+      }
       const dq = maxDelta(r.q, prev.q, dof);
-      if (dq > MAX_STEP) { geom.ok = false; geom.error = `Joint jump of ${dq.toFixed(0)} deg (singularity) at ${(sn * 100).toFixed(0)}%`; break; }
+      if (dq > MAX_STEP) {
+        geom.ok = false;
+        // the branch being followed ran into a joint limit (the solver switched configuration), or a singularity
+        const lim = prev.q.slice(0, dof).findIndex((v, i) => v - g.lower[i] < 3 || g.upper[i] - v < 3);
+        geom.error = lim >= 0 ? `${label} reaches the J${lim + 1} joint limit at ${(sn * 100).toFixed(0)}%` : `Joint jump of ${dq.toFixed(0)} deg (singularity) at ${(sn * 100).toFixed(0)}%`;
+        break;
+      }
       const kn: Knot = { s: sn, q: [...r.q, ...p.e], pose: p.disp, x: p.x };
       const err = this.refine(at, prev, kn, tool, label, knots);
       if (err) { geom.ok = false; geom.error = err; break; }
@@ -370,22 +406,28 @@ function moveGeometry(b: GeomBuilder, q0: number[], spec: ChainMoveSpec, extEnd?
   const e0 = q0.slice(dof, g.n);
   const failed = (msg: string): Geom => ({ cart: false, knots: [{ s: 0, q: q0, pose: b.fkDisp(q0, tool), x: posOf(b.fkDisp(q0, tool)) }], ok: false, error: msg, warnings: [], tool, settings: spec.settings, pathLen: 0 });
   const extOf = (t: Target | null): number[] | null => extEnd ?? (t?.joints && t.joints.length >= g.n && g.n > dof ? t.joints.slice(dof, g.n) : null);
+  // RoboDK: a Cartesian target is its pose relative to its parent frame, applied to the active reference frame
+  const tf = spec.targetFrame ?? null;
+  const relFrame = (t: Target | null): boolean => !!(tf && t && t.parent !== tf);
+  const targetAbs = (t: Target, e: number[]): Mat4 => (relFrame(t) ? multiply(g.refAbs(tf, e), t.pose()) : g.refAbs(t, e));
   const inLimits = (q: number[], tol = 0.5) => q.every((v, i) => Number.isFinite(v) && v >= g.lower[i] - tol && v <= g.upper[i] + tol);
   const clampQ = (q: number[]) => q.map((v, i) => Math.min(g.upper[i], Math.max(g.lower[i], v)));
   if (d.moveType === 'MoveJ') {
     let q1: number[] | null = null;
     if (target) {
       const j = target.joints;
-      if (target.isJointTarget && j && j.length >= dof) q1 = g.full(j, q0);
+      // joint targets, and any target of a mechanism (gripper / gun / positioner: < 5 axes, its pose does not define
+      // its joints), go to their stored joints
+      if ((target.isJointTarget || dof < 5) && j && j.length >= dof) q1 = g.full(j, q0);
       else {
         const e1 = extOf(target) ?? e0;
-        const P = multiply(invert(g.baseAbs(e1)), g.refAbs(target, e1));
+        const P = multiply(invert(g.baseAbs(e1)), targetAbs(target, e1));
         const stored = j && j.length >= dof && j.slice(0, dof).every(Number.isFinite) ? j.slice(0, dof) : null;
         const r = robot.solveIK(P, { seed: stored ?? q0.slice(0, dof) }, tool);
         if (r.ok) q1 = [...r.joints, ...e1];
         else if (g.hasCarrier && !extOf(target) && g.ext.length === 1) {
           const c = g.carrier!;
-          const sol = solveIKWithCarrier(c, robot, multiply(invert(c.poseAbs()), target.poseAbs()), { seed: [...c.joints(), ...(stored ?? q0.slice(0, dof))] });
+          const sol = solveIKWithCarrier(c, robot, multiply(invert(c.poseAbs()), targetAbs(target, e0)), { seed: [...c.joints(), ...(stored ?? q0.slice(0, dof))] });
           if (sol.ok) q1 = [...sol.robotJoints, ...sol.carrierJoints];
         }
       }
@@ -403,11 +445,22 @@ function moveGeometry(b: GeomBuilder, q0: number[], spec: ChainMoveSpec, extEnd?
   }
   // ---- Cartesian moves ----
   let ref: Item | null = null, relEnd: Mat4;
-  let e1 = e0;
+  let e1 = e0, inlineFromJoints = false;
   if (target) {
     if (target.isJointTarget && target.joints && target.joints.length >= dof) { relEnd = robot.solveFK(target.joints.slice(0, dof), tool); e1 = extOf(target) ?? e0; }
+    else if (relFrame(target)) { ref = tf; relEnd = target.pose(); e1 = extOf(target) ?? e0; }
     else { ref = target; relEnd = identity(); e1 = extOf(target) ?? e0; }
-  } else if (d.pose) { ref = spec.frame; relEnd = fromArray(d.pose); }
+  } else if (d.pose) {
+    // inline target (machining / curve-follow moves): its stored 6+N joints carry the synchronised external axes
+    ref = spec.frame; relEnd = fromArray(d.pose);
+    e1 = extEnd ?? (d.joints && d.joints.length >= g.n && g.n > dof ? d.joints.slice(dof, g.n) : e0);
+    // a stored pose that does not match its stored joints (seen in imported stations, e.g. RoboDK 03.i where the
+    // joints are what RoboDK plays): the joints win
+    if (d.joints && d.joints.length >= dof && d.joints.slice(0, dof).every(Number.isFinite)) {
+      const viaJ = multiply(invert(g.refAbs(ref, e1)), multiply(g.baseAbs(e1), robot.solveFK(d.joints.slice(0, dof), tool)));
+      if (norm(sub3(posOf(viaJ), posOf(relEnd))) > 1 || rotationAngle(viaJ, relEnd) > 0.01) { relEnd = viaJ; inlineFromJoints = true; }
+    }
+  }
   else if (d.joints && d.joints.length >= dof) relEnd = robot.solveFK(d.joints.slice(0, dof), tool);
   else return failed('pose could not be resolved');
   const label = d.moveType;
@@ -417,7 +470,7 @@ function moveGeometry(b: GeomBuilder, q0: number[], spec: ChainMoveSpec, extEnd?
   let approxLen = norm(sub3(posOf(relEnd), posOf(rel0)));
   if (d.moveType === 'MoveC') {
     let viaRel: Mat4 | null = null;
-    if (spec.via) viaRel = multiply(invert(refAbs0), g.refAbs(spec.via, e0));
+    if (spec.via) viaRel = multiply(invert(refAbs0), targetAbs(spec.via, e0));
     else if (d.viaPose) viaRel = multiply(invert(refAbs0), multiply(g.refAbs(spec.frame, e0), fromArray(d.viaPose)));
     if (!viaRel) return failed('MoveC via point missing');
     const circ = circleThrough(posOf(rel0), posOf(viaRel), posOf(relEnd));
@@ -439,6 +492,7 @@ function moveGeometry(b: GeomBuilder, q0: number[], spec: ChainMoveSpec, extEnd?
     if (sol.ok) return moveGeometry(b, q0, spec, sol.carrierJoints);
   }
   const geo = b.cartGeom(at, q0, tool, spec.settings, label, approxLen);
+  if (inlineFromJoints) geo.warnings.push('Inline target pose differs from its stored joints: the joints were used');
   if (geo.ok && target?.isJointTarget && target.joints && maxDelta(geo.knots[geo.knots.length - 1].q, target.joints, dof) > 1) geo.warnings.push(`${label} ends in a different configuration than joint target ${target.name}`);
   return geo;
 }
@@ -463,9 +517,9 @@ function cutKnots(geo: Geom, s0: number, s1: number, b: GeomBuilder): Knot[] {
     let q = lerpQ(a.q, c.q, f);
     let pose: Mat4, x: Vec3;
     if (geo.cart && geo.at) {
+      // knot intervals are refined until the joint interpolation stays within the path tolerance: interpolate (no IK)
       const p = geo.at(s);
-      const r = b.ik(p.P, q, geo.tool);
-      if (r.ok) q = [...r.q, ...p.e];
+      q = [...q.slice(0, b.g.dof), ...p.e];
       pose = p.disp; x = p.x;
     } else { q = geo.qAt ? geo.qAt(s) : q; pose = b.fkDisp(q, geo.tool); x = posOf(pose); }
     return { s, q, pose, x };
@@ -526,7 +580,7 @@ export function planChain(g: MotionGroup, q0: number[], specs: ChainMoveSpec[]):
         return { P, e: [], x: pos, disp: P };
       };
       void pa; void pc; void pb;
-      const geo = b.cartGeom(at, ka.q, A.tool, A.settings, 'Blend', norm(sub3(ka.x, kc.x)) + norm(sub3(kb.x, kc.x)), true);
+      const geo = b.cartGeom(at, ka.q, A.tool, A.settings, 'Blend', norm(sub3(ka.x, kc.x)) + norm(sub3(kb.x, kc.x)), true, kb.q);
       const ks = geo.knots;
       if (geo.ok && maxDelta(ks[ks.length - 1].q, kb.q, g.dof) < 1) { knots = ks; blendCart[k] = true; }
     }
@@ -559,26 +613,37 @@ export function planChain(g: MotionGroup, q0: number[], specs: ChainMoveSpec[]):
   const stops = new Set<number>(); // node j = start of interval j
   for (const p of pieces) {
     const s = p.settings;
-    const tAccL = s.accelLinear > 0 ? s.speedLinear / s.accelLinear : 0;
-    const tAccJ = s.accelJoints > 0 ? s.speedJoints / s.accelJoints : 0;
     if (p.stopBefore) stops.add(ivs.length);
     for (let i = 1; i < p.knots.length; i++) {
       const a = p.knots[i - 1], c = p.knots[i];
-      let dtJ = 0, tAcc = p.cart ? tAccL : tAccJ;
+      // dtau: interval time at full speed (programmed linear / rotation / joint speeds and per-joint limits)
+      let dt = 0, dx = 0, dth = 0;
+      const dq: number[] = [];
       for (let j = 0; j < g.n; j++) {
         const dqj = Math.abs((c.q[j] ?? 0) - (a.q[j] ?? 0));
+        dq.push(dqj);
         if (dqj < 1e-12) continue;
         const w = p.cart ? g.vmax[j] : g.jointSpeed(j, s);
-        if (Number.isFinite(w) && w > 0) dtJ = Math.max(dtJ, dqj / w);
-        if (Number.isFinite(g.amax[j]) && Number.isFinite(w)) tAcc = Math.max(tAcc, w / g.amax[j]);
+        if (Number.isFinite(w) && w > 0) dt = Math.max(dt, dqj / w);
       }
-      let dt = dtJ, dx = 0;
       if (p.cart) {
         dx = norm(sub3(c.x, a.x));
-        const dth = rotationAngle(a.pose, c.pose) * RAD;
+        dth = rotationAngle(a.pose, c.pose) * RAD;
         dt = Math.max(dt, dx / Math.max(1e-9, s.speedLinear), dth / Math.max(1e-9, s.speedJoints));
       }
-      ivs.push({ a, b: c, move: p.move, dtau: dt, acc: tAcc > 0 ? 1 / tAcc : Infinity, vfull: dt > 0 ? dx / dt : 0, cart: p.cart });
+      // acceleration of the speed fraction (1/s^2): linear acceleration on the path, joint accelerations (programmed
+      // joint acceleration for joint moves, robot maximum per joint) on every moving joint. No separate rotational
+      // acceleration limit: RoboDK cycle times of reorientation-heavy paths (02.g Tour Eiffel) match without it
+      let acc = Infinity;
+      if (dt > 0) {
+        for (let j = 0; j < g.n; j++) {
+          if (dq[j] < 1e-12) continue;
+          const aj = p.cart ? g.amax[j] : Math.min(g.amax[j], g.prismatic[j] ? s.accelLinear : s.accelJoints);
+          if (aj > 0 && Number.isFinite(aj)) acc = Math.min(acc, (aj * dt) / dq[j]);
+        }
+        if (p.cart && dx > 1e-9 && s.accelLinear > 0) acc = Math.min(acc, (s.accelLinear * dt) / dx);
+      }
+      ivs.push({ a, b: c, move: p.move, dtau: dt, acc, vfull: dt > 0 ? dx / dt : 0, cart: p.cart });
     }
   }
   // velocity passes (phi = fraction of the full speed of each interval)
@@ -591,14 +656,14 @@ export function planChain(g: MotionGroup, q0: number[], specs: ChainMoveSpec[]):
   const phiL = new Array(N + 1).fill(0), phiR = new Array(N + 1).fill(0);
   const isStop = (j: number) => j === 0 || j === N || stops.has(j);
   for (let j = 0; j < N; j++) {
-    const v = Math.sqrt(phiR[j] * phiR[j] + 2 * ivs[j].acc * ivs[j].dtau);
+    const v = Math.sqrt(phiR[j] * phiR[j] + (ivs[j].dtau > 0 ? 2 * ivs[j].acc * ivs[j].dtau : 0));
     const nx = j + 1;
     if (isStop(nx)) { phiL[nx] = 0; phiR[nx] = 0; continue; }
     phiL[nx] = Math.min(1, 1 / kap[nx], v);
     phiR[nx] = Math.min(1, kap[nx] * phiL[nx]);
   }
   for (let j = N - 1; j >= 0; j--) {
-    const v = Math.sqrt(phiL[j + 1] * phiL[j + 1] + 2 * ivs[j].acc * ivs[j].dtau);
+    const v = Math.sqrt(phiL[j + 1] * phiL[j + 1] + (ivs[j].dtau > 0 ? 2 * ivs[j].acc * ivs[j].dtau : 0));
     if (isStop(j)) { phiL[j] = 0; phiR[j] = 0; continue; }
     phiR[j] = Math.min(phiR[j], v);
     phiL[j] = Math.min(phiL[j], phiR[j] / kap[j]);

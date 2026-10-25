@@ -16,13 +16,14 @@ Everything here is implemented; limits are stated explicitly.
 | NC / G-code (milling, cutting, dispensing, 3D printing) | drop `.nc`/`.gcode`/`.tap` → rapid/cut segments with feeds, spindle, tool and extrusion state on an object → `Robot › Robot machining project` | program with NC feeds as speeds, spindle/extruder outputs, approach/retract; same through the API (`setMachiningParameters`) |
 | Programs of robots the studio cannot solve | the RoboDK joint path becomes a `jointPath` instruction | exact replay of RoboDK's motion, exportable through posts |
 | Python programs / macros | name; source when RoboDK exposes it or the `.py` sits next to the station | scripts run against the studio's `robodk` drop-in package (`python/robodk`) |
-| Post processors | `Program › Import RoboDK post processors (.py)` — select any number of files from RoboDK's `Posts/` folder | the **original** RoboDK Python posts run unmodified in the browser (Pyodide) with the official Apache-2.0 `robodk.robomath` / `robofileio` modules and a headless `robodialogs`; persisted in the browser, selectable per robot and in the export dialog |
+| Post processors | built in: 27 RoboDK posts reproduced token for token (docs/posts.md); `Program › Import RoboDK post processors (.py)` for RoboDK's own files | RoboDK's **source** posts run in the browser (Pyodide, official `robodk.robomath` / `robofileio`, headless `robodialogs`); RoboDK's **compiled** posts (`libspp` native modules, most of `C:/RoboDK/Posts`) run on the studio server with RoboDK's embedded Python (`POST /posts/native/run`) |
 | RoboDK API | `RDK = Robolink()` from Python/C#/C++/MATLAB against the studio server, or the browser console | see `docs/robodk-compatibility.md` |
 
 Why not ship RoboDK's posts directly? They are distributed with the RoboDK installer, not in a public repository
 we can fetch from; importing them from your own installation is a one-time drag-and-drop and keeps their licence
-with you. The posts run exactly as in RoboDK: `ProgStart/MoveJ/MoveL/MoveC/setFrame/setTool/Pause/setDO/waitDI/RunCode/RunMessage/ProgFinish`
-are driven by the studio's compiled program (`src/posts/base.ts › compileForPost`).
+with you. The posts run as in RoboDK: `ProgStart/MoveJ/MoveL/MoveC/setFrame/setTool/Pause/setDO/waitDI/RunCode/RunMessage/ProgFinish/ProgSave`
+are driven by the studio's compiled program (`src/posts/base.ts › compileForPost`); compiled RoboDK posts need the studio
+server next to a RoboDK installation (`server/posts_native.ts`), source posts also run in the browser.
 
 ## Blender
 
@@ -69,9 +70,14 @@ The add-on's kinematics are unit-tested against the TypeScript implementation (`
 
 ## ROS / ROS 2
 
-- Import: `.urdf`/`.xacro` (+ meshes, `package://` resolved from dropped files or the online library repositories).
-- Export: URDF package (above); programs via the ROS 2 post (`ros2_control` JointTrajectory YAML/Python).
-- Live: rosbridge client in the browser (`src/ros/rosbridge.ts`) and the ROS 2 driver on the server (`server/drivers/ros2.ts`).
+Details and test evidence: [ros.md](ros.md).
+
+- Import: `.urdf`/`.xacro` with ROS 2 xacro semantics (equal to ROS `xacro` on 13 real packages), ROS package / workspace
+  folders or zips (`package.xml`, launch-file entry points and arguments, SRDF), kinematic trees (mobile base + every chain).
+- Export: URDF package keeping the imported description (names, inertials, ros2_control) with a display launch file and
+  SRDF; Nav2 / SLAM / EKF packages that start in ROS 2 Jazzy; programs via the ROS 2 post.
+- Live: rosbridge `sim` mode (the studio as a webots_ros2-compatible simulator backend), `publish` / `follow` mirrors, and
+  the name-mapping ROS 2 driver on the server (`server/drivers/ros2.ts`).
 
 ## Visual Components / KUKA.Sim Pro
 

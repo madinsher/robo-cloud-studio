@@ -6,7 +6,7 @@
  */
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import { chromium, Browser, Page, BrowserContext } from 'playwright';
-import { existsSync, readFileSync, mkdtempSync } from 'node:fs';
+import { existsSync, readFileSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { gunzipSync } from 'node:zlib';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -103,6 +103,26 @@ describe('simulation UX in the browser', () => {
     noErrors();
   });
 
+  it('URDF opened first, its STLs later: the placeholders are replaced in the 3D view and no stray objects appear', async () => {
+    await load('demo=none');
+    const dir = mkdtempSync(join(tmpdir(), 'vbs-urdf-'));
+    writeFileSync(join(dir, 'probe_bot.urdf'), `<robot name="probe_bot"><link name="base_link"><visual><geometry><mesh filename="package://probe/meshes/base_link.stl"/></geometry></visual></link>
+<link name="arm_link"><visual><geometry><mesh filename="package://probe/meshes/arm_link.stl"/></geometry></visual></link>
+<joint name="j1" type="revolute"><parent link="base_link"/><child link="arm_link"/><origin xyz="0 0 0.1"/><axis xyz="0 0 1"/><limit lower="-3" upper="3" effort="1" velocity="1"/></joint></robot>`);
+    const stl = (s: number) => { const b = Buffer.alloc(134); b.writeUInt32LE(1, 80); [0, 0, 0, s, 0, 0, 0, s, 0].forEach((v, k) => b.writeFloatLE(v, 84 + 12 + k * 4)); return b; };
+    writeFileSync(join(dir, 'base_link.stl'), stl(0.1)); writeFileSync(join(dir, 'arm_link.stl'), stl(0.2));
+    await openFiles([join(dir, 'probe_bot.urdf')], false);
+    await page.waitForFunction(() => (window as any).app.station.itemsOfType?.(2).length === 1);
+    await page.waitForTimeout(300);
+    expect((await meshStats()).missing).toBe(2);
+    await openFiles([join(dir, 'base_link.stl'), join(dir, 'arm_link.stl')], false);
+    await page.waitForTimeout(300);
+    const st = await meshStats();
+    expect(st.missing).toBe(0); expect(st.meshes).toBeGreaterThanOrEqual(2);
+    expect(await ev(() => (window as any).app.station.itemsOfType(5).map((o: any) => o.name))).toEqual([]);
+    noErrors();
+  });
+
   const PP2 = `${LIB}/Example-06.b-Pick and place 2 tables.rdk`;
   it.skipIf(!existsSync(PP2))('an imported RoboDK station saved with Ctrl+S reopens in a fresh page with every mesh', async () => {
     await load('demo=none');
@@ -144,10 +164,12 @@ describe('simulation UX in the browser', () => {
   }
 
   // RoboDK Library stations: main program run to its end; cycle time, final joints and final object poses vs RoboDK
-  const LIBRARY: Array<{ file: string; main: string; then?: string }> = [
+  const LIBRARY: Array<{ file: string; main: string; then?: string; moves?: string; minMove?: number }> = [
     { file: 'Example-01.b-Robot Drilling - KUKA.rdk', main: 'DrillingPart' },
     { file: 'Example-01.a-Robot Painting - Universal Robots.rdk', main: 'MainProg' },
-    { file: 'Example-06.b-Pick and place 2 tables.rdk', main: 'Pick and place', then: 'Replace objects' },
+    { file: 'Example-06.b-Pick and place 2 tables.rdk', main: 'Pick and place', then: 'Replace objects', moves: '^ball', minMove: 300 },
+    { file: 'Example-06.d-Pick and stamp.rdk', main: 'MainProgram', then: 'Replace Objects', moves: '^Phone Case [123]$', minMove: 100 },
+    { file: 'Example-05.e-Manufacturing with 2 robots.rdk', main: 'Main_Program' },
   ];
   for (const s of LIBRARY) {
     const truth = gt(s.file);
@@ -161,22 +183,39 @@ describe('simulation UX in the browser', () => {
         const p = progs.find((x: any) => x.name === a.main);
         if (!p) return { error: `program ${a.main} not found among ${progs.map((x: any) => x.name).join(', ')}` };
         app.select(p);
-        const h = app.runProgram(p); app.runToEnd(3 * a.cycle + 60);
+        const objPos = () => [...app.station.walk()].filter((i: any) => i.type === 5).map((o: any) => [o.name, Array.from(o.poseAbs()).slice(12, 15)]);
+        // play in 0.25 s steps and keep, per object, the largest distance from its start (06.b ends with "Replace objects")
+        const p0 = objPos(), far: number[] = p0.map(() => 0);
+        const h = app.runProgram(p);
+        for (let t = 0; app.activeRuns().length && t < 3 * a.cycle + 60; t += 0.25) {
+          app.seekProgram(app.simTime + 0.25);
+          objPos().forEach((e: any, i: number) => { far[i] = Math.max(far[i], Math.hypot(e[1][0] - p0[i][1][0], e[1][1] - p0[i][1][1])); });
+        }
+        app.runToEnd(60);
         const out: any = { status: h.status, error: h.error?.message, t: typeof h.endTime === 'number' ? h.endTime - (h.startTime ?? 0) : app.simTime, joints: (h.robot ?? app.activeRobot)?.joints?.() ?? null };
+        out.far = p0.map((e: any, i: number) => [e[0], far[i]]);
         if (a.then) { const q = progs.find((x: any) => x.name === a.then); if (q) { const h2 = app.runProgram(q); app.runToEnd(60); out.thenStatus = h2.status; } }
-        out.objects = Object.fromEntries([...app.station.walk()].filter((i: any) => i.type === 5).map((o: any) => [o.name, Array.from(o.poseAbs()).slice(12, 15)]));
+        out.objects = objPos();
         return out;
       }, { main: s.main, then: s.then, cycle: prog.update[1] });
       expect(res.error, JSON.stringify(res)).toBeUndefined();
       expect(res.status).toBe('done');
+      // the parts the program handles left their table (06.b: from Table 1 to Table 2 / the delivery table, 1.4 m away)
+      if (s.moves) for (const [n, d] of res.far.filter(([n]: [string]) => new RegExp(s.moves!, 'i').test(n))) expect(d, `${n}: farthest distance from its start during ${s.main} (mm)`).toBeGreaterThan(s.minMove ?? 300);
+      if (s.then) expect(res.thenStatus, s.then).toBe('done');
       // objects: either never moved, or (06.b) restored by "Replace objects" — final poses equal RoboDK's station poses
+      // names repeat (06.b has two objects called "base"): each RoboDK object is matched to the closest unused one of that name
+      const left: Array<[string, number[]]> = [...res.objects];
       for (const o of truth.objects) {
-        const p = res.objects[o.name];
-        expect(p, `object ${o.name}`).toBeTruthy();
         const g = rows16(o.poseAbs);
-        expect(Math.hypot(p[0] - g[0], p[1] - g[1], p[2] - g[2]), `object ${o.name}`).toBeLessThan(1);
+        const cands = left.filter(([n]) => n === o.name).map((e) => ({ e, d: Math.hypot(e[1][0] - g[0], e[1][1] - g[1], e[1][2] - g[2]) })).sort((x, y) => x.d - y.d);
+        expect(cands.length, `object ${o.name}`).toBeGreaterThan(0);
+        expect(cands[0].d, `object ${o.name}`).toBeLessThan(1);
+        left.splice(left.indexOf(cands[0].e), 1);
       }
-      const last = prog.jl?.at(-1);
+      // final joints = last row of RoboDK's InstructionListJoints, only when that list is complete (06.b: "Path is not
+      // continuous", status -1, the list stops at move 2 and its last row is not the end of the program)
+      const last = (prog.jlStatus ?? 0) >= 0 ? prog.jl?.at(-1) : null;
       if (last && res.joints) res.joints.forEach((q: number, i: number) => expect(Math.abs(q - last[i]), `final J${i + 1}: ${res.joints.map((x: number) => x.toFixed(2))} vs RoboDK ${last.slice(0, res.joints.length)}`).toBeLessThan(1));
       expect(Math.abs(res.t - prog.update[1]) / prog.update[1], `cycle ${res.t} s vs RoboDK ${prog.update[1]} s`).toBeLessThan(0.1);
       noErrors();

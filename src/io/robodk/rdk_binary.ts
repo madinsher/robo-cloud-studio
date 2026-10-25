@@ -20,7 +20,17 @@ export interface RobodkLoad {
   report: RdkScanReport;
 }
 
+/** Node's zlib when running under Node (server, headless runs, tests): ~5× faster than DecompressionStream there. */
+type NodeZlib = { inflateSync: (b: Uint8Array) => Uint8Array; gunzipSync: (b: Uint8Array) => Uint8Array };
+function zlibOfNode(): NodeZlib | null {
+  // process.getBuiltinModule (Node >= 22.3): no import statement, so browser bundles never reference node:zlib
+  const proc = (globalThis as { process?: { getBuiltinModule?: (id: string) => unknown } }).process;
+  try { return (proc?.getBuiltinModule?.('node:zlib') as NodeZlib | undefined) ?? null; } catch { return null; }
+}
+
 async function inflate(buf: Uint8Array, format: 'deflate' | 'gzip'): Promise<Uint8Array | null> {
+  const z = zlibOfNode();
+  if (z) { try { const out = format === 'gzip' ? z.gunzipSync(buf) : z.inflateSync(buf); return new Uint8Array(out.buffer, out.byteOffset, out.byteLength); } catch { /* fall through */ } }
   try {
     if (typeof DecompressionStream === 'undefined') return null;
     const ds = new DecompressionStream(format);

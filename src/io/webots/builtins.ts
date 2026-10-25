@@ -8,8 +8,8 @@ import type { WNode, WValue, ProtoFieldDecl } from './vrml';
 
 export interface BuiltinProto {
   fields: ProtoFieldDecl[];
-  /** Build the base-node tree for the resolved field values. */
-  build(values: Record<string, WValue>, instance: WNode): WNode;
+  /** Build the base-node tree for the resolved field values (`warn`: report line, e.g. a field reset like Webots does). */
+  build(values: Record<string, WValue>, instance: WNode, warn?: (msg: string) => void): WNode;
   /** Appearance-like PROTOs accept any field without a warning. */
   lenient?: boolean;
 }
@@ -22,6 +22,12 @@ const nodes = (ns: WNode[]): WValue => ({ k: 'nodes', v: ns });
 const N = (type: string, fields: Record<string, WValue>, meta?: Record<string, unknown>): WNode => ({ type, fields, base: `builtin:${type}`, ...(meta ? { meta } : {}) });
 const fd = (type: string, name: string, def: WValue): ProtoFieldDecl => ({ kind: 'field', type, name, def });
 const nums = (v: WValue | undefined, d: number[]) => (v && v.k === 'num' && v.v.length ? v.v : d);
+/** Webots resets non-positive sizes of the standard PROTOs to the field default (with a console error); same here. */
+const positive = (proto: string, field: string, v: number[], d: number[], warn?: (msg: string) => void): number[] => {
+  if (v.every((x) => x > 0)) return v;
+  warn?.(`${proto}: '${field}' must be strictly positive, reset to ${d.join(' ')} (as Webots does)`);
+  return d;
+};
 const nodeOf = (v: WValue | undefined): WNode | null => (v ? (v.k === 'node' ? v.v : v.k === 'nodes' ? v.v[0] ?? null : null) : null);
 
 /** Representative colours of the standard appearance PROTOs (texture-free approximation). */
@@ -81,8 +87,8 @@ const floorAppearanceDefault = () => node(N('Parquetry', { type: str('chequered'
 
 const Floor: BuiltinProto = {
   fields: [fd('SFVec3f', 'translation', num(0, 0, 0)), fd('SFRotation', 'rotation', num(0, 0, 1, 0)), fd('SFString', 'name', str('floor')), fd('SFString', 'contactMaterial', str('default')), fd('SFVec2f', 'size', num(10, 10)), fd('SFVec2f', 'tileSize', num(0.5, 0.5)), fd('SFNode', 'appearance', floorAppearanceDefault())],
-  build(v) {
-    const size = nums(v.size, [10, 10]);
+  build(v, _i, warn) {
+    const size = positive('Floor', 'size', nums(v.size, [10, 10]), [10, 10], warn);
     const app = nodeOf(v.appearance);
     return N('Solid', {
       translation: v.translation, rotation: v.rotation, name: v.name, contactMaterial: v.contactMaterial, locked: bool(true),
@@ -94,13 +100,13 @@ const Floor: BuiltinProto = {
 
 const RectangleArena: BuiltinProto = {
   fields: [fd('SFVec3f', 'translation', num(0, 0, 0)), fd('SFRotation', 'rotation', num(0, 0, 1, 0)), fd('SFString', 'name', str('rectangle arena')), fd('SFString', 'contactMaterial', str('default')), fd('SFVec2f', 'floorSize', num(1, 1)), fd('SFVec2f', 'floorTileSize', num(0.5, 0.5)), fd('SFNode', 'floorAppearance', floorAppearanceDefault()), fd('SFFloat', 'wallThickness', num(0.01)), fd('SFFloat', 'wallHeight', num(0.1)), fd('SFNode', 'wallAppearance', node(N('BrushedAluminium', {})))],
-  build(v) {
-    const [fx, fy] = nums(v.floorSize, [1, 1]);
-    const t = nums(v.wallThickness, [0.01])[0], h = nums(v.wallHeight, [0.1])[0];
+  build(v, _i, warn) {
+    const [fx, fy] = positive('RectangleArena', 'floorSize', nums(v.floorSize, [1, 1]), [1, 1], warn);
+    const t = positive('RectangleArena', 'wallThickness', nums(v.wallThickness, [0.01]), [0.01], warn)[0], h = positive('RectangleArena', 'wallHeight', nums(v.wallHeight, [0.1]), [0.1], warn)[0];
     const floorApp = nodeOf(v.floorAppearance), wallApp = nodeOf(v.wallAppearance);
     const children: WNode[] = [N('Shape', { appearance: node(floorApp), geometry: node(N('Plane', { size: num(fx, fy) })) })];
     const bounds: WNode[] = [N('Plane', { size: num(fx, fy) })];
-    if (h > 0 && t > 0) {
+    {
       const walls: Array<[number, number, number, number]> = [[fx / 2 + t / 2, 0, t, fy], [-(fx / 2 + t / 2), 0, t, fy], [0, fy / 2 + t / 2, fx + 2 * t, t], [0, -(fy / 2 + t / 2), fx + 2 * t, t]];
       for (const [x, y, sx, sy] of walls) {
         children.push(N('Pose', { translation: num(x, y, h / 2), children: nodes([N('Shape', { appearance: node(wallApp), geometry: node(N('Box', { size: num(sx, sy, h) })) })]) }));

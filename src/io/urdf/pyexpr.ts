@@ -11,7 +11,7 @@
 
 export class PyError extends Error {
   constructor(readonly pyType: string, message: string) { super(message); this.name = pyType; }
-  toString(): string { return `${this.pyType}: ${this.message}`; }
+  override toString(): string { return `${this.pyType}: ${this.message}`; }
 }
 const err = (t: string, m: string) => new PyError(t, m);
 

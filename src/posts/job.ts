@@ -5,6 +5,7 @@
  */
 import { fromArray } from '../core/math/pose';
 import { PostEvent, PostProgram } from './base';
+import { postProgName, renameEvents } from './robopost';
 
 export interface PostJobProgram { name: string; events: any[] }
 export interface PostJob extends PostJobProgram {
@@ -38,11 +39,13 @@ export function eventFromJSON(o: any): PostEvent {
   return e as PostEvent;
 }
 
+/** Job for a RoboDK post: program names without blanks (as RoboDK passes them), calls renamed accordingly. */
 export function toPostJob(p: PostProgram, extra: Partial<PostJob> = {}): PostJob {
+  const name = postProgName(p.name);
   return {
-    program: p.name, name: p.name, robot: p.robotName, dof: p.dof, axes_type: p.axesType, joint_names: p.jointNames,
+    program: name, name, robot: p.robotName, dof: p.dof, axes_type: p.axesType, joint_names: p.jointNames,
     frame: { name: p.frame.name, pose: Array.from(p.frame.pose) }, tool: { name: p.tool.name, pose: Array.from(p.tool.pose) },
-    events: p.events.map(eventToJSON), subprograms: p.subprograms.map((s) => ({ name: s.name, events: s.events.map(eventToJSON) })), ...extra,
+    events: renameEvents(p.events).map(eventToJSON), subprograms: p.subprograms.map((s) => ({ name: postProgName(s.name), events: renameEvents(s.events).map(eventToJSON) })), ...extra,
   };
 }
 

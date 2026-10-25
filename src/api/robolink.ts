@@ -20,6 +20,7 @@ import { Camera as CameraItem } from '../core/items/item';
 import { renderCamera } from '../vision/sensing';
 import { encodePNG, encodeGrey32 } from '../vision/png';
 import { setFocalLengthPx, cameraFovs } from '../vision/camera_model';
+import { runVisionCall } from '../vision/program_vision';
 import { checkCollisionsMapped, itemsCollide, collisionLine, setCollisionPair, getCollisionMap, collidersOf, CollisionPair } from '../core/collision/collision';
 import { calibrateTcpByPoint, calibrateTcpByLine } from '../core/calibration/tcp';
 import { calibrateFrame } from '../core/calibration/frame';
@@ -143,7 +144,7 @@ interface OfflineRecorder { program: Program; folder: string; post: string; robo
 export class RobolinkItem {
   constructor(readonly rdk: Robolink, public item: CoreItem | null) {}
   Valid(): boolean { return !!this.item && (this.item.type === ItemType.STATION || !!this.item.parent); }
-  private req<T extends CoreItem>(): T { if (!this.item) throw new Error('InputError: Invalid item'); return this.item as T; }
+  private req<T extends CoreItem>(): T { if (!this.item) throw new Error('InputError: Invalid item'); if (this.item.type === ItemType.MACHINING) machiningLinks(this.item); return this.item as T; }
   Name(): string { return this.item?.name ?? ''; }
   setName(n: string): this { this.req().setName(n); return this; }
   Type(): number { return this.item?.type ?? -1; }
@@ -279,6 +280,7 @@ export class RobolinkItem {
       if (speedLinear > 0) it.motion.speedLinear = speedLinear; if (speedJoints > 0) it.motion.speedJoints = speedJoints; if (accelLinear > 0) it.motion.accelLinear = accelLinear; if (accelJoints > 0) it.motion.accelJoints = accelJoints;
       this.rdk.record(it, { kind: 'speed', speedLinear: speedLinear > 0 ? speedLinear : undefined, speedJoints: speedJoints > 0 ? speedJoints : undefined, accelLinear: accelLinear > 0 ? accelLinear : undefined, accelJoints: accelJoints > 0 ? accelJoints : undefined });
     } else if (it instanceof Program) it.setSpeed(speedLinear > 0 ? speedLinear : undefined, speedJoints > 0 ? speedJoints : undefined, accelLinear > 0 ? accelLinear : undefined, accelJoints > 0 ? accelJoints : undefined);
+    else if (it.type === ItemType.MACHINING && speedLinear > 0) it.setParam('speed', speedLinear);   // operation speed of the path
     return this;
   }
   setRounding(r: number): this { const it = this.req(); if (it instanceof Robot) { it.motion.rounding = r; this.rdk.record(it, { kind: 'rounding', radius: r }); } else if (it instanceof Program) it.setRounding(r); return this; }
@@ -515,9 +517,31 @@ export class RobolinkItem {
       if (k === 'Clear' || k === 'DeleteCurves') { if (it instanceof SceneObject) { if (k === 'DeleteCurves' || /Curve/i.test(String(value))) it.curves = []; if (/Point/i.test(String(value))) it.points = []; it.notify('geometry'); } }
       if (k === 'UpdatePath' && it.type === ItemType.MACHINING) this.rdk.updateMachining(it);
       if (k === 'Open') { it.setParam('open', value === '' ? it.getParam('open', 1) : value); return String(it.getParam('open', 1)); }
+      if (k === 'Display') {
+        // RoboDK display command, e.g. "POINTSIZE=4 COLOR=#FF771111" (point cloud), "LINEW=2", "SHOW_ALL" ...: kept on
+        // the item as params.display {raw, pointSize?, lineWidth?, color?} for the renderer
+        const raw = String(value ?? '');
+        const d: Record<string, any> = { raw };
+        for (const m of raw.matchAll(/(\w+)=([^\s]+)/g)) {
+          const key = m[1].toUpperCase(), val = m[2];
+          if (key === 'POINTSIZE') d.pointSize = Number(val);
+          else if (key === 'LINEW') d.lineWidth = Number(val);
+          else if (key === 'COLOR') { const h = val.replace('#', ''); d.color = h.length === 8 ? `#${h.slice(2)}` : `#${h}`; if (h.length === 8) d.alpha = parseInt(h.slice(0, 2), 16) / 255; }
+          else d[key.toLowerCase()] = val;
+        }
+        it.setParam('display', d);
+        it.notify('geometry');
+      }
       return 'OK';
     }
     if (value === '' || value === undefined) { const v = it.getParam(k); return v === undefined ? '' : typeof v === 'object' ? JSON.stringify(v) : String(v); }
+    if (k === 'OptimAxes' && typeof value === 'string' && value.trim().startsWith('{')) {
+      // RoboDK axes optimisation settings: a JSON object; partial updates merge into the current settings
+      let cur: Record<string, unknown> = {};
+      try { cur = JSON.parse(String(it.getParam(k) ?? '{}')); } catch { cur = {}; }
+      it.setParam(k, JSON.stringify({ ...cur, ...JSON.parse(value) }));
+      return 'OK';
+    }
     it.setParam(k, value);
     return 'OK';
   }
@@ -613,17 +637,22 @@ export class RobolinkItem {
   /** Attach the closest object (within tolerance mm of the TCP, optional name keyword / candidate list) to this tool. */
   AttachClosest(keyword: string | number = '', tolerance_mm = -1, list_objects: RobolinkItem[] = []): RobolinkItem {
     if (typeof keyword === 'number') { tolerance_mm = keyword; keyword = ''; }
-    const maxDistance = tolerance_mm > 0 ? tolerance_mm : 500;
     const tool = this.req();
+    // RoboDK: within the tool's attach distance (tool option; 100 mm here when not set) of the object's surface
+    const tolParam = Number(tool.getParam('attachTolerance'));
+    const maxDistance = tolerance_mm > 0 ? tolerance_mm : Number.isFinite(tolParam) && tolParam > 0 ? tolParam : 100;
     const owner = tool instanceof Robot ? tool.activeTool() ?? tool : tool;
     const tcp = owner instanceof Tool ? multiply(owner.poseAbs(), owner.poseTool()) : tool instanceof Robot ? tool.poseTCPAbs() : tool.poseAbs();
     const candidates = list_objects?.length ? list_objects.map((o) => o.item).filter((x): x is CoreItem => !!x) : [...this.rdk.station.walk()];
-    let best: CoreItem | null = null, bd = maxDistance;
+    let best: CoreItem | null = null, bd = maxDistance, bo = Infinity;
     for (const it of candidates) {
       if (!(it instanceof SceneObject) || it instanceof Tool || it.isAncestorOf(owner) || owner.isAncestorOf(it) || !it.visible) continue;
+      if (it.parent instanceof Tool) continue;   // already held by another tool
       if (keyword && !it.name.toLowerCase().includes(String(keyword).toLowerCase())) continue;
-      const d = this.rdk.distanceToObject(it, tcp);
-      if (d < bd) { bd = d; best = it; }
+      const d = this.rdk.distanceToObject(it, tcp, bd);
+      const a = it.poseAbs(), o = Math.hypot(a[12] - tcp[12], a[13] - tcp[13], a[14] - tcp[14]);
+      // equal distances (TCP inside several objects): the object whose origin is nearest
+      if (d < bd - 1e-6 || (Math.abs(d - bd) <= 1e-6 && o < bo)) { bd = d; bo = o; best = it; }
     }
     if (!best) return new RobolinkItem(this.rdk, null);
     best.setParentStatic(owner);
@@ -788,7 +817,8 @@ export class RobolinkItem {
     if (part instanceof RobolinkItem && part.item) it.setParam('partId', part.item.id);
     const res = this.rdk.updateMachining(it);
     const prog = this.rdk.station.findById(String(it.getParam('programId') ?? ''));
-    return [new RobolinkItem(this.rdk, prog), res ? (res.points ? 1 - res.unreachable / res.points : 0) : -1];
+    // RoboDK status: 0 = the whole path is reachable; negative = problems (here: minus the unreachable ratio, -1 = no path)
+    return [new RobolinkItem(this.rdk, prog), res ? (res.points ? (res.unreachable ? -res.unreachable / res.points : 0) : -1) : -1];
   }
   setMillingParameters(ncfile = '', part?: RobolinkItem | number | null, params = ''): [RobolinkItem, number] { return this.setMachiningParameters(ncfile, part, params); }
   MachiningParameters(): any { const it = this.req(); return { ncfile: it.getParam('ncfile'), part: it.getParam('partId'), params: it.getParam('machiningParams'), programId: it.getParam('programId') }; }
@@ -848,7 +878,8 @@ export class RobolinkItem {
   setColorShape(color: string | number[], shape_id = 0): this { const it = this.req<SceneObject>(); const g = it.geometry[shape_id]; if (g) { g.color = toCss(color); it.notify('geometry'); } return this; }
   setColorCurve(color: string | number[], _curve_id = -1): this { this.req().setParam('curveColor', toCss(color)); return this; }
   Color(): number[] { const c = this.req().color ?? '#9aa3ad'; return [parseInt(c.slice(1, 3), 16) / 255, parseInt(c.slice(3, 5), 16) / 255, parseInt(c.slice(5, 7), 16) / 255, 1]; }
-  setValue(varname: string, value: any = ''): any { this.req().setParam(varname, value); return value; }
+  /** RoboDK Item.setValue: same item command channel as setParam for strings ("Display", ...); matrices are stored. */
+  setValue(varname: string, value: any = ''): any { if (typeof value === 'string') return this.setParam(varname, value); this.req().setParam(varname, value); return value; }
   Value(varname = ''): any { return varname ? this.req().getParam(varname) : this.req().params; }
   customInstruction(name: string, path_run: string, _path_icon = '', _blocking = true, cmd_run_on_robot = ''): this {
     const p = this.req<Program>();
@@ -979,10 +1010,13 @@ export class Robolink {
     const items = (t === ITEM_TYPE_ANY ? [...this.station.walk()].slice(1) : this.station.itemsOfType(t as ItemType)).filter((i) => !(i instanceof Instruction));
     return listNames ? items.map((i) => i.name) : items.map((i) => new RobolinkItem(this, i));
   }
+  /** No dialog: the selected item of the type, else the first candidate (headless "user" picks the first one). */
   ItemUserPick(_msg = '', type: number | RobolinkItem[] = ITEM_TYPE_ANY): RobolinkItem {
     if (Array.isArray(type)) return type.find((i) => this.station.selection.includes(i.item!)) ?? type[0] ?? new RobolinkItem(this, null);
-    const sel = this.station.selection.find((s) => type === ITEM_TYPE_ANY || s.type === type);
-    return new RobolinkItem(this, sel ?? (type === ITEM_TYPE_ANY ? null : this.station.itemsOfType(type as ItemType)[0] ?? null));
+    const t = type === ITEM_TYPE_ROBOT_ARM ? ITEM_TYPE_ROBOT : type;
+    const sel = this.station.selection.find((s) => t === ITEM_TYPE_ANY || s.type === t);
+    const first = t === ITEM_TYPE_ANY ? this.station.itemsOfType(ItemType.OBJECT)[0] ?? this.station.itemsOfType(ItemType.ROBOT)[0] ?? null : this.station.itemsOfType(t as ItemType)[0] ?? null;
+    return new RobolinkItem(this, sel ?? first);
   }
   ActiveStation(): RobolinkItem { return new RobolinkItem(this, this.station); }
   AddStation(name = 'New Station'): RobolinkItem {
@@ -1065,15 +1099,28 @@ export class Robolink {
   setSignal(name: string, v: any): void { this.stationSignals.set(name, v); this.exec.rt().signals?.set(name, v); }
   getSignal(name: string): any { return this.exec.rt().signals?.get(name) ?? this.stationSignals.get(name) ?? this.station.getParam(name); }
   /** Distance from a point (TCP pose) to an object: bounding box / colliders when available, else origin distance. */
-  distanceToObject(o: SceneObject, tcp: Mat4): number {
+  distanceToObject(o: SceneObject, tcp: Mat4, limit = Infinity): number {
     const p = [tcp[12], tcp[13], tcp[14]];
+    const local = multiply(invert(o.poseAbs()), tcp);
+    const q = [local[12], local[13], local[14]];
     const bb = o.bbox;
-    if (bb) {
-      const local = multiply(invert(o.poseAbs()), tcp);
-      const q = [local[12], local[13], local[14]];
-      const d = q.map((v, i) => Math.max(bb.min[i] - v, 0, v - bb.max[i]));
-      return Math.hypot(d[0], d[1], d[2]);
+    let dBox = Infinity;
+    if (bb) { const d = q.map((v, i) => Math.max(bb.min[i] - v, 0, v - bb.max[i])); dBox = Math.hypot(d[0], d[1], d[2]); }
+    // exact distance to the triangles when the mesh is known (a big conveyor's box contains the TCP, its surface does not)
+    if (this.assets && o.geometry.some((g) => g.mesh) && dBox <= limit) {
+      let best = Infinity;
+      for (const g of o.geometry) {
+        const m = g.mesh ? this.assets.get(g.mesh)?.mesh : undefined;
+        if (!m?.positions?.length) continue;
+        const gi = g.origin ? invert(Float64Array.from(g.origin)) : null;
+        const s = g.scale ?? [1, 1, 1];
+        const lq = gi ? transformPointM(gi, q) : q;
+        const pq = [lq[0] / s[0], lq[1] / s[1], lq[2] / s[2]];
+        best = Math.min(best, pointMeshDistance(m.positions, pq) * Math.min(s[0], s[1], s[2]));
+      }
+      if (Number.isFinite(best)) return best;
     }
+    if (bb) return dBox;
     const a = o.poseAbs();
     return Math.hypot(a[12] - p[0], a[13] - p[1], a[14] - p[2]);
   }
@@ -1091,7 +1138,7 @@ export class Robolink {
     if (r) p.setRobot(r);
     if (r instanceof Robot) { if (r.activeFrameId) p.setFrame(this.station.findById(r.activeFrameId)); if (r.activeToolId) p.setTool(this.station.findById(r.activeToolId)); }
     this.offline.set(key, { program: p, folder, post, robot: r instanceof Robot ? r : null });
-    if (this.runMode === RUNMODE_SIMULATE) this.runMode = RUNMODE_MAKE_ROBOTPROG;
+    // RoboDK: ProgramStart only names the program; robot moves are recorded when the run mode is RUNMODE_MAKE_ROBOTPROG*
     return 0;
   }
   recorderFor(r: Robot): OfflineRecorder | undefined { return this.offline.get(r.id) ?? this.offline.get(''); }
@@ -1115,6 +1162,8 @@ export class Robolink {
   /** Generate pending offline programs (RoboDK Finish / disconnect). Returns the written file names. */
   Finish(): string[] {
     const out: string[] = [];
+    const making = this.runMode === RUNMODE_MAKE_ROBOTPROG || this.runMode === RUNMODE_MAKE_ROBOTPROG_AND_START || this.runMode === RUNMODE_MAKE_ROBOTPROG_AND_UPLOAD;
+    if (!making) { this.offline.clear(); return out; }   // simulation: nothing to generate
     for (const k of [...this.offline.keys()]) out.push(...this.finishOffline(k));
     if (this.runMode === RUNMODE_MAKE_ROBOTPROG) this.runMode = RUNMODE_SIMULATE;
     return out;
@@ -1127,7 +1176,9 @@ export class Robolink {
     if (!pp) throw new Error(`InputError: unknown post processor ${postName}`);
     const finish = (files: Array<{ name: string; content: string; encoding?: string }>): [boolean, string, boolean] => {
       this.generated.set(p.id, files);
-      const dir = folder || this.paths.PATH_PROGRAMS || this.paths.PATH_DESKTOP || '';
+      // a relative folder is taken relative to the programs folder (never the server's working directory)
+      const base = this.paths.PATH_PROGRAMS || this.paths.PATH_DESKTOP || '';
+      const dir = !folder ? base : /^([a-zA-Z]:)?[\\/]/.test(folder) || !base ? folder : `${base.replace(/[\\/]+$/, '')}/${folder}`;
       const written: string[] = [];
       if (this.fileSystem && dir) {
         const sep = /[\\/]$/.test(dir) ? '' : '/';
@@ -1180,9 +1231,10 @@ export class Robolink {
   AddMillingProject(name = 'Milling settings', robot?: RobolinkItem | number): RobolinkItem { return this.AddMachiningProject(name, robot); }
   /** (Re)generate the program of a machining project item from its part curves (the previous program is replaced in place). */
   updateMachining(it: CoreItem): { points: number; unreachable: number } | null {
+    machiningLinks(it);
     const robot = this.station.findById(String(it.getParam('robotId') ?? '')) as Robot | null;
     const part = this.station.findById(String(it.getParam('partId') ?? '')) as SceneObject | null;
-    if (!(robot instanceof Robot) || !(part instanceof SceneObject) || !part.curves.length) return null;
+    if (!(robot instanceof Robot) || !(part instanceof SceneObject) || (!part.curves.length && !part.points.length)) return null;
     const params = String(it.getParam('machiningParams') ?? '');
     const old = this.station.findById(String(it.getParam('programId') ?? ''));
     // remove the previous program and the targets it generated (no leaks on regeneration)
@@ -1195,8 +1247,18 @@ export class Robolink {
       it.setParam('machiningStats', { cutLength: res.cutLength, rapidLength: res.rapidLength, estimatedTime: res.estimatedTime });
       return { points: res.points, unreachable: res.unreachable };
     }
-    const opts: FollowOptions = { name: it.name, step: num(params, 'Step', 0), approach: num(params, 'Approach', 50), speed: num(params, 'Speed', 50), freeToolZ: /RotZ|FreeZ/i.test(params), zMode: /Normal/i.test(params) ? 'normal' : 'down' };
-    const res = generateCurveFollow(this.station, robot, part, { points: part.curves.flatMap((c) => c.points) }, opts);
+    // curve points carry their surface normals [x,y,z,i,j,k] (AddCurve/ProjectPoints): the tool Z follows them like a
+    // RoboDK curve follow project; the project's tool is the robot tool used
+    // point follow project (object with points only): the points are visited in order like one path
+    const pts = part.curves.length ? part.curves.flatMap((c) => c.points) : part.points.map((p) => p.point);
+    // RoboDK curve normals ijk give the tool Z direction (into the part); generateCurveFollow takes outward surface normals
+    const normals = pts.every((p) => p.length >= 6) ? pts.map((p) => [-p[3], -p[4], -p[5]]) : undefined;
+    const tool = this.station.findById(String(it.getParam('toolId') ?? ''));
+    if (tool instanceof Tool && robot.activeToolId !== tool.id) robot.setTool(tool);
+    const speed = Number(it.getParam('speed') ?? NaN);
+    // RoboDK robot machining default: the tool may rotate about its Z axis to reach the path (RotZ=0 disables it)
+    const opts: FollowOptions = { name: it.name, step: num(params, 'Step', 0), approach: num(params, 'Approach', 50), speed: Number.isFinite(speed) && speed > 0 ? speed : num(params, 'Speed', 50), freeToolZ: !/RotZ\s*[=:]\s*0|FreeZ\s*[=:]\s*0/i.test(params), zMode: /Down/i.test(params) ? 'down' : normals || /Normal/i.test(params) ? 'normal' : 'down' };
+    const res = generateCurveFollow(this.station, robot, part, { points: pts.map((p) => p.slice(0, 3)), normals }, opts);
     it.setParam('programId', res.program.id);
     return { points: res.points, unreachable: res.unreachable };
   }
@@ -1274,6 +1336,18 @@ export class Robolink {
     } catch { return 0; }
     return 0;
   }
+  /**
+   * Studio extension (no RoboDK equivalent; the API may alias it as Vision_Run): run the camera's vision stack once on
+   * the current station (headless software render unless the browser registered WebGL), refresh the "Vision <camera>"
+   * targets (`Pick` / `Pick approach` = first target the robot reaches without collision) and set VISION_FOUND /
+   * VISION_<CAMERA>_FOUND / VISION_TARGET (station params + runtime signals). Returns the number found.
+   */
+  async Cam2D_Detect(cam?: RobolinkItem | number | null, robot?: RobolinkItem | null): Promise<number> {
+    const it = (cam instanceof RobolinkItem ? cam.item : null) ?? [...this.cams.values()].find((c) => c.params.visionStack) ?? this.station.itemsOfType<CameraItem>(ItemType.CAMERA).find((c) => c.params.visionStack);
+    if (!(it instanceof CameraItem)) throw new Error('Cam2D_Detect: no camera with a vision stack');
+    const res = await runVisionCall(this.station, [it.name], { robot: robot?.item ?? null, signals: this.exec.rt().signals ?? null, time: this.exec.rt().time });
+    return res.found;
+  }
 
   // ---- calibration & measurement ----
   /** Points are joints (use_joints=true, FK with the robot's tool) or XYZ in the robot base frame. */
@@ -1327,7 +1401,11 @@ export class Robolink {
     m[12] = p[0]; m[13] = p[1]; m[14] = p[2];
     return [new Mat(m), [1]];
   }
-  StereoCamera_Measure(): [Mat, number[]] { return this.MeasurePose(); }
+  /** Simulated stereo camera (legacy RoboDK API): [Href, Htcp, n points ref, n points tcp, time ms, status 0 = OK]. */
+  StereoCamera_Measure(): [Mat, Mat, number, number, number, number] {
+    const [pose, st] = this.MeasurePose();
+    return [new Mat(identity()), pose, 4, 4, Math.round(this.SimulationTime() * 1000), st[0] === 1 ? 0 : -1];
+  }
   Popup_ISO9283_CubeProgram(robot?: RobolinkItem | number, center: number[] = [1000, 0, 800], side = 400, _blocking = true): RobolinkItem {
     const r = ((robot instanceof RobolinkItem ? robot.item : null) as Robot | null) ?? this.station.itemsOfType<Robot>(ItemType.ROBOT)[0];
     if (!r) return new RobolinkItem(this, null);
@@ -1627,7 +1705,26 @@ export class Robolink {
     return v === undefined ? null : v;
   }
   setParam(key: string, value: any): string { this.station.setParam(key, value); this.stationSignals.set(key, value); this.exec.rt().signals?.set(key, value); return 'OK'; }
-  Command(cmd: string, value: any = '', _skip = false): any { if (Array.isArray(value)) return []; this.station.setParam(`cmd:${cmd}`, value); return 'OK'; }
+  /**
+   * RoboDK station command channel (Tools-Run Script-Show Commands). Queries answer from the studio state
+   * (TrajectoryTime / SimulationTime / SimulationSpeed / CollisionMap / RunMode / Version); settings are stored as
+   * station parameters cmd:<name> and acknowledged with 'OK', like RoboDK.
+   */
+  Command(cmd: string, value: any = '', _skip = false): any {
+    if (Array.isArray(value)) return [];
+    const k = String(cmd);
+    if (/^(PATH|FILE)_/i.test(k) && (value === '' || value == null)) return String(this.getParam(k.toUpperCase()) ?? '');   // e.g. PATH_PROGRAMS
+    if (/^TrajectoryTime$/i.test(k)) return String(this.SimulationTime());
+    if (/^SimulationTime$/i.test(k)) return String(Math.round(this.SimulationTime() * 1000));
+    if (/^SimulationSpeed$/i.test(k) && (value === '' || value == null)) return String(this.SimulationSpeed());
+    if (/^SimulationSpeed$/i.test(k)) { this.setSimulationSpeed(Number(value)); return 'OK'; }
+    if (/^RunMode$/i.test(k) && (value === '' || value == null)) return String(this.runMode);
+    if (/^Version$/i.test(k)) return this.Version();
+    if (/^CollisionMap$/i.test(k) && (value === '' || value == null)) return getCollisionMap(this.station).active ? '1' : '0';
+    if (/^Snapshot$/i.test(k) && value) { const r: any = this.Cam2D_Snapshot(String(value), 0); return r ? 'OK' : 'Snapshot not available'; }
+    this.station.setParam(`cmd:${k}`, value);
+    return 'OK';
+  }
   Version(): string { return '5.9.4 (VerticalBot Studio, RoboDK API compatible)'; }
   License(): [string, string] { return ['VerticalBot Studio', 'MIT']; }
   Selection(): RobolinkItem[] { return this.station.selection.map((s) => new RobolinkItem(this, s)); }
@@ -1641,16 +1738,50 @@ export class Robolink {
   GetPoints(_feature_type = FEATURE_HOVER_OBJECT_MESH): never { throw new Error('GetPoints(FEATURE_HOVER_*) needs the mouse hovering the RoboDK 3D view: not available through the studio API'); }
   EmbedWindow(..._a: any[]): never { throw new Error('EmbedWindow docks a desktop window into RoboDK: not available in VerticalBot Studio'); }
   /** Project points onto an object: along the point normal (6-vectors) or the object's closest surface along -Z (3-vectors). */
+  /**
+   * Project points onto an object (RoboDK ProjectPoints). Points [x,y,z(,i,j,k)] are given in the object's coordinates
+   * (like its curves; absolute without an object). Each point moves to the nearest surface hit along its normal (either
+   * direction; default normal -Z); *_RECALC recomputes the normal from the surface (oriented like the input normal).
+   * Points that do not hit the object are returned unchanged.
+   */
   ProjectPoints(points: number[][], obj?: RobolinkItem | number | null, projection_type = PROJECTION_ALONG_NORMAL_RECALC): number[][] {
     const target = obj instanceof RobolinkItem ? obj.item : null;
     if (projection_type === PROJECTION_NONE) return points.map((p) => [...p]);
+    const M = target ? target.poseAbs() : identity();
+    const Mi = invert(M);
+    const L = 1e4;
+    const onTarget = (h: { item: CoreItem } | null) => !!h && (!target || h.item === target || target.isAncestorOf(h.item));
+    const cast = (o: number[], d: number[]) => {
+      let best: { point: number[]; distance: number } | null = null;
+      for (const s of [1, -1]) {
+        const h = collisionLine(this.station, o as any, [o[0] + s * d[0] * L, o[1] + s * d[1] * L, o[2] + s * d[2] * L], { assets: this.assets, meshAccurate: true });
+        if (onTarget(h) && (!best || h!.distance < best.distance)) best = { point: [...h!.point], distance: h!.distance };
+      }
+      return best;
+    };
+    const recalc = projection_type === PROJECTION_ALONG_NORMAL_RECALC || projection_type === PROJECTION_CLOSEST_RECALC || projection_type === PROJECTION_RECALC;
     return points.map((p) => {
-      const n = p.length >= 6 && Math.hypot(p[3], p[4], p[5]) > 1e-9 ? [p[3], p[4], p[5]].map((v) => v / Math.hypot(p[3], p[4], p[5])) : [0, 0, -1];
-      const L = 1e4;
-      const a: [number, number, number] = [p[0] - n[0] * L, p[1] - n[1] * L, p[2] - n[2] * L], b: [number, number, number] = [p[0] + n[0] * L, p[1] + n[1] * L, p[2] + n[2] * L];
-      const hit = collisionLine(this.station, a, b, { assets: this.assets, only: target ? [target] : undefined } as any);
-      if (!hit || (target && hit.item !== target && !target.isAncestorOf(hit.item))) return [...p];
-      return [...hit.point, ...p.slice(3)];
+      const nl = p.length >= 6 && Math.hypot(p[3], p[4], p[5]) > 1e-9 ? [p[3], p[4], p[5]].map((v) => v / Math.hypot(p[3], p[4], p[5])) : [0, 0, -1];
+      const o = [...transformPointM(M, p)];
+      const n = transformDir(M, nl as any) as number[];
+      const hit = cast(o, n);
+      if (!hit) return [...p];
+      const local = [...transformPointM(Mi, hit.point)];
+      if (p.length < 6) return [...local, ...p.slice(3)];   // no normal given: position only (extra values kept)
+      let nOut = nl;
+      if (recalc) {
+        // surface normal from two neighbouring parallel rays (0.02 mm apart), oriented like the input normal
+        const u = Math.abs(n[2]) < 0.9 ? [0, 0, 1] : [1, 0, 0];
+        const e1 = normalize3(cross3(n, u)), e2 = cross3(n, e1);
+        const E = 0.02, h1 = cast(o.map((v, i) => v + E * e1[i]), n), h2 = cast(o.map((v, i) => v + E * e2[i]), n);
+        if (h1 && h2) {
+          const a = h1.point.map((v, i) => v - hit.point[i]), b = h2.point.map((v, i) => v - hit.point[i]);
+          let sn = normalize3(cross3(a, b));
+          if (sn[0] * n[0] + sn[1] * n[1] + sn[2] * n[2] < 0) sn = sn.map((v) => -v);
+          if (sn.every(Number.isFinite)) nOut = transformDir(Mi, sn as any) as number[];
+        }
+      }
+      return [...local, ...nOut, ...p.slice(6)];
     });
   }
   IsInside(a: RobolinkItem, b: RobolinkItem): number { if (!a.item || !b.item) return 0; const ca = collidersOf(a.item)[0]; if (!ca) return 0; const cb = collidersOf(b.item); const c = ca.shape.kind === 'sphere' ? ca.shape.c : ca.shape.kind === 'capsule' ? ca.shape.a : ca.shape.kind === 'obb' ? ca.shape.center : ca.shape.obb.center; return cb.some((s) => s.shape.kind === 'obb' && insideObb(s.shape, c)) ? 1 : 0; }
@@ -1661,6 +1792,51 @@ export { ItemType, InstructionType, Robot, Program, Target, Frame, Tool, SceneOb
 export type { RunHandleLike };
 
 function num(params: string, key: string, def: number): number { const m = params.match(new RegExp(`${key}\\s*[=:]\\s*([-+]?\\d*\\.?\\d+)`, 'i')); return m ? parseFloat(m[1]) : def; }
+/** RoboDK-imported machining projects keep their links in params.rdkMachining (T1 importer): expose them as the API's keys. */
+function machiningLinks(it: CoreItem): void {
+  const m = it.params.rdkMachining as Record<string, string> | undefined;
+  if (!m) return;
+  for (const k of ['robotId', 'frameId', 'toolId', 'partId', 'programId']) if (m[k] && it.getParam(k) == null) it.setParam(k, m[k]);
+}
+/** Smallest distance from point p to a triangle soup (9 floats per triangle). */
+function pointMeshDistance(pos: ArrayLike<number>, p: number[]): number {
+  let best = Infinity;
+  for (let k = 0; k + 8 < pos.length; k += 9) {
+    const a = [pos[k], pos[k + 1], pos[k + 2]], b = [pos[k + 3], pos[k + 4], pos[k + 5]], c = [pos[k + 6], pos[k + 7], pos[k + 8]];
+    // closest point on triangle (Ericson, Real-Time Collision Detection 5.1.5)
+    const ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]], ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]], ap = [p[0] - a[0], p[1] - a[1], p[2] - a[2]];
+    const dot = (u: number[], v: number[]) => u[0] * v[0] + u[1] * v[1] + u[2] * v[2];
+    const d1 = dot(ab, ap), d2 = dot(ac, ap);
+    let cp: number[];
+    if (d1 <= 0 && d2 <= 0) cp = a;
+    else {
+      const bp = [p[0] - b[0], p[1] - b[1], p[2] - b[2]], d3 = dot(ab, bp), d4 = dot(ac, bp);
+      if (d3 >= 0 && d4 <= d3) cp = b;
+      else {
+        const vc = d1 * d4 - d3 * d2;
+        if (vc <= 0 && d1 >= 0 && d3 <= 0) { const v = d1 / (d1 - d3); cp = [a[0] + v * ab[0], a[1] + v * ab[1], a[2] + v * ab[2]]; }
+        else {
+          const cpp = [p[0] - c[0], p[1] - c[1], p[2] - c[2]], d5 = dot(ab, cpp), d6 = dot(ac, cpp);
+          if (d6 >= 0 && d5 <= d6) cp = c;
+          else {
+            const vb = d5 * d2 - d1 * d6;
+            if (vb <= 0 && d2 >= 0 && d6 <= 0) { const w = d2 / (d2 - d6); cp = [a[0] + w * ac[0], a[1] + w * ac[1], a[2] + w * ac[2]]; }
+            else {
+              const va = d3 * d6 - d5 * d4;
+              if (va <= 0 && d4 - d3 >= 0 && d5 - d6 >= 0) { const w = (d4 - d3) / (d4 - d3 + (d5 - d6)); cp = [b[0] + w * (c[0] - b[0]), b[1] + w * (c[1] - b[1]), b[2] + w * (c[2] - b[2])]; }
+              else { const den = 1 / (va + vb + vc), v = vb * den, w = vc * den; cp = [a[0] + ab[0] * v + ac[0] * w, a[1] + ab[1] * v + ac[1] * w, a[2] + ab[2] * v + ac[2] * w]; }
+            }
+          }
+        }
+      }
+    }
+    const d = Math.hypot(p[0] - cp[0], p[1] - cp[1], p[2] - cp[2]);
+    if (d < best) best = d;
+  }
+  return best;
+}
+function cross3(a: number[], b: number[]): number[] { return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]; }
+function normalize3(v: number[]): number[] { const n = Math.hypot(v[0], v[1], v[2]) || 1; return [v[0] / n, v[1] / n, v[2] / n]; }
 function transformPointM(m: Mat4, p: number[]): [number, number, number] { return [m[0] * p[0] + m[4] * p[1] + m[8] * p[2] + m[12], m[1] * p[0] + m[5] * p[1] + m[9] * p[2] + m[13], m[2] * p[0] + m[6] * p[1] + m[10] * p[2] + m[14]]; }
 function insideObb(o: { center: number[]; axes: number[][]; half: number[] }, p: number[]): boolean { const d = [p[0] - o.center[0], p[1] - o.center[1], p[2] - o.center[2]]; return [0, 1, 2].every((i) => Math.abs(d[0] * o.axes[i][0] + d[1] * o.axes[i][1] + d[2] * o.axes[i][2]) <= o.half[i]); }
 function b64(s: string): Uint8Array {

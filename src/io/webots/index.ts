@@ -25,6 +25,11 @@ export type { OccupancyOptions } from './occupancy';
 export { loadRetailLayout } from './retail_layout';
 export { upgradeOrchard } from './semantic';
 export { parseYaml } from './yaml';
+export { ScriptedFleet, StationFleetWorld, WindowPlan, playScriptedFleet, moduleMountOffset, shortestAngle } from './scripted_fleet';
+export type { FleetScript, FleetWorld, Pose4, WheelState, PlanRow, FleetPlayback } from './scripted_fleet';
+export { defaultMissionBScript, MISSION_B } from './murka_missions';
+export { parseShots, applyShot, viewpointLook } from './shots';
+export type { WebotsShot, WebotsViewpoint } from './shots';
 
 /** In-memory source over a path -> bytes map (keys normalised to '/' separators). */
 export function mapSource(files: Map<string, Uint8Array>): WebotsSource {

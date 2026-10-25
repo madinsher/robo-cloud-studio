@@ -188,7 +188,8 @@ export function compileForPost(station: Station, program: Program, options: Comp
   let frameItem: Item | null = inherited ? inherited.frame : program.frameId ? station.findById(program.frameId) : null;
   if (!inherited && !frameItem) { const t = firstCartTarget(); frameItem = t?.parent && t.parent.type === ItemType.FRAME ? t.parent : robot?.activeFrame() ?? null; }
   let toolItem: Item | null = inherited ? inherited.tool : program.toolId ? station.findById(program.toolId) : robot?.activeTool() ?? null;
-  const framePoseInBase = (): Mat4 => (robot && frameItem ? multiply(invert(robot.poseAbs()), frameItem.poseAbs()) : identity());
+  // frame w.r.t. the robot base (without a robot: w.r.t. the station, poses stay relative to their frame)
+  const framePoseInBase = (): Mat4 => (frameItem ? (robot ? multiply(invert(robot.poseAbs()), frameItem.poseAbs()) : frameItem.poseAbs()) : identity());
   const toolPose = (): Mat4 => (toolItem instanceof Tool ? toolItem.poseTool() : identity());
   const initialFrame = { pose: framePoseInBase(), name: frameItem?.name ?? 'World' };
   const initialTool = { pose: toolPose(), name: toolItem?.name ?? 'Flange' };
@@ -203,6 +204,8 @@ export function compileForPost(station: Station, program: Program, options: Comp
   };
   const solve = (poseInFrame: Mat4, seed: number[] | null, label: string): number[] | null => {
     if (!robot) return seed;
+    // mechanisms (grippers, turntables, rails) move by their stored joints
+    if (robot.dof < 6 && seed && seed.length >= dof) return seed.slice();
     const tool = toolPose();
     const inBase = multiply(framePoseInBase(), poseInFrame);
     if (seed && seed.length >= dof) {
@@ -268,8 +271,11 @@ export function compileForPost(station: Station, program: Program, options: Comp
         const { pose, joints } = resolveTarget(target, d, false);
         const name = target?.name ?? insn.name;
         if (d.moveType === 'MoveJ') {
-          let j = joints;
-          if (!j) { problems.push(`${name}: no joint values for MoveJ, previous joints kept`); j = q.slice(); }
+          let j = joints && joints.length ? joints : null;
+          if (!j) {
+            if (!q.length) { problems.push(`${name}: no joint values for MoveJ (no robot), move skipped`); break; }
+            problems.push(`${name}: no joint values for MoveJ, previous joints kept`); j = q.slice();
+          }
           applyOverrides(d, false);
           q = j;
           events.push({ kind: 'moveJ', joints: j, pose, name, speed: d.speed, rounding: d.rounding, conf: conf(j) });
@@ -322,9 +328,13 @@ export function compileForPost(station: Station, program: Program, options: Comp
       case 'io':
         events.push(d.wait ? { kind: 'waitDI', io: d.io, value: d.value, timeoutMs: d.timeoutMs ?? -1 } : { kind: 'setDO', io: d.io, value: d.value });
         break;
-      case 'code':
-        events.push({ kind: 'runCode', code: d.code, isCall: d.asFunctionCall });
+      case 'code': {
+        // a function call naming a program of the station is a program call (RoboDK "Call program")
+        const sp = d.asFunctionCall && !d.code.includes('(') ? findProgram(null, d.code.trim()) : null;
+        if (sp && sp !== program) events.push({ kind: 'callProgram', name: compileSub(sp) });
+        else events.push({ kind: 'runCode', code: d.code, isCall: d.asFunctionCall });
         break;
+      }
       case 'print':
         events.push(d.isComment ? { kind: 'comment', text: d.message } : { kind: 'message', text: d.message });
         break;
@@ -339,7 +349,8 @@ export function compileForPost(station: Station, program: Program, options: Comp
       case 'call': {
         const sp = findProgram(d.programId, d.programName);
         if (sp) events.push({ kind: 'callProgram', name: compileSub(sp) });
-        else events.push({ kind: 'runCode', code: d.programName ?? String(d.programId ?? ''), isCall: true });
+        // program not in the station: still a program call (RoboDK passes program names without blanks)
+        else { const n = d.programName ?? String(d.programId ?? ''); events.push({ kind: 'runCode', code: n.includes('(') ? n : n.replace(/\s+/g, ''), isCall: true }); }
         break;
       }
       case 'signal':
@@ -368,7 +379,13 @@ export function compileForPost(station: Station, program: Program, options: Comp
       case 'thread': {
         const tp = findProgram(d.programId, d.programName);
         if (tp) events.push({ kind: 'thread', name: compileSub(tp) });
-        else problems.push(`Thread program ${d.programName ?? d.programId} not found`);
+        else {
+          // a station script (RoboDK Python program) started in parallel only drives the simulation: RoboDK writes its bare
+          // name, which is not valid robot code; the studio keeps a comment
+          const nm = d.programName ?? (d.programId ? station.findById(d.programId)?.name : null) ?? String(d.programId ?? '');
+          events.push({ kind: 'comment', text: `Start thread ${nm} (station script, simulation only)` });
+          problems.push(`Thread program ${nm} is not a robot program: written as a comment`);
+        }
         break;
       }
       case 'wait':

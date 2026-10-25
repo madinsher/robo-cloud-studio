@@ -18,7 +18,7 @@ import { Station, Item, ItemType, Target, Tool, SceneObject } from '../items/ite
 import { Robot } from '../items/robot';
 import { Program, Instruction, InstructionData, MoveInstruction } from '../items/program';
 import { EventBus } from '../events';
-import { Mat4, identity, multiply, invert } from '../math/pose';
+import { Mat4, identity, multiply, invert, fromArray } from '../math/pose';
 import { motionGroupFor, planChain, ChainMoveSpec, MotionSettings, MotionGroup, PlannedTrajectory } from './planner';
 import type { Trajectory, TrajectorySample } from './trajectory';
 import { getMobileMotionPlanner, Pose2D } from './mobile_hook';
@@ -98,7 +98,7 @@ export function evalCondition(expr: string, get: (name: string) => unknown): boo
     if (/^\d/.test(t)) return Number(t);
     if (/^true$/i.test(t)) return true;
     if (/^false$/i.test(t)) return false;
-    if (peek() === '[') { i++; const idx = or(); if (peek() === ']') i++; const k1 = `${t}[${idx}]`; const v = get(k1); return v !== undefined ? v : lookup(`${t}${idx}`); }
+    if (peek() === '[') { i++; const idx = String(sum()); if (peek() === ']') i++; const k1 = `${t}[${idx}]`; const v = get(k1); return v !== undefined ? v : lookup(`${t}${idx}`); }
     return lookup(t);
   };
   const truthy = (v: unknown) => (typeof v === 'string' ? (Number.isFinite(toNum(v)) ? toNum(v) !== 0 : v.length > 0) : !!toNum(v));
@@ -117,8 +117,9 @@ export function evalCondition(expr: string, get: (name: string) => unknown): boo
     }
     return a;
   };
-  const and = (): unknown => { let v = truthy(cmp()); while (peek() === '&&' || /^and$/i.test(peek() ?? '')) { i++; const r = truthy(cmp()); v = v && r; } return v; };
-  const or = (): unknown => { let v = truthy(and()); while (peek() === '||' || /^or$/i.test(peek() ?? '')) { i++; const r = truthy(and()); v = v || r; } return v; };
+  // without a logical operator the raw value passes through (so "(n - 1) * 2" keeps its number)
+  const and = (): unknown => { let v = cmp(); while (peek() === '&&' || /^and$/i.test(peek() ?? '')) { i++; const r = truthy(cmp()); v = truthy(v) && r; } return v; };
+  const or = (): unknown => { let v = and(); while (peek() === '||' || /^or$/i.test(peek() ?? '')) { i++; const r = truthy(and()); v = truthy(v) || r; } return v; };
   return truthy(or());
 }
 
@@ -150,7 +151,7 @@ export class StationSnapshot {
   private objects = new Map<Item, { parent: Item | null; pose: Mat4 }>();
   private visible = new Map<Item, boolean>();
   private tools = new Map<Tool, { closed: boolean; attached: string[] }>();
-  private robots = new Map<Robot, { joints: number[]; frame: string | null; tool: string | null }>();
+  private robots = new Map<Robot, { joints: number[]; frame: string | null; tool: string | null; io: Record<string, number | boolean> }>();
   private mobiles = new Map<Item, Mat4>();
   constructor(readonly station: Station, startJoints?: Map<string, number[]>) {
     for (const it of station.walk()) {
@@ -158,7 +159,7 @@ export class StationSnapshot {
       this.visible.set(it, it.visible);
       if (it instanceof Tool) this.tools.set(it, { closed: it.closed, attached: [...it.attached] });
       else if (it instanceof SceneObject) this.objects.set(it, { parent: it.parent, pose: it.pose() });
-      if (it instanceof Robot) this.robots.set(it, { joints: startJoints?.get(it.id) ?? it.joints(), frame: it.activeFrameId, tool: it.activeToolId });
+      if (it instanceof Robot) this.robots.set(it, { joints: startJoints?.get(it.id) ?? it.joints(), frame: it.activeFrameId, tool: it.activeToolId, io: { ...(it.state.io ?? {}) } });
       if (it.type === ItemType.MOBILE_ROBOT) this.mobiles.set(it, it.pose());
     }
   }
@@ -174,7 +175,7 @@ export class StationSnapshot {
   restore(): void {
     this.restoreObjects();
     for (const [tool, s] of this.tools) { tool.closed = s.closed; tool.attached = [...s.attached]; }
-    for (const [r, s] of this.robots) { r.setJoints(s.joints); r.activeFrameId = s.frame; r.activeToolId = s.tool; r.state.moving = false; }
+    for (const [r, s] of this.robots) { r.setJoints(s.joints); r.activeFrameId = s.frame; r.activeToolId = s.tool; r.state.moving = false; if (r.state.io) r.state.io = { ...s.io }; }
     for (const [m, p] of this.mobiles) m.setPose(p);
     for (const [it, v] of this.visible) if (it.visible !== v) it.setVisible(v);
   }
@@ -200,9 +201,16 @@ export interface RunHandle {
   /** Run that started this one with a thread instruction. */
   parentId?: string;
 }
-export interface StartOptions { robot?: Robot | Item | null; startJoints?: number[]; args?: string[] }
+export interface StartOptions {
+  robot?: Robot | Item | null;
+  startJoints?: number[];
+  args?: string[];
+  /** Start at this top-level instruction ("Run from here"); the speed / rounding / tool / frame set before it apply. */
+  fromIndex?: number;
+}
 export interface ScriptContext { station: Station; runtime: StationRuntime; name: string; args: string[]; robot: Robot | Item | null; program: Program | Item | null }
-export type ScriptRunner = (ctx: ScriptContext) => Promise<void>;
+/** A script runner resolves `false` when it does not handle the call: the next registered runner is tried. */
+export type ScriptRunner = (ctx: ScriptContext) => Promise<void | boolean>;
 export interface Problem { instructionId: string; message: string; severity: 'error' | 'warning'; runId?: string; /** Simulation time at which it happened. */ t?: number }
 
 export interface RuntimeEvents extends Record<string, unknown> {
@@ -235,7 +243,13 @@ export interface RuntimeSink {
   detach?(objectId: string): void;
 }
 
-interface RobotRunState { settings: MotionSettings; toolId: string | null; frameId: string | null }
+interface RobotRunState {
+  settings: MotionSettings; toolId: string | null; frameId: string | null;
+  /** The frame was set by the program (Set Ref. instruction or program frame): Cartesian targets are taken relative to it. */
+  frameSet?: boolean;
+}
+/** Placement restored by a RoboDK "Replace objects" event: object id, parent frame id and pose relative to it (16 numbers, column-major). */
+export interface ObjectPlacement { id: string; parentId?: string | null; pose?: number[]; visible?: boolean }
 interface Frame { program: Program; list: Instruction[]; pc: number; robot: Robot | null; mover: Item | null; repeat: number }
 interface MotionSeg { t0: number; t1: number; traj?: Trajectory; group?: MotionGroup; mobile?: { item: Item; sample: (t: number) => Pose2D }; ins?: Instruction; index?: number }
 type Block =
@@ -285,6 +299,12 @@ export class StationRuntime {
   /** Optional asset store (mesh bounds for attach distance). */
   assets: { get(id: string): { mesh?: { min: number[]; max: number[] } } | undefined } | null = null;
   sink: RuntimeSink = {};
+  /**
+   * Do not apply Set speed instructions (robot default speeds only). RoboDK's Item.Update() cycle-time estimate behaves
+   * like this (31 of 32 Library programs with speed changes match it within 1 %), while its playback and
+   * InstructionListJoints honour the programmed speeds (the default here).
+   */
+  ignoreSpeedInstructions = false;
   /** Record mode: every executed instruction. */
   readonly recorded: RecordedStep[] = [];
   /** Record mode: TCP distance and executed instruction count. */
@@ -348,13 +368,18 @@ export class StationRuntime {
   /** Start a program (or a station Python program). Programs of a busy robot are queued. */
   start(program: Program | Item, opts: StartOptions = {}): RunHandle {
     if (!this.home && this.mode === 'live') this.captureHome();
+    this.nameIndex = null;
     const robot = programRobot(program, opts.robot);
     let resolve!: (h: RunHandle) => void;
     const done = new Promise<RunHandle>((r) => (resolve = r));
     const handle: RunHandle = { id: `run${++runCounter}`, program, robot, status: 'queued', done };
     const arm = robot instanceof Robot ? robot : null;
     const c: Ctx = { handle, frames: [], cursor: this.time, block: null, robot: arm, resolve, children: [] };
-    if (program instanceof Program) c.frames.push(this.frameFor(program, arm));
+    if (program instanceof Program) {
+      const fr = this.frameFor(program, arm);
+      if (opts.fromIndex && opts.fromIndex > 0) this.skipTo(fr, Math.min(opts.fromIndex, fr.list.length));
+      c.frames.push(fr);
+    }
     else if (program.type === ItemType.PROGRAM_PYTHON) {
       const st = { done: false as boolean, error: undefined as unknown, at: undefined as number | undefined };
       c.block = { kind: 'script', state: st, ins: null };
@@ -367,13 +392,28 @@ export class StationRuntime {
     return handle;
   }
 
+  /** "Run from here": robot state instructions before `index` take effect (no motion, no IO). */
+  private skipTo(fr: Frame, index: number): void {
+    const robot = fr.robot;
+    for (let j = 0; j < index; j++) {
+      const x = fr.list[j];
+      if (!x.enabled || !robot) continue;
+      const d = x.data, st = this.robotState(robot);
+      if (d.kind === 'speed' && !this.ignoreSpeedInstructions) this.applySpeed(st.settings, d);
+      else if (d.kind === 'rounding') st.settings.rounding = d.radius;
+      else if (d.kind === 'tool') { st.toolId = d.toolId; const t = d.toolId ? this.station.findById(d.toolId) : null; robot.setTool(t instanceof Tool ? t : null); }
+      else if (d.kind === 'frame') { st.frameId = d.frameId; st.frameSet = true; robot.setFrame(d.frameId ? this.station.findById(d.frameId) : null); }
+    }
+    fr.pc = index;
+  }
+
   private frameFor(program: Program, robot: Robot | null): Frame {
     const r = programRobot(program) ?? robot;
     const arm = r instanceof Robot ? r : robot;
     if (arm && program instanceof Program) {
       const st = this.robotState(arm);
       if (program.toolId) st.toolId = program.toolId;
-      if (program.frameId) st.frameId = program.frameId;
+      if (program.frameId) { st.frameId = program.frameId; st.frameSet = true; }
     }
     return { program, list: program.instructions(), pc: 0, robot: arm, mover: mobileOf(r instanceof Item ? r : null), repeat: 0 };
   }
@@ -390,7 +430,11 @@ export class StationRuntime {
     if (sj && c.robot) c.robot.setJoints(sj);
     this.ctxs.push(c);
     const ps = (c as any).pendingScript;
-    if (ps) this.launchScript(c, ps.name, ps.args, ps.state, c.handle.program);
+    if (ps) {
+      // record mode (compile) never executes scripts
+      if (this.mode === 'record') { ps.state.done = true; ps.state.at = c.cursor; }
+      else this.launchScript(c, ps.name, ps.args, ps.state, c.handle.program);
+    }
     this.events.emit('run', { handle: c.handle });
   }
 
@@ -675,7 +719,7 @@ export class StationRuntime {
       }
       case 'speed': {
         fr.pc++;
-        if (robot) this.applySpeed(this.robotState(robot).settings, d);
+        if (robot && !this.ignoreSpeedInstructions) this.applySpeed(this.robotState(robot).settings, d);
         this.record(c, ins, robot, c.cursor, c.cursor);
         return;
       }
@@ -686,7 +730,7 @@ export class StationRuntime {
         return;
       case 'frame': {
         fr.pc++;
-        if (robot) this.robotState(robot).frameId = d.frameId;
+        if (robot) { const rs = this.robotState(robot); rs.frameId = d.frameId; rs.frameSet = true; }
         const st = this.station, id = d.frameId;
         this.instant(c, ins, robot, () => robot?.setFrame(id ? st.findById(id) : null));
         return;
@@ -737,7 +781,7 @@ export class StationRuntime {
       case 'event': {
         fr.pc++;
         const toolId = robot ? this.robotState(robot).toolId : null;
-        const fn = this.eventAction(robot, toolId, d.action, d.objectId ?? null, d.name ?? null);
+        const fn = this.eventAction(robot, toolId, d.action, d.objectId ?? null, d.name ?? null, (d as { restore?: ObjectPlacement[] }).restore);
         this.instant(c, ins, robot, fn);
         return;
       }
@@ -788,7 +832,21 @@ export class StationRuntime {
       }
       case 'thread': {
         fr.pc++;
-        const sub = d.programId ? this.station.findById(d.programId) : this.findProgram(d.programName ?? '');
+        const sub = (d.programId ? this.station.findById(d.programId) : null) ?? this.findProgram(parseCallText(d.programName ?? '').name);
+        if (sub && sub.type === ItemType.PROGRAM_PYTHON) {
+          // a station Python program on its own thread (RoboDK "Run on a separate thread"): script runner in live
+          // playback, not simulated when compiling
+          this.record(c, ins, robot, c.cursor, c.cursor);
+          if (this.mode === 'record') { this.warnOnce(c, ins, `pythread:${sub.id}`, `Thread ${sub.name} is a Python program: it runs through the script runner in live playback only`); return; }
+          const saved = this.time;
+          this.time = Math.max(this.time, c.cursor);
+          const h = this.start(sub, { args: parseCallText(d.programName ?? '').args });
+          this.time = saved;
+          h.parentId = c.handle.id;
+          const child = [...this.ctxs, ...this.queue].find((x) => x.handle === h);
+          if (child) { child.parent = c; c.children.push(child); }
+          return;
+        }
         if (!(sub instanceof Program)) return this.fail(c, ins, `Thread program ${d.programName ?? d.programId} not found`);
         const subRobot = programRobot(sub);
         if (subRobot && robot && subRobot === robot) this.problem(c, ins, 'Thread uses the same robot as the main program', 'warning');
@@ -823,9 +881,23 @@ export class StationRuntime {
     }
   }
 
-  private findProgram(name: string): Item | null {
+  /** Items by name (built once per start(): code calls such as Extruder(N) and named events are looked up per instruction). */
+  private nameIndex: Map<string, Item[]> | null = null;
+  /** First item named `name` (optionally of a type) in tree order, like Station.find but O(1). */
+  findNamed(name: string, type?: ItemType): Item | null {
     if (!name) return null;
-    return this.station.find(name, ItemType.PROGRAM) ?? this.station.find(name, ItemType.PROGRAM_PYTHON);
+    if (!this.nameIndex) {
+      this.nameIndex = new Map();
+      for (const it of this.station.walk()) { if (it === this.station) continue; const l = this.nameIndex.get(it.name); if (l) l.push(it); else this.nameIndex.set(it.name, [it]); }
+    }
+    for (const it of this.nameIndex.get(name) ?? []) {
+      if (it.station !== this.station) { this.nameIndex = null; return this.findNamed(name, type); }
+      if (type === undefined || it.type === type) return it;
+    }
+    return null;
+  }
+  private findProgram(name: string): Item | null {
+    return this.findNamed(name, ItemType.PROGRAM) ?? this.findNamed(name, ItemType.PROGRAM_PYTHON);
   }
 
   private callByName(c: Ctx, fr: Frame, ins: Instruction, name: string, args: string[], text: string): void {
@@ -862,9 +934,18 @@ export class StationRuntime {
     }
     const robot = c.robot;
     const ctx: ScriptContext = { station: this.station, runtime: this, name, args, robot, program: item ?? c.handle.program };
-    let p: Promise<void>;
-    try { p = Promise.resolve(runners[0](ctx)); } catch (e) { p = Promise.reject(e); }
-    p.then(() => { state.done = true; state.at = this.time; }, (e) => { state.done = true; state.error = e ?? 'error'; state.at = this.time; });
+    // runners in order (per-runtime first, then global); a runner resolving `false` does not handle the call
+    const tryAt = (i: number): void => {
+      if (i >= runners.length) {
+        this.events.emit('message', { text: item ? `No script runner handled ${name}: not executed` : `Call ${name}: no program or script named ${name} in the station (ignored in simulation)`, level: 'warn', handle: c.handle });
+        state.done = true; state.at = this.time;
+        return;
+      }
+      let p: Promise<void | boolean>;
+      try { p = Promise.resolve(runners[i](ctx)); } catch (e) { p = Promise.reject(e); }
+      p.then((r) => { if (r === false) tryAt(i + 1); else { state.done = true; state.at = this.time; } }, (e) => { state.done = true; state.error = e ?? 'error'; state.at = this.time; });
+    };
+    tryAt(0);
   }
 
   private waitFor(c: Ctx, ins: Instruction, robot: Robot | null, names: string[], test: () => boolean, timeout: number, label: string): void {
@@ -888,9 +969,15 @@ export class StationRuntime {
     if (d.accelJoints !== undefined && d.accelJoints > 0) s.accelJoints = d.accelJoints;
   }
 
+  /**
+   * TCP relative to the robot flange. A tool mounted on a mechanism the robot carries (weld gun / gripper robot, RoboDK
+   * 03.i, 06.f) is resolved through that mechanism at its current joints, not as if it sat on the flange.
+   */
   toolPose(robot: Robot, toolId: string | null): Mat4 {
     const t = toolId ? this.station.findById(toolId) : robot.activeTool();
-    return t instanceof Tool ? t.poseTool() : identity();
+    if (!(t instanceof Tool)) return identity();
+    if (t.parent && t.parent !== robot && robot.isAncestorOf(t)) return multiply(invert(multiply(robot.poseAbs(), robot.solveFKFlange())), t.poseAbs());
+    return t.poseTool();
   }
   private frameItem(robot: Robot, frameId: string | null): Item | null {
     const f = frameId ? this.station.findById(frameId) : robot.activeFrame();
@@ -909,6 +996,9 @@ export class StationRuntime {
     let pending: Instruction[] = [];
     let settingsAfterLast = { ...settings };
     const tool = this.toolPose(robot, st.toolId), frame = this.frameItem(robot, st.frameId);
+    // RoboDK reference semantics apply once the program set its reference frame (RoboDK programs always do; a studio
+    // program that never sets one keeps its targets at their absolute poses whatever frame is active in the UI)
+    const targetFrame = st.frameSet && st.frameId ? this.station.findById(st.frameId) : null;
     for (let j = fr.pc; j < fr.list.length && specs.length < CHAIN_MAX; j++) {
       const x = fr.list[j];
       if (!x.enabled) continue;
@@ -920,7 +1010,7 @@ export class StationRuntime {
           break;
         }
         const via = xd.viaTargetId ? this.station.findById(xd.viaTargetId) : null;
-        specs.push({ data: xd as MoveInstruction, target: target as Target | null, via: via instanceof Target ? via : null, tool, frame, settings: { ...settings, speedLinear: xd.speed && xd.speed > 0 ? xd.speed : settings.speedLinear, rounding: xd.rounding ?? settings.rounding } });
+        specs.push({ data: xd as MoveInstruction, target: target as Target | null, via: via instanceof Target ? via : null, tool, frame, targetFrame, settings: { ...settings, speedLinear: xd.speed && xd.speed > 0 ? xd.speed : settings.speedLinear, rounding: xd.rounding ?? settings.rounding } });
         chainIns.push(x); chainIdx.push(j);
         for (const p of pending) between.push({ after: specs.length - 2, ins: p });
         pending = [];
@@ -928,7 +1018,7 @@ export class StationRuntime {
         continue;
       }
       if (PASSTHROUGH.has(xd.kind) && !((xd.kind === 'io' || xd.kind === 'signal') && xd.wait)) {
-        if (xd.kind === 'speed') this.applySpeed(settings, xd);
+        if (xd.kind === 'speed' && !this.ignoreSpeedInstructions) this.applySpeed(settings, xd);
         if (xd.kind === 'rounding') settings.rounding = xd.radius;
         pending.push(x);
         continue;
@@ -938,19 +1028,21 @@ export class StationRuntime {
     const group = motionGroupFor(robot, specs.flatMap((s) => [s.target, s.via]));
     const res = planChain(group, group.current(), specs);
     const t0 = c.cursor;
-    const nRun = res.failed ? res.failed.index + 1 : res.moves.length;
+    // a failing move is not executed: the robot stops at the end of the previous move (RoboDK stops the program at the
+    // instruction it cannot execute)
+    const nRun = res.failed ? res.failed.index : res.moves.length;
     const segs: MotionSeg[] = [];
     for (let k = 0; k < nRun; k++) {
       const m = res.moves[k];
       segs.push({ t0: t0 + m.t0, t1: t0 + m.t1, traj: m.trajectory, group, ins: chainIns[k], index: chainIdx[k] });
       this.distance += m.trajectory.length;
-      for (const w of m.warnings) this.problem(c, chainIns[k], w, 'warning');
+      for (const w of m.warnings) this.warnOnce(c, chainIns[k], `${fr.program.id}:${w}`, w);
       this.record(c, chainIns[k], robot, t0 + m.t0, t0 + m.t1, { trajectory: m.trajectory, group });
       if (k > 0) this.executed++;
     }
     const events: Array<{ t: number; fn: () => void }> = [];
     for (const b of between) {
-      if (b.after >= nRun - (res.failed ? 1 : 0)) continue;
+      if (b.after >= nRun) continue;
       const tEv = b.after >= 0 ? t0 + res.moves[b.after].t1 : t0;
       const bi = b.ins, bd = bi.data;
       events.push({ t: tEv, fn: () => {
@@ -966,7 +1058,10 @@ export class StationRuntime {
       fr.pc = chainIdx[res.failed.index] + 1;
       const k = res.failed.index;
       st.settings = this.settingsUpTo(fr, pc0, chainIdx[k], base);
-      c.block = { kind: 'motion', t1: segs.length ? segs[segs.length - 1].t1 : t0, segs, events, ei: 0, fail: { ins: chainIns[k], message: res.failed.message } };
+      const tf = segs.length ? segs[segs.length - 1].t1 : t0;
+      this.record(c, chainIns[k], robot, tf, tf);
+      if (k > 0) this.executed++;
+      c.block = { kind: 'motion', t1: tf, segs, events, ei: 0, fail: { ins: chainIns[k], message: res.failed.message } };
     } else {
       fr.pc = chainIdx[chainIdx.length - 1] + 1;
       st.settings = settingsAfterLast;
@@ -980,7 +1075,7 @@ export class StationRuntime {
     for (let j = from; j < to; j++) {
       const d = fr.list[j].data;
       if (!fr.list[j].enabled) continue;
-      if (d.kind === 'speed') this.applySpeed(s, d);
+      if (d.kind === 'speed' && !this.ignoreSpeedInstructions) this.applySpeed(s, d);
       if (d.kind === 'rounding') s.rounding = d.radius;
     }
     return s;
@@ -988,11 +1083,11 @@ export class StationRuntime {
 
   // -- events (attach / detach / show / hide) -----------------------------------------------------------------------
 
-  private eventAction(robot: Robot | null, toolId: string | null, action: string, objectId: string | null, label: string | null): (() => void) | undefined {
+  private eventAction(robot: Robot | null, toolId: string | null, action: string, objectId: string | null, label: string | null, restore?: ObjectPlacement[]): (() => void) | undefined {
     const st = this.station;
     const toolOf = (): Tool | null => {
       let tool = (toolId ? st.findById(toolId) : robot?.activeTool()) as Tool | null;
-      if (label) { const named = st.find(label, ItemType.TOOL); if (named instanceof Tool) tool = named; }
+      if (label) { const named = this.findNamed(label, ItemType.TOOL); if (named instanceof Tool) tool = named; }
       return tool instanceof Tool ? tool : null;
     };
     switch (action) {
@@ -1021,11 +1116,13 @@ export class StationRuntime {
       case 'show':
       case 'hide': {
         if (label === 'objects') return () => setPartVisibility(st, action === 'show' ? 'show-raw' : 'hide-done');
-        const target = objectId ? st.findById(objectId) : label ? st.find(label) : null;
+        const target = objectId ? st.findById(objectId) : label ? this.findNamed(label) : null;
         return target ? () => target.setVisible(action === 'show') : undefined;
       }
       case 'custom': {
-        if (label === 'Replace objects') {
+        if (label && /^replace objects$/i.test(label)) {
+          // RoboDK "Replace objects" stores the placements to restore (imported as `restore`): parent frame + pose
+          if (restore?.length) return () => { for (const r of restore) this.placeObject(r); };
           const home = this.home?.snap ?? null;
           return () => { home?.restoreObjects(); setPartVisibility(st, 'reset'); };
         }
@@ -1033,6 +1130,19 @@ export class StationRuntime {
       }
     }
     return undefined;
+  }
+
+  /** Put an object back under a frame at a pose relative to it (releasing it from a tool). */
+  placeObject(r: ObjectPlacement): void {
+    const o = this.station.findById(r.id);
+    if (!(o instanceof SceneObject)) return;
+    if (o.parent instanceof Tool) { o.parent.attached = o.parent.attached.filter((x) => x !== o.id); this.sink.detach?.(o.id); }
+    for (const t of this.station.walk()) if (t instanceof Tool && t.attached.includes(o.id)) t.attached = t.attached.filter((x) => x !== o.id);
+    this.homeParents.delete(o.id);
+    const par = r.parentId ? this.station.findById(r.parentId) : null;
+    if (par && o.parent !== par && !o.isAncestorOf(par)) par.addChild(o);
+    if (Array.isArray(r.pose) && r.pose.length === 16) o.setPose(fromArray(r.pose));
+    if (r.visible !== undefined && o.visible !== r.visible) o.setVisible(r.visible);
   }
 
   /** Attach: the object becomes a child of the tool (RoboDK semantics), keeping its absolute pose. */
@@ -1059,14 +1169,21 @@ export class StationRuntime {
     this.sink.detach?.(id);
   }
 
-  /** Object closest to the TCP whose bounding box is within the tool's reach (tool param attachTolerance, mm). */
+  /**
+   * Object closest to the TCP whose bounding box is within the tool's reach (tool param attachTolerance, mm). A hidden
+   * object counts only as the twin of a part this tool already holds (same pose): RoboDK stations carry a hidden raw part
+   * and its visible finished twin with two Attach events (06.d), while a single Attach must take the visible part (06.f).
+   */
   closestObject(tool: Tool, robot: Robot | null): SceneObject | null {
     const tcp = tool.poseAbs();
     const p: [number, number, number] = [tcp[12], tcp[13], tcp[14]];
     const tolParam = Number(tool.getParam('attachTolerance'));
-    let best: SceneObject | null = null, bestD = Infinity, bestO = Infinity;
+    let best: SceneObject | null = null, bestD = Infinity, bestO = Infinity, bestV = false;
+    const held = tool.attached.map((id) => this.station.findById(id)).filter((o): o is Item => !!o).map((o) => o.poseAbs());
+    const twinOfHeld = (o: Item) => { const q = o.poseAbs(); return held.some((h) => Math.hypot(h[12] - q[12], h[13] - q[13], h[14] - q[14]) < 1); };
     for (const it of this.station.walk()) {
-      if (!(it instanceof SceneObject) || it instanceof Tool || !it.visible) continue;
+      if (!(it instanceof SceneObject) || it instanceof Tool) continue;
+      if (!it.visible && !twinOfHeld(it)) continue;
       if (it.parent instanceof Tool || it.isAncestorOf(tool) || (robot && (it.isAncestorOf(robot) || robot.isAncestorOf(it)))) continue;
       const box = this.localBox(it);
       const abs = it.poseAbs();
@@ -1080,7 +1197,8 @@ export class StationRuntime {
       }
       const tol = Number.isFinite(tolParam) && tolParam > 0 ? tolParam : box ? 50 : 300;
       if (d > tol) continue;
-      if (d < bestD - 1e-6 || (Math.abs(d - bestD) <= 1e-6 && originD < bestO)) { best = it; bestD = d; bestO = originD; }
+      const better = d < bestD - 1e-6 || (Math.abs(d - bestD) <= 1e-6 && ((it.visible && !bestV) || (it.visible === bestV && originD < bestO)));
+      if (better) { best = it; bestD = d; bestO = originD; bestV = it.visible; }
     }
     return best;
   }
@@ -1137,8 +1255,9 @@ function sampleTraj(tr: Trajectory, t: number): TrajectorySample {
 }
 
 /** Record a program run (event driven, continue after errors) and restore the station afterwards. */
-export function recordProgram(station: Station, program: Program, opts: { startJoints?: Map<string, number[]>; sink?: RuntimeSink; assets?: StationRuntime['assets'] } = {}) {
+export function recordProgram(station: Station, program: Program, opts: { startJoints?: Map<string, number[]>; sink?: RuntimeSink; assets?: StationRuntime['assets']; ignoreSpeedInstructions?: boolean } = {}) {
   const rt = new StationRuntime(station, { mode: 'record', continueOnError: true });
+  rt.ignoreSpeedInstructions = !!opts.ignoreSpeedInstructions;
   if (opts.sink) rt.sink = opts.sink;
   if (opts.assets) rt.assets = opts.assets;
   const snap = new StationSnapshot(station, opts.startJoints);

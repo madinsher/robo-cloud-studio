@@ -12,13 +12,15 @@
  * - transport: load at the location, deliver to `meta.dropoff`, unload.
  * Also provides the orchard alleys as traffic segments.
  */
-import { Station, ItemType } from '../core/items/item';
+import { Station, ItemType, Camera, Item } from '../core/items/item';
 import { MobileRobot, ZoneItem } from '../mobile/items';
 import { FleetManager, FleetTask, registerTaskProcess, registerSegmentProvider, TrafficSegment, WorkDirective, fleetPlugins } from '../fleet/fleet';
 import { FieldItem, CropRow, MissionItem } from './items';
 import { fruitWorldPositions } from './orchard';
 import { armOf, armMount, armReach } from './harvest';
 import { plantWorld } from './collision_world';
+import { actionEnergy } from './equipment';
+import { detectFruit } from './vision';
 import { Robot } from '../core/items/robot';
 import { poseFromZ, multiply, invert, getPos, normalize } from '../core/math/pose';
 
@@ -56,6 +58,12 @@ function serviceLocation(fm: FleetManager, robot: MobileRobot, kinds: string[]):
 }
 function resource(robot: MobileRobot, name: string, capacity: number, unit: string, full = true) {
   return (robot.resources[name] ??= { capacity, level: full ? capacity : 0, unit });
+}
+
+/** First camera mounted on the carrier (or on its arm). */
+function cameraOf(robot: MobileRobot): Camera | null {
+  for (const it of robot.walk() as Iterable<Item>) if (it instanceof Camera) return it;
+  return null;
 }
 
 /** Orient a row work path so that the carrier's arm faces the row (fixes the arm facing the neighbour row). */
@@ -161,6 +169,7 @@ function pickProcess(kind: 'harvest' | 'thin') {
         p.stops = r.stops; p.unreachable = r.unreachable;
       }
       p.stopIdx = 0; p.picks = [];
+      task.meta.fruitSource = kind === 'harvest' && cameraOf(robot) ? 'vision' : 'ground_truth';
       fm.bookStat(kind, 'unreachable', p.unreachable);
     },
     onWork: (fm: FleetManager, task: FleetTask, robot: MobileRobot, s: number, _dt: number, holding: boolean): WorkDirective | void => {
@@ -177,6 +186,7 @@ function pickProcess(kind: 'harvest' | 'thin') {
         const f = row.plants[pk.ref[0]]?.fruit[pk.ref[1]];
         if (!f || f.picked) continue;
         f.picked = true;
+        actionEnergy(fm, robot, 'pick');
         if (kind === 'thin') (f as any).thinned = true;
         if (kind === 'harvest') {
           fm.bookYield({ fruit: 1, kg: fruitKg });
@@ -200,8 +210,18 @@ function pickProcess(kind: 'harvest' | 'thin') {
       if (p.stopIdx < stops.length && s >= stops[p.stopIdx].s - 25) {
         const stop = stops[p.stopIdx++];
         const settle = st.settleSeconds ?? 2;
-        stop.fruit.forEach((ref, i) => p.picks.push({ t: fm.time + settle + (i + 1) * spf, ref }));
-        return { hold: settle + stop.fruit.length * spf + 0.05 };
+        let fruit = stop.fruit;
+        // with a camera on the carrier the arm only picks what the camera detects at the stop (misses stay on the tree)
+        const cam = kind === 'harvest' ? cameraOf(robot) : null;
+        if (cam) {
+          const seen = new Set(detectFruit(fm.station, cam, { onlyRipe: true, solids: [] }).map((d) => d.fruit));
+          const vis = fruit.filter((ref) => seen.has(row.plants[ref[0]]?.fruit[ref[1]]));
+          fm.bookStat('harvest', 'missedByVision', fruit.length - vis.length);
+          fm.bookStat('harvest', 'detectedAtStops', vis.length);
+          fruit = vis;
+        }
+        fruit.forEach((ref, i) => p.picks.push({ t: fm.time + settle + (i + 1) * spf, ref }));
+        return { hold: settle + fruit.length * spf + 0.05 };
       }
     },
     onService: (fm: FleetManager, _task: FleetTask, robot: MobileRobot, k: string) => { if (k === 'unload' && robot.resources.bin) { fm.bookStat('harvest', 'unloadedKg', robot.resources.bin.level); robot.resources.bin.level = 0; fm.bookStat('harvest', 'unloads', 1); } },
@@ -257,6 +277,7 @@ function liquidProcess(kind: 'spray' | 'irrigate') {
       }
       tank.level -= litres;
       fm.bookStat(kind, 'litres', litres);
+      actionEnergy(fm, robot, 'litre', litres);
       p.s = s;
     },
     onService: (fm: FleetManager, _task: FleetTask, robot: MobileRobot) => { const t = robot.resources[res]; if (t) t.level = t.capacity; fm.bookStat(kind, 'refills', 1); },
@@ -321,6 +342,7 @@ function perPlantProcess(kind: 'prune' | 'pollinate') {
         t += st.secondsPerPlant ?? vol * (kind === 'prune' ? 25 : 4);
         if (kind === 'prune') pl.prunedAt = fm.time; else pl.pollinatedAt = fm.time;
         fm.bookStat(kind, 'plants', 1);
+        actionEnergy(fm, _robot, kind === 'prune' ? 'cut' : 'plant');
       }
       void crop;
       if (t > 0) { fm.bookStat(kind, 'seconds', t); return { hold: t }; }
@@ -355,6 +377,7 @@ registerTaskProcess('scout', {
       const obs: ScoutObservation = { t: fm.time, rowId: row.id, plant: idx, health: +h.toFixed(3), diseased: h < thr, robot: robot.name };
       if (mission) mission.observations.push(obs);
       fm.bookStat('scout', 'observations', 1);
+      actionEnergy(fm, robot, 'image');
       if (obs.diseased) fm.bookStat('scout', 'diseased', 1);
     }
   },

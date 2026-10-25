@@ -13,7 +13,7 @@ import { pose2Fanuc } from './euler';
 interface Part { name: string; lines: string[]; pos: string[]; nPos: number }
 
 export class FanucPost extends RoboPost {
-  PROG_EXT = 'LS';
+  override PROG_EXT = 'LS';
   protected files: Part[] = [];
   protected progParts: Part[] = [];
   protected cur!: Part;
@@ -61,7 +61,7 @@ export class FanucPost extends RoboPost {
     return this.files.map((p) => {
       const L = [`/PROG  ${p.name}`, '/ATTR', 'OWNER\t\t= MNEDITOR;', 'COMMENT\t\t= "VerticalBot sequence";', 'PROG_SIZE\t= 0;', `CREATE\t\t= ${date};`, `MODIFIED\t= ${date};`, `FILE_NAME\t= ${p.name};`, 'VERSION\t\t= 0;', `LINE_COUNT\t= ${p.lines.length};`, 'MEMORY_SIZE\t= 0;', 'PROTECT\t\t= READ_WRITE;',
         'TCD:  STACK_SIZE\t= 0,', '      TASK_PRIORITY\t= 50,', '      TIME_SLICE\t= 0,', '      BUSY_LAMP_OFF\t= 0,', '      ABORT_REQUEST\t= 0,', '      PAUSE_REQUEST\t= 0;', `DEFAULT_GROUP\t= ${this.rj3 ? '1,*,*,*,*' : '1,*,*,*,*,*,*'};`, 'CONTROL_CODE\t= 00000000 00000000;', '/MN'];
-      p.lines.forEach((l, i) => L.push(`${String(i + 1).padStart(4)}:${l.replace('\n', `\n       `)}`));
+      p.lines.forEach((l, i) => L.push(`${String(i + 1).padStart(4)}:${l.replace('\n', `\r\n       `)}`));
       L.push('/POS', ...p.pos, '/END');
       return { name: `${p.name}.LS`, content: L.join('\r\n') + '\r\n' };
     });
@@ -87,16 +87,16 @@ export class FanucPost extends RoboPost {
   protected accTxt() { return this.acc ? ` ACC${this.acc}` : ''; }
   MoveJ(_pose: Mat4 | null, joints: number[]): void {
     this.splitIfNeeded();
-    this.mn(`J P[${this.addPos(null, joints, null)}] ${this.jspeed} ${this.cnt}${this.accTxt()} ;`);
+    this.motion(`J P[${this.addPos(null, joints, null)}] ${this.jspeed} ${this.cnt}${this.accTxt()} ;`);
   }
   MoveL(pose: Mat4 | null, joints: number[], conf: number[]): void {
     this.splitIfNeeded();
-    this.mn(`L P[${this.addPos(pose, joints, pose ? conf : null)}] ${this.speed} ${this.cnt}${this.accTxt()} ;`);
+    this.motion(`L P[${this.addPos(pose, joints, pose ? conf : null)}] ${this.speed} ${this.cnt}${this.accTxt()} ;`);
   }
   override MoveC(pose1: Mat4 | null, joints1: number[], pose2: Mat4 | null, joints2: number[], conf1: number[], conf2: number[]): void {
     this.splitIfNeeded();
     const a = this.addPos(pose1, joints1, pose1 ? conf1 : null), b = this.addPos(pose2, joints2, pose2 ? conf2 : null);
-    this.mn(`C P[${a}] \nP[${b}] ${this.speed} ${this.cnt} ;`);
+    this.motion(`C P[${a}] \nP[${b}] ${this.speed} ${this.cnt} ;`);
   }
   protected frameLines(kind: 'UFRAME' | 'UTOOL', pose: Mat4, id: number): number {
     const v = pose2Fanuc(pose);
@@ -134,9 +134,24 @@ export class FanucPost extends RoboPost {
   }
   protected callName(code: string) {
     const m = code.trim().match(/^([^(]*)(\(.*\))?$/)!;
-    return `${m[1].trim().replace(/ /g, '_').slice(0, this.callLen)}${m[2] ?? ''}`;
+    const base = m[1].trim().replace(/ /g, '_');
+    // a program generated in this run is called by its (shorter) file name
+    if (!m[2] && this.ctx.programs.includes(base)) return this.safe(base).slice(0, this.nameLen);
+    return `${base.slice(0, this.callLen)}${m[2] ?? ''}`;
   }
+  /** Last motion line (RoboDK's arc-welding calls modify it). */
+  protected lastMotion: { part: Part; idx: number } | null = null;
+  protected motion(s: string): void { this.mn(s); this.lastMotion = { part: this.cur, idx: this.cur.lines.length - 1 }; }
   override RunCode(code: string, isCall = false): void {
+    // RoboDK arc welding: ArcStart / ArcEnd become options of the previous motion line (FINE termination) and
+    // ArcStart adds a weave instruction ("ArcStart(3)" -> Weave Sine[3])
+    const arc = isCall ? code.trim().match(/^Arc(Start|End)\s*(?:\((.*)\))?$/i) : null;
+    if (arc && this.lastMotion) {
+      const { part, idx } = this.lastMotion;
+      part.lines[idx] = part.lines[idx].replace(/ CNT\d+/, ' FINE').replace(/ ;$/, ` Arc ${arc[1].toLowerCase() === 'start' ? 'Start' : 'End'}[11] ;`);
+      if (arc[1].toLowerCase() === 'start') this.addline(`Weave Sine[${arc[2] ?? '2.0Hz,8.0mm,0.075s,0.075'}]`);
+      return;
+    }
     if (isCall) this.addline(`CALL ${this.callName(code)}`);
     else this.mn(`  ${code};`);
   }

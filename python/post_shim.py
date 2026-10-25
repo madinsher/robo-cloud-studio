@@ -159,7 +159,31 @@ def _replay(post, prog, Mat):
         c = ev.get(key)
         return list(c) if c else [0, 0, 0]
 
-    post.ProgStart(prog['name'])
+    missing = set()
+    real = post
+
+    class _Tolerant(object):
+        # methods a minimal post does not define are reported once in the log instead of aborting the generation
+        def __getattr__(self, name):
+            fn = getattr(real, name, None)
+            if fn is not None:
+                return fn
+
+            def _skip(*a, **k):
+                if name not in missing:
+                    missing.add(name)
+                    try:
+                        post_log = getattr(real, 'LOG', None)
+                        msg = '%s not defined by this post: instruction skipped' % name
+                        if isinstance(post_log, list):
+                            post_log.append(msg)
+                        elif isinstance(post_log, str):
+                            real.LOG = post_log + msg + chr(10)
+                    except Exception:
+                        pass
+            return _skip
+    post = _Tolerant()
+    real.ProgStart(prog['name'])
     for c in prog.get('header_comments') or []:
         post.RunMessage(c, True)
     for ev in prog['events']:
@@ -179,11 +203,11 @@ def _replay(post, prog, Mat):
         elif k == 'setSpeed':
             if ev.get('speedLinear') is not None:
                 post.setSpeed(ev['speedLinear'])
-            if ev.get('speedJoints') is not None and hasattr(post, 'setSpeedJoints'):
+            if ev.get('speedJoints') is not None and hasattr(real, 'setSpeedJoints'):
                 post.setSpeedJoints(ev['speedJoints'])
-            if ev.get('accelLinear') is not None and hasattr(post, 'setAcceleration'):
+            if ev.get('accelLinear') is not None and hasattr(real, 'setAcceleration'):
                 post.setAcceleration(ev['accelLinear'])
-            if ev.get('accelJoints') is not None and hasattr(post, 'setAccelerationJoints'):
+            if ev.get('accelJoints') is not None and hasattr(real, 'setAccelerationJoints'):
                 post.setAccelerationJoints(ev['accelJoints'])
         elif k == 'setRounding':
             post.setZoneData(ev.get('radius', -1))
@@ -191,7 +215,7 @@ def _replay(post, prog, Mat):
             post.Pause(ev.get('timeMs', 0))
         elif k == 'setDO':
             post.setDO(_io(ev.get('io')), _value(ev.get('value')))
-        elif k == 'setAO' and hasattr(post, 'setAO'):
+        elif k == 'setAO' and hasattr(real, 'setAO'):
             post.setAO(_io(ev.get('io')), ev.get('value'))
         elif k == 'waitDI':
             post.waitDI(_io(ev.get('io')), _value(ev.get('value')), ev.get('timeoutMs', -1))
@@ -263,9 +287,15 @@ def _run_group(module, job, group, folder, Mat, logs):
     for p in group:
         _replay(post, p, Mat)
     try:
-        post.ProgSave(folder, group[0]['name'], False, False)
-    except TypeError:
-        post.ProgSave(folder, group[0]['name'])
+        try:
+            post.ProgSave(folder, group[0]['name'], False, False)
+        except TypeError:
+            post.ProgSave(folder, group[0]['name'])
+    except RuntimeError as e:
+        # some posts (AUBO, ...) write their files and then ask the RoboDK API to show / send them: keep the files
+        if 'Robolink is not available' not in str(e) or not _collect(folder):
+            raise
+        logs.append('ProgSave: files written; the post then needed the RoboDK API (%s)' % e)
     plog = getattr(post, 'LOG', '')
     if isinstance(plog, list):
         plog = '\n'.join(plog)

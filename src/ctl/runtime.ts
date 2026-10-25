@@ -284,6 +284,8 @@ export function hostBindings(host: StationHost): WorldBindings & { locks: RobotL
       await: (ctx, args) => { const e = String(args.expr ?? args.await ?? args.condition ?? 'true'); try { return expr(e).bool(envOf(ctx.bb)) ? 'success' : 'running'; } catch (err) { ctx.log?.(`await ${e}: ${(err as Error).message}`); return 'failure'; } },
       event: (_c, args) => { const e = args.emit ?? args.name; if (typeof e === 'string') pending.push(e); return 'success'; },
       log: (ctx, args) => { ctx.log?.(String(args.message ?? args.text ?? '')); return 'success'; },
+      report: (ctx) => { ctx.bb.reported = true; return 'success'; },
+      select_target: (ctx) => (Number(ctx.bb.targets ?? 0) > 0 ? 'success' : 'failure'),
     },
     halt: {
       program: (_c, _a, node) => { if (!node) return; const s = runs.get(node.id); if (s?.run) host.programs.stop(s.run); runs.delete(node.id); locks.release(node.id); },

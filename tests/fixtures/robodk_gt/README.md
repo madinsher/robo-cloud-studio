@@ -18,3 +18,13 @@ keeping the last row of every MOVE_ID and every 20th row, `make` = `MakeProgram(
 
 `code/robodk_generated_code.tgz` holds the programs RoboDK generated with each robot's own post processor
 (free licence: machining programs and programs over the licence limits are missing).
+
+Re-dumps (T1, round 1): `Example-03.g…` and `Example-02.f…Turntable…` were truncated in the first dump (the hidden Fanuc
+post blocked `MakeProgram` until RoboDK died; the collision-checked `Update` of the 02.f machining program never
+finished). They were dumped again with `DUMP_NO_MAKE=1` (no generated code) and, for 02.f turntable,
+`DUMP_NO_COLLISION=1` (`updateCollision` = null).
+
+`synthetic/` holds stations RoboDK 5.9.4 wrote itself through its API (`make_synthetic.py`): `T1-instructions.rdk`
+(+ its ground truth) covers what the Library lacks — IO set/wait, analog output, "Stop", rounding, joint speeds and
+accelerations, every RunInstruction variant, inline joint/pose moves, MoveC, duplicate target names, a station
+Python program and parameter, Cyrillic names; `T1-collision.rdk` pins the collision map layout.

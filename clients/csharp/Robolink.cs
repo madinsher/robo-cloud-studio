@@ -1,8 +1,11 @@
 // VerticalBot Studio — C# client (RoboDK-API-like) over WebSocket JSON-RPC. .NET 6+, no dependencies.
+// Build: dotnet build clients/csharp/Robolink.csproj (net6.0+). The official RoboDK C# API (RoboDK.cs) also works
+// unmodified against the studio when the server runs the RoboDK binary protocol (STUDIO_RDK_PORT, docs/api.md).
 // Usage:  var rdk = new Robolink("ws://localhost:20500"); var robot = await rdk.Item("", Robolink.ITEM_TYPE_ROBOT);
 //         await robot.MoveJ(new double[]{0,-90,90,0,90,0}); var pose = await robot.Pose();
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;

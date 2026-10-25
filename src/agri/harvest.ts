@@ -11,7 +11,7 @@ import { MobileRobot } from '../mobile/items';
 import { CropRow, PlantRecord } from './items';
 import { fruitWorldPositions } from './orchard';
 import { cropColliders } from './collision_world';
-import { collidersOf, checkColliders, Collider } from '../core/collision/collision';
+import { robotCollisionChecker } from '../core/collision/collision';
 import { poseFromZ, multiply, invert, transl, mul, Mat4, getPos, normalize, sub } from '../core/math/pose';
 
 /** Reference of one fruit: `fruit:<rowId>:<plant>:<index>`. */
@@ -150,29 +150,28 @@ export function generateHarvestProgram(station: Station, robot: Robot, rows: Cro
   if (opts.detections) for (const d of opts.detections) cands.push({ p: d.p, ref: d.ref ?? 'fruit:none', dist: Math.hypot(d.p[0] - basePos[0], d.p[1] - basePos[1], d.p[2] - basePos[2]) });
   else for (const row of rows) for (const f of fruitTargets(row)) if (!opts.side || f.side === opts.side) cands.push({ p: f.p, ref: f.ref, dist: Math.hypot(f.p[0] - basePos[0], f.p[1] - basePos[1], f.p[2] - basePos[2]) });
   const reachable = cands.filter((c) => c.dist <= maxReach).sort((a, b) => a.dist - b.dist);
-  // collision context: carrier, rigid crop near the arm, everything else within 4 m
+  // collision context: the same checker the program simulator uses (arm links + tool against themselves, the carrier
+  // and the rest of the station, collision map honoured) plus the rigid crop near the arm; joint paths are sampled
+  // every 2 deg like the simulator's timeline check
   const check = opts.collisionCheck !== false;
-  let colliders: Collider[] = [];
   let crop: Item | null = null;
-  const armItems = [...robot.walk()];
-  const armSet = new Set<Item>(armItems);
-  let baseline = new Set<string>();
-  const keyOf = (a: Collider, b: Collider) => `${a.item.id}/${a.part}|${b.item.id}/${b.part}`;
+  let checker: { check(version?: number): unknown[] } | null = null;
+  let baseline = 0;
   if (check) {
     crop = cropColliders(station, [basePos[0], basePos[1]], maxReach + 1500, `${robot.name} crop colliders`);
-    for (const it of station.walk()) {
-      if (it === station || armSet.has(it) || !it.visible) continue;
-      if (it.type === ItemType.FIELD || it.type === ItemType.CROP_ROW || it.type === ItemType.MAP || it.type === ItemType.ZONE || it.type === ItemType.FRAME || it.type === ItemType.TARGET || it.type === ItemType.PROGRAM) continue;
-      const p = it.poseAbs();
-      if (Math.hypot(p[12] - basePos[0], p[13] - basePos[1]) > maxReach + 4000 && !(crop && it === crop)) continue;
-      colliders.push(...collidersOf(it));
-    }
-    baseline = new Set(pairsAt(robot, startQ, armItems, colliders).map((p) => keyOf(p.a, p.b)));
+    checker = robotCollisionChecker(station, robot, {});
+    robot.setJoints(startQ);
+    baseline = checker.check(0).length;
   }
-  const collides = (q: number[]) => check && pairsAt(robot, q, armItems, colliders).some((p) => !baseline.has(keyOf(p.a, p.b)));
+  const collides = (qq: number[]) => {
+    if (!checker) return false;
+    robot.setJoints(qq);
+    return checker.check(0).length > baseline;
+  };
   const pathCollides = (q0: number[], q1: number[]) => {
-    if (!check) return false;
-    for (let i = 1; i <= 6; i++) { const t = i / 6; if (collides(q0.map((v, k) => v + (q1[k] - v) * t))) return true; }
+    if (!checker) return false;
+    const n = Math.max(2, Math.ceil(Math.max(...q0.map((v, k) => Math.abs(q1[k] - v))) / 2));
+    for (let i = 1; i <= n; i++) { const t = i / n; if (collides(q0.map((v, k) => v + (q1[k] - v) * t))) return true; }
     return false;
   };
   let picked = 0, skipped = 0, attempts = 0, rejects = 0;
@@ -192,7 +191,8 @@ export function generateHarvestProgram(station: Station, robot: Robot, rows: Cro
       if (!r1.ok) continue;
       const r2 = robot.solveIK(multiply(invert(base), pickAbs), { seed: r1.joints, restarts: 0, maxIterations: 60 });
       if (!r2.ok) continue;
-      if (collides(r1.joints) || collides(r2.joints) || pathCollides(q, r1.joints) || pathCollides(r1.joints, r2.joints)) { rejects++; continue; }
+      // approach, pick, the joint moves in between and the way back home must all be free
+      if (collides(r1.joints) || collides(r2.joints) || pathCollides(q, r1.joints) || pathCollides(r1.joints, r2.joints) || pathCollides(r1.joints, startQ)) { rejects++; continue; }
       qa = r1.joints; qp = r2.joints; ok = true;
       break;
     }
@@ -206,7 +206,9 @@ export function generateHarvestProgram(station: Station, robot: Robot, rows: Cro
     tP.setJoints(qp);
     prog.addMoveJ(tA);
     prog.addMoveL(tP);
-    prog.event('gripper_close', null, c.ref);
+    // the fruit is not a scene object: the explicit (non-item) object reference keeps the simulator from attaching
+    // the nearest object (the crop colliders) to the gripper; bindHarvestEvents removes the fruit by its name
+    prog.event('gripper_close', c.ref, c.ref);
     prog.pause(300);
     prog.addMoveL(tA);
     if (opts.dropPose) {
@@ -221,17 +223,6 @@ export function generateHarvestProgram(station: Station, robot: Robot, rows: Cro
   prog.addMoveJ(home);
   robot.setJoints(startQ);
   return { program: prog, picked, skipped, targets, source, collisionRejects: rejects };
-}
-
-function pairsAt(robot: Robot, q: number[], armItems: Item[], others: Collider[]) {
-  const saved = robot.joints();
-  robot.setJoints(q);
-  const mine: Collider[] = [];
-  for (const it of armItems) mine.push(...collidersOf(it));
-  robot.setJoints(saved);
-  // arm (with tool) against the environment, plus arm self-collision
-  const pairs = checkColliders([...mine, ...others]).filter((p) => armItems.includes(p.a.item) || armItems.includes(p.b.item));
-  return pairs;
 }
 
 /**

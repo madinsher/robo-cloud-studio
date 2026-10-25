@@ -191,7 +191,8 @@ export class App {
     this.runtime.assets = this.assets;
     this.runtime.sink.message ??= (text, level) => this.log(text, level);
     for (const hook of this.runtimeHooks) { try { hook(this.runtime, this); } catch (e) { console.error(e); } }
-    this.simState = 'idle'; this.simTime = 0; this.runs = []; this.session = []; this.atHome = true;
+    // a station that already ran (tab switched back, API runs) keeps its home state: Reset / the next Play restore it
+    this.simState = 'idle'; this.simTime = 0; this.runs = []; this.session = []; this.atHome = !this.runtime.hasHome;
   }
 
   /** Bind the per-station subscriptions (released on switch, so tab round trips do not accumulate listeners). */
@@ -573,12 +574,26 @@ export class App {
       if (q && robot instanceof Robot) { start.startJoints = q; robot.setJoints(q); }
     }
     const h = this.runtime.start(p, start as any) as unknown as RunInfo;
+    if (opts.fromIndex) this.startAt(h, opts.fromIndex);
     this.runs.push(h);
     this.session.push({ program: p, at: this.simTime, opts });
     this.simState = 'playing';
     void h.done.then(() => this.onRunFinished(h), (e) => this.log(`${p.name}: ${(e as Error)?.message ?? e}`, 'error'));
     this.emitSim();
     return h;
+  }
+
+  /**
+   * "Run from here": a run that has not executed anything yet starts at instruction `index`. Uses the runtime's
+   * StartOptions.fromIndex when it honours it (requested from T3); otherwise the new run's top frame is positioned
+   * before its first step (start() only queues / begins it, instructions execute on the next tick).
+   */
+  private startAt(h: RunInfo, index: number) {
+    if (typeof h.instructionIndex === 'number' && h.instructionIndex >= index) return;
+    const rt = this.runtime as unknown as { ctxs?: Array<{ handle: unknown; frames: Array<{ pc: number; list: unknown[] }> }>; queue?: Array<{ handle: unknown; frames: Array<{ pc: number; list: unknown[] }> }> };
+    const c = [...(rt.ctxs ?? []), ...(rt.queue ?? [])].find((x) => x.handle === h);
+    const fr = c?.frames?.[0];
+    if (fr && fr.pc === 0 && index < fr.list.length) { fr.pc = index; h.instructionIndex = index; }
   }
 
   /** Joints of the program's robot at the start of instruction `index` (from the preview compile). */
@@ -683,7 +698,10 @@ export class App {
       for (const s of replay) {
         if (s.at > t) break;
         this.advance(s.at - this.simTime);
-        const h = this.runtime.start(s.program, { ...(s.program.robot() ? { robot: s.program.robot() } : {}), ...(s.opts.args ? { args: s.opts.args } : {}) } as any) as unknown as RunInfo;
+        const from = s.opts.fromIndex ?? 0, rb = s.program.robot();
+        const q = from > 0 ? this.jointsBefore(s.program, from) : null;
+        const h = this.runtime.start(s.program, { ...(rb ? { robot: rb } : {}), ...(s.opts.args ? { args: s.opts.args } : {}), ...(q && rb instanceof Robot ? { startJoints: q } : {}), ...(from > 0 ? { fromIndex: from } : {}) } as any) as unknown as RunInfo;
+        if (from > 0) this.startAt(h, from);
         this.runs.push(h);
         this.session.push({ program: s.program, at: s.at, opts: s.opts });
         void h.done.then(() => this.onRunFinished(h));
@@ -826,17 +844,33 @@ export class App {
    */
   private async openProjects(files: File[]): Promise<File[]> {
     const path = (f: File) => ((f as any).webkitRelativePath || (f as any).relativePath || f.name) as string;
-    const webots = files.some((f) => /\.(wbt|proto)$/i.test(f.name));
-    const rosPkg = !webots && files.some((f) => /(^|\/)package\.xml$/i.test(path(f)));
+    // a .zip holding a Webots project (.wbt) or a ROS package (package.xml) goes to that importer: entry names are read
+    // without inflating anything
+    const zipKind = new Map<File, 'webots' | 'ros'>();
+    for (const f of files) {
+      if (!/\.zip$/i.test(f.name)) continue;
+      const names: string[] = [];
+      try { const { unzipSync } = await import('fflate'); unzipSync(new Uint8Array(await f.arrayBuffer()), { filter: (e) => { names.push(e.name); return false; } }); } catch { continue; }
+      if (names.some((n) => /\.wbt$/i.test(n))) zipKind.set(f, 'webots');
+      else if (names.some((n) => /(^|\/)package\.xml$/i.test(n))) zipKind.set(f, 'ros');
+    }
+    const webots = files.some((f) => /\.(wbt|proto)$/i.test(f.name)) || [...zipKind.values()].includes('webots');
+    const rosPkg = !webots && (files.some((f) => /(^|\/)package\.xml$/i.test(path(f))) || [...zipKind.values()].includes('ros'));
     if (!webots && !rosPkg) return files;
     const map = await App.filesToMap(files);
     if (webots) {
+      // the Webots importer reads plain files: expand project zips in place (paths inside the zip kept)
+      for (const [f, k] of zipKind) if (k === 'webots') {
+        const { unzipSync } = await import('fflate');
+        map.delete(path(f).replace(/\\/g, '/'));
+        for (const [zk, zv] of Object.entries(unzipSync(new Uint8Array(await f.arrayBuffer())))) if (!zk.endsWith('/')) map.set(zk, zv);
+      }
       this.events.emit('progress', { label: 'Importing Webots world', detail: `${map.size} files` });
       try {
         const { importWebotsFiles } = await import('./io/webots/index');
         const { station, report } = await importWebotsFiles(map, this.assets);
         this.setStation(station);
-        for (const n of (report as any)?.notes ?? (Array.isArray(report) ? report : [])) this.log(String(n), 'info');
+        for (const n of report) this.log(String(n), 'info');
         this.log(`Opened Webots world ${station.name}`);
       } finally { this.events.emit('progress', { label: 'Importing Webots world', done: true }); }
       return [];
@@ -844,10 +878,12 @@ export class App {
     this.events.emit('progress', { label: 'Importing ROS package', detail: `${map.size} files` });
     try {
       const { importRosPackageFiles } = await import('./io/urdf/package');
-      const { items, report } = await importRosPackageFiles(map, this.assets);
-      this.cmd(() => { for (const it of items as Item[]) this.station.addChild(it); const r = (items as Item[]).find((x) => x instanceof Robot) as Robot | undefined; if (r) { this.setActiveRobot(r); this.select(r); } else if (items[0]) this.select(items[0]); });
-      for (const n of (report as any)?.notes ?? (Array.isArray(report) ? report : [])) this.log(String(n), 'info');
-      this.log(`Imported ROS package: ${(items as Item[]).map((x) => x.name).join(', ') || 'no items'}`);
+      const res = await importRosPackageFiles(map, this.assets);
+      const items = res.items as Item[];
+      if (items.length) this.cmd(() => { for (const it of items) this.station.addChild(it); const r = items.find((x) => x instanceof Robot) as Robot | undefined; if (r) { this.setActiveRobot(r); this.select(r); } else this.select(items[0]); });
+      for (const n of res.report ?? []) this.log(String(n), 'info');
+      for (const e of res.errors ?? []) this.log(`ROS package: ${e}`, 'error');
+      this.log(`Imported ROS package: ${items.map((x) => x.name).join(', ') || 'no items'}`, items.length ? 'info' : 'warn');
     } finally { this.events.emit('progress', { label: 'Importing ROS package', done: true }); }
     return [];
   }
@@ -1081,7 +1117,6 @@ export class App {
       if (!res.ok) { const j = await res.json().catch(() => ({})); this.log(`RoboDK converter not available on the server (${j.error ?? res.status}); using best-effort import`, 'warn'); return false; }
       const data = await res.json();
       const st = loadStation(data, this.assets);
-      const { isRdkExport, postProcessRdkExport } = await import('./io/robodk/rdk_import');
       if (isRdkExport(st)) postProcessRdkExport(st);
       if (f.name.toLowerCase().endsWith('.rdk')) this.setStation(st);
       else this.cmd(() => this.mergeImported(st, f.name.toLowerCase().endsWith('.tool')));

@@ -55,8 +55,9 @@ END`;
     const res = importProgram(src, { station: st, robot, filename: 'demo.src' });
     expect(res.program.name).toBe('demo');
     expect(res.program.robot()).toBe(robot);
-    expect(res.warnings).toContain('CIRC imported as two MoveL');
-    expect(kinds(res.program)).toEqual(['print', 'speed', 'rounding', 'MoveJ', 'MoveJ', 'MoveL', 'MoveL', 'MoveL', 'code', 'pause', 'io', 'io', 'pause', 'code', 'code']);
+    // CIRC is a real MoveC now (it used to be split into two MoveL); system-variable lines such as $BWDSTART are not code
+    expect(res.warnings).toEqual(['unknown point in "PTP HOME"']);
+    expect(kinds(res.program)).toEqual(['print', 'speed', 'rounding', 'MoveJ', 'MoveJ', 'MoveL', 'MoveC', 'code', 'pause', 'io', 'io', 'pause', 'code']);
     expect(res.targets.length).toBe(5);
     expect(res.targets[0].name).toBe('home');
     expect(res.targets[0].isJointTarget).toBe(true);
@@ -66,13 +67,13 @@ END`;
     expect(res.targets[3].name).toBe('arc_via');
     const d = res.program.instructions().map((i) => i.data as any);
     expect(d[1].speedLinear).toBe(250);
-    expect(d[2].radius).toBe(3);
-    expect(d[9].timeMs).toBe(1500);
-    expect(d[10]).toMatchObject({ io: '3', value: true, wait: false });
-    expect(d[11]).toMatchObject({ io: '7', value: false, wait: true });
-    expect(d[12].timeMs).toBe(-1);
-    expect(d[13]).toMatchObject({ code: 'MYSUB', asFunctionCall: true });
-    expect(d[14]).toMatchObject({ code: '$BWDSTART = FALSE', asFunctionCall: false });
+    expect(d[2].radius).toBe(-1); // $APO.CDIS only applies to motions with C_DIS; these stop exactly
+    expect(d[6]).toMatchObject({ moveType: 'MoveC' });
+    expect(d[8].timeMs).toBe(1500);
+    expect(d[9]).toMatchObject({ io: '3', value: true, wait: false });
+    expect(d[10]).toMatchObject({ io: '7', value: false, wait: true });
+    expect(d[11].timeMs).toBe(-1);
+    expect(d[12]).toMatchObject({ code: 'MYSUB', asFunctionCall: true });
   });
   it('imports RAPID with named targets, MoveC, MoveAbsJ, IO and messages', () => {
     const st = new Station();
@@ -98,20 +99,23 @@ END`;
   ENDPROC
 ENDMODULE`;
     const res = importProgram(mod, { station: st, robot, language: 'rapid', name: 'Mod' });
-    expect(res.warnings).toContain('MoveC imported as two MoveL');
-    expect(kinds(res.program)).toEqual(['print', 'speed', 'MoveJ', 'speed', 'MoveJ', 'speed', 'MoveL', 'speed', 'MoveL', 'MoveL', 'pause', 'io', 'io', 'print', 'pause', 'code', 'code']);
+    // MoveC is kept as MoveC; tool and zone arguments become tool / rounding instructions
+    expect(res.warnings).toEqual([]);
+    expect(kinds(res.program)).toEqual(['print', 'tool', 'rounding', 'speed', 'MoveJ', 'rounding', 'speed', 'MoveJ', 'rounding', 'speed', 'MoveL', 'speed', 'MoveC', 'pause', 'io', 'io', 'print', 'pause', 'code', 'code']);
     expect(res.targets[0].joints).toEqual([0, 0, 0, 0, 90, 0]);
     expect(res.targets[0].name).toBe('jHome');
     expect(res.targets[1].name).toBe('pHome');
     expect(getPos(res.targets[1].pose())).toEqual([300, 0, 400]);
     expect(res.targets[2].name).toBe('inline');
-    expect(res.targets[3].name).toBe('pVia_via');
+    expect(res.targets[3].name).toBe('pHome_via');
     const d = res.program.instructions().map((i) => i.data as any);
-    expect(d[1].speedLinear).toBe(1000);
-    expect(d[10].timeMs).toBe(500);
-    expect(d[13]).toMatchObject({ message: 'Done', isComment: false });
-    expect(d[15]).toMatchObject({ code: 'Sub1', asFunctionCall: true });
-    expect(d[16]).toMatchObject({ code: 'x := 1', asFunctionCall: false });
+    expect(d[3].speedLinear).toBe(1000);
+    expect(d[5].radius).toBe(10);
+    expect(d[12]).toMatchObject({ moveType: 'MoveC' });
+    expect(d[13].timeMs).toBe(500);
+    expect(d[16]).toMatchObject({ message: 'Done', isComment: false });
+    expect(d[18]).toMatchObject({ code: 'Sub1', asFunctionCall: true });
+    expect(d[19]).toMatchObject({ code: 'x := 1', asFunctionCall: false });
     // targets go to the station when the robot has no active frame
     expect(res.targets[0].parent).toBe(st);
   });
@@ -186,19 +190,22 @@ end
 prog()`;
     const res = importProgram(script, { station: st, robot, filename: 'prog.script' });
     // bare `name()` lines (program entry calls) are skipped by design
-    expect(kinds(res.program)).toEqual(['print', 'speed', 'MoveJ', 'speed', 'MoveJ', 'speed', 'MoveL', 'speed', 'MoveL', 'MoveL', 'pause', 'io', 'io', 'print', 'print', 'code']);
+    // set_tcp sets a real tool, movec is a MoveC, movej v= is a joint speed (rad/s)
+    expect(kinds(res.program)).toEqual(['tool', 'speed', 'MoveJ', 'speed', 'MoveJ', 'speed', 'MoveL', 'MoveC', 'pause', 'io', 'io', 'print', 'print', 'code', 'print']);
     expect(res.targets[0].joints!.map((v) => Math.round(v))).toEqual([0, -90, 90, -90, -90, 0]);
     expect(res.targets[0].isJointTarget).toBe(true);
     expect(getPos(res.targets[1].pose()).map((v) => +v.toFixed(3))).toEqual([400, 100, 300]);
     const d = res.program.instructions().map((i) => i.data as any);
-    expect(d[0].message).toBe('set_tcp tcp');
-    expect(d[1].speedLinear).toBe(1050);
-    expect(d[10].timeMs).toBe(250);
-    expect(d[11]).toMatchObject({ io: '2', value: true });
-    expect(d[12]).toMatchObject({ io: '3', value: false });
-    expect(d[13].message).toBe('hi');
-    expect(d[14]).toMatchObject({ message: 'only a comment', isComment: true });
-    expect(d[15]).toMatchObject({ code: 'popup("x")', asFunctionCall: false });
+    expect(d[0].kind).toBe('tool');
+    expect(d[1].speedJoints).toBeCloseTo(1.05 * 180 / Math.PI, 6);
+    expect(d[7]).toMatchObject({ moveType: 'MoveC' });
+    expect(d[8].timeMs).toBe(250);
+    expect(d[9]).toMatchObject({ io: '2', value: true });
+    expect(d[10]).toMatchObject({ io: '3', value: false });
+    expect(d[11].message).toBe('hi');
+    expect(d[12]).toMatchObject({ message: 'only a comment', isComment: true });
+    expect(d[13]).toMatchObject({ code: 'mysub', asFunctionCall: true });
+    expect(d[14]).toMatchObject({ message: 'x', isComment: false }); // popup shows a message
 
     const csv = `type,name,x,y,z,rx,ry,rz,j1,j2,j3,j4,j5,j6\nmoveJ,A,100,0,200,0,180,0,1,2,3,4,5,6\nmoveL,B,150,0,200,0,180,0\nmoveC,C,x,0,200,0,180,0,1,2,3,4,5,6\n# c\nspeed,1\n`;
     const r2 = importProgram(csv, { station: st, language: 'csv', name: 'csv' });
@@ -222,7 +229,7 @@ describe('G-code', () => {
     expect(g.segments[0].tool).toBe(3);
     expect(g.segments[0].points[1]).toEqual([25.4, 0, 12.7]);
     const cut = g.segments.find((s) => s.kind === 'cut')!;
-    expect(cut.feed).toBe(10);
+    expect(cut.feed).toBeCloseTo(254, 9); // F10 in G20 (inch/min) mode
     expect(cut.spindle).toBe(true);
     // the G2 quarter circle in inches ends at (0, 25.4)
     const arcEnd = g.segments.filter((s) => s.kind === 'cut').flatMap((s) => s.points).find((p) => Math.abs(p[0]) < 1e-6 && Math.abs(p[1] - 25.4) < 1e-6);
@@ -231,7 +238,7 @@ describe('G-code', () => {
     expect(g.bounds.max[2]).toBe(100);
     const st = gcodeStats(g);
     expect(st.tools).toEqual([3]);
-    expect(st.feeds).toEqual(expect.arrayContaining([10, 200]));
+    expect(st.feeds.map((f) => Math.round(f))).toEqual(expect.arrayContaining([254, 200]));
     expect(st.rapids).toBeGreaterThan(0);
     expect(st.cuts).toBeGreaterThan(0);
     expect(st.cutLength + st.rapidLength).toBeCloseTo(g.length, 6);

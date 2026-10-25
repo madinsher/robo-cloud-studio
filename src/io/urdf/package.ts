@@ -119,11 +119,11 @@ export function launchEntries(files: Map<string, Uint8Array>, pkgs: Record<strin
       const defaults: Record<string, string> = {};
       for (const m of src.matchAll(/<arg\s+[^>]*name="([\w/]+)"[^>]*?(?:default|value)="([^"]*)"/g)) defaults[m[1]] = m[2];
       const sub = (s: string) => s.replace(/\$\(arg ([\w/]+)\)/g, (_x, n) => defaults[n] ?? '');
-      for (const m of src.matchAll(/\$\(find(?:-pkg-share)? (\w+)\)\/([^\s'"]+\.(?:urdf|xacro))((?:\s+[\w]+:=[^\s'"]+)*)/g)) {
+      for (const m of sub(src).matchAll(/\$\(find(?:-pkg-share)? (\w+)\)\/([^\s'"]+\.(?:urdf|xacro))((?:\s+[\w]+:=[^\s'"]*)*)/g)) {
         const path = joinPath(pkgs[m[1]] ?? '', m[2]);
         if (!exists(path)) continue;
         const args: Record<string, string> = {};
-        for (const a of m[3].matchAll(/([\w]+):=([^\s'"]+)/g)) args[a[1]] = sub(a[2]);
+        for (const a of m[3].matchAll(/([\w]+):=([^\s'"]*)/g)) args[a[1]] = a[2];
         if (!out.some((e) => e.file === path && JSON.stringify(e.args) === JSON.stringify(args))) out.push({ file: path, package: m[1], args, source: p });
       }
     }

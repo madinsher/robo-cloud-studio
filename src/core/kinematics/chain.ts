@@ -285,7 +285,11 @@ export function flangePoseInto(chain: ChainDef, q: ArrayLike<number>, out: Mat4)
     const j = chain.joints[i];
     multiply(cur, j.origin, nxt); [cur, nxt] = [nxt, cur];
     const v = info.coupleSrc[i] >= 0 ? full[i] + j.couple!.multiplier * full[info.coupleSrc[i]] : full[i];
-    if (j.type === 'revolute' || j.type === 'continuous') { setRotAxis(sM, j.axis[0], j.axis[1], j.axis[2], v * DEG); multiply(cur, sM, nxt); [cur, nxt] = [nxt, cur]; }
+    if ((j.type === 'revolute' || j.type === 'continuous') && j.axis[0] === 0 && j.axis[1] === 0 && j.axis[2] !== 0) {
+      // rotation about ±z (DH joints): right-multiply by Rz in place (columns 0 and 1)
+      const t = (j.axis[2] > 0 ? v : -v) * DEG, c = Math.cos(t), s = Math.sin(t);
+      for (let r = 0; r < 3; r++) { const x = cur[r], y = cur[4 + r]; cur[r] = c * x + s * y; cur[4 + r] = c * y - s * x; }
+    } else if (j.type === 'revolute' || j.type === 'continuous') { setRotAxis(sM, j.axis[0], j.axis[1], j.axis[2], v * DEG); multiply(cur, sM, nxt); [cur, nxt] = [nxt, cur]; }
     else if (j.type === 'prismatic') {
       // translate along the axis in the current frame
       const tx = j.axis[0] * v, ty = j.axis[1] * v, tz = j.axis[2] * v;
@@ -293,7 +297,14 @@ export function flangePoseInto(chain: ChainDef, q: ArrayLike<number>, out: Mat4)
       cur[13] += cur[1] * tx + cur[5] * ty + cur[9] * tz;
       cur[14] += cur[2] * tx + cur[6] * ty + cur[10] * tz;
     }
-    if (j.post) { multiply(cur, j.post, nxt); [cur, nxt] = [nxt, cur]; }
+    const p = j.post;
+    if (p) {
+      if (p[0] === 1 && p[5] === 1 && p[10] === 1 && p[1] === 0 && p[2] === 0 && p[4] === 0 && p[6] === 0 && p[8] === 0 && p[9] === 0 && p[12] === 0 && p[13] === 0) {
+        // pure translation along z (DH d): column 3 += d · column 2
+        const d = p[14];
+        if (d !== 0) { cur[12] += d * cur[8]; cur[13] += d * cur[9]; cur[14] += d * cur[10]; }
+      } else { multiply(cur, p, nxt); [cur, nxt] = [nxt, cur]; }
+    }
   }
   return multiply(cur, chain.flange, out);
 }
@@ -373,28 +384,65 @@ function deltaFK(chain: ChainDef, q: number[]): FKResult {
  * Linear part in mm, angular part in rad, per unit joint (rad for revolute, mm for prismatic).
  */
 export function jacobian(chain: ChainDef, q: number[]): number[][] {
-  if (chain.parallel || (chain.flangeLink !== undefined && chain.flangeLink !== chain.joints.length)) return numericJacobian(chain, q);
-  const fk = forwardKinematics(chain, q);
-  const pe = getPos(fk.flange);
+  const n = chainInfo(chain).idx.length;
+  return jacobianInto(chain, q, Array.from({ length: 6 }, () => new Array(n).fill(0)));
+}
+
+// scratch for jacobianInto: per joint frame position and axis (world), grown on demand
+let jacP = new Float64Array(48), jacW = new Float64Array(48);
+const jA = new Float64Array(16), jB = new Float64Array(16), jM = new Float64Array(16);
+
+/** Geometric Jacobian written into `J` (6 rows x dof, zero-filled here) without per-call matrix allocations. */
+export function jacobianInto(chain: ChainDef, q: ArrayLike<number>, J: number[][]): number[][] {
+  if (chain.parallel || (chain.flangeLink !== undefined && chain.flangeLink !== chain.joints.length)) {
+    const Jn = numericJacobian(chain, Array.from(q));
+    for (let r = 0; r < 6; r++) for (let k = 0; k < Jn[r].length; k++) J[r][k] = Jn[r][k];
+    return J;
+  }
   const info = chainInfo(chain);
-  const idx = info.idx;
-  const J: number[][] = Array.from({ length: 6 }, () => new Array(idx.length).fill(0));
+  const n = info.n;
+  if (jacP.length < 3 * n) { jacP = new Float64Array(6 * n); jacW = new Float64Array(6 * n); }
+  const full = fullScratch(n);
+  for (let i = 0; i < n; i++) full[i] = info.qIndex[i] >= 0 ? (q[info.qIndex[i]] ?? 0) : 0;
+  for (let i = 0; i < n; i++) if (info.mimicSrc[i] >= 0) { const m = chain.joints[i].mimic!; full[i] = m.multiplier * full[info.mimicSrc[i]] + m.offset; }
+  let cur = jA, nxt = jB;
+  if (chain.base) cur.set(chain.base); else { cur.fill(0); cur[0] = cur[5] = cur[10] = cur[15] = 1; }
+  for (let i = 0; i < n; i++) {
+    const j = chain.joints[i];
+    multiply(cur, j.origin, nxt); [cur, nxt] = [nxt, cur];
+    // joint frame: position and motion axis in the base frame
+    const ax = j.axis[0], ay = j.axis[1], az = j.axis[2];
+    let wx = cur[0] * ax + cur[4] * ay + cur[8] * az, wy = cur[1] * ax + cur[5] * ay + cur[9] * az, wz = cur[2] * ax + cur[6] * ay + cur[10] * az;
+    if (j.type !== 'prismatic') { const l = Math.hypot(wx, wy, wz) || 1; wx /= l; wy /= l; wz /= l; }
+    jacP[3 * i] = cur[12]; jacP[3 * i + 1] = cur[13]; jacP[3 * i + 2] = cur[14];
+    jacW[3 * i] = wx; jacW[3 * i + 1] = wy; jacW[3 * i + 2] = wz;
+    const v = info.coupleSrc[i] >= 0 ? full[i] + j.couple!.multiplier * full[info.coupleSrc[i]] : full[i];
+    if (j.type === 'revolute' || j.type === 'continuous') { setRotAxis(jM, ax, ay, az, v * DEG); multiply(cur, jM, nxt); [cur, nxt] = [nxt, cur]; }
+    else if (j.type === 'prismatic') {
+      const tx = ax * v, ty = ay * v, tz = az * v;
+      cur[12] += cur[0] * tx + cur[4] * ty + cur[8] * tz;
+      cur[13] += cur[1] * tx + cur[5] * ty + cur[9] * tz;
+      cur[14] += cur[2] * tx + cur[6] * ty + cur[10] * tz;
+    }
+    if (j.post) { multiply(cur, j.post, nxt); [cur, nxt] = [nxt, cur]; }
+  }
+  const F = chain.flange;
+  const px = cur[0] * F[12] + cur[4] * F[13] + cur[8] * F[14] + cur[12];
+  const py = cur[1] * F[12] + cur[5] * F[13] + cur[9] * F[14] + cur[13];
+  const pz = cur[2] * F[12] + cur[6] * F[13] + cur[10] * F[14] + cur[14];
+  const nq = info.idx.length;
+  for (let r = 0; r < 6; r++) for (let k = 0; k < nq; k++) J[r][k] = 0;
   // Column of every moving joint (mimic joints add their screw, scaled, to their source column).
   const addScrew = (ji: number, k: number, scale: number) => {
-    const j = chain.joints[ji];
-    const frame = fk.jointFrames[ji];
-    const axisW = transformDir(frame, j.axis);
-    if (j.type !== 'prismatic') { const l = Math.hypot(...axisW) || 1; axisW[0] /= l; axisW[1] /= l; axisW[2] /= l; }
-    if (j.type === 'prismatic') {
-      J[0][k] += scale * axisW[0]; J[1][k] += scale * axisW[1]; J[2][k] += scale * axisW[2];
-    } else if (j.type === 'revolute' || j.type === 'continuous') {
-      const pj = getPos(frame);
-      const lin = cross(axisW, sub(pe, pj));
-      J[0][k] += scale * lin[0]; J[1][k] += scale * lin[1]; J[2][k] += scale * lin[2];
-      J[3][k] += scale * axisW[0]; J[4][k] += scale * axisW[1]; J[5][k] += scale * axisW[2];
-    }
+    const t = chain.joints[ji].type;
+    const wx = jacW[3 * ji], wy = jacW[3 * ji + 1], wz = jacW[3 * ji + 2];
+    if (t === 'prismatic') { J[0][k] += scale * wx; J[1][k] += scale * wy; J[2][k] += scale * wz; return; }
+    if (t !== 'revolute' && t !== 'continuous') return;
+    const rx = px - jacP[3 * ji], ry = py - jacP[3 * ji + 1], rz = pz - jacP[3 * ji + 2];
+    J[0][k] += scale * (wy * rz - wz * ry); J[1][k] += scale * (wz * rx - wx * rz); J[2][k] += scale * (wx * ry - wy * rx);
+    J[3][k] += scale * wx; J[4][k] += scale * wy; J[5][k] += scale * wz;
   };
-  for (let ji = 0; ji < info.n; ji++) {
+  for (let ji = 0; ji < n; ji++) {
     const j = chain.joints[ji];
     if (j.type === 'fixed') continue;
     // which actuated joint drives this one, and how much (a mimic of a mimic is resolved one level)

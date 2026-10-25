@@ -8,6 +8,7 @@ import { describe, it, expect, beforeAll } from 'vitest';
 import { installDomStubs, makeApp } from './ui_harness';
 import { App, ItemType, Program, Robot, SceneObject, Target } from '../src/app';
 import { transl } from '../src/core/math/pose';
+import { ProgramEditor } from '../src/ui/program-editor';
 
 beforeAll(() => installDomStubs());
 const tick = (app: App, s: number, dt = 1 / 30) => { for (let t = 0; t < s - 1e-9; t += dt) (app as any).tick(dt); };
@@ -52,6 +53,22 @@ describe('station simulation in the app', () => {
     tick(app, 0.5); expect(rl.joints()).not.toEqual(q);
   });
 
+  it('validating the playing program while it holds a part leaves the part attached where it was', () => {
+    const app = makeApp('pickplace');
+    const tool = app.activeRobot!.activeTool()!;
+    app.runProgram();
+    for (let i = 0; i < 600 && !tool.attached.length; i++) tick(app, 0.05);
+    expect(tool.attached.length).toBe(1);
+    const held = app.station.findById(tool.attached[0]) as SceneObject;
+    const pose = Array.from(held.poseAbs()), parent = held.parent, q = app.activeRobot!.joints(), t = app.simTime;
+    const r = app.validateProgram(app.activeProgram)!;
+    expect(r.duration).toBeGreaterThan(5);
+    expect(tool.attached).toEqual([held.id]); expect(held.parent).toBe(parent);
+    expect(Array.from(held.poseAbs())).toEqual(pose); expect(app.activeRobot!.joints()).toEqual(q); expect(app.simTime).toBe(t);
+    tick(app, 0.5);
+    expect(dist(posOf(held), pose.slice(12, 15))).toBeGreaterThan(1); // still carried by the moving tool
+  });
+
   it('programs on different robots run at the same time on the shared clock', () => {
     const app = makeApp('welding');
     const progs = app.station.itemsOfType<Program>(ItemType.PROGRAM);
@@ -82,6 +99,43 @@ describe('station simulation in the app', () => {
     boxes(app).forEach((b, i) => Array.from(b.poseAbs()).forEach((v, k) => expect(v).toBeCloseTo(home.boxes[i][k], 9)));
   });
 
+  it('a station keeps its home state across tab switches: Reset after switching back restores it', () => {
+    const app = makeApp('pickplace');
+    const st1 = app.station; app.stations.push(st1);
+    const robot = app.activeRobot!;
+    const home = { q: robot.joints(), b: boxes(app).map(posOf) };
+    app.runProgram(); tick(app, 6);
+    expect(robot.joints()).not.toEqual(home.q);
+    app.addStation('Other'); expect(app.station).not.toBe(st1);
+    app.setStation(st1);
+    expect(app.atHome).toBe(false);
+    app.resetSimulation();
+    expect(robot.joints()).toEqual(home.q);
+    boxes(app).map(posOf).forEach((p, i) => expect(dist(p, home.b[i])).toBeLessThan(1e-6));
+  });
+
+  it('"Run from here" starts at the chosen instruction: only the last box is carried, the first two stay put', () => {
+    const app = makeApp('pickplace');
+    const prog = app.activeProgram!;
+    const ins = prog.instructions();
+    const k = ins.findIndex((i) => i.data.kind === 'move' && /3/.test((app.station.findById(i.data.targetId ?? '') as Target | null)?.name ?? ''));
+    expect(k).toBeGreaterThan(5);
+    const start = boxes(app).map(posOf);
+    const h = app.runProgram(prog, { fromIndex: k })!;
+    tick(app, 0.1);
+    expect(h.instructionIndex).toBeGreaterThanOrEqual(k);
+    app.runToEnd();
+    expect(h.status).toBe('done');
+    const end = boxes(app).map(posOf);
+    expect(dist(end[0], start[0])).toBeLessThan(1e-6); expect(dist(end[1], start[1])).toBeLessThan(1e-6);
+    expect(dist(end[2], start[2])).toBeGreaterThan(100);
+    // seeking back replays the session from the same instruction (deterministic): box 3 back home, then carried again
+    app.seekProgram(0.05);
+    boxes(app).map(posOf).forEach((p, i) => expect(dist(p, start[i])).toBeLessThan(1e-6));
+    app.seekProgram(app.simDuration + 1);
+    boxes(app).map(posOf).forEach((p, i) => expect(dist(p, end[i])).toBeLessThan(1e-6));
+  });
+
   it('a program plays up to its first error; the editor marker points at that instruction', () => {
     const app = makeApp('pickplace');
     const prog = app.activeProgram!;
@@ -96,5 +150,10 @@ describe('station simulation in the app', () => {
     expect(h.error!.instructionIndex).toBe(k);
     expect(app.errorInstruction(prog)).toBe(k);
     expect(robot.joints()).not.toEqual(q0); // the instructions before the error were played
+    // the program editor marks exactly that row
+    const pe = new ProgramEditor(app); pe.render();
+    const rows = [...pe.el.querySelectorAll('.ins-row')];
+    expect(rows.findIndex((r) => r.classList.contains('error-at'))).toBe(k);
+    expect(rows.filter((r) => r.classList.contains('error-at')).length).toBe(1);
   });
 });

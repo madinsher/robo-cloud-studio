@@ -22,6 +22,8 @@ export interface RetailLayoutOptions {
   builder?: WebotsSceneBuilder;
   /** World file the PROTO declarations come from (scope of the IMPORTABLE EXTERNPROTO). */
   worldPath?: string;
+  /** PROTO used for the products (default: RetailProduct, else the world's only IMPORTABLE EXTERNPROTO). */
+  productProto?: string;
   /** Robot receiving the basket slot Targets (default: the first MobileRobot). */
   robot?: MobileRobot | null;
 }
@@ -125,8 +127,12 @@ export function loadRetailLayout(station: Station, productsYaml: string, locatio
   const instances = Array.isArray(prod.instances) ? prod.instances : [];
   const builder = opts.builder;
   const base = opts.worldPath ?? builder?.reg.scopeOf(station.filePath ?? '')?.file ?? station.filePath ?? '';
-  const viaProto = !!builder && !!builder.reg.scopeOf(base)?.externs.has('RetailProduct');
-  if (!viaProto) report.push('RetailProduct PROTO not declared by the world: products built as plain boxes');
+  // the supervisor spawns RetailProduct; other worlds declare their product PROTO as the (single) IMPORTABLE EXTERNPROTO
+  const scope = builder?.reg.scopeOf(base);
+  const imp = [...(scope?.importable ?? [])];
+  const protoName = opts.productProto ?? (scope?.externs.has('RetailProduct') ? 'RetailProduct' : imp.length === 1 ? imp[0] : undefined);
+  const viaProto = !!builder && !!protoName && !!scope?.externs.has(protoName);
+  if (!viaProto) report.push(`product PROTO ${protoName ?? 'RetailProduct'} not declared by the world${imp.length > 1 ? ` (IMPORTABLE: ${imp.join(', ')})` : ''}: products built as plain boxes`);
   for (const raw of instances) {
     const inst = asObj(raw);
     const name = String(inst.name), sku = String(inst.sku), slot = String(inst.slot);
@@ -138,7 +144,7 @@ export function loadRetailLayout(station: Station, productsYaml: string, locatio
     const x = num(sp.x), y = num(sp.y), z = num(sp.z) + size[2] / 2 + 0.002;
     let item: Item | null = null;
     if (viaProto) {
-      const text = `DEF ${name} RetailProduct { translation ${x.toFixed(4)} ${y.toFixed(4)} ${z.toFixed(4)} name "${name}" size ${size.map((v) => v.toFixed(3)).join(' ')} color ${color.map((v) => v.toFixed(3)).join(' ')} }`;
+      const text = `DEF ${name} ${protoName} { translation ${x.toFixed(4)} ${y.toFixed(4)} ${z.toFixed(4)} name "${name}" size ${size.map((v) => v.toFixed(3)).join(' ')} color ${color.map((v) => v.toFixed(3)).join(' ')} }`;
       const [n] = parseNodes(text, base);
       const resolved = builder!.reg.resolve(n);
       if (resolved) item = builder!.buildNode(resolved, folder, identity());

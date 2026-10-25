@@ -90,6 +90,9 @@ export class MobileRobot extends Item {
   home: { x: number; y: number; theta: number } | null = null;
   /** Consumable / capacity resources used by process models: spray tank (L), water (L), fruit bin (kg), cargo (kg). */
   resources: Record<string, { capacity: number; level: number; unit: string }> = {};
+  /** Mounted modular equipment (ids of the agri equipment catalogue) and the capabilities of the bare platform. */
+  equipment: string[] = [];
+  baseCapabilities: string[] | null = null;
 
   constructor(name = 'Mobile robot', id?: string) {
     super(ItemType.MOBILE_ROBOT, name, id);
@@ -127,7 +130,7 @@ export class MobileRobot extends Item {
   }
 
   protected override serializeExtra() {
-    return { kin: this.kin, battery: this.battery, state: this.state, geometry: this.geometry, sensors: this.sensors, capabilities: this.capabilities, payloadKg: this.payloadKg, rosNamespace: this.rosNamespace, fleetId: this.fleetId, home: this.home, resources: this.resources };
+    return { kin: this.kin, battery: this.battery, state: this.state, geometry: this.geometry, sensors: this.sensors, capabilities: this.capabilities, payloadKg: this.payloadKg, rosNamespace: this.rosNamespace, fleetId: this.fleetId, home: this.home, resources: this.resources, equipment: this.equipment, baseCapabilities: this.baseCapabilities };
   }
   override deserializeExtra(d: SerializedItem, _ctx: DeserializeContext) {
     this.kin = { ...this.kin, ...((d.kin as any) ?? {}) };
@@ -144,6 +147,8 @@ export class MobileRobot extends Item {
     this.fleetId = (d.fleetId as string | null) ?? null;
     this.home = (d.home as any) ?? null;
     this.resources = (d.resources as any) ?? {};
+    this.equipment = (d.equipment as string[]) ?? [];
+    this.baseCapabilities = (d.baseCapabilities as string[] | null) ?? null;
     this.syncStateFromPose();
   }
 }
@@ -262,7 +267,9 @@ function unrle(r: number[], size: number): Uint8Array {
   return out;
 }
 
-export type ZoneKind = 'work' | 'nogo' | 'charging' | 'loading' | 'unloading' | 'parking' | 'speed_limit' | 'headland' | 'gnss_denied';
+/** Zone kinds: `nogo` is never entered by planned paths, `speed_limit` caps the speed inside, `lane` is a one-way-at-a-time
+ *  traffic segment (at most `capacity` robots inside), `depot` is an equipment depot (reconfiguration slots = capacity). */
+export type ZoneKind = 'work' | 'nogo' | 'charging' | 'loading' | 'unloading' | 'parking' | 'speed_limit' | 'headland' | 'gnss_denied' | 'lane' | 'depot';
 
 /** Polygonal zone on the ground plane (points relative to this item, mm). */
 export class ZoneItem extends Item {
@@ -282,6 +289,11 @@ export class ZoneItem extends Item {
     }
     return inside;
   }
+  /** Polygon in the station frame. */
+  worldPolygon(): number[][] {
+    const a = this.poseAbs();
+    return this.polygon.map((p) => [a[0] * p[0] + a[4] * p[1] + a[12], a[1] * p[0] + a[5] * p[1] + a[13]]);
+  }
   centroid(): [number, number] {
     if (!this.polygon.length) return [0, 0];
     let sx = 0, sy = 0;
@@ -299,3 +311,6 @@ export class ZoneItem extends Item {
 registerItemType(ItemType.MOBILE_ROBOT, (n, id) => new MobileRobot(n, id));
 registerItemType(ItemType.MAP, (n, id) => new MapItem(n, id));
 registerItemType(ItemType.ZONE, (n, id) => new ZoneItem(n, id));
+
+// Navigate / Follow path instructions drive the base through the mobile planner (contract I2)
+import './program_motion';

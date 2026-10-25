@@ -40,7 +40,9 @@ import { ExecutorWorld, Runner, Running, Verdict, makeEval, Sensors, ExecSummary
 export type FsmStateKind = 'skill' | 'decision' | 'machine' | 'pass';
 export interface FsmState { name: string; kind: FsmStateKind; initial?: boolean; action?: ActionBinding; entry: ActionBinding[]; exit: ActionBinding[]; timeout?: number; when: Array<{ expr: string; outcome: string }>; otherwise?: string; transitions: Record<string, string>; machine?: FsmMachine }
 export interface FsmMachine { name: string; outcomes: string[]; states: FsmState[] }
-export interface FsmDoc { name: string; root: FsmMachine; blackboard: Record<string, string | number | boolean>; layout: Record<string, Record<string, [number, number]>>; sensors: Array<{ event: string; expr: string }> }
+/** `group all | group robots=a,b | group capability=spray`: the machine is a template instantiated for every member robot (group_fsm.ts). */
+export interface FsmGroup { all?: boolean; robots?: string[]; capability?: string }
+export interface FsmDoc { name: string; root: FsmMachine; blackboard: Record<string, string | number | boolean>; layout: Record<string, Record<string, [number, number]>>; sensors: Array<{ event: string; expr: string }>; group?: FsmGroup; /** `capabilities robot=c1,c2 …` (inline capability ontology) */ capabilities?: Record<string, string[]> }
 
 const TR_RE = /^(?:on\s+)?([A-Za-z_][\w.-]*)\s*-+>\s*([A-Za-z_][\w.-]*)$/;
 const WHEN_RE = /^when\s+(?:"([^"]*)"|'([^']*)'|(.+?))\s*-+>\s*([A-Za-z_][\w.-]*)$/;
@@ -68,6 +70,8 @@ export function parseFsm(src: string): FsmDoc {
     if (kw === 'blackboard' || kw === 'bb') { Object.assign(doc.blackboard, opts); continue; }
     if (kw === 'layout') { const m = words[1]; if (!m) throw new DslError('layout <machine path> state=x,y …', l.n); const L: Record<string, [number, number]> = (doc.layout[m] ??= {}); for (const [k, v] of Object.entries(opts)) { const mm = /^(-?[\d.]+),(-?[\d.]+)$/.exec(String(v)); if (mm) L[k] = [Number(mm[1]), Number(mm[2])]; } continue; }
     if (kw === 'sensor') { const ev = words[1]; if (!ev) throw new DslError('sensor <event> "<expression>"', l.n); doc.sensors.push({ event: ev, expr: quoted[0] ?? t.slice(t.indexOf(ev) + ev.length).trim() }); continue; }
+    if (kw === 'group' && l.indent === 0) { const g: FsmGroup = {}; if (words.includes('all')) g.all = true; if (opts.robots !== undefined) g.robots = String(opts.robots).split(',').map((x) => x.trim()).filter(Boolean); if (opts.capability !== undefined) g.capability = String(opts.capability); if (!g.all && !g.robots && !g.capability) throw new DslError('group all | group robots=a,b | group capability=<cap>', l.n); doc.group = g; continue; }
+    if (kw === 'capabilities' && l.indent === 0) { const c = (doc.capabilities ??= {}); for (const [k, v] of Object.entries(opts)) c[k] = String(v).split(',').map((x) => x.trim()).filter(Boolean); continue; }
     while (stack.length > 1 && stack[stack.length - 1].indent >= l.indent) stack.pop();
     const top = stack[stack.length - 1];
     if (kw === 'state' || kw === 'machine') {
@@ -122,6 +126,8 @@ export function fsmToDsl(doc: FsmDoc): string {
   };
   states(doc.root, '');
   for (const s of doc.sensors) out.push(`sensor ${s.event} "${s.expr.replace(/"/g, "'")}"`);
+  if (doc.group) out.push(`group${doc.group.all ? ' all' : ''}${doc.group.robots ? ` robots=${doc.group.robots.join(',')}` : ''}${doc.group.capability ? ` capability=${doc.group.capability}` : ''}`);
+  if (doc.capabilities && Object.keys(doc.capabilities).length) out.push(`capabilities ${Object.entries(doc.capabilities).map(([r, c]) => `${r}=${c.join(',')}`).join(' ')}`);
   for (const [m, L] of Object.entries(doc.layout)) { const e = Object.entries(L); if (e.length) out.push(`layout ${m} ${e.map(([s, p]) => `${s}=${fmtNum(p[0])},${fmtNum(p[1])}`).join(' ')}`); }
   return out.join('\n');
 }
@@ -194,8 +200,14 @@ export class FsmExecutor {
   private ctx(dt: number): TickContext { return { time: this.time, dt, bb: this.runner.bb, log: (m) => this.say(m) }; }
   /** Active state path, e.g. `Mission/Depal/Pick`. */
   where(): string { const f = this.frames.at(-1); return f ? `${f.path}/${f.state.name}` : this.outcome ? `⊙ ${this.outcome}` : ''; }
-  private instant(b: ActionBinding): void {
-    const run = this.runner.start(b, this.time); if (!run) { this.failed++; return; }
+  /** `$name` in a binding's value / string arguments is replaced by the blackboard value (`goto=$task_zone`). */
+  private bindVars(b: ActionBinding): ActionBinding {
+    const sub = (v: unknown) => (typeof v === 'string' && v.startsWith('$') && this.runner.bb[v.slice(1)] !== undefined ? String(this.runner.bb[v.slice(1)]) : v);
+    if (!b.value.startsWith('$') && !Object.values(b.args).some((v) => typeof v === 'string' && v.startsWith('$'))) return b;
+    return { ...b, value: String(sub(b.value)), args: Object.fromEntries(Object.entries(b.args).map(([k, v]) => [k, sub(v) as string | number | boolean])) };
+  }
+  private instant(b0: ActionBinding): void {
+    const b = this.bindVars(b0); const run = this.runner.start(b, this.time); if (!run) { this.failed++; return; }
     const st = this.runner.tick(run, this.ctx(0)); if (st === 'running') { this.say(`${b.target}: ${b.kind} ${b.value} is not instantaneous — halted`); this.runner.stop(run, this.ctx(0)); } else if (st === 'failure') this.failed++;
   }
   private enter(m: FsmMachine, path: string, s: FsmState): void {
@@ -203,7 +215,7 @@ export class FsmExecutor {
     this.frames.push(f); this.runner.bb.fsm_state = this.where();
     for (const b of s.entry) this.instant(b);
     if (s.kind === 'machine' && s.machine) { const init = initialState(s.machine); if (!init) { this.say(`${path}/${s.name}: empty machine`); return; } this.enter(s.machine, `${path}/${s.name}`, init); return; }
-    if (s.kind === 'skill' && s.action) { f.run = this.runner.start(s.action, this.time); if (!f.run) this.failed++; this.say(`${path}/${s.name}: ${s.action.kind} ${s.action.value}${s.action.robot ? ` on ${s.action.robot}` : ''}`); }
+    if (s.kind === 'skill' && s.action) { const b = this.bindVars(s.action); f.run = this.runner.start(b, this.time); if (!f.run) this.failed++; this.say(`${path}/${s.name}: ${b.kind} ${b.value}${b.robot ? ` on ${b.robot}` : ''}`); }
   }
   /** The state of frame `i` produced outcome `o`: exit, follow the transition, pop finished machines. */
   private resolve(i: number, o: string): void {

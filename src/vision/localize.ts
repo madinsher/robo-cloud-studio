@@ -93,6 +93,19 @@ function ransacPlanes(P: Float64Array, pool: number[], thr: number, seed: number
     // orient the normal towards the camera (origin): n·p + d = 0 with the origin on the positive side
     if (best.d < 0) { best.n = scale(best.n, -1); best.d = -best.d; }
     { let cx = 0, cy = 0, cz = 0; for (const i of best.inl) { cx += P[i * 3]; cy += P[i * 3 + 1]; cz += P[i * 3 + 2]; } const l = Math.hypot(cx, cy, cz) || 1; if (Math.abs(best.n[0] * cx + best.n[1] * cy + best.n[2] * cz) / l < minCos) { const s0 = new Set(best.inl); rest = rest.filter((i) => !s0.has(i)); continue; } }
+    // degenerate support: a thin strip (e.g. the sliver of a top face at the image border) fits planes of any tilt
+    // about its long axis — the narrow in-plane spread must clearly exceed the residual along the normal
+    if (best.inl.length >= 3) {
+      const m = best.inl.length; let cx = 0, cy = 0, cz = 0;
+      for (const i of best.inl) { cx += P[i * 3]; cy += P[i * 3 + 1]; cz += P[i * 3 + 2]; }
+      cx /= m; cy /= m; cz /= m;
+      const a = normalize(Math.abs(best.n[0]) < 0.9 ? cross(best.n, [1, 0, 0]) : cross(best.n, [0, 1, 0])), bb = cross(best.n, a);
+      let saa = 0, sab = 0, sbb = 0, rr = 0;
+      for (const i of best.inl) { const q: Vec3 = [P[i * 3] - cx, P[i * 3 + 1] - cy, P[i * 3 + 2] - cz]; const qa = dot(q, a), qb = dot(q, bb), qn = dot(q, best.n); saa += qa * qa; sab += qa * qb; sbb += qb * qb; rr += qn * qn; }
+      saa /= m; sab /= m; sbb /= m; rr = Math.sqrt(rr / m);
+      const minorVar = (saa + sbb) / 2 - Math.sqrt(((saa - sbb) / 2) ** 2 + sab * sab);
+      if (Math.sqrt(Math.max(0, minorVar)) < 3 * Math.max(rr, 1)) { const s0 = new Set(best.inl); rest = rest.filter((i) => !s0.has(i)); continue; }
+    }
     out.push(best);
     const s = new Set(best.inl); rest = rest.filter((i) => !s.has(i));
   }
@@ -149,8 +162,10 @@ export interface LocalizeOptions {
   /** Reference axis (world) for the symmetric yaw choice. Default world X. */
   refAxis?: Vec3;
   seed?: number;
-  /** Max pixel samples (default 6000). */
+  /** Max pixel samples (default 4000). */
   maxSamples?: number;
+  /** Round object known only by its size (fruit): no plane fit, the centre lies one radius behind the visible surface. */
+  round?: boolean;
 }
 
 /** Surface / centre of one detection from a metric depth image; null when it has no valid depth. */
@@ -164,11 +179,10 @@ export function localizeFromDepth(frame: DepthFrame, b: Box2D, opts: LocalizeOpt
   // noisy sensors: 5×5 edge-preserving mean (neighbours within 3σ of the pixel, inside the mask) — the spatial filter
   // depth SDKs apply; it cuts i.i.d. pixel noise ~4× so planes are found with a tight threshold
   const smooth = !!opts.sigma, R2 = 2;
-  const U: number[] = [], V: number[] = [], Z: number[] = [];
-  for (let y = y0; y < y1; y += step) for (let x = x0; x < x1; x += step) {
-    if (mb && !maskAt(mb, x, y)) continue;
+  /** Depth at a pixel (smoothed for noisy sensors), 0 when invalid. */
+  const sampleDepth = (x: number, y: number): number => {
     let d = depth[y * W + x];
-    if (!(d > 0) || !Number.isFinite(d)) continue;
+    if (!(d > 0) || !Number.isFinite(d)) return 0;
     if (smooth) {
       const gate = 3 * opts.sigma!(d);
       let sum = 0, cnt = 0;
@@ -181,7 +195,13 @@ export function localizeFromDepth(frame: DepthFrame, b: Box2D, opts: LocalizeOpt
       }
       d = sum / cnt;
     }
-    U.push(x + 0.5); V.push(y + 0.5); Z.push(d);
+    return d;
+  };
+  const U: number[] = [], V: number[] = [], Z: number[] = [];
+  for (let y = y0; y < y1; y += step) for (let x = x0; x < x1; x += step) {
+    if (mb && !maskAt(mb, x, y)) continue;
+    const d = sampleDepth(x, y);
+    if (d > 0) { U.push(x + 0.5); V.push(y + 0.5); Z.push(d); }
   }
   const n = Z.length;
   if (n < 6) return null;
@@ -192,21 +212,55 @@ export function localizeFromDepth(frame: DepthFrame, b: Box2D, opts: LocalizeOpt
   const thr = Math.max(3, 2.5 * sig);
   const R = (v: Vec3): Vec3 => [camWorld[0] * v[0] + camWorld[4] * v[1] + camWorld[8] * v[2], camWorld[1] * v[0] + camWorld[5] * v[1] + camWorld[9] * v[2], camWorld[2] * v[0] + camWorld[6] * v[1] + camWorld[10] * v[2]];
   const up: Vec3 = [0, 0, 1];
-  // box only: keep the nearest depth layer (the object), not the background behind it
+  // box only: split the box pixels into depth layers (gaps larger than the object can explain) and keep the layer that
+  // fills the centre of the box — the detected object, not the table behind it nor leaves in front of a fruit
   let pool = Array.from({ length: n }, (_, i) => i);
   if (!mb) {
-    const zNear = zs[Math.floor(0.05 * n)];
-    const ext = opts.dims ? Math.max(...opts.dims) : (Math.max(x1 - x0, y1 - y0) * zNear) / K.fx;
-    const zCut = zNear + ext + 3 * sig;
-    pool = pool.filter((i) => Z[i] <= zCut);
+    const ext = opts.dims ? Math.max(...opts.dims) : (Math.max(x1 - x0, y1 - y0) * zMed) / K.fx;
+    const gapThr = Math.max(15, 4 * sig, 0.25 * ext);
+    const bcx = b.x + b.w / 2, bcy = b.y + b.h / 2, rx = Math.max(1, b.w / 2), ry = Math.max(1, b.h / 2);
+    const order = pool.slice().sort((a, c) => Z[a] - Z[c]);
+    let best: number[] = [], bestScore = -1, cur: number[] = [], score = 0;
+    const flush = () => { if (score > bestScore) { bestScore = score; best = cur; } cur = []; score = 0; };
+    for (let k = 0; k < order.length; k++) {
+      const i = order[k];
+      if (k && Z[i] - Z[order[k - 1]] > gapThr) flush();
+      const du = (U[i] - bcx) / rx, dv = (V[i] - bcy) / ry;
+      cur.push(i); score += Math.max(0, 1 - (du * du + dv * dv)) + 1e-3;
+    }
+    flush();
+    pool = best;
   }
-  const planes = ransacPlanes(P, pool, thr, opts.seed ?? 7);
+  // round objects (only a size prior, e.g. fruit): robust surface point of the central pixels, centre one radius behind it along the ray
+  if (opts.round && pool.length >= 3) {
+    const bcx = b.x + b.w / 2, bcy = b.y + b.h / 2, rx = Math.max(1, b.w / 2), ry = Math.max(1, b.h / 2);
+    let core = pool.filter((i) => { const du = (U[i] - bcx) / rx, dv = (V[i] - bcy) / ry; return du * du + dv * dv <= 0.36; });
+    if (core.length < 3) core = pool;
+    const med = (k: number) => { const v = core.map((i) => P[i * 3 + k]).sort((a, c) => a - c); return v[v.length >> 1]; };
+    const pc: Vec3 = [med(0), med(1), med(2)];
+    const pw = transformPoint(camWorld, pc);
+    const camPos: Vec3 = [camWorld[12], camWorld[13], camWorld[14]];
+    const nrm = normalize(sub(camPos, pw));
+    let xa = cross([0, 0, 1], nrm); xa = norm(xa) < 1e-6 ? [1, 0, 0] : normalize(xa);
+    const r = opts.dims ? Math.max(...opts.dims) / 2 : 0;
+    return { point: pw, normal: nrm, xAxis: xa, size: [0, 0], symmetryDeg: 360, centroid: r ? sub(pw, scale(nrm, r)) : undefined, points: core.length, planar: false };
+  }
+  const planes = ransacPlanes(P, pool, thr, opts.seed ?? 7, mb ? 3 : 4, mb ? 0.12 : 0.06);
   let pl: Plane | null = null;
   if (planes.length) {
-    const ok = planes.filter((p) => p.inl.length >= Math.max(12, 0.2 * n));
+    const ok = planes.filter((p) => p.inl.length >= Math.max(12, (mb ? 0.2 : 0.08) * n));
     const cand = ok.length ? ok : planes.slice(0, 1);
     if (mb) pl = cand.reduce((a, c) => (dot(R(c.n), up) > dot(R(a.n), up) + 0.05 ? c : a));
-    else pl = cand.reduce((a, c) => { const za = a.inl.reduce((s, i) => s + P[i * 3 + 2], 0) / a.inl.length, zc = c.inl.reduce((s, i) => s + P[i * 3 + 2], 0) / c.inl.length; return zc < za - thr ? c : a; });
+    else {
+      // box only: the planes of the object (within its size of the nearest plane), then the most upward-facing one (the
+      // face a top grasp uses, not a side face seen obliquely), the nearest on ties (the object's top, not the table)
+      const zm = (p: Plane) => p.inl.reduce((s, i) => s + P[i * 3 + 2], 0) / p.inl.length;
+      const z0 = Math.min(...cand.map(zm)), ext = opts.dims ? Math.max(...opts.dims) : (Math.max(x1 - x0, y1 - y0) * z0) / K.fx;
+      const near = cand.filter((p) => zm(p) <= z0 + ext + thr);
+      const maxInl = Math.max(...near.map((p) => p.inl.length)), strong = near.filter((p) => p.inl.length >= 0.5 * maxInl); // well-supported faces only (not a sliver)
+      const upMax = Math.max(...strong.map((p) => dot(R(p.n), up)));
+      pl = strong.filter((p) => dot(R(p.n), up) >= upMax - 0.1).reduce((a, c) => (zm(c) < zm(a) ? c : a));
+    }
   }
   const refW = opts.refAxis ?? [1, 0, 0];
   // non-planar (the best plane explains less than half of a masked object): robust centroid, normal towards the camera
@@ -232,9 +286,57 @@ export function localizeFromDepth(frame: DepthFrame, b: Box2D, opts: LocalizeOpt
   }
   const e2 = cross(nC, e1);
   const o = scale(nC, -dC); // plane point closest to the camera origin
+  // face pixels: the plane inliers, and (box only) the connected pixels of the same plane beyond a loose detection box
+  const faceU: number[] = pl.inl.map((i) => U[i]), faceV: number[] = pl.inl.map((i) => V[i]);
+  if (!mb) {
+    // margin: detectors are off by a few % of the box; a wider window lets the face leak along plane/surface intersection bands
+    const mx = Math.ceil((0.15 * (x1 - x0) + 3) / step), my = Math.ceil((0.15 * (y1 - y0) + 3) / step);
+    const ni = Math.ceil((x1 - x0) / step) + 2 * mx, nj = Math.ceil((y1 - y0) / step) + 2 * my;
+    const state = new Uint8Array(ni * nj); // 1 = on the face (visited)
+    const stack: number[] = [];
+    const gx = (u: number) => Math.round((u - 0.5 - x0) / step) + mx, gy = (v: number) => Math.round((v - 0.5 - y0) / step) + my;
+    // seeds: the connected group of inliers that fills the centre of the box (a loose box may also cover a neighbour
+    // object whose face lies in the same plane, e.g. the next box on the table)
+    {
+      const inlCell = new Map<number, number>();
+      for (const i of pl.inl) inlCell.set(gy(V[i]) * ni + gx(U[i]), i);
+      const seen = new Set<number>();
+      const bcx = b.x + b.w / 2, bcy = b.y + b.h / 2, rx = Math.max(1, b.w / 2), ry = Math.max(1, b.h / 2);
+      let bestComp: number[] = [], bestScore = -1;
+      for (const k0 of inlCell.keys()) {
+        if (seen.has(k0)) continue;
+        const comp: number[] = [], st2 = [k0]; seen.add(k0); let score = 0;
+        while (st2.length) {
+          const k = st2.pop()!; comp.push(k);
+          const i = inlCell.get(k)!, du = (U[i] - bcx) / rx, dv = (V[i] - bcy) / ry;
+          score += Math.max(0, 1 - (du * du + dv * dv)) + 1e-3;
+          const ci = k % ni, cj = (k - ci) / ni;
+          for (let dj = -1; dj <= 1; dj++) for (let di = -1; di <= 1; di++) { const k2 = (cj + dj) * ni + ci + di; if ((di || dj) && ci + di >= 0 && ci + di < ni && inlCell.has(k2) && !seen.has(k2)) { seen.add(k2); st2.push(k2); } }
+        }
+        if (score > bestScore) { bestScore = score; bestComp = comp; }
+      }
+      for (const k of bestComp) { state[k] = 1; stack.push(k); }
+    }
+    faceU.length = 0; faceV.length = 0;
+    while (stack.length) {
+      const k = stack.pop()!, i = k % ni, j = (k - i) / ni;
+      faceU.push(x0 + (i - mx) * step + 0.5); faceV.push(y0 + (j - my) * step + 0.5);
+      for (const [di, dj] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+        const i2 = i + di, j2 = j + dj;
+        if (i2 < 0 || j2 < 0 || i2 >= ni || j2 >= nj || state[j2 * ni + i2]) continue;
+        const x = x0 + (i2 - mx) * step, y = y0 + (j2 - my) * step;
+        if (x < 0 || y < 0 || x >= W || y >= H) continue;
+        const d = sampleDepth(x, y);
+        if (!(d > 0)) continue;
+        const px = ((x + 0.5 - K.cx) / K.fx) * d, py = ((y + 0.5 - K.cy) / K.fy) * d;
+        if (Math.abs(pl.n[0] * px + pl.n[1] * py + pl.n[2] * d + pl.d) >= thr) continue;
+        state[j2 * ni + i2] = 1; stack.push(j2 * ni + i2);
+      }
+    }
+  }
   const pts2: Array<[number, number]> = [];
-  for (const i of pl.inl) {
-    const ray: Vec3 = [(U[i] - K.cx) / K.fx, (V[i] - K.cy) / K.fy, 1];
+  for (let fi = 0; fi < faceU.length; fi++) {
+    const ray: Vec3 = [(faceU[fi] - K.cx) / K.fx, (faceV[fi] - K.cy) / K.fy, 1];
     const den = dot(nC, ray); if (Math.abs(den) < 1e-9) continue;
     const t = -dC / den; const q = scale(ray, t); const r0 = sub(q, o);
     pts2.push([dot(r0, e1), dot(r0, e2)]);
@@ -251,16 +353,6 @@ export function localizeFromDepth(frame: DepthFrame, b: Box2D, opts: LocalizeOpt
   if (opts.dims) {
     const d = [...opts.dims].sort((a, c) => c - a) as Vec3;
     const combos: Array<[number, number, number]> = [[d[0], d[1], d[2]], [d[0], d[2], d[1]], [d[1], d[2], d[0]]];
-    // match (A, B) to the measured sides allowing truncation (measured ≤ model): smallest model excess
-    let bestC = combos[0], bestE = Infinity, swap = false;
-    for (const c of combos) for (const sw of [false, true]) {
-      const A = sw ? c[1] : c[0], B = sw ? c[0] : c[1];
-      const tolA = 4 + 0.06 * A, tolB = 4 + 0.06 * B;
-      const e = Math.max(0, size[0] - A - tolA) * 10 + Math.max(0, size[1] - B - tolB) * 10 + Math.abs(A - size[0]) + Math.abs(B - size[1]);
-      if (e < bestE) { bestE = e; bestC = c; swap = sw; }
-    }
-    const A = swap ? bestC[1] : bestC[0], B = swap ? bestC[0] : bestC[1];
-    thickness = bestC[2];
     const side = (axis: Vec3, sgn: number, half: number, other: Vec3, otherHalf: number): boolean => {
       // a side is cut when just beyond it lies the image border or a nearer surface
       for (const f of [-0.5, 0, 0.5]) {
@@ -268,14 +360,30 @@ export function localizeFromDepth(frame: DepthFrame, b: Box2D, opts: LocalizeOpt
         if (pC[2] <= 1) return true;
         const u = K.cx + (K.fx * pC[0]) / pC[2], v = K.cy + (K.fy * pC[1]) / pC[2];
         if (u < 0 || v < 0 || u >= W || v >= H) return true;
-        const dd = depth[Math.floor(v) * W + Math.floor(u)];
-        if (dd > 0 && dd < pC[2] - Math.max(15, 2 * sig)) return true;
+        // smoothed depth (the same filter as the face pixels) and a 4σ gate: sensor noise alone never "cuts" a side
+        const dd = sampleDepth(Math.floor(u), Math.floor(v));
+        if (dd > 0 && dd < pC[2] - Math.max(15, 4 * sig)) return true;
       }
       return false;
     };
+    // sides cut by the image border or a nearer surface: there the measured size is only a lower bound
+    const cut = { xp: side(ax, 1, size[0] / 2, ay, size[1] / 2), xm: side(ax, -1, size[0] / 2, ay, size[1] / 2), yp: side(ay, 1, size[1] / 2, ax, size[0] / 2), ym: side(ay, -1, size[1] / 2, ax, size[0] / 2) };
+    const cutX = cut.xp || cut.xm, cutY = cut.yp || cut.ym;
+    // match the face (A, B) of the model to the measured sides: an uncut side must equal the model, a cut one may be shorter
+    let bestC = combos[0], bestE = Infinity, swap = false;
+    for (const c of combos) for (const sw of [false, true]) {
+      const A = sw ? c[1] : c[0], B = sw ? c[0] : c[1];
+      const tolA = 4 + 0.06 * A, tolB = 4 + 0.06 * B;
+      const e = Math.max(0, size[0] - A - tolA) * 10 + Math.max(0, size[1] - B - tolB) * 10 + (cutX ? 0 : Math.abs(A - size[0])) + (cutY ? 0 : Math.abs(B - size[1])) - 1e-4 * A * B; // ties (truncated faces): the largest face up, the stable resting pose
+      if (e < bestE) { bestE = e; bestC = c; swap = sw; }
+    }
+    const A = swap ? bestC[1] : bestC[0], B = swap ? bestC[0] : bestC[1];
+    thickness = bestC[2];
     const fix = (axis: Vec3, measured: number, model: number, other: Vec3, otherMeasured: number): number => {
       if (measured >= model - Math.max(4, 0.06 * model)) return 0;
-      const plus = side(axis, 1, measured / 2, other, otherMeasured / 2), minus = side(axis, -1, measured / 2, other, otherMeasured / 2);
+      const isX = axis === ax;
+      const plus = isX ? cut.xp : cut.yp, minus = isX ? cut.xm : cut.ym;
+      void other; void otherMeasured;
       if (plus && !minus) return (model - measured) / 2; // grow towards the cut side
       if (minus && !plus) return -(model - measured) / 2;
       return 0;

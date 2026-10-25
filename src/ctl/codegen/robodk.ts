@@ -36,7 +36,7 @@ export function runtimeModel(kind: ControlKind, source: string): { kind: 'des' |
     const guards: Record<string, string> = {}; for (const [e, g] of Object.entries(doc.guards ?? {})) { guards[e] = py(g); addIds(g); }
     const sensors = (doc.sensors ?? []).map((s) => { addIds(s.expr); return [s.event, py(s.expr)]; });
     const sup = doc.specs.length ? synthesizeSupervisor(doc) : null;
-    return { kind: 'des', model: { comps, uc: doc.uncontrollable, guards, sensors, actions, supervisor: sup?.table ?? null, bb: doc.blackboard ?? {} }, signals: [...sig] };
+    return { kind: 'des', model: { comps, uc: doc.uncontrollable, guards, sensors, actions, supervisor: sup?.table ?? null, bb: doc.blackboard ?? {}, terminate: doc.terminate ?? null }, signals: [...sig] };
   }
   if (kind === 'petri') {
     const doc = parsePetri(source); const net = new PetriNet(doc.spec);

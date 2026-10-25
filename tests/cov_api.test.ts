@@ -365,8 +365,8 @@ describe('RobolinkItem: programs and targets', () => {
     expect(status).toBe(2);
     expect(rows.length).toBeGreaterThan(0);
     expect(rows[0].length).toBe(10);
-    expect(prog.Save().length).toBeGreaterThan(50);
-    expect(RDK.Item('', RL.ITEM_TYPE_STATION).Save().length).toBeGreaterThan(100);
+    expect(String(prog.Save()).length).toBeGreaterThan(50);
+    expect(JSON.parse(String(RDK.Item('', RL.ITEM_TYPE_STATION).Save())).station.name).toBe(st.name);
     // moving the robot with different target types
     r.MoveJ(t1);
     expect(r.Joints()[0]).toBeCloseTo(2, 3);
@@ -460,11 +460,11 @@ describe('RobolinkItem: objects, attach/detach, collisions and colours', () => {
     expect(robot.MoveL_Test(q0, pose.mul(robomath.transl(0, 0, -20)))).toBe(0);
     expect(robot.MoveJ_Test(q0, q0.map((v, i) => (i === 5 ? v + 20 : v)))).toBe(0);
     expect(robot.MoveL_Test(q0, robomath.transl(20000, 0, 0))).toBe(-2);
-    const contact = robot.SearchL(pose.mul(robomath.transl(0, 0, 5)));
+    const contact = robot.SearchL(pose.mul(robomath.transl(0, 0, 5))) as number[];
     expect(contact.length).toBe(6);
     robot.setJoints(q0);
     const t = RDK.Item('Above 1');
-    const near = robot.SearchL(t);
+    const near = robot.SearchL(t) as number[];
     expect(near.length).toBe(6);
     robot.setJoints(q0);
     // machining params on a plain item
@@ -490,7 +490,8 @@ describe('Robolink: station-level API', () => {
     expect(RDK.Item('nothing-here').Valid()).toBe(false);
     expect(RDK.ItemList(RL.ITEM_TYPE_TARGET).length).toBeGreaterThan(5);
     expect(RDK.ItemUserPick('pick', RL.ITEM_TYPE_ROBOT).item).toBe(robot.item);
-    expect(RDK.ItemUserPick().Valid()).toBe(false);
+    // no dialog: the headless pick for ITEM_TYPE_ANY is the first object (Library macros pick objects this way)
+    expect(RDK.ItemUserPick().item).toBe(st.itemsOfType(RL.ITEM_TYPE_OBJECT as any)[0]);
     RDK.setSelection([prog, new RobolinkItem(RDK, null)]);
     expect(RDK.Selection().map((s) => s.Name())).toEqual(['PickPlace']);
     expect(RDK.ItemUserPick('', RL.ITEM_TYPE_PROGRAM).item).toBe(prog.item);
@@ -523,7 +524,7 @@ describe('Robolink: station-level API', () => {
     expect((curve.item as SceneObject).curves.length).toBe(2);
     const registered: string[] = [];
     RDK.assetsRegister = (id) => registered.push(id);
-    const shape = RDK.AddShape([[0, 0, 0, 10, 0, 0, 0, 10, 0]], holder, 'Tri');
+    const shape = RDK.AddShape([[0, 0, 0, 10, 0, 0, 0, 10, 0]], holder, false, 'Tri');
     expect(registered.length).toBe(1);
     expect(shape.Name()).toBe('Tri');
     // merge objects with curves; empty merge is invalid
@@ -656,7 +657,10 @@ describe('Robolink: station-level API', () => {
     const [mp, ok] = RDK.MeasurePose();
     expect(ok).toEqual([1]);
     expect(Math.abs(mp.Pos()[2] - tcp[2])).toBeLessThan(5);
-    expect(RDK.StereoCamera_Measure()[1]).toEqual([1]);
+    const stereo = RDK.StereoCamera_Measure();   // [Href, Htcp, n ref, n tcp, time ms, status]
+    expect(stereo.length).toBe(6);
+    expect(stereo[5]).toBe(0);
+    expect(Math.abs(stereo[1].Pos()[2] - tcp[2])).toBeLessThan(5);
     const q = robot.Joints();
     const ref = RDK.Calibrate_Reference([q, q.map((v, i) => (i === 0 ? v + 10 : v)), q.map((v, i) => (i === 1 ? v + 10 : v))], RL.CALIBRATE_FRAME_3P_P1_ORIGIN, true, robot);
     expect(ref.Pos().every((v) => Number.isFinite(v))).toBe(true);
@@ -757,7 +761,7 @@ describe('Robolink: station-level API', () => {
     const proj = RDK.AddMachiningProject('Mill', r);
     const [mprog, mstatus] = proj.setMachiningParameters('part.nc', part, 'Approach=20 Speed=15 SpindleIO=Spindle RotZ=0 Rounding=2');
     expect(mprog.InstructionCount()).toBeGreaterThan(0);
-    expect(mstatus).toBe(1);
+    expect(mstatus).toBe(0);                     // RoboDK: 0 = path fully reachable
     expect(proj.getParam('machiningStats')).toMatchObject({ cutLength: expect.any(Number) });
     const pid = String(proj.getParam('programId'));
     expect(st.findById(pid)).toBeInstanceOf(Program);
@@ -852,7 +856,8 @@ describe('studio server WebSocket bridge (browser side)', () => {
     expect(received[2]).toMatchObject({ id: 2 });
     expect(robot.Joints()[5]).toBe(33);
     await until(() => app.snapshot.mock.calls.length >= 1);
-    expect(app.previewProgram).toHaveBeenCalled();
+    // C3: recompiling the preview after API calls cancelled RunProgram playback; the bridge must not do it
+    expect(app.previewProgram).not.toHaveBeenCalled();
     s.send(JSON.stringify({ id: 3, method: 'WaitForEvent', params: [0.01] }));
     await until(() => received.length >= 4);
     expect(received[3]).toEqual({ id: 3, result: null });

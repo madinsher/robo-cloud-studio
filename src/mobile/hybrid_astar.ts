@@ -107,12 +107,13 @@ function dijkstra2D(world: CollisionWorld, o: FootprintPlanOptions, goal: [numbe
   const extra = o.extra ?? [];
   const blocked = o.blocked ?? [];
   const okArr = new Uint8Array(cg.w * cg.h);
+  const bb = polyBoxes(blocked);
   for (let j = 0; j < cg.h; j++) for (let i = 0; i < cg.w; i++) {
     const idx = j * cg.w + i;
     if (cg.c[idx] < need - res * 0.5) continue;
     const x = cg.x0 + (i + 0.5) * res, y = cg.y0 + (j + 0.5) * res;
-    if (extra.some((c) => Math.hypot(c.x - x, c.y - y) < c.r + need - res * 0.5)) continue;
-    if (blocked.some((p) => rectIntersectsPolygon({ x, y, theta: 0, L: W, W }, p))) continue;
+    if (extra.length && extra.some((c) => Math.hypot(c.x - x, c.y - y) < c.r + need - res * 0.5)) continue;
+    if (blocked.length && bb.some((b) => x + W >= b.x0 && x - W <= b.x1 && y + W >= b.y0 && y - W <= b.y1 && rectIntersectsPolygon({ x, y, theta: 0, L: W, W }, b.p))) continue;
     okArr[idx] = 1;
   }
   const g = new Float64Array(cg.w * cg.h).fill(Infinity);
@@ -195,6 +196,10 @@ export function planGridFootprint(world: CollisionWorld, start: Pose2, goal: { x
   return { ...core, path, length };
 }
 
+function polyBoxes(polys: number[][][]): Array<{ p: number[][]; x0: number; y0: number; x1: number; y1: number }> {
+  return polys.map((p) => ({ p, x0: Math.min(...p.map((q) => q[0])), y0: Math.min(...p.map((q) => q[1])), x1: Math.max(...p.map((q) => q[0])), y1: Math.max(...p.map((q) => q[1])) }));
+}
+
 function segmentFreeDir(free: (x: number, y: number, th: number) => boolean, a: number[], b: number[], th: number, step: number): boolean {
   const len = Math.hypot(b[0] - a[0], b[1] - a[1]);
   const n = Math.max(1, Math.ceil(len / step));
@@ -217,13 +222,14 @@ function planGridCore(world: CollisionWorld, start: Pose2, goal: { x: number; y:
   const inG = (i: number, j: number) => i >= 0 && j >= 0 && i < cg.w && j < cg.h;
   if (!inG(gi, gj)) return { ok: false, path: [], length: 0, expanded: 0, error: 'Goal outside the map', method: 'grid' };
   const okCache = new Int8Array(cg.w * cg.h); // 0 unknown, 1 ok, -1 blocked
+  const bbs = polyBoxes(blocked);
   const ok = (i: number, j: number) => {
     const idx = j * cg.w + i;
     if (okCache[idx]) return okCache[idx] > 0;
     let v = cg.c[idx] >= need;
     const x = cg.x0 + (i + 0.5) * res, y = cg.y0 + (j + 0.5) * res;
     if (v && extra.length) v = !extra.some((c) => Math.hypot(c.x - x, c.y - y) < c.r + need);
-    if (v && blocked.length) v = !blocked.some((p) => rectIntersectsPolygon({ x, y, theta: 0, L: W + 2 * m, W: W + 2 * m }, p));
+    if (v && blocked.length) v = !bbs.some((b) => x + W + 2 * m >= b.x0 && x - W - 2 * m <= b.x1 && y + W + 2 * m >= b.y0 && y - W - 2 * m <= b.y1 && rectIntersectsPolygon({ x, y, theta: 0, L: W + 2 * m, W: W + 2 * m }, b.p));
     okCache[idx] = v ? 1 : -1;
     return v;
   };

@@ -55,6 +55,14 @@ export class AbbPost extends RoboPost {
     if (/^\d/.test(s)) s = prefix + s;
     return s.slice(0, this.charLimit) || prefix;
   }
+  /** RoboDK renames a tooldata / wobjdata that would clash with a program (PROC) name: Frame "TopSurf" -> TopSurf2. */
+  protected noClash(nm: string): string {
+    const used = new Set(this.ctx.programs.map((p) => this.ident(p, 'P').toLowerCase()));
+    if (!used.has(nm.toLowerCase())) return nm;
+    let k = 2;
+    while (used.has(`${nm}${k}`.toLowerCase())) k++;
+    return `${nm}${k}`;
+  }
   override addline(s: string): void { this.cur.parts[this.cur.parts.length - 1].push(s); this.nLines++; }
   override ProgStart(name: string): void {
     const first = this.procs.length === 0;
@@ -129,14 +137,14 @@ export class AbbPost extends RoboPost {
     this.addline(`MoveC ${this.robtarget(pose1, joints1, conf1)},${this.robtarget(pose2, joints2, conf2)},${this.tail()}`);
   }
   override setTool(pose: Mat4, _id: number, name: string): void {
-    const nm = this.ident(name, 't');
+    const nm = this.noClash(this.ident(name, 't'));
     const data = `[TRUE,${rapidPose(pose)},[1,[0,0,20],[1,0,0,0],0,0,0.005]]`;
     if (this.decls.has(nm)) this.addline(`${nm} := ${data};`);
     else { this.decls.set(nm, 'tool'); this.toolDecl.push(`\tPERS tooldata ${nm} := ${data};`); }
     this.tool = nm;
   }
   override setFrame(pose: Mat4, _id: number, name: string): void {
-    const nm = this.variant !== 'S4C' && /base$/i.test(name.trim()) ? 'RobotBase' : this.ident(name, 'w');
+    const nm = this.variant !== 'S4C' && /base$/i.test(name.trim()) ? 'RobotBase' : this.noClash(this.ident(name, 'w'));
     const p = rapidPose(pose);
     const data = this.variant === 'S4C' ? `[FALSE, TRUE, "", ${p},[[0,0,0],[1,0,0,0]]]` : `[FALSE, TRUE, "", [[0,0,0],[1,0,0,0]],${p}]`;
     if (this.decls.has(nm)) this.addline(`${nm} := ${data};`);
@@ -156,7 +164,7 @@ export class AbbPost extends RoboPost {
     if (!isCall) { this.addline(code); return; }
     const m = code.trim().match(/^([^(]*)(?:\((.*)\))?\s*$/);
     if (!m) { this.addline(`${code};`); return; }
-    const name = m[1].trim().replace(/ /g, '_');
+    const name = m[1].trim().replace(/ /g, '');
     if (/^extruder$/i.test(name)) return; // RoboDK: 3D-printing extruder calls drive the synchronized axis, no code
     this.addline(m[2] === undefined ? `${name};` : `${name} ${m[2]};`);
   }

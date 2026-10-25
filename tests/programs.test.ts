@@ -86,7 +86,7 @@ describe('post processors', () => {
       expect(files[0].content.length, post.id).toBeGreaterThan(50);
     }
     const krl = getPost('KUKA_KRC4')!.generate(compiled)[0].content;
-    expect(krl).toMatch(/DEF PICKPLACE/);
+    expect(krl).toMatch(/^DEF PickPlace \( \)/m); // RoboDK keeps the program name case
     expect(krl).toMatch(/LIN \{X/);
     const rapid = getPost('ABB_RAPID_IRC5')!.generate(compiled)[0].content;
     expect(rapid).toMatch(/MoveL \[\[/);

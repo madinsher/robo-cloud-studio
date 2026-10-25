@@ -10,7 +10,8 @@ import { ensureVisionRuntime, visionRuntimeOf, createTargetsFromOutput, followCo
 import { generateRosVisionPackage, rosVisionPackageZip, publishCameraFrame } from '../vision/vision_ros';
 import { parsePCD, parsePLY, PointCloud, decimate, pointCount, cloudStats, writePCD } from '../vision/pointcloud';
 import { intrinsicsFromCamera, applySensorToCamera } from '../vision/camera_model';
-import { setCameraRenderer, CameraRender } from '../vision/sensing';
+import { setCameraRenderer, setSensingAssets, CameraRender } from '../vision/sensing';
+import { installVisionRunnerGlobal } from '../vision/program_vision';
 import { collectHandEyeSamples, solveEyeToHand, solveEyeInHand, applyHandEye } from '../vision/handeye';
 import { captureDatasetSample, yoloDataset, cocoDataset, DatasetSample } from '../vision/dataset';
 import { zipSync } from 'fflate';
@@ -50,6 +51,8 @@ export function addCamera(app: App, parent?: Item, modality: VisionModality = 'm
 /** Camera renders in the browser come from WebGL (exact depth + instance IDs); vision/sensing.ts falls back to software otherwise. */
 export function registerCameraRenderer(app: App): void {
   setCameraRenderer((st, cam, req) => app.renderer.renderCameraBuffers(st, cam, req));
+  setSensingAssets(app.assets); // meshes for software renders of other stations (and the Node-side fallback)
+  installVisionRunnerGlobal(); // VisionDetect("<camera>") in robot programs (StationRuntime script runner)
 }
 
 /** Properties section for a camera item. */
@@ -70,7 +73,9 @@ export function visionSection(app: App, cam: CameraItem, liveFields: Array<() =>
   upd();
   liveFields.push(upd);
   const cfg = getVisionStack(cam);
-  return section('Machine vision', stats,
+  // which image axis the field of view spans: RoboDK Cam2D / three.js = vertical, Webots / URDF / datasheets = horizontal
+  const fovAxis = formField({ key: 'fovAxis', label: 'Field of view spans', type: 'select', value: cam.fovAxis, options: [{ value: 'vertical', label: 'image height (RoboDK, vertical)' }, { value: 'horizontal', label: 'image width (Webots / URDF / datasheet, horizontal)' }] }, (v) => app.cmd(() => { cam.fovAxis = v === 'horizontal' ? 'horizontal' : 'vertical'; cam.notify('camera'); })).el;
+  return section('Machine vision', fovAxis, stats,
     h('div', { class: 'btn-row' },
       h('button', { class: 'btn primary', onClick: () => visionStackDialog(app, cam) }, t(cfg ? 'Change vision stack…' : 'Select vision stack…')),
       cfg ? h('button', { class: 'btn', onClick: () => { (app as any).bottom?.show?.('vision'); } }, t('Vision tab')) : null,

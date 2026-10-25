@@ -192,10 +192,11 @@ function shownInView(it: Item, station: Station): boolean {
   return true;
 }
 
+const fieldCache = new WeakMap<FieldItem, { key: string; meshes: SceneMesh[] }>();
 /** The station as triangle meshes in world coordinates (what the 3D view and the camera renders draw). */
 export function sceneMeshes(station: Station, opts: SceneMeshOptions = {}): SceneMesh[] {
   const out: SceneMesh[] = [];
-  const push = (key: string, itemId: string, kind: SceneMeshKind, world: Mat4, tris: Float32Array, color: [number, number, number], flags: { closed?: boolean; foliage?: boolean } = {}) => { const bb = aabbOf(world, tris); out.push({ key, itemId, kind, world, tris, color, min: bb.min, max: bb.max, ...flags }); };
+  const push = (key: string, itemId: string, kind: SceneMeshKind, world: Mat4, tris: Float32Array, color: [number, number, number], flags: { closed?: boolean; foliage?: boolean; seeThrough?: boolean } = {}) => { const bb = aabbOf(world, tris); out.push({ key, itemId, kind, world, tris, color, min: bb.min, max: bb.max, ...flags }); };
   const C = { closed: true };
   for (const it of station.walk()) {
     if (it === station || !shownInView(it, station) || opts.exclude?.(it)) continue;
@@ -234,9 +235,17 @@ export function sceneMeshes(station: Station, opts: SceneMeshOptions = {}): Scen
       }
     } else if (it instanceof FieldItem && opts.fields !== false) {
       const abs = it.poseAbs(); const c = it.crop;
+      // orchards hold tens of thousands of fruit: reuse the meshes while the field (pose, crop, plants, fruit state) is unchanged
+      const rows = it.rows();
+      let sig = 0, nPlants = 0, nFruit = 0;
+      for (const r of rows) for (const p of r.plants) { nPlants++; sig += p.height * 1.3 + p.width * 0.7; for (const fr of p.fruit) { nFruit++; if (fr.picked) sig += 17 + nFruit * 1e-4; if (fr.ripe >= 0.5) sig += 0.5; } }
+      const key = `${Array.from(abs).map((v) => v.toFixed(3)).join(',')}|${JSON.stringify(c)}|${it.indoor}|${rows.length}|${nPlants}|${nFruit}|${sig}`;
+      const hit = fieldCache.get(it);
+      if (hit && hit.key === key) { for (const m of hit.meshes) out.push(m); continue; }
+      const start = out.length;
       const boxCanopy = c.training === 'trellis_2d' || c.training === 'v_trellis' || c.training === 'greenhouse_gutter';
       const fruitCol = hexColor(c.crop === 'citrus' ? '#ff922b' : c.crop === 'grape' ? '#7048e8' : '#e03131', [224, 49, 49]);
-      for (const r of it.rows()) {
+      for (const r of rows) {
         const [dx, dy] = r.direction(); const yaw = Math.atan2(dy, dx);
         for (const p of r.plants) {
           const [x, y] = plantPosition(r, p);
@@ -251,6 +260,7 @@ export function sceneMeshes(station: Station, opts: SceneMeshOptions = {}): Scen
           }
         }
       }
+      fieldCache.set(it, { key, meshes: out.slice(start) });
     }
   }
   if (opts.ground) {
@@ -384,7 +394,8 @@ function rasterMesh(m: SceneMesh, ki: number, K: Intrinsics, inv: Mat4, near: nu
         let pi = yy * bw + minX;
         for (let xx = minX; xx <= maxX; xx++, pi++, w0 += w0dx, w1 += w1dx) {
           const w2 = 1 - w0 - w1;
-          if (w0 < 0 || w1 < 0 || w2 < 0) continue;
+          // small tolerance: a pixel centre exactly on an edge shared by two triangles is filled (no cracks)
+          if (w0 < -1e-9 || w1 < -1e-9 || w2 < -1e-9) continue;
           const z = 1 / (w0 * iz0 + w1 * iz1 + w2 * iz2);
           if (z > far || z >= zbuf[pi]) continue;
           zbuf[pi] = z; written++;

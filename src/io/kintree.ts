@@ -375,7 +375,9 @@ export function buildStationItemsFromTree(tree: KinTree, opts: KinBuildOptions =
       const prism = j.type === 'prismatic';
       const cont = j.type === 'continuous' || (!prism && (j.lower === undefined || j.upper === undefined));
       const lower = j.lower ?? (prism ? -1000 : cont ? -360 : -180), upper = j.upper ?? (prism ? 1000 : cont ? 360 : 180);
-      const def: JointDef = { name: j.name, type: prism ? 'prismatic' : cont ? 'continuous' : 'revolute', origin, axis: normalize(j.axis), lower, upper, home: Math.max(lower, Math.min(upper, j.position ?? 0)) };
+      // continuous joints keep the equivalent angle in (-180, 180] (e.g. a valve stored at -15.706 rad), others are clamped
+      const p0 = j.position ?? 0, home = cont && !prism ? p0 - 360 * Math.round(p0 / 360) : Math.max(lower, Math.min(upper, p0));
+      const def: JointDef = { name: j.name, type: prism ? 'prismatic' : cont ? 'continuous' : 'revolute', origin, axis: normalize(j.axis), lower, upper, home };
       if (j.velocity !== undefined) def.maxVelocity = j.velocity;
       if (j.mimic) {
         if (jset.has(j.mimic.joint)) def.mimic = { ...j.mimic };

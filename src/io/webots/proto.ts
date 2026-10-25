@@ -43,6 +43,7 @@ export const isStandardLibraryUrl = (u: string) => /^webots:\/\//i.test(u) || /r
 /** Resolve a URL relative to the file that declares it. */
 export function resolveUrl(url: string, fromFile: string): string {
   if (isRemote(url)) return url;
+  if (isRemote(fromFile)) { try { return new URL(url.replace(/\\/g, '/'), fromFile).href; } catch { return url; } } // relative to a remote PROTO
   if (/^[A-Za-z]:[\\/]/.test(url) || url.startsWith('/')) return normPath(url);
   return normPath(`${dirOf(fromFile)}/${url}`);
 }
@@ -58,6 +59,8 @@ export interface ProtoDecl {
 export interface Scope {
   file: string;
   externs: Map<string, string>;
+  /** PROTO names declared IMPORTABLE (spawned at run time by a supervisor, e.g. RetailProduct). */
+  importable?: Set<string>;
 }
 
 export interface ProtoRegistryOptions {
@@ -144,14 +147,29 @@ export class ProtoRegistry {
 
   /** Register the EXTERNPROTO list of a file (world or PROTO). */
   registerScope(file: string, externs: WExtern[]): Scope {
-    const m = new Map<string, string>();
-    for (const e of externs) m.set(baseName(e.url).replace(/\.proto$/i, ''), isRemote(e.url) ? e.url : resolveUrl(e.url, file));
-    const s = { file, externs: m };
+    const m = new Map<string, string>(), imp = new Set<string>();
+    for (const e of externs) {
+      const name = baseName(e.url).replace(/\.proto$/i, '');
+      m.set(name, isRemote(e.url) ? e.url : resolveUrl(e.url, file));
+      if (e.importable) imp.add(name);
+    }
+    const s = { file, externs: m, importable: imp };
     this.scopes.set(file, s);
     return s;
   }
   scopeOf(file: string): Scope | undefined {
     return this.scopes.get(file);
+  }
+
+  /** `webots://` -> raw GitHub URL of the world's Webots version (the Webots cache key), other URLs unchanged. */
+  canonicalUrl(url: string): string {
+    if (!/^webots:\/\//i.test(url)) return url;
+    const v = this.opts.context?.webots_version ?? { major: 'R2025', revision: 'a' };
+    return `https://raw.githubusercontent.com/cyberbotics/webots/${v.major}${v.revision}/${url.replace(/^webots:\/\//i, '')}`;
+  }
+  /** Bytes of a remote PROTO / mesh / texture through `opts.remote` (e.g. the local Webots cache); undefined offline. */
+  fetchRemote(url: string): Uint8Array | undefined {
+    return this.opts.remote ? this.opts.remote(this.canonicalUrl(url)) : undefined;
   }
 
   /** Find a file in the source: exact path, case-insensitive path, then unique basename. */
@@ -181,7 +199,7 @@ export class ProtoRegistry {
     if (this.files.has(path)) return this.files.get(path)!;
     this.files.set(path, null);
     let bytes = this.src.read(path);
-    if (!bytes && isRemote(path) && this.opts.remote) bytes = this.opts.remote(path);
+    if (!bytes && isRemote(path)) bytes = this.fetchRemote(path);
     if (!bytes) return null;
     try {
       const pf = parseProtoFile(new TextDecoder().decode(bytes), path);
@@ -262,10 +280,11 @@ export class ProtoRegistry {
     const fields: Record<string, { value: unknown; defaultValue: unknown }> = {};
     for (const f of decl.fields) fields[f.name] = { value: jsFieldValue(f.type, values[f.name], this, scope), defaultValue: jsFieldValue(f.type, f.def, this, scope) };
     const ctx: TemplateContext = {
-      world: this.opts.context?.world ?? '', proto: pf.path, id: `n${++instanceCounter}`, coordinate_system: this.opts.context?.coordinate_system ?? 'ENU',
+      world: this.opts.context?.world ?? '', proto: pf.path, id: ++instanceCounter, coordinate_system: this.opts.context?.coordinate_system ?? 'ENU',
       webots_version: this.opts.context?.webots_version ?? { major: 'R2025', revision: 'a' }, os: this.opts.context?.os ?? 'linux', webots_home: '', temporary_files_path: '/tmp/',
     };
-    return expandTemplate(pf.body, fields, ctx);
+    const messages: string[] = [];
+    try { return expandTemplate(pf.body, fields, ctx, { messages }); } finally { for (const m of messages) this.warnOnce(`${decl.name}: ${m}`); }
   }
 
   /** Expanded body text of a PROTO instance (template applied, IS not substituted); null if not a file PROTO. */
@@ -284,14 +303,15 @@ export class ProtoRegistry {
     const decl = this.lookup(node.type, scope);
     if (!decl) { this.expanded.set(node, null); return null; }
     const key = decl.path;
-    if (this.stack.includes(key) || key === node.base) { this.report.push(`${node.type}: recursive PROTO ${key}`); this.expanded.set(node, null); return null; }
+    // nodes made by a built-in carry base 'builtin:<type>' (e.g. the default BrushedAluminium wall appearance): not a cycle
+    if (this.stack.includes(key) || (key === node.base && !decl.builtin)) { this.report.push(`${node.type}: recursive PROTO ${key}`); this.expanded.set(node, null); return null; }
     this.stack.push(key);
     try {
       const values: Record<string, WValue> = {};
       for (const f of decl.fields) values[f.name] = node.fields[f.name] ?? f.def;
       if (!decl.builtin?.lenient) for (const k of Object.keys(node.fields)) if (!decl.fields.some((f) => f.name === k)) this.warnOnce(`${node.type}: unknown field '${k}' ignored`);
       let root: WNode | null = null;
-      if (decl.builtin) root = decl.builtin.build(values, node);
+      if (decl.builtin) root = decl.builtin.build(values, node, (m) => this.warnOnce(m));
       else if (decl.file) {
         const pf = decl.file;
         if (pf.template === 'lua') { this.report.push(`${node.type}: Lua template PROTOs are not supported`); this.expanded.set(node, null); return null; }

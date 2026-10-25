@@ -10,7 +10,9 @@
 import { App } from '../app';
 import { Robolink, RobolinkItem, Mat } from './robolink';
 import { executeRpcAsync, READ_ONLY_METHODS } from './rpc';
+import { pythonSource } from './exec';
 import type { ScriptContext } from './exec';
+import { registerScriptRunner } from '../core/motion/runtime';
 
 export interface BridgeOptions { snapshotDebounceMs?: number }
 
@@ -21,18 +23,22 @@ export async function connectToStudioServer(app: App, RDK: Robolink, url: string
   ws.send(JSON.stringify({ role: 'host', name: 'browser' }));
   app.log(`Connected to studio server at ${url} (Python robolink clients can now drive this station)`);
   RDK.exec.mode = 'realtime';
-  // station Python programs: run them on the server's CPython, their API calls come back through this bridge
+  // station Python programs: while connected they run on the server's CPython (threads, numpy, Python posts), their
+  // API calls come back through this bridge; the previous runner (Pyodide) is restored when the server goes away
   const httpBase = url.replace(/^ws/, 'http').replace(/\/+$/, '');
-  if (!RDK.exec.hasScriptRunner() || (RDK.exec as any).scriptRunnerKind !== 'pyodide') {
-    RDK.exec.setScriptRunner(async (ctx: ScriptContext) => {
-      const p: any = ctx.program?.params ?? ctx.station.find(ctx.name)?.params ?? {};
-      const res = await fetch(`${httpBase}/python/run`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: ctx.name, code: p.pythonCode ?? p.source ?? p.code ?? null, args: ctx.args }) });
-      const body = await res.json().catch(() => ({}));
-      if (!res.ok || body.error) throw new Error(body.error ?? `HTTP ${res.status}`);
-      if (body.output) app.log(String(body.output).trim().split(/\r?\n/).slice(-20).join('\n'));
-    });
-    (RDK.exec as any).scriptRunnerKind = 'server';
-  }
+  const prevRunner = RDK.exec.getScriptRunner();
+  const prevKind = (RDK.exec as any).scriptRunnerKind ?? null;
+  const serverRunner = async (ctx: ScriptContext) => {
+    const code = pythonSource(ctx);
+    if (code == null) return false as any;      // not a station Python program: not handled
+    const res = await fetch(`${httpBase}/python/run`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: ctx.name, code, args: ctx.args }) });
+    const body = await res.json().catch(() => ({}));
+    if (body.output) app.log(String(body.output).trim().split(/\r?\n/).slice(-20).join('\n'));
+    if (!res.ok || body.error) throw new Error(body.error ?? `HTTP ${res.status}`);
+  };
+  RDK.exec.setScriptRunner(serverRunner);
+  (RDK.exec as any).scriptRunnerKind = 'server';
+  const offGlobal = registerScriptRunner(serverRunner as any);
   let timer: ReturnType<typeof setTimeout> | null = null;
   const debounce = opts.snapshotDebounceMs ?? 400;
   ws.onmessage = (ev) => {
@@ -46,7 +52,11 @@ export async function connectToStudioServer(app: App, RDK: Robolink, url: string
       timer = setTimeout(() => { timer = null; app.snapshot(); }, debounce);
     });
   };
-  ws.onclose = () => app.log('Studio server disconnected');
+  ws.onclose = () => {
+    offGlobal();
+    if (RDK.exec.getScriptRunner() === serverRunner) { RDK.exec.setScriptRunner(prevRunner); (RDK.exec as any).scriptRunnerKind = prevKind; }
+    app.log('Studio server disconnected');
+  };
 }
 
 export { RobolinkItem, Mat };

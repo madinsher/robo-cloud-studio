@@ -43,6 +43,26 @@ export function rectsOverlap(a: Rect2, b: Rect2, gap = 0): boolean {
   return true;
 }
 
+/**
+ * Signed separation of two oriented rectangles along the SAT axes (mm): > 0 a lower bound of their distance (the
+ * largest gap between projections), < 0 the smallest penetration depth. Used to tell whether a motion separates
+ * two footprints that are already too close.
+ */
+export function rectSeparation(a: Rect2, b: Rect2): number {
+  const A = rectCorners(a), B = rectCorners(b);
+  let best = -Infinity;
+  for (const r of [a, b]) {
+    const th = (r.theta * Math.PI) / 180;
+    for (const [ax, ay] of [[Math.cos(th), Math.sin(th)], [-Math.sin(th), Math.cos(th)]]) {
+      let amin = Infinity, amax = -Infinity, bmin = Infinity, bmax = -Infinity;
+      for (const p of A) { const v = p[0] * ax + p[1] * ay; if (v < amin) amin = v; if (v > amax) amax = v; }
+      for (const p of B) { const v = p[0] * ax + p[1] * ay; if (v < bmin) bmin = v; if (v > bmax) bmax = v; }
+      best = Math.max(best, Math.max(bmin - amax, amin - bmax));
+    }
+  }
+  return best;
+}
+
 /** Point in polygon (even-odd). */
 export function pointInPolygon(x: number, y: number, p: number[][]): boolean {
   let inside = false;

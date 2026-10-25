@@ -5,10 +5,12 @@
  *  - A (youBot mobile manipulator): a differential base with a UR3e arm and a gripper, zones home / table / bin / dock,
  *    arm programs Reach / Stow / Grasp / Release (Grasp and Release write the IO `Holding` / `Delivered`). The DES is the
  *    course plant made cyclic (`o_next`) under the supervisor E1 E2 E3 E5; vision events come from `sensor` lines on the
- *    base zone, mission decisions from `guard` lines over the signals. The BT mission uses the same supervisor.
+ *    base zone, mission decisions from `guard` lines over the signals (the supervisor says what is allowed, the guards
+ *    what the cell wants: stow only after the grasp / the release, go to the table only empty-handed…). The BT mission
+ *    uses the same supervisor.
  *  - B (production cell): M1 (UR10e) serves the machine-loading process A and unloads the AMR of process B through the
  *    shared zone Z — the course net with its siphon deadlock; M2 (IRB 1200) unloads the machine concurrently. The GMEC
- *    monitor a1 + b1 ≤ 1 (graphdoc `applyDeadlockMonitors`) makes it live.
+ *    monitor a1 + b1 ≤ 1 (supervisor.ts `applyDeadlockMonitors`) makes it live.
  */
 import { Station, Frame, Target, Tool, SceneObject, ItemType } from '../core/items/item';
 import { Program } from '../core/items/program';
@@ -47,12 +49,15 @@ export function buildCourseStationA(st: Station = new Station('Course example A 
   const grip = arm.addChild(new Tool('Gripper')); grip.toolKind = 'gripper'; grip.setPoseTool(transl(0, 0, 120)); arm.setTool(grip);
   box(st, 'Table', [800, 800, 700], [4900, 0, 0], '#868e96');
   const part = box(st, 'Part', [60, 60, 60], [4550, 0, 700], '#e8590c');
-  box(st, 'Bin', [600, 600, 400], [4900, 3000, 0], '#2f9e44');
+  // the arm reaches ~550 mm ahead of the base: the part waits there on the table (base arrives heading +x) and the bin
+  // stands there at the bin zone (base arrives from the table heading +y)
+  box(st, 'Bin', [600, 600, 400], [4000, 3550, 0], '#2f9e44');
   const stow = [0, -90, 0, -90, 0, 0], reach = [0, -40, -80, -60, 90, 0];
   arm.setJoints(stow);
   jointProgram(st, arm, 'Reach', [['A stow', stow], ['A reach', reach]]);
   jointProgram(st, arm, 'Stow', [['A reach', reach], ['A stow', stow]]);
-  const grasp = st.addChild(new Program('Grasp')); grasp.setRobot(arm); grasp.pause(500); grasp.event('attach', part.id); grasp.setDO('Holding', 1); grasp.pause(300);
+  // Holding / Delivered are written last: the signal reports a completed grasp / release (the guards read it)
+  const grasp = st.addChild(new Program('Grasp')); grasp.setRobot(arm); grasp.pause(500); grasp.event('attach', part.id); grasp.pause(300); grasp.setDO('Holding', 1);
   const release = st.addChild(new Program('Release')); release.setRobot(arm); release.pause(300); release.event('detach', part.id); release.setDO('Holding', 0); release.setDO('Delivered', 1);
   return { station: st, base, arm, part };
 }
@@ -62,6 +67,7 @@ const S = youbotSpecs();
 export const YOUBOT_STATION_DES = `des youBot cell on the station (example A)
 ${specsToDsl(youbotPlant(true, true).map((d) => d.toSpec()), [S.E1, S.E2, S.E3, S.E5].map((d) => d.toSpec()), YOUBOT_UC, YOUBOT_UO)}
 blackboard Holding=0 Delivered=0
+terminate marked
 action Base.mT goto=table robot=youBot done=b_arrive timeout=60
 action Base.mB goto=bin robot=youBot done=b_arrive timeout=60
 action Base.mH goto=home robot=youBot done=b_arrive timeout=60
@@ -71,12 +77,13 @@ action Grip.C program=Grasp done=g_ok fail=g_miss timeout=20
 action Object.Bx program=Release timeout=20
 sensor v_detect "zone == 'table' && Holding == 0"
 sensor v_lost "zone != 'table'"
-guard b_go_table "Delivered == 0 && Holding == 0"
+guard b_go_table "Delivered == 0 && Holding == 0 && zone != 'table'"
 guard b_go_box "Holding == 1"
 guard b_go_home "Delivered == 1"
 guard a_reach "(zone == 'table' && Holding == 0 && Delivered == 0) || (zone == 'bin' && Holding == 1)"
-guard g_close "zone == 'table'"
-guard g_put "zone == 'bin'"
+guard a_stow "(zone == 'table' && Holding == 1) || (zone == 'bin' && Delivered == 1)"
+guard g_close "zone == 'table' && Holding == 0"
+guard g_put "zone == 'bin' && Holding == 1"
 guard o_next "false"
 guard o_giveup "false"`;
 

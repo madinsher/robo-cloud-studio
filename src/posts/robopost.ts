@@ -6,7 +6,7 @@
  * (tests/posts_gt.test.ts). Control-flow events (loop / if / thread / wait-signal) go through `ctl*` hooks that
  * vendor posts override with native syntax; the default writes a comment and a warning (I6).
  */
-import { Mat4 } from '../core/math/pose';
+import { Mat4, poseToQuat, quatToPose } from '../core/math/pose';
 import { PostEvent, PostFile, PostProgram } from './base';
 export { nameIndex } from './base';
 
@@ -42,6 +42,47 @@ export const pyI = (v: number) => String(Math.trunc(v));
 export function pyRound(v: number, d = 0): number {
   const m = 10 ** d, x = v * m, r = Math.round(x);
   return (Math.abs(x % 1) === 0.5 ? (r % 2 === 0 ? r : r - 1) : r) / m;
+}
+
+/**
+ * Linear approximation of a circular move for controllers without a circle instruction: the circle through the start,
+ * via and end positions is sampled every <= maxStepDeg (orientation slerped from start to end, like RoboDK's MoveC).
+ * Returns the intermediate poses plus the end pose and the radius; null when the points are (nearly) collinear.
+ */
+export function arcPoses(p0: Mat4, p1: Mat4, p2: Mat4, maxStepDeg = 10): { poses: Mat4[]; radius: number } | null {
+  const P = (m: Mat4) => [m[12], m[13], m[14]];
+  const a = P(p0), b = P(p1), c = P(p2);
+  const ab = b.map((v, i) => v - a[i]), ac = c.map((v, i) => v - a[i]);
+  const cr = (u: number[], v: number[]) => [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+  const dt = (u: number[], v: number[]) => u[0] * v[0] + u[1] * v[1] + u[2] * v[2];
+  const n = cr(ab, ac), n2 = dt(n, n);
+  if (n2 < 1e-9) return null;
+  // circumcentre of the three positions
+  const t1 = cr(n, ab).map((v) => v * dt(ac, ac)), t2 = cr(ac, n).map((v) => v * dt(ab, ab));
+  const ctr = a.map((v, i) => v + (t1[i] + t2[i]) / (2 * n2));
+  const radius = Math.hypot(a[0] - ctr[0], a[1] - ctr[1], a[2] - ctr[2]);
+  const nn = n.map((v) => v / Math.sqrt(n2));
+  const u = a.map((v, i) => (v - ctr[i]) / radius), w = cr(nn, u);
+  const ang = (q: number[]) => { const d = q.map((v, i) => v - ctr[i]); let t = Math.atan2(dt(d, w), dt(d, u)); if (t < 0) t += 2 * Math.PI; return t; };
+  const total = ang(c);
+  const steps = Math.max(2, Math.ceil((total * 180) / Math.PI / maxStepDeg));
+  const qa = poseToQuat(p0);
+  let qb = poseToQuat(p2);
+  if (qa[0] * qb[0] + qa[1] * qb[1] + qa[2] * qb[2] + qa[3] * qb[3] < 0) qb = qb.map((v) => -v) as typeof qb;
+  const slerp = (t: number): typeof qa => {
+    const d = Math.min(1, Math.abs(qa[0] * qb[0] + qa[1] * qb[1] + qa[2] * qb[2] + qa[3] * qb[3])), th = Math.acos(d);
+    if (th < 1e-9) return qa;
+    const s0 = Math.sin((1 - t) * th) / Math.sin(th), s1 = Math.sin(t * th) / Math.sin(th);
+    return qa.map((v, i) => v * s0 + qb[i] * s1) as typeof qa;
+  };
+  const poses: Mat4[] = [];
+  for (let k = 1; k < steps; k++) {
+    const t = k / steps, th = total * t;
+    const pt = ctr.map((v, i) => v + radius * (Math.cos(th) * u[i] + Math.sin(th) * w[i]));
+    poses.push(quatToPose(pt[0], pt[1], pt[2], slerp(t)));
+  }
+  poses.push(p2);
+  return { poses, radius };
 }
 
 export type IoName = string | number;
@@ -157,30 +198,53 @@ export function rdkDate(d: Date): string {
   return `${p(d.getDate())}/${p(d.getMonth() + 1)}/${d.getFullYear()} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
 
-function flattenPrograms(p: PostProgram): PostProgram[] {
+/** Program name as RoboDK hands it to the posts: blanks removed ("Pick EarCup 1" -> PickEarCup1 in every RoboDK output). */
+export const postProgName = (n: string) => n.replace(/\s+/g, '');
+export function renameEvents(events: PostEvent[]): PostEvent[] {
+  return events.map((e) => {
+    switch (e.kind) {
+      case 'callProgram': return { ...e, name: postProgName(e.name) };
+      case 'thread': return { ...e, name: postProgName(e.name) };
+      case 'loop': return { ...e, body: postProgName(e.body) };
+      case 'if': return { ...e, then: e.then && postProgName(e.then), else: e.else && postProgName(e.else) };
+      default: return e;
+    }
+  });
+}
+/** Main program followed by every (nested) sub-program once, with post-safe names. */
+export function flattenPrograms(p: PostProgram): PostProgram[] {
   const out: PostProgram[] = [p];
   const seen = new Set([p.name]);
   const walk = (q: PostProgram) => { for (const s of q.subprograms) { if (seen.has(s.name)) continue; seen.add(s.name); out.push(s); walk(s); } };
   walk(p);
-  return out;
+  return out.map((q) => (/\s/.test(q.name) || q.events.some((e) => (e.kind === 'callProgram' || e.kind === 'thread' || e.kind === 'loop' || e.kind === 'if')) ? { ...q, name: postProgName(q.name), events: renameEvents(q.events) } : q));
 }
 
 /** Feed one program's events into a post instance (same mapping as python/post_shim.py `_replay`). */
 export function replayEvents(post: RoboPost, events: PostEvent[]): void {
+  // per-move speed / rounding overrides (events not produced by compileForPost, which already made them explicit):
+  // applied before the move and restored before the next move without override
+  let progSpeed: number | undefined, curSpeed: number | undefined, progRound: number | undefined, curRound: number | undefined;
+  const overrides = (ev: { speed?: number; rounding?: number }, linear: boolean) => {
+    const sp = linear ? ev.speed ?? progSpeed : undefined;
+    if (sp !== undefined && sp !== curSpeed) { post.setSpeed(sp); curSpeed = sp; }
+    const rd = ev.rounding ?? progRound;
+    if (rd !== undefined && rd !== curRound) { post.setZoneData(rd); curRound = rd; }
+  };
   for (const ev of events) {
     switch (ev.kind) {
-      case 'moveJ': post.MoveJ(ev.pose, ev.joints, ev.conf ?? [0, 0, 0]); break;
-      case 'moveL': post.MoveL(ev.pose, ev.joints ?? [], ev.conf ?? [0, 0, 0]); break;
-      case 'moveC': post.MoveC(ev.via, ev.viaJoints ?? ev.joints ?? [], ev.pose, ev.joints ?? [], ev.viaConf ?? ev.conf ?? [0, 0, 0], ev.conf ?? [0, 0, 0]); break;
+      case 'moveJ': overrides(ev, false); post.MoveJ(ev.pose, ev.joints, ev.conf ?? [0, 0, 0]); break;
+      case 'moveL': overrides(ev, true); post.MoveL(ev.pose, ev.joints ?? [], ev.conf ?? [0, 0, 0]); break;
+      case 'moveC': overrides(ev, true); post.MoveC(ev.via, ev.viaJoints ?? ev.joints ?? [], ev.pose, ev.joints ?? [], ev.viaConf ?? ev.conf ?? [0, 0, 0], ev.conf ?? [0, 0, 0]); break;
       case 'setFrame': post.setFrame(ev.pose, ev.frameId ?? -1, ev.name); break;
       case 'setTool': post.setTool(ev.pose, ev.toolNum ?? -1, ev.name); break;
       case 'setSpeed':
-        if (ev.speedLinear !== undefined) post.setSpeed(ev.speedLinear);
+        if (ev.speedLinear !== undefined) { post.setSpeed(ev.speedLinear); progSpeed = curSpeed = ev.speedLinear; }
         if (ev.speedJoints !== undefined) post.setSpeedJoints(ev.speedJoints);
         if (ev.accelLinear !== undefined) post.setAcceleration(ev.accelLinear);
         if (ev.accelJoints !== undefined) post.setAccelerationJoints(ev.accelJoints);
         break;
-      case 'setRounding': post.setZoneData(ev.radius); break;
+      case 'setRounding': post.setZoneData(ev.radius); progRound = curRound = ev.radius; break;
       case 'pause': post.Pause(ev.timeMs); break;
       case 'setDO': post.setDO(ioName(ev.io), ioValue(ev.value)); break;
       case 'setAO': post.setAO(ioName(ev.io), ev.value); break;
@@ -229,7 +293,7 @@ export function runRoboPost(make: (ctx: RoboPostCtx) => RoboPost, p: PostProgram
   if (includeSubPrograms) {
     const post = make(ctx);
     for (const q of progs) play(post, q);
-    files.push(...post.ProgSave(p.name));
+    files.push(...post.ProgSave(progs[0].name));
   } else {
     for (const q of progs) {
       const post = make(ctx);
@@ -237,7 +301,14 @@ export function runRoboPost(make: (ctx: RoboPostCtx) => RoboPost, p: PostProgram
       files.push(...post.ProgSave(q.name));
     }
   }
-  // de-duplicate file names (sub-program generated twice through different call paths)
-  const seen = new Set<string>();
-  return files.filter((f) => (seen.has(f.name) ? false : (seen.add(f.name), true)));
+  // same file name twice (vendor name truncation, e.g. Motoman DropPart1/DropPart2 -> DROPPAR.JBI): like RoboDK the last
+  // file written wins; the clash is reported because calls then reach the last program only
+  const byName = new Map<string, PostFile>();
+  for (const f of files) {
+    const prev = byName.get(f.name);
+    if (prev && prev.content !== f.content) p.problems?.push(`Post: two programs are written to the same file ${f.name} (name truncated by the controller limits); rename them`);
+    byName.set(f.name, f);
+  }
+  for (const w of warnings) if (!p.problems?.includes(w)) p.problems?.push(w);
+  return [...byName.values()];
 }

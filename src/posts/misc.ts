@@ -2,7 +2,7 @@ import { PostProcessor, PostProgram, PostFile, f, safeName, registerPost } from 
 import { poseToKuka, poseToXyzrpw, poseToZyz, getPos, poseToQuat } from './euler';
 
 /** Stäubli VAL3 post processor (.pgx + .dtx simplified). */
-export const STAUBLI_VAL3: PostProcessor = {
+const STAUBLI_VAL3_LEGACY: PostProcessor = {
   id: 'Staubli_VAL3',
   name: 'Stäubli VAL3',
   brand: 'Staubli',
@@ -37,10 +37,10 @@ export const STAUBLI_VAL3: PostProcessor = {
     return [{ name: `${name}.pgx`, content: L.join('\n') + '\n' }];
   },
 };
-registerPost(STAUBLI_VAL3);
+// Staubli_VAL3: RoboDK-compatible VAL3 project post in staubli.ts
 
 /** Doosan DRL (Python-like) post processor. */
-export const DOOSAN: PostProcessor = {
+const DOOSAN_LEGACY: PostProcessor = {
   id: 'Doosan_Robotics',
   name: 'Doosan Robotics (DRL)',
   brand: 'Doosan',
@@ -73,7 +73,7 @@ export const DOOSAN: PostProcessor = {
     return [{ name: `${safeName(p.name)}.drl`, content: L.join('\n') + '\n' }];
   },
 };
-registerPost(DOOSAN);
+// Doosan_Robotics: RoboDK-compatible DRL post in vendors.ts
 
 /** Mecademic (Python API-like) */
 export const MECADEMIC: PostProcessor = {
@@ -109,7 +109,7 @@ export const MECADEMIC: PostProcessor = {
     return [{ name: `${safeName(p.name)}.py`, content: L.join('\n') + '\n' }];
   },
 };
-registerPost(MECADEMIC);
+// Mecademic: RoboDK-compatible program text post in vendors.ts
 
 /** Generic CSV trace: one line per move with pose (XYZRPW) and joints. */
 export const GENERIC_CSV: PostProcessor = {

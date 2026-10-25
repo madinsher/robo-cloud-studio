@@ -16,7 +16,7 @@ export function exprTokens(src: string): Tok[] {
   while (i < src.length) {
     const c = src[i];
     if (/\s/.test(c)) { i++; continue; }
-    if (/[0-9.]/.test(c) && /[0-9]/.test(src[i + 1] ?? c)) { let j = i; while (j < src.length && /[0-9.eE]/.test(src[j])) j++; out.push({ k: 'num', v: src.slice(i, j) }); i = j; continue; }
+    if (/[0-9]/.test(c) || (c === '.' && /[0-9]/.test(src[i + 1] ?? ''))) { let j = i; while (j < src.length && (/[0-9.]/.test(src[j]) || (/[eE]/.test(src[j]) && /[0-9+-]/.test(src[j + 1] ?? '')) || (/[+-]/.test(src[j]) && /[eE]/.test(src[j - 1])))) j++; out.push({ k: 'num', v: src.slice(i, j) }); i = j; continue; }
     if (c === "'" || c === '"') { const j = src.indexOf(c, i + 1); if (j < 0) throw new Error(`unterminated string in ${src}`); out.push({ k: 'str', v: src.slice(i + 1, j) }); i = j + 1; continue; }
     if (/[A-Za-z_]/.test(c)) { let j = i; while (j < src.length && /[A-Za-z0-9_.]/.test(src[j])) j++; out.push({ k: 'id', v: src.slice(i, j) }); i = j; continue; }
     const two = src.slice(i, i + 2);

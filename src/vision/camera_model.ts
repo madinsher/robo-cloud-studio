@@ -28,6 +28,11 @@ export function cameraIntrinsics(cam: CameraLike, width = cam.width, height = ca
 }
 /** Same as cameraIntrinsics at the camera resolution (kept for existing callers). */
 export function intrinsicsFromCamera(cam: CameraLike): Intrinsics { return cameraIntrinsics(cam); }
+/** A pixel of the camera image (cam.width × cam.height) in a render of the same camera at width × height (overlays on a canvas of another size/aspect). */
+export function rescalePixel(cam: CameraLike, u: number, v: number, width: number, height: number): [number, number] {
+  const K = cameraIntrinsics(cam), K2 = cameraIntrinsics(cam, width, height);
+  return [K2.cx + ((u - K.cx) * K2.fx) / K.fx, K2.cy + ((v - K.cy) * K2.fy) / K.fy];
+}
 /** Vertical field of view (deg) for THREE.PerspectiveCamera rendering this camera into a width×height target. */
 export function threeFovDeg(cam: CameraLike, width = cam.width, height = cam.height): number {
   const K = cameraIntrinsics(cam, width, height);

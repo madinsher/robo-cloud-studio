@@ -7,11 +7,11 @@ Legend: ✅ implemented · 🟡 partial / simplified · ❌ not implemented
 | RoboDK feature | Status | Notes |
 |---|---|---|
 | Station tree (frames, robots, tools, targets, programs, objects, folders) | ✅ | |
-| Robot library (online library with hundreds of robots, .robot files) | ✅ | 22 built-in models (UR exact DH) + **online library of 91 robots** (Fanuc, ABB, KUKA, Yaskawa/Motoman, Stäubli, UR, Franka, Kinova, Doosan) fetched as open URDF packages from GitHub with exact kinematics and meshes (`src/io/library/online_library.ts`); URDF/DH import; RoboDK `.robot` files are proprietary — convert with `rdk2vbs.py` / `POST /convert/rdk` |
+| Robot library (online library with hundreds of robots, .robot files) | ✅ | 22 built-in models (UR exact DH) + **online library of 91 robots** (Fanuc, ABB, KUKA, Yaskawa/Motoman, Stäubli, UR, Franka, Kinova, Doosan) fetched as open URDF packages from GitHub with exact kinematics and meshes (`src/io/library/online_library.ts`); URDF/DH import; RoboDK `.robot` files decode natively (kinematics = RoboDK SolveFK, all link meshes; docs/robodk-library-compat.md) |
 | Import geometry: STL, OBJ, COLLADA (.dae) | ✅ | COLLADA reader handles unit scale, Y-up conversion, node transforms |
 | Import geometry: STEP/IGES/BREP | ✅ | OpenCascade WebAssembly (occt-import-js), loaded on demand; SLDPRT/3DS/WRL ❌ |
 | Program playback of recorded joint paths (RoboDK InstructionListJoints, ROS bags, CSV logs) | ✅ | `jointPath` instruction: exact replay in the simulator, exported through posts as joint moves; created automatically for RoboDK programs whose robot kinematics could not be rebuilt |
-| .rdk station load/save | 🟡 | lossless import through a headless RoboDK behind the studio server (`python/rdk2vbs.py`, `POST /convert/rdk`, tried automatically when a `.rdk`/`.robot`/`.tool` is dropped): targets, programs + RoboDK's simulated joint path, object curves/points, machining projects (curve/point follow, 3D print, milling), Python programs; otherwise best-effort binary reader; export via `rdk_export.py` + API script |
+| .rdk station load/save | ✅ | native reader checked against RoboDK 5.9.4 for all 96 Library files (tree, poses, FK, targets, programs by item reference incl. IO / threads / code calls, Python programs, curves / points, station parameters, collision map; `docs/robodk-library-compat.md`); not reproduced: machining settings, animated passive links (listed in the import report); `POST /convert/rdk` re-saves files of other RoboDK versions; export via `rdk_export.py` + API script |
 | .robot / .tool file build ("Robot builder") | ✅ | `BuildMechanism` (1R/1T/2R/2T/3R/3T/4R/4T/6DOF/7DOF/SCARA), `setRobotParams` (modified DH), DH import/export |
 | Targets: cartesian / joint, teach, configuration flags | ✅ | flags derived (elbow/wrist/front), no explicit conf editing |
 | Programs: MoveJ/MoveL/MoveC, speed, rounding, frame/tool, pause, IO, code, comment, message, call | ✅ | |
@@ -85,7 +85,7 @@ robots replace their DH tables instead).
 
 ## Remaining gaps
 
-- Proprietary binary containers (`.rdk`, `.robot`, `.tool`) stay best-effort; the lossless path is the API bridge.
+- RoboDK binary files are read natively (format: docs/robodk-file-format.md); machining project settings and animated passive links are not reproduced.
 - Native (non-ROS) drivers exist for UR, ABB (RWS) and KUKA (KVP); other brands connect through their ROS 2 drivers.
 - Depth/segmentation camera buffers, 3D PDF export, Simulink blocks and C++ add-ins are not implemented.
 - `EmbedWindow` and file-path based `AddFile` do not apply to a browser application.

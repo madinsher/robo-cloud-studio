@@ -149,7 +149,9 @@ function visualColliders(item: Item, part: string, linkIndex: number | undefined
     if (p.kind === 'cone') return [{ item, part, linkIndex, shape: { kind: 'capsule', a: transformPoint(pose, [0, 0, -p.length / 2]), b: transformPoint(pose, [0, 0, p.length / 2]), r: p.radius * 0.7 } }];
   }
   if (g.mesh && opts.assets) {
-    const a = opts.assets.get(g.mesh) ?? [...opts.assets.entries()].find(([id]) => id.split(/[\\/]/).pop()?.toLowerCase() === g.mesh!.split(/[\\/]/).pop()?.toLowerCase())?.[1];
+    // exact id, else the basename index (O(1); the old linear scan per mesh dominated checks of big stations)
+    const st = opts.assets as AssetStore & { resolve?: AssetStore['resolve'] };
+    const a = st.get(g.mesh) ?? (typeof st.resolve === 'function' ? st.resolve(g.mesh.split('\\').pop()!) : undefined);
     if (a?.mesh) {
       const s = g.scale ?? [1, 1, 1];
       const min = a.mesh.min.map((v, i) => v * s[i]) as [number, number, number];
@@ -336,8 +338,23 @@ export function checkColliders(colliders: Collider[], opts: CollisionOptions = {
   return pairs;
 }
 
+/** SRDF <disable_collisions> pairs stored by the URDF importer on the imported root (params.disabledCollisions). */
+const srdfCache = new WeakMap<object, Set<string>>();
+function srdfDisabled(it: Item): Set<string> | null {
+  for (let p: Item | null = it; p; p = p.parent) {
+    const d = p.params?.disabledCollisions as unknown;
+    if (!Array.isArray(d) || !d.length) continue;
+    let set = srdfCache.get(d);
+    if (!set) srdfCache.set(d, (set = new Set(d.flatMap((x: any) => (Array.isArray(x) ? [`${x[0]}|${x[1]}`, `${x[1]}|${x[0]}`] : [])))));
+    return set;
+  }
+  return null;
+}
+
 /** Default collision rules (RoboDK-like): adjacent links, tool vs its flange links, attached parts, mounts. */
 function skipPair(A: Collider, B: Collider, opts: CollisionOptions, ignore: Set<string>): boolean {
+  const sd = srdfDisabled(A.item);
+  if (sd && sd.has(`${A.part}|${B.part}`) && srdfDisabled(B.item) === sd) return true;
   if (A.item === B.item) {
     // same robot: skip the same link and neighbours (approximate capsules overlap at the shoulder/wrist)
     if (A.linkIndex !== undefined && B.linkIndex !== undefined) {
@@ -367,6 +384,7 @@ function skipPair(A: Collider, B: Collider, opts: CollisionOptions, ignore: Set<
   if (A.item instanceof Tool && A.item.attached.includes(B.item.id)) return true;
   if (B.item instanceof Tool && B.item.attached.includes(A.item.id)) return true;
   if ((A.item instanceof Tool && B.item.parent === A.item) || (B.item instanceof Tool && A.item.parent === B.item)) return true;
+  if (heldBy(A.item, B.item) || heldBy(B.item, A.item)) return true;
   // robot base link vs the item it is mounted on (mobile platform / pedestal parent)
   if ((A.linkIndex === 0 && A.item.parent === B.item) || (B.linkIndex === 0 && B.item.parent === A.item)) return true;
   if (opts.selfOnly && (rootOf(A.item) !== rootOf(B.item) || !(rootOf(A.item) instanceof Robot))) return true;
@@ -377,6 +395,25 @@ function skipPair(A: Collider, B: Collider, opts: CollisionOptions, ignore: Set<
   // A box around an imported tool is fatter than the shell and crosses the forearm while the triangles do not.
   const ownedTool = (A.item instanceof Tool && A.item.parent === B.item) || (B.item instanceof Tool && B.item.parent === A.item);
   if (ownedTool && (A.approx || B.approx)) return true;
+  return false;
+}
+
+/**
+ * A part held by a tool (attached) vs the gripper mechanism doing the holding (RoboDK gripper robots mounted with the
+ * tool on the arm, 06.f RobotiQ fingers): the fingers touch the part. The arm's own links still collide with it.
+ */
+function heldBy(obj: Item, other: Item): boolean {
+  const t = obj.parent;
+  if (!(t instanceof Tool) || !t.attached.includes(obj.id) || !(other instanceof Robot) || other.dof >= 5) return false;
+  return other.isAncestorOf(t) || other.parent === t.parent || (!!t.parent && t.parent.isAncestorOf(other));
+}
+
+/** Pairs never checked, whatever the collision map says: one link with itself, a part with the tool holding it. */
+function hardSkip(A: Collider, B: Collider): boolean {
+  if (A.item === B.item && (A.linkIndex === B.linkIndex || A.linkIndex === undefined || B.linkIndex === undefined)) return true;
+  if (heldBy(A.item, B.item) || heldBy(B.item, A.item)) return true;
+  if (A.item instanceof Tool && (A.item.attached.includes(B.item.id) || B.item.parent === A.item)) return true;
+  if (B.item instanceof Tool && (B.item.attached.includes(A.item.id) || A.item.parent === B.item)) return true;
   return false;
 }
 
@@ -413,12 +450,38 @@ export interface CollisionMapData {
   disabled: Array<[string, number, string, number]>;
   /** Pairs explicitly enabled (override default rules such as adjacent links). */
   enabled: Array<[string, number, string, number]>;
+  /**
+   * RoboDK station collision map (imported from .rdk): the collision entities (robots one per mesh link, objects, tools)
+   * and the index pairs RoboDK checks. Between two entities only these pairs are checked; explicit enabled/disabled
+   * entries (setCollisionPair) override it, items outside the entity list follow the default rules.
+   */
+  entities?: Array<{ id: string; name?: string; link?: number }>;
+  pairs?: Array<[number, number]>;
 }
 
 export function getCollisionMap(station: Station): CollisionMapData {
   let m = station.params.collisionMap as unknown as CollisionMapData | undefined;
   if (!m || typeof m !== 'object') { m = { active: true, disabled: [], enabled: [] }; station.params.collisionMap = m as any; }
+  // an imported RoboDK map ({ entities, pairs }) gets the switch and override lists, keeping its pairs
+  if (typeof m.active !== 'boolean') m.active = true;
+  if (!Array.isArray(m.disabled)) m.disabled = [];
+  if (!Array.isArray(m.enabled)) m.enabled = [];
   return m;
+}
+
+/** Entity index lookup and checked-pair set of an imported RoboDK map (cached per map object). */
+const rdkMapCache = new WeakMap<object, { index: Map<string, number>; pairs: Set<number>; n: number }>();
+function rdkMap(m: CollisionMapData): { index: Map<string, number>; pairs: Set<number>; n: number } | null {
+  if (!Array.isArray(m.entities) || !Array.isArray(m.pairs)) return null;
+  let c = rdkMapCache.get(m);
+  if (!c || c.n !== m.pairs.length) {
+    const index = new Map<string, number>();
+    m.entities.forEach((e, i) => index.set(`${e.id}|${e.link ?? -1}`, i));
+    const N = m.entities.length;
+    c = { index, pairs: new Set(m.pairs.map(([i, j]) => Math.min(i, j) * N + Math.max(i, j))), n: m.pairs.length };
+    rdkMapCache.set(m, c);
+  }
+  return c;
 }
 
 export function setCollisionPair(station: Station, a: Item, b: Item, linkA = -1, linkB = -1, check = true): void {
@@ -437,6 +500,15 @@ function pairState(m: CollisionMapData, A: Collider, B: Collider): 'enabled' | '
   };
   if (m.disabled.some(match)) return 'disabled';
   if (m.enabled.some(match)) return 'enabled';
+  const r = rdkMap(m);
+  if (r) {
+    // a robot whose RoboDK mesh links do not map 1:1 onto its chain links (KR 90 R3100: 9 meshes, 7 links, extra
+    // counterbalance parts) cannot be matched link by link: its pairs follow the default rules
+    const unmapped = (c: Collider) => c.item instanceof Robot && c.item.params.rdkMeshLinks !== undefined && Number(c.item.params.rdkMeshLinks) !== c.item.chain.links.length;
+    const ent = (c: Collider) => (unmapped(c) ? undefined : r.index.get(`${c.item.id}|${c.linkIndex ?? -1}`) ?? (c.linkIndex !== undefined ? undefined : r.index.get(`${c.item.id}|-1`)));
+    const i = ent(A), j = ent(B);
+    if (i !== undefined && j !== undefined) return r.pairs.has(Math.min(i, j) * m.entities!.length + Math.max(i, j)) ? 'enabled' : 'disabled';
+  }
   return 'default';
 }
 
@@ -794,7 +866,9 @@ export function exactHit(s1: Shape, s2: Shape, margin = 0): boolean {
           for (let y = b2.start[j]; y < b2.start[j] + b2.count[j]; y++) {
             b2.tri(b2.order[y], tB);
             if (triTri(tA, [xf(T, tB[0]), xf(T, tB[1]), xf(T, tB[2])])) return true;
-            if (++budget > 2_000_000) return true;
+            // coplanar contact (a robot base standing on its pedestal) can make the traversal explode: past this many
+            // triangle tests the meshes are taken as touching
+            if (++budget > 250_000) return true;
           }
         }
       } else if (leafA) stack.push(i, b2.left[j], i, b2.right[j]);
@@ -863,39 +937,78 @@ const IGNORED_TYPES = new Set([ItemType.FIELD, ItemType.CROP_ROW, ItemType.MAP, 
  * Link and object meshes are tested triangle-exactly (BVH) when an asset store is given (meshAccurate defaults on);
  * the station collision map (disabled / enabled pairs) is honoured.
  */
-export function robotCollisionChecker(station: Station, robot: Robot, opts: CollisionOptions = {}): { check(version?: number): CollisionPair[] } {
+const shapeIds = new WeakMap<object, number>();
+let shapeSeq = 0;
+/** Stable id of a collider's geometry (mesh positions or the collider object) for result caching. */
+function shapeId(s: Shape): string {
+  const k: object = s.kind === 'mesh' ? s.positions : s;
+  let id = shapeIds.get(k);
+  if (id === undefined) shapeIds.set(k, (id = ++shapeSeq));
+  return s.kind === 'mesh' ? `m${id}` : `p${s.kind}${id}`;
+}
+const samePose = (a: ArrayLike<number> | undefined, b: ArrayLike<number> | undefined): boolean => {
+  if (!a || !b || a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (Math.abs(a[i] - b[i]) > 1e-9) return false;
+  return true;
+};
+
+export function robotCollisionChecker(station: Station, robot: Robot, opts: CollisionOptions = {}): { check(version?: number, skip?: (a: Collider, b: Collider) => boolean): CollisionPair[] } {
   const o: CollisionOptions = { ...opts, meshAccurate: opts.meshAccurate ?? !!opts.assets };
   const margin = o.margin ?? 0;
   const ignore = new Set((o.ignore ?? []).map(([a, b]) => `${a}|${b}`));
   let version = NaN;
   let mine = new Set<Item>();
   let statics: Array<{ c: Collider; box: AABB }> = [];
+  let movers: Item[] = [];
+  const meshCache = new Map<string, { pa: number[]; pb: number[]; d: number }>();
+  // items that move during a program (other robots and mechanisms, the carrier, mobile robots and everything they
+  // carry) are re-evaluated at every check; the rest of the station is cached until `version` changes
+  const moving = (it: Item): boolean => { for (let p: Item | null = it; p && p !== station; p = p.parent) if (p instanceof Robot || p instanceof MobileRobot) return true; return false; };
   return {
-    check(v = 0): CollisionPair[] {
+    /** `skip(a, b)`: pairs the caller does not want (e.g. meshes already in contact at the start). */
+    check(v = 0, skip?: (a: Collider, b: Collider) => boolean): CollisionPair[] {
       const map = station.params.collisionMap ? getCollisionMap(station) : null;
       if (map && !map.active) return [];
       if (v !== version) {
         version = v;
         mine = new Set(robot.walk());
-        statics = [];
+        statics = []; movers = [];
         if (!o.selfOnly) for (const it of station.walk()) {
           if (it === station || !it.visible || mine.has(it) || IGNORED_TYPES.has(it.type)) continue;
+          if (moving(it)) { movers.push(it); continue; }
           for (const c of collidersOf(it, o)) statics.push({ c, box: shapeAABB(c.shape) });
         }
       }
       const own: Array<{ c: Collider; box: AABB }> = [];
       for (const it of mine) if (it.visible && !IGNORED_TYPES.has(it.type)) for (const c of collidersOf(it, o)) own.push({ c, box: shapeAABB(c.shape) });
+      const others: Array<{ c: Collider; box: AABB }> = [...statics];
+      for (const it of movers) for (const c of collidersOf(it, o)) others.push({ c, box: shapeAABB(c.shape) });
       const pairs: CollisionPair[] = [];
       const test = (A: { c: Collider; box: AABB }, B: { c: Collider; box: AABB }) => {
         const state = map ? pairState(map, A.c, B.c) : 'default';
         if (state === 'disabled') return;
-        if (state !== 'enabled' && skipPair(A.c, B.c, o, ignore)) return;
+        if (state === 'enabled' ? hardSkip(A.c, B.c) : skipPair(A.c, B.c, o, ignore)) return;
+        if (skip && skip(A.c, B.c)) return;
         if (!aabbOverlap(A.box, B.box, margin)) return;
+        // exact mesh tests are expensive: reuse the result while neither mesh moved (base link vs its pedestal, two
+        // static parts of a robot standing still)
+        const ma = A.c.shape.kind === 'mesh' ? A.c.shape : null, mb = B.c.shape.kind === 'mesh' ? B.c.shape : null;
+        let key = '';
+        if (ma || mb) {
+          key = `${shapeId(A.c.shape)}|${shapeId(B.c.shape)}`;
+          const hit = meshCache.get(key);
+          const pa = ma ? ma.pose : (A.c.shape as any).center, pb = mb ? mb.pose : (B.c.shape as any).center;
+          if (hit && samePose(hit.pa, pa) && samePose(hit.pb, pb)) { if (hit.d > 0) pairs.push({ a: A.c, b: B.c, depth: hit.d }); return; }
+          const d = pairDepth(A.c, B.c, o, margin);
+          meshCache.set(key, { pa: pa ? Array.from(pa as ArrayLike<number>) : [], pb: pb ? Array.from(pb as ArrayLike<number>) : [], d });
+          if (d > 0) pairs.push({ a: A.c, b: B.c, depth: d });
+          return;
+        }
         const d = pairDepth(A.c, B.c, o, margin);
         if (d > 0) pairs.push({ a: A.c, b: B.c, depth: d });
       };
       for (let i = 0; i < own.length; i++) for (let j = i + 1; j < own.length; j++) test(own[i], own[j]);
-      for (const A of own) for (const B of statics) test(A, B);
+      for (const A of own) for (const B of others) test(A, B);
       return pairs;
     },
   };

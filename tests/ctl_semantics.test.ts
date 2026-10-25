@@ -268,3 +268,17 @@ describe('B16/B17/B18: timed semantics, capacities, deadlock verdict', () => {
     const notFin = new PetriExecutor({ world: noWorld(), doc: parsePetri('petri f\nplace a tokens=1\nplace b\nplace c\ntransition t\narc a -> t -> b\nfinal c') }); notFin.run(2); expect(notFin.verdict).toBe('deadlock');
   });
 });
+
+describe('end of an automaton run', () => {
+  const cell = (terminate: boolean) => `des cell\nautomaton C\n  initial I\n  marked I\n  I -part-> W\n  W -go-> D\n  D -done-> I\nuncontrollable part done\nsensor part "present"\naction C.D wait=1 done=done${terminate ? '\nterminate marked' : ''}`;
+  it('an event-driven cell back in its marked state keeps waiting for the next part; `terminate marked` ends it done', () => {
+    for (const term of [false, true]) {
+      const host = simulatedHost(); const world: ExecutorWorld = { host, forRobot: () => null, events: () => [], step: () => {} };
+      const x = new AutomatonExecutor({ doc: parseDes(cell(term)), world });
+      x.run(2, 0.1); expect(x.status).toBe('running'); expect(x.fired).toBe(0); // waiting for the first part, whatever the option
+      (host as unknown as { signals: Record<string, unknown> }).signals.present = true; x.run(5, 0.1);
+      expect(x.trace.map((e) => e.event)).toEqual(['part', 'go', 'done']);
+      if (term) { expect(x.status).toBe('idle'); expect(x.verdict).toBe('done'); } else expect(x.status).toBe('running');
+    }
+  });
+});

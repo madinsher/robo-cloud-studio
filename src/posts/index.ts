@@ -7,4 +7,7 @@ import './misc';
 import './robodk_python';
 import './ros2';
 import './more';
+import './vendors';
+import './staubli';
+import './urp';
 export * from './base';

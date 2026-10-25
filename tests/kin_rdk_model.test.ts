@@ -33,7 +33,7 @@ describe('kin: RoboDK robot model vs RoboDK SolveFK', () => {
     }
     expect(bad, bad.join('\n')).toEqual([]);
     expect(checked).toBeGreaterThan(700);
-    expect(synced).toBe(2); // ABB IRB 6640 on rail + turntable (05.c), Comau NM 45 on the Gudel gantry (05.d)
+    expect(synced).toBe(3); // ABB IRB 6640 on rail + turntable (05.c), Comau NM 45 on the Gudel gantry (05.d), ABB IRB 2600 on the turntable (02.f)
   });
 
   it.skipIf(!haveLib)('brand conventions: KUKA, Fanuc, Yaskawa, Kawasaki and Comau chains carry the RoboDK senses and couplings', { timeout: 180000 }, () => {
