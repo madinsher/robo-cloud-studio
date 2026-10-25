@@ -82,10 +82,19 @@ export function collidersOf(item: Item, opts: CollisionOptions = {}): Collider[]
     const reach = Math.max(300, item.reach);
     const r0 = Math.max(18, reach / 22);
     const hasMeshes = chain.links.some((l) => l.visuals.length > 0);
+    // collision geometry declared by the source (Webots boundingObject / URDF <collision>: robots built from a kinematic
+    // tree, or any link carrying `collisions`): links without it do not collide, like in Webots / ROS (a transparent
+    // "ghost" arm without boundingObject has no colliders); other robots (RoboDK) collide with their visual meshes
+    const declared = item.params.source === 'kintree' || chain.links.some((l) => !!l.collisions);
     for (let i = 0; i < chain.links.length; i++) {
       const linkPose = multiply(base, fk.linkPoses[i]);
       const link = chain.links[i];
-      if (link.visuals.length) {
+      if (link.collisions) {
+        // collision geometry declared by the source (Webots boundingObject, URDF <collision>): used instead of the visuals
+        for (const g of link.collisions) out.push(...visualColliders(item, link.name, i, multiply(linkPose, Float64Array.from(g.origin ?? identity16())), g as any, opts));
+      } else if (declared) {
+        continue;
+      } else if (link.visuals.length) {
         for (const v of link.visuals) for (const c of visualColliders(item, link.name, i, multiply(linkPose, v.passive ? visualOrigin(fk.linkPoses, i, v) : v.origin), v, opts)) { if (v.meshLink !== undefined) c.meshLink = v.meshLink; out.push(c); }
       } else if (!hasMeshes) {
         // capsule from the joint pivot to the link end (mirrors the procedural renderer)

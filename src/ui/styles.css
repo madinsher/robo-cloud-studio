@@ -43,7 +43,7 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .tb-sep { width: 1px; height: 18px; background: var(--border); margin: 0 4px; }
 .statusbar { height: 22px; background: var(--panel); border-top: 1px solid var(--border); padding: 2px 10px; color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; }
 .bottom-dock { height: 260px; background: var(--panel); border-top: 1px solid var(--border); display: flex; flex-direction: column; }
-.bottom-dock.collapsed { height: 28px; }
+.bottom-dock.collapsed { height: 28px !important; }  /* over the dragged height */
 .bottom-dock.collapsed .tab-content { display: none; }
 .tab-bar { display: flex; gap: 2px; padding: 2px 6px 0; border-bottom: 1px solid var(--border); }
 .tab { background: none; border: none; padding: 4px 10px; cursor: pointer; border-bottom: 2px solid transparent; color: var(--muted); }
@@ -160,6 +160,10 @@ progress { accent-color: var(--accent-2); }
 @media (max-width: 1000px) { .tree-panel { width: 200px; } .props-panel { width: 260px; } }
 
 .cam-canvas { background: #000; border: 1px solid var(--border); max-width: 100%; }
+/* the Vision tab's camera image is scaled to the dock height (it used to be cut: 229 px of a 538 px canvas) */
+.tab-content .vision-canvas { width: auto; height: auto; max-width: 100%; max-height: calc(var(--dock-h, 260px) - 150px); min-height: 90px; object-fit: contain; }
+.dock-resize { height: 5px; margin-bottom: -5px; cursor: ns-resize; position: relative; z-index: 2; flex: none; }
+.dock-resize:hover { background: var(--accent, #4dabf7); opacity: 0.5; }
 .cam-panel { display: flex; flex-direction: column; gap: 6px; }
 .mini-chart { display: block; margin: 6px 0; border: 1px solid var(--border); max-width: 100%; }
 

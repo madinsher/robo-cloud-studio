@@ -284,9 +284,10 @@ export class PetriExecutor {
       } else done = this.time >= a.end - 1e-9;
       if (done) { this.marking = this.marking.map((v, k) => v + this.net.post[a.t][k]); const id = this.net.transitionId(a.t); this.firings[id] = (this.firings[id] ?? 0) + 1; this.active.splice(this.active.indexOf(a), 1); this.trace.push({ t: this.time, transition: id, phase: 'end' }); this.say(`${id} completed → ${this.where()}`); }
     }
-    // fire
+    // fire (not after a partial deadlock: the firings in progress complete, nothing new starts)
     let n = 0; const max = this.opts.maxPerTick ?? 20; const pendingEv = [...evs];
     for (;;) {
+      if (this.draining) break;
       const en = this.candidates(pendingEv); if (!en.length || n++ >= max) break;
       const t = en[0]; const tr = this.net.transitions[t];
       const id = this.net.transitionId(t); const b = this.opts.doc.actions.find((x) => x.target === id);
@@ -302,16 +303,23 @@ export class PetriExecutor {
     }
     w.step?.(dt);
     this.time += dt; this.ticks++;
+    if (this.draining) {
+      if (!this.active.length) { this.status = 'idle'; this.verdict = 'deadlock'; this.say(`stopped after the partial deadlock at marking {${this.where()}}: the firings in progress have completed`); }
+      return this.status;
+    }
     const waitsForEvent = this.net.transitions.some((tr, j) => !this.faulted.has(j) && (tr.on || tr.guard) && this.net.isEnabled(this.marking, j) && this.inProgress(j) < (tr.servers ?? 1));
     if (!this.active.length && !this.candidates().length && !waitsForEvent) this.finish();
     else if (this.opts.stopOnPartialDeadlock !== false) this.checkPartialDeadlock();
     return this.status;
   }
-  private lastChecked = ''; private noDeadlockCheck = false;
+  private lastChecked = ''; private noDeadlockCheck = false; private draining = false;
   /**
    * Partial deadlock: from the marking the running firings lead to, some token-holding activity places can never be left
    * (all their output transitions are dead in the reachability set from there — structure only, so guards / events /
    * timing cannot revive them) while other transitions still cycle. Exact for bounded nets; skipped for large ones.
+   * Not a deadlock while a declared `final` marking is still reachable (the places left marked are part of the
+   * declared end state, e.g. the loser of a race). When it is one, no new firing starts and the run ends once the
+   * firings in progress have completed (robots are not stopped in mid-motion).
    */
   private checkPartialDeadlock(): void {
     if (this.noDeadlockCheck) return;
@@ -324,15 +332,18 @@ export class PetriExecutor {
     const blocked = this.net.places.map((p, i) => i).filter((i) => m[i] > 0 && !['resource', 'idle', 'monitor'].includes(this.net.places[i].kind ?? '') && this.net.placeOut(i).length > 0 && this.net.placeOut(i).every(dead));
     // reported when it has happened: every blocked place holds its tokens now (no running firing still produces into it)
     if (!blocked.length || blocked.some((i) => this.marking[i] < m[i])) return;
+    if (this.opts.doc.finals?.length && rg.markings.some((x) => this.isFinalMarking(x))) return;
     const deadT = this.net.transitions.map((_, j) => j).filter(dead).map((j) => this.net.transitionId(j));
-    this.stop('deadlock'); this.status = 'idle';
-    this.say(`DEADLOCK (partial) at marking {${this.where()}}: ${blocked.map((i) => this.net.places[i].id).join(', ')} can never be left; dead transitions ${deadT.join(', ')}`);
+    this.draining = true; this.verdict = 'deadlock';
+    if (!this.active.length) this.status = 'idle';
+    this.say(`DEADLOCK (partial) at marking {${this.where()}}: ${blocked.map((i) => this.net.places[i].id).join(', ')} can never be left; dead transitions ${deadT.join(', ')}${this.active.length ? `; no new firing starts, waiting for ${this.active.map((a) => this.net.transitionId(a.t)).join(', ')} to complete` : ''}`);
   }
-  /** Final marking reached: a declared `final` marking (≤ for the places listed), else tokens only in sink places or resource / idle / monitor places. */
-  isFinal(): boolean {
+  /** Final marking reached: a declared `final` marking (= for the places listed), else tokens only in sink places or resource / idle / monitor places. */
+  isFinal(): boolean { return this.isFinalMarking(this.marking); }
+  private isFinalMarking(mk: number[]): boolean {
     const finals = this.opts.doc.finals;
-    if (finals?.length) return finals.some((f) => this.net.places.every((p, i) => (f[p.id] === undefined ? true : this.marking[i] === f[p.id])) && Object.keys(f).every((k) => this.net.pIndex.has(k)));
-    return this.net.places.every((p, i) => !this.marking[i] || this.net.placeOut(i).length === 0 || ['resource', 'idle', 'monitor'].includes(p.kind ?? ''));
+    if (finals?.length) return finals.some((f) => this.net.places.every((p, i) => (f[p.id] === undefined ? true : mk[i] === f[p.id])) && Object.keys(f).every((k) => this.net.pIndex.has(k)));
+    return this.net.places.every((p, i) => !mk[i] || this.net.placeOut(i).length === 0 || ['resource', 'idle', 'monitor'].includes(p.kind ?? ''));
   }
   private finish(): void {
     this.status = 'idle';

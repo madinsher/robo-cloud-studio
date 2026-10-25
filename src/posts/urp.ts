@@ -85,7 +85,9 @@ export class URPPost extends RoboPost {
     const sp = type === 'MoveJ' ? this.speedRads : this.speedMs, ac = type === 'MoveJ' ? this.accelRadss : this.accelMss;
     const head = `        <Move motionType="${type}" speed="${fx(sp)}" acceleration="${fx(ac)}" useActiveTCP="true">`;
     const wp = [`            <Waypoint type="Fixed" name="Waypoint_${++this.nWay}">`, ...(blend > 0 ? [`              <motionParameters blendRadius="${fx(blend)}"/>`] : []),
-      `              <position joints="${joints.slice(0, 6).map((v) => fx(v * DEG, 6)).join(', ')}" pose="${tcp}"/>`, `              <poseInFeatureCoordinates pose="${tcp}"/>`, `              <outputFlangePose pose="${flange}"/>`, '            </Waypoint>'];
+      // a joint target has no pose: RoboDK writes the joint position only
+      ...(b ? [`              <position joints="${joints.slice(0, 6).map((v) => fx(v * DEG, 6)).join(', ')}" pose="${tcp}"/>`, `              <poseInFeatureCoordinates pose="${tcp}"/>`, `              <outputFlangePose pose="${flange}"/>`]
+        : [`              <position joints="${joints.slice(0, 6).map((v) => fx(v * DEG, 6)).join(', ')}"/>`]), '            </Waypoint>'];
     if (this.progs[0] !== this.cur) return;
     if (type === 'MoveL' && this.openMove === head) { this.cur.xml.splice(this.cur.xml.length - 2, 0, ...wp); return; }
     this.node(head, '          <children>', ...wp, '          </children>', '        </Move>');
@@ -97,12 +99,20 @@ export class URPPost extends RoboPost {
     const line = `movej([${[0, 1, 2, 3, 4, 5].map((i) => fx((joints[i] ?? 0) * DEG, 6)).join(', ')}],${fx(this.accelRadss, 5)},${fx(this.speedRads, 5)},0,${fx(b, 4)})`;
     this.addline(line);
     this.script(line);
-    this.waypoint('MoveJ', joints, pose, 0);
+    // a joint target (no pose) is a script line only in the .urp (RoboDK)
+    if (pose) this.waypoint('MoveJ', joints, pose, 0); else this.openMove = null;
     this.lastLinear = false;
     this.lastPos = pose ? Array.from(this.base(pose).subarray(12, 15)) : null;
   }
   MoveL(pose: Mat4 | null, joints: number[]): void {
-    if (!pose) { this.MoveJ(null, joints); return; }
+    if (!pose) {
+      // a linear move to a joint target: movel with the joint values, never blended (RoboDK's Universal_Robots_URP post)
+      this.addline(`movel([${[0, 1, 2, 3, 4, 5].map((i) => fx((joints[i] ?? 0) * DEG, 6)).join(', ')}],accel_mss,speed_ms,0,${fx(0)})`);
+      this.waypoint('MoveL', joints, null, this.blend);
+      this.lastLinear = false;
+      this.lastPos = null;
+      return;
+    }
     this.addline(`movel(p[${v6(this.base(pose))}],accel_mss,speed_ms,0,${fx(this.blend)})`);
     this.waypoint('MoveL', joints, pose, this.blend);
     this.lastLinear = true;

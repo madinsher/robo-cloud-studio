@@ -177,38 +177,60 @@ export async function importRosPackageFiles(filesIn: Map<string, Uint8Array>, as
     if (!/<robot[\s>]/.test(t)) continue;
     candidates.push({ file: p, package: pkgOf(p)?.[0], args: {}, source: 'top-level' });
   }
-  type Expanded = { entry: RosEntry; xml: string; includes: string[]; links: number };
+  type Expanded = { entry: RosEntry; xml: string; includes: string[]; links: number; robot: boolean; signature: string };
   const expanded: Expanded[] = [];
-  const failed = new Map<string, string>();
+  const failed: Array<{ entry: RosEntry; msg: string }> = [];
   const expand = (e: RosEntry): Expanded | null => {
     const t = fileText(e.file);
-    if (t === null) { failed.set(e.file, `${e.file}: file not found`); return null; }
+    if (t === null) { failed.push({ entry: e, msg: `${e.file}: file not found` }); return null; }
     try {
       const pk = e.package ?? pkgOf(e.file)?.[0];
       const filename = pk ? canonical(e.file) : e.file;
       const res = isXacro(t) ? expandXacro(t, { filename, packages, resolveInclude, args: { ...e.args, ...(opts.args ?? {}) }, env: {} }) : { xml: t, includes: [] as string[], warnings: [] as string[] };
       for (const w of res.warnings) if (!/redefining global symbol|deprecated/.test(w)) report.push(`${e.file}: ${w}`);
       const links = (res.xml.match(/<link[\s>]/g) ?? []).length;
-      return { entry: e, xml: res.xml, includes: res.includes.map((i) => locate(i) ?? i), links };
+      // the expanded document must be a URDF <robot> (a launch file may also expand an SDF / world xacro for Gazebo)
+      const root = rootElement(res.xml);
+      const robot = root === 'robot';
+      if (!robot && links > 0 && !report.some((r) => r.startsWith(`${e.file}: <${root}>`))) report.push(`${e.file}: <${root}> document (not a URDF robot), skipped`);
+      return { entry: e, xml: res.xml, includes: res.includes.map((i) => locate(i) ?? i), links, robot, signature: robot ? robotSignature(res.xml) : '' };
     } catch (err) {
-      failed.set(e.file, `${e.file}${Object.keys(e.args).length ? ` (${Object.entries(e.args).map(([k, v]) => `${k}:=${v}`).join(' ')})` : ''}: ${(err as Error).message}`);
+      failed.push({ entry: e, msg: `${e.file}${Object.keys(e.args).length ? ` (${Object.entries(e.args).map(([k, v]) => `${k}:=${v}`).join(' ')})` : ''}: ${(err as Error).message}` });
       return null;
     }
   };
   for (const e of [...launch, ...candidates]) { const x = expand(e); if (x) expanded.push(x); }
   const included = new Set(expanded.flatMap((x) => x.includes));
-  const robotsFound = expanded.filter((x) => x.links > 0 && (x.entry.source !== 'top-level' || !included.has(x.entry.file)));
+  const robotsFound = expanded.filter((x) => x.robot && x.links > 0 && (x.entry.source !== 'top-level' || !included.has(x.entry.file)));
   // one result per file: a launch entry wins over the bare top-level expansion of the same file
   const byFile = new Map<string, Expanded[]>();
   for (const x of robotsFound) { const l = byFile.get(x.entry.file) ?? []; l.push(x); byFile.set(x.entry.file, l); }
   const entries: RosEntry[] = [];
   for (const [, list] of byFile) { const fromLaunch = list.filter((x) => x.entry.source !== 'top-level'); for (const x of fromLaunch.length ? fromLaunch : list.slice(0, 1)) entries.push(x.entry); }
-  let chosen = entries;
+  const exp = (e: RosEntry) => expanded.find((y) => y.entry === e)!;
+  // the same robot reached twice (its xacro from one launch file and the pre-expanded URDF from another, or two launch
+  // files with the same arguments): one copy; the other is listed as an alternative
+  const sameAs = new Map<RosEntry, RosEntry>();
+  entries.forEach((e, k) => { const first = entries.slice(0, k).find((f) => !sameAs.has(f) && exp(f).signature === exp(e).signature); if (first) sameAs.set(e, first); });
+  const robotEntries = entries.filter((e) => !sameAs.has(e));
+  let chosen = robotEntries;
   if (opts.entries?.length) chosen = entries.filter((e) => opts.entries!.includes(e.file));
-  else if (!opts.all && launch.length && entries.some((e) => e.source !== 'top-level')) chosen = entries.filter((e) => e.source !== 'top-level');
-  for (const e of entries) if (!chosen.includes(e)) report.push(`Also available: ${e.file} (${e.source})`);
-  // errors: only for files that would have been robots (top-level and not included elsewhere), launch entries always
-  for (const [f, msg] of failed) if (!included.has(f) && (launch.some((l) => l.file === f) || !entries.some((e) => e.file === f))) errors.push(msg);
+  else if (!opts.all && launch.length && robotEntries.some((e) => e.source !== 'top-level')) chosen = robotEntries.filter((e) => e.source !== 'top-level');
+  for (const e of entries) {
+    if (chosen.includes(e)) continue;
+    const twin = sameAs.get(e);
+    report.push(twin && chosen.includes(twin) ? `Same robot as ${twin.file} (${twin.source}): ${e.file} (${e.source}) is not imported twice` : `Also available: ${e.file} (${e.source})`);
+  }
+  // errors: only for files that would have been robots (top-level and not included elsewhere), launch entries always —
+  // unless the same file expanded fine for another entry (the bare top-level expansion of a xacro that needs the
+  // arguments its launch file passes)
+  const okFiles = new Set(robotsFound.map((x) => x.entry.file));
+  const reported = new Set<string>();
+  for (const { entry: e, msg } of failed) {
+    const f = e.file;
+    if (included.has(f) || okFiles.has(f) || reported.has(msg)) continue;
+    if (e.source !== 'top-level' || !entries.some((x) => x.file === f)) { errors.push(msg); reported.add(msg); }
+  }
 
   // ---- SRDFs
   const srdfs: SRDFModel[] = [];
@@ -220,8 +242,8 @@ export async function importRosPackageFiles(filesIn: Map<string, Uint8Array>, as
   const models: URDFModel[] = [];
   const missing = new Set<string>();
   let offset = 0;
-  for (const e of chosen) {
-    const x = expanded.find((y) => y.entry === e)!;
+  const importOne = (e: RosEntry): boolean => {
+    const x = exp(e);
     try {
       const model = parseURDF(x.xml);
       const baseDir = dirnameOf(e.file);
@@ -251,13 +273,37 @@ export async function importRosPackageFiles(filesIn: Map<string, Uint8Array>, as
       const dof = res.robots.reduce((n, r) => n + r.dof, 0);
       report.push(`Imported ${model.name} from ${e.file}${Object.keys(e.args).length ? ` [${Object.entries(e.args).map(([k, v]) => `${k}:=${v}`).join(' ')}]` : ''}: ${res.robots.length} robot(s), ${dof} DOF${res.mobile ? `, mobile base (${res.mobile.kin.drive})` : ''}`);
       report.push(...res.report);
+      return true;
     } catch (err) {
       errors.push(`${e.file}: ${(err as Error).message}`);
+      return false;
     }
+  };
+  let imported = 0;
+  for (const e of chosen) if (importOne(e)) imported++;
+  // no robot of the launch files could be imported: the package's other robot descriptions are what the user dropped
+  if (!imported && !opts.entries?.length) {
+    for (const e of robotEntries.filter((x) => !chosen.includes(x))) if (importOne(e)) { imported++; report.push(`Imported ${e.file} (${e.source}) instead: no robot of the launch files could be imported`); }
   }
   if (missing.size) report.push(`${missing.size} mesh file(s) not in the drop: ${[...missing].slice(0, 8).join(', ')}${missing.size > 8 ? ' …' : ''}`);
   if (!chosen.length && !errors.length) errors.push('No robot description (URDF / xacro with links) found in the dropped files');
   return { items, robots, report, errors, entries, packages, models };
+}
+
+/** Name of the root element of an XML document (after the declaration, comments and a DOCTYPE). */
+export function rootElement(xml: string): string {
+  const body = xml.replace(/<\?[\s\S]*?\?>/g, '').replace(/<!--[\s\S]*?-->/g, '').replace(/<!DOCTYPE[^>]*>/gi, '');
+  return /<([A-Za-z_][\w:.-]*)/.exec(body)?.[1] ?? '';
+}
+
+/** Identity of an expanded URDF: robot name, links and joints (name, type, parent, child). Two files describing the same
+ *  robot (a xacro and its pre-expanded URDF) give the same signature. */
+export function robotSignature(xml: string): string {
+  try {
+    const m = parseURDF(xml);
+    const joints = [...m.joints.values()].map((j) => `${j.name}:${j.type}:${j.parent}>${j.child}`).sort();
+    return `${m.name}|${[...m.links.keys()].sort().join(',')}|${joints.join(',')}`;
+  } catch { return `unparsed:${xml.length}:${xml.slice(0, 200)}`; }
 }
 
 export { XacroError };

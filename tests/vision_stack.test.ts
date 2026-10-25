@@ -123,10 +123,14 @@ describe('simulated perception pipeline', () => {
     const targets = createTargetsFromOutput(st, cam, out, { robotId: null });
     expect(targets.length).toBe(out.targets.length * 2);
     const frame = st.children.find((c) => c instanceof Frame && c.name === 'Vision Cam') as Frame;
-    // + "Pick" / "Pick approach": always the first target, for programs that MoveL(Pick) after a VisionDetect call
+    // + "Pick" / "Pick approach": the most confident target (not the first in detector order), for programs that
+    // MoveL(Pick) after a VisionDetect call
     expect(frame.children.filter((c) => c instanceof Target).length).toBe(targets.length + 2);
     const pick = frame.children.find((c) => c.name === 'Pick') as Target;
-    expect(Array.from(pick.poseAbs()).map((v) => +v.toFixed(6))).toEqual(Array.from(out.targets[0].grasp).map((v) => +v.toFixed(6)));
+    const best = out.targets.reduce((a, c) => ((c.score ?? 0) > (a.score ?? 0) ? c : a));
+    expect(out.targets.every((t) => typeof t.score === 'number')).toBe(true);
+    expect((pick.getParam('vision') as any).source).toBe(best.name);
+    expect(Array.from(pick.poseAbs()).map((v) => +v.toFixed(6))).toEqual(Array.from(best.grasp).map((v) => +v.toFixed(6)));
     // approach target lies 100 mm behind the grasp along the tool Z
     const g = out.targets[0];
     const d = Math.hypot(g.grasp[12] - g.approach[12], g.grasp[13] - g.approach[13], g.grasp[14] - g.approach[14]);

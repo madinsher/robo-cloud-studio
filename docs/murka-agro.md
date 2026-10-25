@@ -172,15 +172,21 @@ Hungarian reaction. Event log: `result.eventsJsonl()` (events.jsonl lines).
 
 | Level / controller | makespan s | WaitSwap s (% of makespan) | boxes | completeness % | logist path m | decision messages / matrix cells | reaction to the failure s |
 |---|---|---|---|---|---|---|---|
-| A Hungarian | 1847 [1733–1943] | 1267 [1079–1384] (69) | 12 [11–13] | 100 | 550 [495–591] | 49 cells | — |
-| A contract net | 1891 [1817–1994] | 1295 [1062–1469] (69) | 12 [11–13] | 100 | 572 [520–623] | 72 messages | — |
-| A hybrid | 1873 [1764–1913] | 1215 [1091–1368] (65) | 12 [11–13] | 100 | 554 [499–590] | 65 | — |
-| B Hungarian | 2298 [2275–2327] | 1598 [1460–1657] (68) | 15 [14–16] | 100 | 667 [638–706] | 52 cells | — |
-| B contract net | 2271 [2163–2345] | 1616 [1493–1765] (72) | 15 [14–16] | 100 | 689 [662–732] | 81 messages | — |
-| B hybrid | 2221 [2091–2274] | 1552 [1418–1737] (71) | 15 [14–16] | 100 | 671 [646–711] | 74 | — |
-| C Hungarian | 2497 [2439–2629] | 967 [784–1050] (37) | 12 [10–12] | 94 | 534 [481–579] | 53 cells | 1515 [1446–1617] |
-| C contract net | 2697 [2577–2804] | 947 [849–1138] (36) | 12 [11–13] | 94 | 545 [505–588] | 86 messages | 309 [133–318] |
-| C hybrid | 2564 [2508–2632] | 924 [792–1067] (36) | 12 [11–12] | 94 | 545 [488–561] | 79 | 67 [58–249] |
+| A Hungarian | 1847 [1733–1943] | 1267 [1079–1384] (69) | 12 [11–13] | 100 | 550 [495–591] | 49 cells · 20 messages | — |
+| A contract net | 1891 [1817–1994] | 1295 [1062–1469] (69) | 12 [11–13] | 100 | 572 [520–623] | 64 [62–66] messages | — |
+| A hybrid | 1873 [1764–1913] | 1215 [1091–1368] (65) | 12 [11–13] | 100 | 554 [499–590] | 58 [56–60] messages + 16 cells | — |
+| B Hungarian | 2298 [2275–2327] | 1598 [1460–1657] (68) | 15 [14–16] | 100 | 667 [638–706] | 52 cells · 23 messages | — |
+| B contract net | 2271 [2163–2345] | 1616 [1493–1765] (72) | 15 [14–16] | 100 | 689 [662–732] | 73 [71–75] messages | — |
+| B hybrid | 2221 [2091–2274] | 1552 [1418–1737] (71) | 15 [14–16] | 100 | 671 [646–711] | 67 [65–69] messages + 16 cells | — |
+| C Hungarian | 2497 [2439–2629] | 967 [784–1050] (37) | 12 [10–12] | 94 | 534 [481–579] | 53 cells · 20.5 messages | 1515 [1446–1617] |
+| C contract net | 2697 [2577–2804] | 947 [849–1138] (36) | 12 [11–13] | 94 | 545 [505–588] | 68.5 [67–72] messages | 309 [133–318] |
+| C hybrid | 2564 [2508–2632] | 924 [792–1067] (36) | 12 [11–12] | 94 | 545 [488–561] | 62.5 [61–64] messages + 16 cells | 67 [58–249] |
+
+Decision messages = `metrics.comm.messages`: every message of the decision protocol — an announcement to each eligible
+bidder (a harvester that is failed or at its 2-contract limit is not addressed), each bid, each award / assignment (the
+Hungarian assignments too) and every retransmission (none here: `msgLoss` = 0); matrix cells = `metrics.comm.matrixCells`,
+Σ free robots × open tasks over the Hungarian decisions. `tests/murka_agro_s1_table.test.ts` re-runs the 90 runs and
+checks the makespan and this column against the table.
 
 Reading: with one logist the logistics dominate (two thirds of the makespan are harvester idle time in WaitSwap, the
 logist cycle ≈ travel + 45 s + travel + 30 s per box); the decision mechanism changes the makespan by a few percent; the

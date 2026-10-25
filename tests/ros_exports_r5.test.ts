@@ -82,7 +82,10 @@ describe('estimated inertials', () => {
     r.params.massKg = 20.6;
     const urdf = exportRobotURDF(r).urdf;
     const model = parseURDF(urdf);
-    const links = [...model.links.values()].filter((l) => !/tool0/.test(l.name));
+    // KDL: no inertia on the root link — it sits on the fixed child <root>_inertia (as in ur_description)
+    expect(model.links.get(model.rootLink)!.inertial).toBeFalsy();
+    const links = [...model.links.values()].filter((l) => !/tool0/.test(l.name) && l.name !== model.rootLink);
+    expect(links.map((l) => l.name)).toContain(`${model.rootLink}_inertia`);
     expect(links.length).toBe(7);
     let total = 0;
     for (const l of links) {

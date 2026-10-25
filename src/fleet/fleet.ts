@@ -241,6 +241,9 @@ export class FleetManager {
   /** Robots whose task starts are decided by their own controller (per-robot FSM, fleet_fsm.ts): the allocator skips
    *  them and automatic charging leaves them alone while held. */
   readonly hold = new Set<string>();
+  /** Called at the end of every step (process models that keep moving equipment between work phases, e.g. an arm
+   *  returning to its travel pose after the last pick of a row). */
+  readonly afterStep: Array<(dt: number) => void> = [];
   constructor(readonly station: Station, readonly fleet: FleetItem) {
     // resume the fleet clock of a station saved mid-mission (pending picks / holds are timed on it)
     if (fleet.tasks.some((t) => t.status === 'working' || t.status === 'travelling' || t.status === 'assigned')) this.time = this.t0 = fleet.simTime || 0;
@@ -558,6 +561,17 @@ export class FleetManager {
     for (const set of this.reservations.values()) set.delete(robotId);
     this.taskHolds.delete(robotId);
   }
+  /**
+   * Release a robot's work holds but keep the segments its footprint is in as transit reservations (dropped by the
+   * drive logic once it has left them): a robot leaving its alley for a service trip must not meet, head-on, a robot
+   * let in behind it (one-way pipe rails, narrow alleys).
+   */
+  private releaseHoldsKeepInside(r: MobileRobot): void {
+    const rect = this.rectOf(r);
+    const inside = new Set(this.segments().filter((sg) => rectIntersectsPolygon(rect, sg.polygon)).map((sg) => sg.id));
+    for (const [id, set] of this.reservations) if (!inside.has(id)) set.delete(r.id);
+    this.taskHolds.delete(r.id);
+  }
   /** Robots holding a segment (other than `except`). */
   private holders(seg: string, except: string): string[] { return [...(this.reservations.get(seg) ?? [])].filter((x) => x !== except); }
 
@@ -602,6 +616,7 @@ export class FleetManager {
     for (const r of robots) this.stepRobot(r, dt, robots);
     this.resolveDeadlocks(robots);
     if (this.checkContacts) this.measureContacts(robots);
+    for (const h of this.afterStep) h(dt);
   }
 
   private stepRobot(r: MobileRobot, dt: number, robots: MobileRobot[]): void {
@@ -672,7 +687,7 @@ export class FleetManager {
       const d = proc?.onWork?.(this, task, r, s, dt, false) ?? {};
       if (d.service) {
         rt.phase = 'service'; rt.service = { ...d.service }; rt.resumeS = s;
-        this.releaseAll(r.id);
+        this.releaseHoldsKeepInside(r);
         const path = this.planTo(r, d.service.location);
         if (path) { followPath(r, path); this.logMsg(`${r.name}: ${d.service.kind} trip from ${task.id}`); }
         else { this.logMsg(`${r.name}: no path for ${d.service.kind}`, 'warn'); rt.phase = 'serviceWait'; rt.service.left = d.service.duration; }

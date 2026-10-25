@@ -4,7 +4,7 @@
  * IK solution checked against the carrier, the arm itself and the rigid crop (trunks / leaders), targets from vision
  * detections when given (else ground truth, flagged), and fruit removed when the gripper closes during simulation.
  */
-import { Station, Frame, Target, ItemType, Item } from '../core/items/item';
+import { Station, Frame, Target, ItemType, Item, SceneObject } from '../core/items/item';
 import { Robot } from '../core/items/robot';
 import { Program } from '../core/items/program';
 import { MobileRobot } from '../mobile/items';
@@ -66,10 +66,75 @@ export function armReach(arm: Robot): number {
   return r;
 }
 
-/** Arm mounted on a carrier: mount offset in the carrier frame (mm) and the side it faces (sign of the mount y). */
+/**
+ * Vertical lift of an arm mount on its carrier: the arm base rises along the carrier z axis from its nominal mount
+ * height `baseZ` (param `liftBaseZ`) up to `baseZ + stroke` (param `liftStroke`, mm); `h` = current lift height. A fixed
+ * mount has stroke 0. Set up with `mountArmOnLift` (and `addLiftColumn` for the telescopic column under the arm).
+ */
+export function armLift(arm: Robot): { stroke: number; baseZ: number; h: number } {
+  const stroke = Math.max(0, Number(arm.getParam('liftStroke') ?? 0) || 0);
+  const z = arm.pose()[14];
+  const baseZ = stroke > 0 ? Number(arm.getParam('liftBaseZ') ?? z) : z;
+  return { stroke, baseZ, h: Math.max(0, Math.min(stroke, z - baseZ)) };
+}
+
+/** Put an arm on a vertical lift of `stroke` mm above its current mount (the current mount is the lowest position). */
+export function mountArmOnLift(arm: Robot, stroke: number): void {
+  arm.setParam('liftBaseZ', armLift(arm).baseZ);
+  arm.setParam('liftStroke', Math.max(0, stroke));
+}
+
+/** Move the arm base along its lift to height `h` (clamped to the stroke; no-op for a fixed mount). */
+export function setArmLift(arm: Robot, h: number): void {
+  const { stroke, baseZ } = armLift(arm);
+  if (stroke <= 0) return;
+  const m = arm.pose();
+  const z = baseZ + Math.max(0, Math.min(stroke, h));
+  if (Math.abs(m[14] - z) < 1e-6) return;
+  m[14] = z;
+  arm.setPose(m);
+  placeLiftColumn(arm);
+}
+
+/**
+ * Telescopic column under an arm on a lift: `stages` nested tubes (scene objects of the carrier, so they are part of
+ * the carrier for rendering and collision checks) that follow the lift — collapsed into the deck at h = 0, each stage
+ * rising h / stages more than the one below it, the top stage carrying the arm base. Nothing of the lift is above the
+ * arm base, so the arm never sweeps through it.
+ */
+export function addLiftColumn(arm: Robot, stages = 4, radius = 80, color = '#868e96'): SceneObject[] {
+  const carrier = arm.parent;
+  const { stroke } = armLift(arm);
+  if (!carrier || stroke <= 0) return [];
+  const n = Math.max(1, Math.round(stages));
+  const len = stroke / n + 60;
+  const out: SceneObject[] = [];
+  for (let k = 0; k < n; k++) {
+    const o = carrier.addChild(new SceneObject(`${arm.name} lift stage ${k + 1}`));
+    o.geometry = [{ primitive: { kind: 'cylinder', radius: radius * (1 - 0.1 * k), length: len }, origin: Array.from(transl(0, 0, -len / 2)), color }];
+    o.setParam('liftColumnOf', arm.id);
+    o.setParam('liftStage', k);
+    out.push(o);
+  }
+  placeLiftColumn(arm);
+  return out;
+}
+
+/** Put the column stages of an arm's lift at the current lift height. */
+function placeLiftColumn(arm: Robot): void {
+  const carrier = arm.parent;
+  if (!carrier) return;
+  const stages = carrier.children.filter((c) => c.params.liftColumnOf === arm.id);
+  if (!stages.length) return;
+  const { baseZ, h } = armLift(arm);
+  const m = arm.pose();
+  for (const s of stages) s.setPose(transl(m[12], m[13], baseZ + (h * (Number(s.params.liftStage) + 1)) / stages.length));
+}
+
+/** Arm mounted on a carrier: mount offset in the carrier frame (mm, lift at its lowest position) and the side it faces (sign of the mount y). */
 export function armMount(arm: Robot): { x: number; y: number; z: number; side: 1 | -1 } {
   const m = arm.pose();
-  return { x: m[12], y: m[13], z: m[14], side: m[13] >= 0 ? 1 : -1 };
+  return { x: m[12], y: m[13], z: armLift(arm).baseZ, side: m[13] >= 0 ? 1 : -1 };
 }
 
 /** First arm (Robot child) of a carrier. */

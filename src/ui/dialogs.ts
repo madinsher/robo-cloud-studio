@@ -522,7 +522,8 @@ export async function exportDialog(app: App, program: Program | null = app.activ
       preview.textContent = files.map((f) => `# ---- ${f.name} ----\n${f.encoding === 'base64' ? `(binary, ${Math.round((f.content.length * 3) / 4)} bytes)` : f.content}`).join('\n').slice(0, 20000);
     } catch (e: any) { if (my === seq) { showProblems([]); preview.textContent = `Post processor failed: ${e?.message ?? e}`; } }
   };
-  const initial = posts.some((p) => p.id === def) ? def : 'Generic';
+  // the robot's post by id or by one of its RoboDK aliases ("Fanuc_R30i" -> Fanuc_R30iA)
+  const initial = posts.find((p) => p.id === def || ((p as { aliases?: string[] }).aliases ?? []).some((a) => a.toLowerCase() === String(def).toLowerCase()))?.id ?? 'Generic';
   void update({ post: initial });
   const r = await dialog<{ post: string }>(`Export ${program.name}`, [
     { key: 'post', label: 'Post processor', type: 'select', value: initial, options: posts.map((p) => ({ value: p.id, label: `${p.name} (.${p.extension})` })) },
@@ -547,6 +548,47 @@ export async function importDialog(app: App): Promise<void> {
 export async function importFolderDialog(app: App): Promise<void> {
   const files = await pickFolder();
   if (files.length) await app.openFiles(files);
+}
+
+/** `k:=v k2:=v2` (or `k=v`, one per line or space separated) -> args. */
+export function parseXacroArgs(s: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const m of String(s ?? '').matchAll(/([\w./-]+)\s*:?=\s*("[^"]*"|'[^']*'|[^\s]*)/g)) out[m[1]] = m[2].replace(/^["']|["']$/g, '');
+  return out;
+}
+
+/**
+ * Import choices of App.openProjects as dialogs: the world of a folder with several .wbt files, Webots world vs ROS
+ * description for packages that ship both, and the ROS description entry point with its xacro args (launch defaults
+ * prefilled; e.g. robot_name:=utp_a_02 slot_front:=lidar2d for murca_description, name:=ur5e for ur_description).
+ */
+export function importChoiceDialogs(): NonNullable<App['importUi']> {
+  return {
+    chooseWorld: async (worlds, def) => {
+      const r = await dialog<{ w: string }>('Open Webots world', [{ key: 'w', label: `${worlds.length} worlds in the folder`, type: 'select', value: def, options: worlds.map((w) => ({ value: w, label: w })) }], { okLabel: 'Open' });
+      return r?.w ?? null;
+    },
+    chooseKind: async (choices) => {
+      const r = await dialog<{ k: 'webots' | 'ros' }>('Open folder', [{ key: 'k', label: 'This folder holds both', type: 'select', value: choices[0].value, options: choices.map((c) => ({ value: c.value, label: c.label })) }], { okLabel: 'Open' });
+      return r?.k ?? null;
+    },
+    rosOptions: async ({ entries, imported, errors }) => {
+      if (!entries.length) return null;
+      const label = (e: { file: string; args: Record<string, string>; source: string }) => `${e.file}${e.source !== 'top-level' ? ` (${e.source.split('/').pop()})` : ''}`;
+      const first = entries[0];
+      const fmt = (a: Record<string, string>) => Object.entries(a).map(([k, v]) => `${k}:=${v}`).join(' ');
+      const body = h('div', null,
+        h('p', { class: 'hint' }, imported.length ? `Imported with the defaults: ${imported.join(', ')}. Pick another description or change its xacro arguments to import a variant.` : 'No robot was imported with the defaults.'),
+        ...errors.slice(0, 4).map((e) => h('p', { class: 'hint warn' }, e)));
+      const r = await dialog<{ entry: string; all: boolean; args: string }>('ROS robot description', [
+        { key: 'entry', label: 'Robot description (URDF / xacro entry point)', type: 'select', value: first.file, options: entries.map((e) => ({ value: e.file, label: label(e) })) },
+        { key: 'all', label: 'Import every description of the package', type: 'checkbox', value: false },
+        { key: 'args', label: 'xacro arguments (name:=value, space separated)', type: 'text', value: fmt(first.args), hint: 'Launch file defaults are prefilled; ROS needs every argument the xacro uses without a default.' },
+      ], { okLabel: 'Import', body });
+      if (!r) return null;
+      return { entries: r.all ? entries.map((e) => e.file) : [r.entry], args: parseXacroArgs(r.args) };
+    },
+  };
 }
 
 export async function robotParametersDialog(app: App, robot: Robot): Promise<void> {

@@ -180,8 +180,9 @@ describe('graph editor (automata and Petri nets)', () => {
     const dI = inspector(); expect(dI.textContent).toContain('Document'); change(fieldIn(dI, 'Uncontrollable'), 'b2, b1'); expect(editor().state().des!.uncontrollable).toEqual(['b2', 'b1']); expect(m.source).toContain('uncontrollable');
     change(fieldIn(inspector(), 'Unobservable'), 'x'); expect(editor().state().des!.unobservable).toEqual(['x']); change(fieldIn(inspector(), 'Faults'), 'f'); expect(editor().state().des!.faults).toEqual(['f']);
     change(fieldIn(inspector(), 'Alphabet'), 'extra'); expect(editor().state().des!.plant[0].events).toContain('extra');
-    change(inspector().querySelectorAll<HTMLInputElement>('input.ge-text')[4], 'M1x'); expect(editor().state().des!.plant[0].name).toBe('M1x');
-    change(inspector().querySelectorAll<HTMLInputElement>('input.ge-text')[4], 'has space'); expect(lastToast()).toBe('a name without spaces');
+    // inputs: document Name, Uncontrollable, Unobservable, Faults, Sensors, then the automaton Name
+    change(inspector().querySelectorAll<HTMLInputElement>('input.ge-text')[5], 'M1x'); expect(editor().state().des!.plant[0].name).toBe('M1x');
+    change(inspector().querySelectorAll<HTMLInputElement>('input.ge-text')[5], 'has space'); expect(lastToast()).toBe('a name without spaces');
     change(inspector().querySelectorAll<HTMLInputElement>('input.ge-text')[0], 'Renamed doc'); expect(editor().state().des!.name).toBe('Renamed doc'); expect(m.source.split('\n')[0]).toBe('des Renamed doc');
     // add a state programmatically and interactively
     const id = editor().addNodeAt(300, 200)!; expect(id).toBeTruthy(); expect(editor().state().selection).toEqual({ type: 'node', id }); expect(editor().state().des!.layout![editor().state().des!.plant[0].name][id]).toEqual([300, 200]);

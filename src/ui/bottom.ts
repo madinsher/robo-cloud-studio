@@ -59,7 +59,19 @@ export class BottomPanel {
       el.style.display = id === this.active ? '' : 'none';
       content.appendChild(el);
     }
-    this.el.append(tabBar, content);
+    // the dock's height is dragged at its top edge (and remembered): the Vision camera image and the long tabs need
+    // more than the default 260 px; the vision image always fits the dock height (styles.css .vision-canvas)
+    const grip = h('div', { class: 'dock-resize', title: 'Drag to resize the panel' });
+    const setH = (px: number) => { const hpx = Math.max(120, Math.min(Math.round(px), Math.round(window.innerHeight * 0.85))); this.el.style.height = `${hpx}px`; this.el.style.setProperty('--dock-h', `${hpx}px`); setTimeout(() => app.renderer?.resize?.(), 30); return hpx; };
+    try { const saved = Number(localStorage.getItem('vbs.dockHeight')); if (saved > 0) setH(saved); } catch { /* storage unavailable */ }
+    grip.addEventListener('pointerdown', (e: PointerEvent) => {
+      e.preventDefault();
+      const y0 = e.clientY, h0 = this.el.getBoundingClientRect().height;
+      const move = (ev: PointerEvent) => setH(h0 + (y0 - ev.clientY));
+      const up = (ev: PointerEvent) => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); try { localStorage.setItem('vbs.dockHeight', String(setH(h0 + (y0 - ev.clientY)))); } catch { /* ignore */ } };
+      window.addEventListener('pointermove', move); window.addEventListener('pointerup', up);
+    });
+    this.el.append(grip, tabBar, content);
     app.events.on('simulation', ({ time, duration }) => { this.timelineRange.max = String(duration); this.timelineRange.value = String(time); this.timeLabel.textContent = `${fmt(time, 2)} / ${fmt(duration, 2)} s`; });
     app.events.on('log', ({ text, level }) => { this.logOut.appendChild(h('div', { class: `log-${level}` }, `${new Date().toLocaleTimeString()}  ${text}`)); this.logOut.scrollTop = this.logOut.scrollHeight; });
     setInterval(() => { if (this.active === 'fleet') this.renderFleet(); if (this.active === 'process') this.renderProcess(); if (this.active === 'nav') this.navPanel.render(); }, 500);

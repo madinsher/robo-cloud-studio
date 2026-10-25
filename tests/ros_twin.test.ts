@@ -129,6 +129,59 @@ describe('ROS 2 digital twin (webots_ros2 / MURKA topic set)', () => {
     expect(f.last('/tf').transforms[0].child_frame_id).toBe(base);
   });
 
+  // V5 F9: TurtleBot 4 + UR5e in one station (both have a base_link): the links get prefixed in the combined description,
+  // the joints keep their URDF names, and a standard JointTrajectory with the URDF names moves the arm
+  it('multi-robot station: /joint_states keeps the URDF joint names and JointTrajectory commands with them are executed', () => {
+    const st = new Station('New station');
+    const tb4 = importURDF(read(join(FIX, 'xacro', 'tb4.urdf')));
+    const ur = importURDF(read(join(FIX, 'xacro', 'ur5e.urdf')));
+    st.addChild(tb4.root); st.addChild(ur.root);
+    ur.root.setPose(Float64Array.from([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 1500, 0, 1]) as any);
+    const urJoints = parseURDF(read(join(FIX, 'xacro', 'ur5e.urdf'))).joints.filter((j) => j.type !== 'fixed').map((j) => j.name);
+    expect(urJoints).toContain('shoulder_pan_joint');
+    const f = fakeIO();
+    const twin = new RosTwin(st, f.io);
+    twin.start();
+    twin.step(0.05);
+    const js = f.last('/joint_states');
+    for (const n of urJoints) expect(js.name, n).toContain(n);
+    expect(js.name).toContain('left_wheel_joint');
+    expect(new Set(js.name).size).toBe(js.name.length);
+    // robot_state_publisher consistency: every /joint_states name is a joint of the published description, links unique
+    const desc = parseURDF(f.sent.find((s) => s.topic === '/robot_description')!.msg.data);
+    for (const n of js.name) expect(desc.joints.some((j) => j.name === n), n).toBe(true);
+    expect(desc.links.size).toBe([...tb4.model.links.keys(), ...ur.model.links.keys()].length + 1); // + world
+    const target = [0.5, -1.0, 1.2, -0.5, 0.4, 0.3];
+    f.subs.get('/joint_trajectory_controller/joint_trajectory')!.cb({ joint_names: urJoints.slice(0, 6), points: [{ positions: target, time_from_start: { sec: 1, nanosec: 0 } }] });
+    for (let i = 0; i < 30; i++) twin.step(0.05);
+    const after = f.last('/joint_states');
+    urJoints.slice(0, 6).forEach((n, i) => expect(after.position[after.name.indexOf(n)], n).toBeCloseTo(target[i], 6));
+  });
+
+  it('two robots with the same joint names: the second is prefixed on /joint_states, its own topic takes its URDF names', () => {
+    const st = new Station('Two arms');
+    const a = importURDF(read(join(FIX, 'xacro', 'ur5e.urdf')));
+    const b = importURDF(read(join(FIX, 'xacro', 'ur5e.urdf')));
+    b.root.name = 'Right arm'; b.root.params.urdfName = 'right_arm';
+    st.addChild(a.root); st.addChild(b.root);
+    const f = fakeIO();
+    const twin = new RosTwin(st, f.io);
+    twin.start();
+    twin.step(0.05);
+    const js = f.last('/joint_states');
+    expect(new Set(js.name).size).toBe(js.name.length);
+    expect(js.name).toContain('shoulder_pan_joint');
+    const pref = js.name.filter((n: string) => n !== 'shoulder_pan_joint' && n.endsWith('shoulder_pan_joint'));
+    expect(pref.length).toBe(1);
+    const desc = parseURDF(f.sent.find((s) => s.topic === '/robot_description')!.msg.data);
+    for (const n of js.name) expect(desc.joints.some((j) => j.name === n), n).toBe(true);
+    f.subs.get('/right_arm/joint_trajectory')!.cb({ joint_names: ['shoulder_pan_joint'], points: [{ positions: [0.7], time_from_start: { sec: 0, nanosec: 500000000 } }] });
+    for (let i = 0; i < 20; i++) twin.step(0.05);
+    const after = f.last('/joint_states');
+    expect(after.position[after.name.indexOf(pref[0])]).toBeCloseTo(0.7, 6);
+    expect(after.position[after.name.indexOf('shoulder_pan_joint')]).toBeCloseTo(0, 6);
+  });
+
   it('LaserScan angles are relative to the sensor, not the world', () => {
     const map = new MapItem('m');
     map.resize(100, 100, 100, -5000, -5000);

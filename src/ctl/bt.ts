@@ -108,7 +108,7 @@ export class BehaviorTree {
         const fn = s.fn ? this.bindings.actions?.[s.fn] : undefined;
         if (!fn) { this.unknown.add(s.fn ?? '?'); ctx.log?.(`action '${s.fn ?? '?'}' has no binding — failure`); n.startedAt = null; return this.done(n, 'failure'); }
         let st: BTStatus = fn(ctx, s.args ?? {}, n) ?? 'success';
-        if (st === 'running' && s.timeout !== undefined && n.startedAt !== null && ctx.time - n.startedAt >= s.timeout) { this.halt(n, ctx); st = 'failure'; }
+        if (st === 'running' && s.timeout !== undefined && n.startedAt !== null && ctx.time - n.startedAt >= s.timeout) { this.halt(n, ctx); st = 'failure'; ctx.log?.(`action ${s.name ?? s.fn ?? '?'} timed out after ${s.timeout} s — failure`); }
         if (st === 'success' && s.post && !evalBB(s.post, ctx.bb)) st = 'failure';
         if (st === 'running') this.running.add(n); else n.startedAt = null;
         return this.done(n, st);

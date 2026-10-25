@@ -30,8 +30,10 @@ def _call(kind, payload):
     _out.write(json.dumps({'k': kind, 'p': payload}) + '\n'); _out.flush()
     return json.loads(_in.readline())['r']
 host = types.ModuleType('studio_host')
-host.transport = lambda text: _call('transport', text)
-host.sleep = lambda s: _call('sleep', s)
+host.transport = lambda text, rid=0: _call('transport', [text, rid])
+host.sleep = lambda s, rid=0: _call('sleep', [s, rid])
+host.out = lambda rid, s, stream: _call('out', [rid, s, stream])
+host.job = lambda rid: _call('job', rid)
 sys.modules['studio_host'] = host
 class _W(object):  # Pyodide's batched stdout delivers whole lines
     def __init__(self, k): self.k, self.buf = k, ''
@@ -77,10 +79,14 @@ function cpythonPyodide() {
             const msg = JSON.parse(buf.slice(0, i)); buf = buf.slice(i + 1);
             if (msg.k === 'result') { resolve(msg.p); child.stdin.end(); continue; }
             let r: any = null;
-            if (msg.k === 'transport') r = modules.studio_host.transport(msg.p);
-            else if (msg.k === 'sleep') modules.studio_host.sleep(msg.p);
-            else if (msg.k === 'out') (msg.p[0] === 'stderr' ? stderr : stdout)?.batched(String(msg.p[1]).replace(/\n$/, ''));
-            child.stdin.write(JSON.stringify({ r }) + '\n');
+            const h = modules.studio_host;
+            if (msg.k === 'transport') r = h.transport(msg.p[0], msg.p[1]);
+            else if (msg.k === 'sleep') r = h.sleep(msg.p[0], msg.p[1]);
+            else if (msg.k === 'out') { if (h.out) h.out(msg.p[0], msg.p[1], msg.p[2]); else (msg.p[2] === 'stderr' ? stderr : stdout)?.batched(String(msg.p[1]).replace(/\n$/, '')); }
+            else if (msg.k === 'job') r = h.job(msg.p);
+            // a promise answer (cooperative mode) blocks this script's process until it settles, like run_sync in the
+            // browser, while this event loop (the page) keeps running
+            Promise.resolve(r).then((v) => child.stdin.write(JSON.stringify({ r: v ?? null }) + '\n'));
           }
         });
         child.on('close', (c) => { if (c) reject(new Error(`python exited ${c}: ${err}`)); });
@@ -181,5 +187,87 @@ print('not reached')
     expect(inst.history.map((x) => x.args)).toEqual([['1']]);
     inst.uninstall();
     expect(new RobolinkItem(rdk, prog).Valid()).toBe(true);
+  });
+});
+
+const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+async function until(cond: () => boolean, ms: number): Promise<boolean> { const t0 = Date.now(); while (!cond() && Date.now() - t0 < ms) await wait(20); return cond(); }
+
+// F1 (V1 critical): RoboDK background scripts (`while True: ... pause()`, Library 06.c-06.f) froze the browser tab: the
+// runner ran them synchronously on the page thread and one at a time, so the first endless loop never returned.
+describe.skipIf(!py)('Pyodide runner: background station scripts (cooperative mode, JSPI semantics)', { timeout: 120000 }, () => {
+  const LOOP = `from robolink import *\nfrom robodk import *\nRDK = Robolink()\nn = 0\nprint('loop started')\nwhile True:\n    n += 1\n    RDK.setParam('N', n)\n    pause(0.02)\n`;
+
+  it('a thread running an endless loop runs beside its program, outlives it like in RoboDK and ends on Stop', async () => {
+    const { st, r } = cell();
+    const rdk = new Robolink(st);
+    const rt = new StationRuntime(st);
+    rdk.exec.attach(rt as any, { mode: 'virtual' });
+    const inst = installPyodideRunner(rdk, { load: async () => cpythonPyodide(), global: false, cooperative: true });
+    const loop = script(st, 'Loop', LOOP);
+    const prog = new Program('Main');
+    st.addChild(prog);
+    prog.setRobot(r);
+    prog.addInstruction({ kind: 'thread', programId: loop.id, programName: 'Loop' } as any);
+    prog.addInstruction({ kind: 'move', moveType: 'MoveJ', targetId: null, joints: [20, -90, 90, -90, -90, 0] } as any);
+    prog.addInstruction({ kind: 'pause', timeMs: 1500 } as any);
+    prog.addInstruction({ kind: 'move', moveType: 'MoveJ', targetId: null, joints: [40, -90, 90, -90, -90, 0] } as any);
+    const h = rt.start(prog, { robot: r as Robot });
+    // the page's animation loop: real-time ticks while the script loops concurrently
+    const t0 = Date.now();
+    while ((h.status === 'running' || h.status === 'queued') && Date.now() - t0 < 60000) { rt.tick(0.05); await wait(50); }
+    expect(h.status).toBe('done');
+    expect(r.joints()[0]).toBeCloseTo(40, 6);
+    const n1 = Number(st.getParam('N'));
+    expect(n1).toBeGreaterThan(5);                       // the loop made progress while the program ran
+    expect(inst.running()).toEqual(['Loop']);            // and still runs (a thread outlives its program)
+    rt.stop();                                           // Stop / Reset ends it at its next call
+    expect(await until(() => inst.running().length === 0, 15000)).toBe(true);
+    const last = inst.history.at(-1)!;
+    expect(last).toMatchObject({ name: 'Loop', code: 0, stopped: true });
+    expect(last.output).toContain('loop started');
+    const n2 = Number(st.getParam('N'));
+    await wait(300);
+    expect(Number(st.getParam('N'))).toBe(n2);
+    inst.uninstall();
+  });
+
+  it('two endless scripts and a blocking script run concurrently; a blocking API move plays in real time', async () => {
+    const { st, r } = cell();
+    const rdk = new Robolink(st);                         // browser setup: exec not attached, page clock 'virtual'
+    const runner = createPyodideRunner({ rdk, load: async () => cpythonPyodide(), cooperative: true });
+    script(st, 'LoopA', LOOP.replace(/'N'/g, "'A'"));
+    script(st, 'LoopB', LOOP.replace(/'N'/g, "'B'"));
+    script(st, 'Mover', `from robolink import *\nRDK = Robolink()\nrobot = RDK.Item('', ITEM_TYPE_ROBOT)\nrobot.setSpeed(-1, 60)\nrobot.MoveJ([60, -90, 90, -90, -90, 0])\nRDK.setParam('MOVED', '%.1f' % robot.Joints().list()[0])\n`);
+    const abortA = { aborted: false }, abortB = { aborted: false };
+    const a = runner({ station: st, runtime: null as any, name: 'LoopA', args: [], robot: null, program: null, abort: abortA } as any).catch((e) => e);
+    const b = runner({ station: st, runtime: null as any, name: 'LoopB', args: [], robot: null, program: null, abort: abortB } as any).catch((e) => e);
+    const seen: number[] = [];
+    const iv = setInterval(() => seen.push(r.joints()[0]), 10);
+    const t0 = Date.now();
+    await runner({ station: st, runtime: null as any, name: 'Mover', args: [], robot: null, program: null });
+    const took = Date.now() - t0;
+    clearInterval(iv);
+    expect(String(st.getParam('MOVED'))).toBe('60.0');
+    // 60 deg at 60 deg/s (plus acceleration): about a second of real time, with intermediate joint values on the way
+    expect(took).toBeGreaterThan(700);
+    expect(seen.some((q) => q > 5 && q < 55)).toBe(true);
+    expect(Number(st.getParam('A'))).toBeGreaterThan(3);
+    expect(Number(st.getParam('B'))).toBeGreaterThan(3);
+    abortA.aborted = abortB.aborted = true;
+    await Promise.all([a, b]);
+    expect(runner.running()).toEqual([]);
+    expect(runner.history.filter((x) => x.stopped).map((x) => x.name).sort()).toEqual(['LoopA', 'LoopB']);
+  });
+
+  it('synchronous mode (no JSPI): an endless script is stopped after the page-thread budget instead of freezing', async () => {
+    const { st } = cell();
+    const rdk = new Robolink(st);
+    const runner = createPyodideRunner({ rdk, load: async () => cpythonPyodide(), cooperative: false, syncBudgetS: 1 });
+    script(st, 'Loop', LOOP);
+    const t0 = Date.now();
+    await expect(runner({ station: st, runtime: null as any, name: 'Loop', args: [], robot: null, program: null })).rejects.toThrow(/stopped after 1 s.*JSPI/);
+    expect(Date.now() - t0).toBeLessThan(20000);
+    expect(Number(st.getParam('N'))).toBeGreaterThan(1);
   });
 });

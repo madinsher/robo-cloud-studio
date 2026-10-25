@@ -78,7 +78,13 @@ describe('process models (acceptance 11)', () => {
     expect(after.picked - after.unripePicked).toBe(before.picked - before.unripePicked); // no ripe fruit removed
     expect(k.process.thin.fruitRemoved).toBe(after.unripePicked - before.unripePicked);
     updateMissionProgress(m, fm);
-    expect(m.status).toBe('done');
+    // the excess fruit above the fixed-mount arm's reach stay: the mission is incomplete and says why (V3 F6)
+    const t = fleet.tasks[0];
+    const left = (t.meta.unreachable ?? 0) + (t.meta.armUnreachable ?? 0);
+    expect(left).toBeGreaterThan(0);
+    expect(m.fruit).toMatchObject({ picked: k.process.thin.fruitRemoved, left });
+    expect(m.status).toBe('incomplete');
+    expect(m.warnings).toContain(`Result: ${left} excess fruit stayed on the plants (out of the arms' reach)`);
   }, 120000);
 
   it('a harvester with a camera picks only the fruit its camera detects at each stop; misses stay on the tree', () => {

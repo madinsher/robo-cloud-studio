@@ -135,6 +135,32 @@ export interface Kripke {
   next(s: string): string[];
   holds(s: string, atom: string): boolean;
   describe?(s: string): string;
+  /**
+   * The names an atom may use (automata / components, their states, places, `marked`, `deadlock`) and, per variable,
+   * its values. When given, a formula over an unknown name or value is an error instead of a vacuous verdict.
+   */
+  vocabulary?: { names: Set<string>; values?: Map<string, Set<string>> };
+}
+
+const TL_WORDS = new Set(['true', 'false', 'and', 'or', 'not', 'abs', 'min', 'max', 'sqrt', 'hypot', 'sin', 'cos', 'exp', 'log', 'floor', 'ceil', 'sign']);
+/** Throw when an atom of `f` uses a name (or a value of a variable) the structure does not have. */
+export function validateAtoms(m: Kripke, f: LTL): void {
+  const voc = m.vocabulary; if (!voc) return;
+  const known = (n: string) => voc.names.has(n);
+  const hint = () => { const all = [...voc.names].filter((n) => !/^(state|marked|deadlock)$/.test(n)); return all.length > 12 ? `${all.slice(0, 12).join(', ')}, …` : all.join(', '); };
+  for (const a of atoms(f)) {
+    if (known(a)) continue;
+    const c = /^([A-Za-z_][\w.:]*)\s*(==|=|!=|<=|>=|<|>)\s*(.+)$/.exec(a);
+    if (c) {
+      if (!known(c[1])) throw new Error(`unknown name '${c[1]}' in atom ${a} (known: ${hint()})`);
+      const vals = voc.values?.get(c[1]); const v = c[3].trim().replace(/^['"]|['"]$/g, '');
+      if (vals && (c[2] === '=' || c[2] === '==' || c[2] === '!=') && !vals.has(v)) throw new Error(`'${v}' is not a state of ${c[1]} in atom ${a} (states: ${[...vals].join(', ')})`);
+      continue;
+    }
+    const ids = (a.match(/[A-Za-z_][\w.:]*/g) ?? []).filter((x) => !TL_WORDS.has(x));
+    const bad = ids.find((x) => !known(x));
+    if (bad || !ids.length) throw new Error(`unknown name '${bad ?? a}' in atom ${a} (known: ${hint()})`);
+  }
 }
 
 /** Atom over a value environment: `name`, `name=value`, `name!=value`, `name>=3`… evaluated with the expression language. */
@@ -154,14 +180,17 @@ export function kripkeFromDES(g: DES): Kripke {
     e[s] = true;
     return e;
   };
-  return { states: [...g.X], initial: [g.x0], next: (s) => [...new Set(g.f.get(s)?.values() ?? [])], holds: (s, atom) => atomHolds(atom, env(s)), describe: (s) => s };
+  const names = new Set<string>(['state', 'marked', 'deadlock', ...g.X]); const values = new Map<string, Set<string>>();
+  for (const s of g.X) g.parts.get(s)?.forEach((p, i) => { const c = g.components[i] ?? `c${i}`; names.add(c); names.add(p); let v = values.get(c); if (!v) { v = new Set(); values.set(c, v); } v.add(p); });
+  values.set('state', new Set(g.X));
+  return { states: [...g.X], initial: [g.x0], next: (s) => [...new Set(g.f.get(s)?.values() ?? [])], holds: (s, atom) => atomHolds(atom, env(s)), describe: (s) => s, vocabulary: { names, values } };
 }
 
 /** Kripke structure of a reachability graph: atoms are place names (marked), comparisons on token counts, `deadlock`. */
 export function kripkeFromPetri(rg: ReachabilityGraph): Kripke {
   const net: PetriNet = rg.net;
   const env = (i: number) => { const e: Record<string, number | boolean> = { deadlock: rg.succ[i].length === 0 }; net.places.forEach((p, k) => { e[p.id] = rg.markings[i][k]; }); return e; };
-  return { states: rg.markings.map((_, i) => String(i)), initial: ['0'], next: (s) => rg.succ[Number(s)].map(String), holds: (s, atom) => atomHolds(atom, env(Number(s))), describe: (s) => net.markingString(rg.markings[Number(s)]) };
+  return { states: rg.markings.map((_, i) => String(i)), initial: ['0'], next: (s) => rg.succ[Number(s)].map(String), holds: (s, atom) => atomHolds(atom, env(Number(s))), describe: (s) => net.markingString(rg.markings[Number(s)]), vocabulary: { names: new Set(['deadlock', ...net.places.map((p) => p.id)]) } };
 }
 
 function successors(m: Kripke, s: string): string[] { const n = m.next(s); return n.length ? n : [s]; } // deadlock states stutter
@@ -174,6 +203,7 @@ export interface CTLResult { holds: boolean; formula: string; satisfying: number
 
 export function checkCTL(m: Kripke, formula: string | LTL): CTLResult {
   const f = typeof formula === 'string' ? parseCTL(formula) : formula;
+  validateAtoms(m, f);
   const all = m.states; const idx = new Map(all.map((s, i) => [s, i]));
   const pre = new Map<string, string[]>(); for (const s of all) for (const t of successors(m, s)) { let a = pre.get(t); if (!a) { a = []; pre.set(t, a); } a.push(s); }
   const preE = (Tset: Set<string>): Set<string> => { const out = new Set<string>(); for (const t of Tset) for (const s of pre.get(t) ?? []) out.add(s); return out; };
@@ -337,6 +367,7 @@ export interface LTLResult { holds: boolean; formula: string; /** counterexample
 
 export function checkLTL(m: Kripke, formula: string | LTL, opts: { fairness?: string[]; maxProduct?: number } = {}): LTLResult {
   let f = typeof formula === 'string' ? parseLTL(formula) : formula;
+  validateAtoms(m, f);
   for (const fair of opts.fairness ?? []) f = implies(G(F(parseLTL(fair))), f);
   const b = ltlToBuchi(not(f));
   const label = new Map(b.nodes.map((n) => [n.id, n]));

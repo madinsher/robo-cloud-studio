@@ -408,7 +408,9 @@ export function trackPath(robot: MobileRobot, opts: PurePursuitOptions = {}): Ve
     const end = path[leg.b], prevE = path[Math.max(leg.a, leg.b - 1)];
     const tdx = end[0] - prevE[0], tdy = end[1] - prevE[1], tl = Math.hypot(tdx, tdy) || 1;
     const along = ((pose.x - end[0]) * tdx + (pose.y - end[1]) * tdy) / tl; // >0 beyond the end
-    const legTol = last ? goalTol : Math.min(goalTol, 80);
+    // an Ackermann base cannot fix its heading at the goal: it drives its last leg to the end (a Reeds–Shepp approach
+    // still curves there: stopping 80 mm early on a 1.5 m radius leaves 3° of heading error, V3 Navigate legs)
+    const legTol = last ? (k.drive === 'ackermann' ? Math.min(goalTol, 15) : goalTol) : Math.min(goalTol, 80);
     if (rem < legTol || (bestI === leg.b - 1 && along > -legTol * 0.5)) {
       robot.state.pathIndex = leg.b;
       if (last) return null;

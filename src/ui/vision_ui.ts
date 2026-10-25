@@ -6,7 +6,7 @@ import { Robot } from '../core/items/robot';
 import { MobileRobot } from '../mobile/items';
 import { integrate } from '../mobile/controller';
 import { TASK_LABELS, MODALITY_LABELS, COMPUTE_LABELS, VISION_SENSORS, COMPUTE_TARGETS, VISION_MODELS, recommendVisionStacks, configFromRecommendation, getVisionStack, setVisionStack, modalityForCamera, cameraKindForModality, errorBudget, VisionStackConfig, VisionTask, VisionModality, ComputeClass, VisionRecommendation, VisionRequest } from '../vision/stack';
-import { ensureVisionRuntime, visionRuntimeOf, createTargetsFromOutput, followCommand, summarize, PipelineOutput, analyseCloud, solveTcpAbs } from '../vision/pipeline';
+import { ensureVisionRuntime, visionRuntimeOf, createTargetsFromOutput, followCommand, summarize, PipelineOutput, analyseCloud, solveTcpAbs, fpText } from '../vision/pipeline';
 import { generateRosVisionPackage, rosVisionPackageZip, publishCameraFrame } from '../vision/vision_ros';
 import { parsePCD, parsePLY, PointCloud, decimate, pointCount, cloudStats, writePCD } from '../vision/pointcloud';
 import { intrinsicsFromCamera, applySensorToCamera } from '../vision/camera_model';
@@ -68,7 +68,7 @@ export function visionSection(app: App, cam: CameraItem, liveFields: Array<() =>
     const eb = errorBudget(c);
     stats.append(kv('Error budget', `${eb.depthSigmaMm === null ? 'no depth' : `depth σ ${eb.depthSigmaMm.toFixed(1)} mm`} · ${eb.pixelMm.toFixed(2)} mm/px · ${eb.latencyMs.toFixed(0)} ms`));
     const rt = visionRuntimeOf(cam);
-    if (rt?.last) { const st = rt.stats; const p = st.tp + st.fp ? st.tp / (st.tp + st.fp) : 0, r = st.tp + st.fn ? st.tp / (st.tp + st.fn) : 0; stats.append(kv('Last run', `${rt.last.detections.length} detections · P ${(p * 100).toFixed(0)} % R ${(r * 100).toFixed(0)} % · pos. error ${st.posErrN ? (st.posErrSum / st.posErrN).toFixed(0) : '–'} mm · ${st.lastLatencyMs.toFixed(0)} ms`)); }
+    if (rt?.last) { const st = rt.stats; const p = st.tp + st.fp ? st.tp / (st.tp + st.fp) : 0, r = st.tp + st.fn ? st.tp / (st.tp + st.fn) : 0; stats.append(kv('Last run', `${rt.last.detections.length} detections · P ${(p * 100).toFixed(0)} % R ${(r * 100).toFixed(0)} % · pos. error ${st.posErrN ? (st.posErrSum / st.posErrN).toFixed(0) : '–'} mm (true positives)${fpText(st)} · ${st.lastLatencyMs.toFixed(0)} ms`)); }
   };
   upd();
   liveFields.push(upd);
@@ -319,7 +319,7 @@ export function buildVisionPanel(app: App): { el: HTMLElement; render: () => voi
       draw(cam, out);
       info.textContent = summarize(out, rt.cfg);
       const st = rt.stats; const p = st.tp + st.fp ? st.tp / (st.tp + st.fp) : 0, r = st.tp + st.fn ? st.tp / (st.tp + st.fn) : 0;
-      statsEl.textContent = `${st.frames} frames · precision ${(p * 100).toFixed(0)} % · recall ${(r * 100).toFixed(0)} % · position error ${st.posErrN ? (st.posErrSum / st.posErrN).toFixed(0) : '–'} mm · ${st.lastLatencyMs.toFixed(0)} ms/frame${out.frame.truth ? ` · truth ${out.frame.truth.filter((x) => x.visible).length} visible` : ''}`;
+      statsEl.textContent = `${st.frames} frames · precision ${(p * 100).toFixed(0)} % · recall ${(r * 100).toFixed(0)} % · position error ${st.posErrN ? (st.posErrSum / st.posErrN).toFixed(0) : '–'} mm (true positives)${fpText(st)} · ${st.lastLatencyMs.toFixed(0)} ms/frame${out.frame.truth ? ` · truth ${out.frame.truth.filter((x) => x.visible).length} visible` : ''}`;
       if (out.text) answer.textContent = out.text;
       if (out.vla?.tcp && robot && rt.cfg.vla && opts.prompt !== undefined) { const ik = solveTcpAbs(robot, out.vla.tcp); if (ik.ok) app.cmd(() => robot.setJoints(ik.joints)); else app.log(`${cam.name}: VLA step out of reach`, 'warn'); }
       if (follow.checked) doFollow(out);

@@ -28,7 +28,7 @@ Legend: ✅ implemented · 🟡 partial / simplified · ❌ not implemented
 | Conveyor tracking | 🟡 | process conveyors move products; no tracked picking |
 | Robot drivers (live connection to controllers) | ✅ | server drivers: UR (URScript + real-time joints), ABB RWS, KUKA KUKAVARPROXY, generic ROS 2 (rosbridge + ros2_control, covers Fanuc/Yaskawa/Stäubli/Techman ROS drivers); `RUNMODE_RUN_ROBOT` from Python |
 | Robot calibration, ballbar, ISO 9283, laser tracker, TCP/frame calibration | ✅ | numeric DH identification, ISO cube/ballbar programs and statistics, TCP by point/line, frame 3P/6P/turntable; measuring devices simulated |
-| 2D/3D camera simulation (`Cam2D_*`) | 🟡 | `Cam2D_Add/SetParams/Snapshot/Close`, camera view render, camera parameters dialog, simulated detections; depth/segmentation buffers ❌ |
+| 2D/3D camera simulation (`Cam2D_*`) | ✅ | `Cam2D_Add/SetParams/Settings/Snapshot/Close` ("Camera N" names, RoboDK settings string), RGB PNG and RoboDK `.grey32` depth (`DEPTH`), per-pixel item ids (segmentation), `Cam2D_Snapshot(file)` saves and returns 1 (server: disk; browser: the session's files, File › Files saved by scripts), `setColor` / `Recolor` drawn by the cameras; docs/vision.md |
 | Simulation events (attach/detach objects, show/hide) | ✅ | |
 | Python API (`robolink`, `robomath`) | 🟡 | see tables below |
 | C#, C++, MATLAB APIs, plugin interface | 🟡 | C# (WebSocket), C++ and MATLAB (TCP JSON-lines) clients in `clients/`; JS plugins via `PluginLoad` (ES modules); Simulink and C++ add-ins ❌ |
@@ -47,10 +47,11 @@ setWindowState setInteractiveMode setViewPose ViewPose Joints setJoints setPoses
 ShowSequence FilterTarget getParams SimulationTime setSimulationTime Spray_Add Spray_SetState Spray_GetStats Spray_Clear
 EventsListen WaitForEvent PluginLoad PluginCommand ProjectPoints IsInside Save`.
 
-Previously implemented (39): `ActiveStation AddCurve AddFile(stub) AddFolder AddFrame AddPoints AddProgram AddShape AddStation AddTarget
-Cam2D_Snapshot(stub) Collisions(stub) Command Connect Delete Disconnect Finish IsInside(stub) Item ItemList ItemUserPick License
-ProjectPoints(stub) Render RunMode Save(stub) Selection ShowMessage SimulationSpeed Update Version getParam setParam setRunMode
-setSelection setSimulationSpeed` + extensions `AddRobot AddMobileRobot App`.
+Implemented in the first version (39; the "stub" marks of that list are history — AddFile, Cam2D_Snapshot,
+Collisions, IsInside, ProjectPoints and Save are implemented now; their parity is covered in the tables below): `ActiveStation AddCurve AddFile AddFolder AddFrame AddPoints
+AddProgram AddShape AddStation AddTarget Cam2D_Snapshot Collisions Command Connect Delete Disconnect Finish IsInside Item
+ItemList ItemUserPick License ProjectPoints Render RunMode Save Selection ShowMessage SimulationSpeed Update Version getParam
+setParam setRunMode setSelection setSimulationSpeed` + extensions `AddRobot AddMobileRobot App`.
 
 Still missing / stubbed: `EmbedWindow` (no native windows in a browser), `AddFile` from a local path (browser sandbox:
 use drag & drop or the station file). Measurement functions return simulated values (configurable noise) unless a real

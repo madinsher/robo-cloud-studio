@@ -224,10 +224,11 @@ describe('App', () => {
     app.teach('MoveJ'); expect(app.logs.at(-1)!.text).toBe('Select a robot first');
     const r = app.addRobotFromLibrary('UR5e');
     app.teach('MoveJ');
-    const prog = app.activeProgram!; expect(prog.instructions().length).toBe(1); expect((prog.instructions()[0].data as any).moveType).toBe('MoveJ');
+    // RoboDK: the first move taught into an empty program brings "Set reference frame" and "Set tool" with it
+    const prog = app.activeProgram!; expect(prog.instructions().map((i) => i.data.kind)).toEqual(['frame', 'tool', 'move']); expect((prog.instructions()[2].data as any).moveType).toBe('MoveJ');
     const t0 = app.station.itemsOfType<Target>(ItemType.TARGET)[0]; expect(t0.isJointTarget).toBe(true);
     r.setJoints([20, -80, 90, -100, -90, 10]);
-    app.teach('MoveL'); expect(prog.instructions().length).toBe(2); expect((prog.instructions()[1].data as any).moveType).toBe('MoveL');
+    app.teach('MoveL'); expect(prog.instructions().length).toBe(4); expect((prog.instructions()[3].data as any).moveType).toBe('MoveL');
     const simEv: Array<{ playing: boolean; time: number; duration: number; paused?: boolean }> = []; app.events.on('simulation', (e) => simEv.push(e));
     app.previewProgram(); expect(app.sim.duration).toBeGreaterThan(0); expect(simEv.at(-1)!.playing).toBe(false);
     const d = app.sim.duration; const home = r.joints();

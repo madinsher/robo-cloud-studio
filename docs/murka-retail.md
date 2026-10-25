@@ -107,9 +107,17 @@ tolerance 5 mm.
   `test_clearance.py` checks manipulation at nominal parking, not the drive-in, and the Webots hand has no
   boundingObject, so the original does not notice it. `runMurkaRetailMission(…, { fixes: { bothCarryZ: 1.46 } })` (off by
   default, to stay faithful) lowers the carry by 4 cm: zero contacts of every kind (tested on `depalletize`).
+  The contact depends on the task's glide end pose: 4.9–6.8 mm in `full`, up to 6.5 mm in the scenario example and in
+  `scan= order=coffee_can` (independent mesh monitor of the verification, l_palm × bulk_B1 / bulk_B3).
 * v1-classic: arm links 0, body 0; the classic tip grasp hangs the product `GRIP_CLEARANCE` under the tip and aims the
-  place at the surface itself with a tip IK accepted up to 2 cm, so products dip a few mm into the packing table top
-  (as in the original classic scheme; products are kinematic in Webots).
+  place at the surface itself with a tip IK accepted up to 2 cm, and the joints move linearly from the pre-place to the
+  place pose, so the carried product **passes through the packing-table edge** on the way down: its bottom is up to
+  ≈ 70 mm below the table top inside the table footprint for about a second (≈ 20 ticks) of PLACE_PACK, ≈ 40 mm for
+  the full-run monitor (juice / tea), and rests on the top at the end. This is the original classic scheme
+  (pick_place_server.py, the same joint-linear moves); products are kinematic in Webots too, so it passes there as well.
+* Basket: the server puts a product where it actually is in the hand over its basket slot (`basket_xy`, as
+  pick_place_server.py), so two products in neighbouring slots can overlap by a few mm (6 mm juice × tea in `full`,
+  16 mm after a cancel put the juice into basket_0); products are kinematic, as in MURKA.
 
 ## Differences to the Webots / ROS runs (limits)
 

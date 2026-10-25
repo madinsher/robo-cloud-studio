@@ -17,6 +17,29 @@ a realtime clock (`STUDIO_SIM_SPEED`). Per-method timeouts (src/api/rpc.ts `meth
 per burst of mutating calls (debounced, none for read-only calls) and no longer recompiles the program preview after
 each call (that cancelled `RunProgram`).
 
+The page connects to the server only when asked: `?server=ws://host:port` (`?server=auto` = port 20500 of the page's
+host) or Connect › Studio server › Connect. It no longer probes `ws://<host>:20500` on every load.
+
+## Access control (src/api/security.ts)
+
+The API runs code (station Python programs on CPython through `POST /python/run`, RoboDK posts and user post sources
+through `POST /posts/native/run`, `RunProgram` of Python items), so the server serves this machine only by default:
+
+| Setting | Default | Effect |
+|---|---|---|
+| `STUDIO_HOST` | `127.0.0.1` | bind address of the HTTP / WebSocket, TCP JSON-lines and binary-protocol sockets; `0.0.0.0` serves other hosts (WSL, LAN) — every host that reaches it can run code |
+| `STUDIO_ALLOWED_ORIGINS` | — | extra browser origins (comma separated, `*` = any). A request with an `Origin` header (every request a web page makes, WebSocket upgrades included) is refused with 403 unless the origin is local (`http(s)://localhost`, `127.0.0.1`, `[::1]`, `*.localhost`, any port) or listed |
+| `STUDIO_ALLOWED_HOSTS` | — | DNS names the server may be reached by; other `Host` headers are refused (DNS rebinding). Loopback names and IP literals always pass |
+| `STUDIO_TOKEN` | — | shared secret: HTTP requests need `x-studio-token` (or `Authorization: Bearer`, or `?token=`), WebSocket upgrades `?token=` |
+
+CORS answers echo the allowed origin (never `*`), and the code-running endpoints accept `content-type:
+application/json` only, so a cross-site page always needs a preflight. Python / MATLAB / C# / C++ clients send no
+`Origin` header (or a local one) and are not affected.
+
+In the browser the API's file writes (`Cam2D_Snapshot(file)`, `MakeProgram`, `Save`, CSV exports of scripts) go to the
+session's in-memory files (src/api/memory_fs.ts): the calls succeed like in RoboDK (`Cam2D_Snapshot(file)` returns 1,
+a script can `AddFile` what it saved) and File › Files saved by scripts downloads them.
+
 ## Python drop-in
 
 `python/robodk/robolink.py` subclasses `RobolinkAPI` / `ItemAPI` from `_official.py`, which
@@ -52,12 +75,25 @@ They run when double-clicked (`RunCode`/`RunProgram` on the item) or when a prog
   replaces tkinter by `python/robodk/_headless_gui` for unattended runs: `mainloop()` presses the main button with
   the default values, message boxes / file dialogs return their defaults, matplotlib uses Agg.
 - **Pyodide runner** (browser without server: src/api/runner_pyodide.ts, `installPyodideRunner(RDK)`, installed by
-  `src/main.ts` at start-up, Pyodide downloaded on the first call): the drop-in is written into Pyodide's file system
-  and talks to the page's `Robolink` through a synchronous in-process transport; waits, blocking moves and
-  `time.sleep()` advance the station clock (virtual time). The tree's "Run Python program" (RoboDK double-click) and
-  `App.runProgram(pythonItem)` start a script item. `tests/e2e/pyodide.e2e.test.ts` runs real Pyodide in Chrome on
-  Library stations 06.a (Gripper(1)/Gripper(0): fingers at ±6·arg), 01.a (SprayOn(1)/SprayOn(0): gun on, paint
-  deposited, gun off at the end) and 07.a (DoWeld: the TCP passes the 6 hexagon vertices < 1 mm, ends at Home).
+  `src/main.ts` at start-up; Pyodide is downloaded when a station with Python programs is shown, and a run waiting for
+  a script while it loads has its clock held, so the download is not simulation time). The drop-in is written into
+  Pyodide's file system and talks to the page's `Robolink` in process. Two modes:
+  - **cooperative** (browsers with WebAssembly JSPI: Chrome / Edge 137+): every script is a coroutine
+    (`pyodide.ffi.run_sync`); `pause()` / `time.sleep()` wait in real time scaled by the simulation speed, blocking
+    moves / `WaitMove` / `WaitFinished` wait for the realtime clock (`rdk.exec.asyncDepth`), and scripts run
+    concurrently like RoboDK's script processes — RoboDK "background" scripts (`while True:` conveyor, laser-sensor
+    and gripper simulations of Library 06.c, 06.d, 06.e, 06.f) run beside the programs without blocking the page.
+    `print()` output and `tic()` / `toc()` are per script. A script whose calling run stops (Stop, Reset, another
+    station) gets `StudioScriptStopped` at its next API call or pause and ends (history entry `stopped`).
+  - **synchronous** (no JSPI): waits, blocking moves and `time.sleep()` advance the station clock (virtual time), one
+    script at a time; a script that keeps the page thread busy longer than 30 s (an endless background loop) is
+    stopped with a message instead of freezing the tab.
+  The tree's "Run Python program" (RoboDK double-click) and `App.runProgram(pythonItem)` start a script item.
+  `tests/e2e/pyodide.e2e.test.ts` runs real Pyodide in Chrome on Library stations 06.a (Gripper(1)/Gripper(0): fingers
+  at ±6·arg), 01.a (SprayOn(1)/SprayOn(0): gun on, paint deposited, gun off at the end) and 07.a (DoWeld: the TCP passes
+  the 6 hexagon vertices < 1 mm, ends at Home); `tests/e2e/pyodide_background.e2e.test.ts` plays 06.e StartSimulation
+  (both parts carried over the conveyor and stored on table B), 06.d laser sensor (18 parts on PalletB), 06.c 2D camera
+  (12 parts on PalletB) and 06.f delta with the page answering every second, then Stop ends the background loops.
 - `App.runToEnd` ("⏭ End") waits for script runners: the clock stands still while a script answers (a declining runner
   resumes the run at the call), so the end state equals a run without the browser's runners (Library sweep).
 - While the page is connected to a server, station scripts run on the server's CPython (POST /python/run).

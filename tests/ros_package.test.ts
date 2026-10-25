@@ -105,6 +105,58 @@ describe('ROS package import (I7)', () => {
     expect(res.errors[0]).toMatch(/robot\.urdf\.xacro.*missing\.xacro/);
   });
 
+  // V5 F7 (nav2_minimal_tb3_sim): spawn_tb3.launch.py expands gz_waffle.sdf.xacro for Gazebo; the URDF next to it is the robot
+  it('a launch entry that expands to an SDF (Gazebo) is skipped; the package URDF is still imported', async () => {
+    const files = new Map<string, Uint8Array>([
+      ['tb3_sim/package.xml', strToU8('<package format="3"><name>tb3_sim</name></package>')],
+      ['tb3_sim/launch/spawn.launch.py', strToU8("import os\nfrom ament_index_python.packages import get_package_share_directory\nfrom launch_ros.actions import Node\ndef generate_launch_description():\n    d = get_package_share_directory('tb3_sim')\n    sdf = os.path.join(d, 'urdf', 'gz_waffle.sdf.xacro')\n    return LaunchDescription([Node(package='ros_gz_sim', executable='create', arguments=['-string', Command(['xacro', ' ', sdf, ' namespace:=', ''])])])\n")],
+      ['tb3_sim/urdf/gz_waffle.sdf.xacro', strToU8('<?xml version="1.0"?>\n<sdf version="1.8" xmlns:xacro="http://www.ros.org/wiki/xacro"><xacro:arg name="namespace" default=""/><model name="waffle"><link name="base_footprint"/><link name="base_link"/><joint name="j" type="fixed"><parent>base_footprint</parent><child>base_link</child></joint></model></sdf>')],
+      ['tb3_sim/urdf/waffle.urdf', strToU8('<?xml version="1.0"?>\n<!-- TurtleBot3 -->\n<robot name="turtlebot3_waffle"><link name="base_footprint"/><link name="base_link"/><link name="arm"/><joint name="base_joint" type="fixed"><parent link="base_footprint"/><child link="base_link"/></joint><joint name="lift" type="prismatic"><parent link="base_link"/><child link="arm"/><axis xyz="0 0 1"/><limit lower="0" upper="0.2" effort="1" velocity="1"/></joint></robot>')],
+    ]);
+    const res = await importRosPackageFiles(files, new AssetStore());
+    expect(res.errors).toEqual([]);
+    expect(res.items.map((i) => i.name)).toEqual(['turtlebot3_waffle']);
+    expect(res.robots.length).toBe(1);
+    expect(res.report.some((r) => /gz_waffle\.sdf\.xacro: <sdf> document \(not a URDF robot\), skipped/.test(r))).toBe(true);
+  });
+
+  it("a launch robot that cannot be expanded is an error, and the package's other robot is still imported", async () => {
+    const files = new Map<string, Uint8Array>([
+      ['p/package.xml', strToU8('<package format="3"><name>p_description</name></package>')],
+      ['p/launch/display.launch.py', strToU8("import os\nfrom ament_index_python.packages import get_package_share_directory\ndef generate_launch_description():\n    f = os.path.join(get_package_share_directory('p_description'), 'urdf', 'broken.urdf.xacro')\n")],
+      ['p/urdf/broken.urdf.xacro', strToU8('<robot name="broken" xmlns:xacro="http://www.ros.org/wiki/xacro"><link name="a"/><xacro:wheel side="left"/></robot>')],
+      ['p/urdf/good.urdf', strToU8('<robot name="good"><link name="a"/><link name="b"/><joint name="j" type="revolute"><parent link="a"/><child link="b"/><axis xyz="0 0 1"/><limit lower="-1" upper="1" effort="1" velocity="1"/></joint></robot>')],
+    ]);
+    const res = await importRosPackageFiles(files, new AssetStore());
+    expect(res.items.map((i) => i.name)).toEqual(['good']);
+    expect(res.errors.length).toBe(1);
+    expect(res.errors[0]).toMatch(/broken\.urdf\.xacro.*wheel/);
+  });
+
+  // V5 F10 (webots_ros2_universal_robot): multirobot_launch.py expands ur5e_with_gripper.urdf.xacro name:=..., another
+  // launch file loads the pre-expanded ur5e_with_gripper.urdf — the same robot, imported once, no spurious xacro error
+  it('the same robot from its xacro and its pre-expanded URDF (two launch files) is imported once, without an arg error', async () => {
+    const urdf = (name: string) => `<robot name="${name}"><link name="base_link"/><link name="tool0"/><joint name="shoulder_pan_joint" type="revolute"><parent link="base_link"/><child link="tool0"/><axis xyz="0 0 1"/><limit lower="-3" upper="3" effort="1" velocity="1"/></joint></robot>`;
+    const files = new Map<string, Uint8Array>([
+      ['ws/ur_pkg/package.xml', strToU8('<package format="3"><name>ur_pkg</name></package>')],
+      ['ws/ur_pkg/launch/multirobot_launch.py', strToU8("import os\nfrom ament_index_python.packages import get_package_share_directory\ndef generate_launch_description():\n    d = get_package_share_directory('ur_pkg')\n    x = xacro.process_file(os.path.join(d, 'resource', 'ur5e.urdf.xacro'), mappings={'name': 'UR5eWithGripper'})\n")],
+      ['ws/ur_pkg/launch/moveit_launch.py', strToU8("import os\nfrom ament_index_python.packages import get_package_share_directory\ndef generate_launch_description():\n    d = get_package_share_directory('ur_pkg')\n    description = open(os.path.join(d, 'resource', 'ur5e.urdf')).read()\n")],
+      // the xacro needs $(arg name) (no default): ROS rejects it without the launch file's mapping
+      ['ws/ur_pkg/resource/ur5e.urdf.xacro', strToU8('<robot name="UR5e" xmlns:xacro="http://www.ros.org/wiki/xacro"><link name="base_link"><visual><geometry><box size="0.1 0.1 0.1"/></geometry><material name="$(arg name)_grey"/></visual></link><link name="tool0"/><joint name="shoulder_pan_joint" type="revolute"><parent link="base_link"/><child link="tool0"/><axis xyz="0 0 1"/><limit lower="-3" upper="3" effort="1" velocity="1"/></joint></robot>')],
+      ['ws/ur_pkg/resource/ur5e.urdf', strToU8(urdf('UR5e'))],
+    ]);
+    const res = await importRosPackageFiles(files, new AssetStore());
+    expect(res.errors).toEqual([]);
+    expect(res.items.length).toBe(1);
+    expect(res.robots.length).toBe(1);
+    expect(res.items[0].params.urdfFile).toBe('ws/ur_pkg/resource/ur5e.urdf.xacro');
+    expect(res.report.some((r) => /Same robot as ws\/ur_pkg\/resource\/ur5e\.urdf\.xacro .*ur5e\.urdf .*not imported twice/.test(r))).toBe(true);
+    // two different robots from two launch files are both kept
+    files.set('ws/ur_pkg/resource/ur5e.urdf', strToU8(urdf('UR10e')));
+    const res2 = await importRosPackageFiles(files, new AssetStore());
+    expect(res2.items.length).toBe(2);
+  });
+
   it('an unknown macro call is an error', async () => {
     const files = new Map<string, Uint8Array>([
       ['p/package.xml', strToU8('<package format="3"><name>m_description</name></package>')],

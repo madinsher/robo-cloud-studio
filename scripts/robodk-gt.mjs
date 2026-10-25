@@ -87,6 +87,7 @@ if (SIM) {
     lines.push(`* Collision verdict equal to RoboDK: **${c.filter((p) => p.collision.ours === p.collision.roboDK).length} of ${c.length}** programs (RoboDK reports a collision in ${c.filter((p) => p.collision.roboDK).length}).`);
   }
 } else lines.push('* Simulation columns are empty in import-only mode; run with `--sim` (sets ROBODK_GT_SIM=1).');
+lines.push('* Also checked outside this table: every Library `.tool` imports as a Tool with RoboDK\'s TCP whatever name the caller passes (the table\'s tool flag [50] decides; `tests/rdk_tool_files.test.ts`, File › Open mounts it on the selected robot); RoboDK\'s visibility rule (a hidden reference frame / robot / tool hides only itself: 03.b, 02.b, 06.d Pick and stamp, 06.f CNC keep their robots drawn; `tests/rdk_visibility.test.ts` against the GT `Visible()` flags); robots without a stored post export with their brand\'s RoboDK post (`tests/rdk_default_post.test.ts`); Motoman pulses per degree from the robot table [980+i] reach the JBI PULSE positions (`tests/rdk_motoman_code.test.ts`).');
 lines.push('');
 lines.push(`| File | Result | Import s | FK max (mm+mrad) | Programs (RoboDK valid / ours ok) | Worst joint dev (°) | Cycle-time ratio (min–max) |${COLL ? ' Collision verdict equal |' : ''} Issues |`);
 lines.push(`|---|---|---:|---:|---|---:|---|${COLL ? '---|' : ''}---|`);

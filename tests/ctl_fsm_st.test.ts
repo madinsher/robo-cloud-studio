@@ -8,6 +8,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { fsmToST } from '../src/ctl/codegen/plc_fsm';
+import { automatonToST, petriToST } from '../src/ctl/codegen/plc';
 import { fsmToPlcOpen, flattenFsm } from '../src/ctl/codegen/plc_fsm_sfc';
 import { parseXml, XmlNode } from '../src/ctl/codegen/common';
 import { controlExports } from '../src/ctl/codegen';
@@ -28,7 +29,7 @@ function lex(src: string): Tok[] {
     const id = /^[A-Za-z_][A-Za-z0-9_]*/.exec(s.slice(i)); if (id) { out.push({ k: 'id', v: id[0] }); i += id[0].length; continue; }
     const n = /^\d+(\.\d+)?/.exec(s.slice(i)); if (n) { out.push({ k: 'num', v: n[0] }); i += n[0].length; continue; }
     if (c === "'") { const j = s.indexOf("'", i + 1); out.push({ k: 'str', v: s.slice(i + 1, j) }); i = j + 1; continue; }
-    const op = /^(:=|<=|>=|<>|%[IQ][XW][\d.]+|[=<>+\-*/();:,.])/.exec(s.slice(i)); if (op) { out.push({ k: 'op', v: op[0] }); i += op[0].length; continue; }
+    const op = /^(:=|<=|>=|<>|%[IQ][XWD][\d.]+|[=<>+\-*/();:,.])/.exec(s.slice(i)); if (op) { out.push({ k: 'op', v: op[0] }); i += op[0].length; continue; }
     throw new Error(`lex error at ${s.slice(i, i + 20)}`);
   }
   return out;
@@ -273,3 +274,106 @@ function findStateByStep(doc: ReturnType<typeof parseFsm>, step: string): any {
   const walk = (m: typeof doc.root, prefix: string): any => { for (const s of m.states) { const id = `${prefix}${s.name}`; if (s.machine) { const r = walk(s.machine, `${id}_`); if (r) return r; } else if (id === step) return s; } return null; };
   return walk(doc.root, '');
 }
+
+// ------------------------------------------------------------------ directly represented addresses and handshake edges
+/** Bytes of a directly represented address: CODESYS indexes words / dwords (%IWn = bytes 2n..), Siemens uses byte offsets. */
+function addrBytes(addr: string, model: 'codesys' | 'siemens'): { area: string; cells: Array<[number, number | null]> } {
+  const m = /^%([IQ])([XWD])(\d+)(?:\.(\d+))?$/.exec(addr)!; const area = m[1], sz = m[2], n = Number(m[3]);
+  if (sz === 'X') return { area, cells: [[n, Number(m[4] ?? 0)]] };
+  const nb = sz === 'W' ? 2 : 4; const start = model === 'codesys' ? n * nb : n;
+  return { area, cells: Array.from({ length: nb }, (_, k) => [start + k, null] as [number, null]) };
+}
+function overlaps(st: string): string[] {
+  const decls = [...st.matchAll(/^\s*(\w+) AT (%\S+) : (\w+);/gm)].map((x) => ({ n: x[1], a: x[2], t: x[3] }));
+  const out: string[] = [];
+  for (const d of decls) { const sz = /^%[IQ]([XWD])/.exec(d.a)![1]; const bits = { X: 1, W: 16, D: 32 }[sz]!; const tb = { BOOL: 1, INT: 16, REAL: 32 }[d.t as 'BOOL']; if (tb !== bits) out.push(`${d.n}: ${d.t} at ${d.a}`); }
+  for (const model of ['codesys', 'siemens'] as const) {
+    const occ = new Map<string, Array<{ n: string; bit: number | null }>>();
+    for (const d of decls) { const { area, cells } = addrBytes(d.a, model); for (const [b, bit] of cells) { const k = `${area}${b}`; for (const o of occ.get(k) ?? []) if (bit === null || o.bit === null || bit === o.bit) out.push(`[${model}] ${d.n} (${d.a}) overlaps ${o.n}`); occ.set(k, [...(occ.get(k) ?? []), { n: d.n, bit }]); } }
+  }
+  return out;
+}
+const DES_2R = `des Two machines and a buffer
+automaton RA
+  initial I
+  marked I F
+  I -sA-> P
+  P -fA-> D
+  D -sC-> Q
+  Q -fC-> F
+automaton RB
+  initial I
+  marked I F
+  I -sB-> W
+  W -fB-> F
+spec Buffer
+  events fA sB
+  initial E
+  marked E G
+  E -fA-> A
+  A -sB-> G
+uncontrollable fA fB fC
+action RA.P program=A_Pick robot=R1 done=fA
+action RA.Q program=A_Place robot=R1 done=fC
+action RB.W program=B_Work robot=R2 done=fB`;
+const FSM_GUARD = `fsm Pick all boxes
+outcomes done aborted
+state PickA initial
+  do program=A_Pick timeout=30
+  fail -> aborted
+  ok -> Work
+state Work
+  do skill=inspect outcomes=good,bad
+  good -> Check
+  bad -> aborted
+state Check
+  when "Ready == 1" -> yes
+  otherwise -> no
+  yes -> PlaceA
+  no -> aborted
+state PlaceA
+  do program=A_Place
+  ok -> done
+  fail -> aborted`;
+
+describe('PLC programs: I/O addresses and handshake edges', () => {
+  it('FSM, automaton and Petri ST: bits, INT words and REAL inputs never share bytes (CODESYS and Siemens address models)', () => {
+    const fsm = fsmToST(FSM_GUARD, 'fsm')[0].content;
+    expect(fsm).toMatch(/Ready AT %ID\d+ : REAL;/); expect(fsm).toMatch(/RES_Work AT %IW\d+ : INT;/); expect(fsm).toMatch(/FSM_OUTCOME AT %QW\d+ : INT;/);
+    expect(overlaps(fsm)).toEqual([]);
+    const des = automatonToST(DES_2R.replace('action RB.W', 'guard sC "Ready == 1"\naction RB.W'), 'des')[0].content;
+    expect(overlaps(des)).toEqual([]);
+    const petri = petriToST('petri g\nplace a tokens=1\nplace b\nplace c\nplace d\ntransition t1\ntransition t2 guard="Ready == 1 && level > 0.5"\ntransition t3 guard="go"\narc a -> t1 -> b\narc b -> t2 -> c\narc c -> t3 -> d\naction t1 program=P1\naction t2 program=P2', 'petri')[0].content;
+    expect(petri).toMatch(/level AT %ID\d+ : REAL;/); expect(petri).toMatch(/go AT %IX\d\.\d : BOOL;/);
+    expect(overlaps(petri)).toEqual([]);
+    // executed against a scripted cell: A_Pick, the 2-outcome skill, the decision on Ready, A_Place
+    const prog = new StProgram(fsm); const answered = new Set<string>(); const starts: string[] = [];
+    for (let i = 0; i < 400 && !prog.vars.FSM_DONE; i++) {
+      for (const op of ['PickA', 'Work', 'PlaceA']) {
+        if (prog.vars[`START_${op}`] && !answered.has(op)) { answered.add(op); starts.push(op); if (op === 'Work') prog.vars.RES_Work = 1; prog.vars[`DONE_${op}`] = true; if (op === 'Work') prog.vars.Ready = 1; }
+        if (!prog.vars[`START_${op}`] && answered.has(op)) prog.vars[`DONE_${op}`] = false;
+      }
+      prog.scan(0.05);
+    }
+    expect(starts).toEqual(['PickA', 'Work', 'PlaceA']); expect(prog.vars.FSM_OUTCOME).toBe(1);
+  });
+  it('automaton ST: two operations finishing in the same PLC scan are both taken (no lost DONE edge, no handshake deadlock)', () => {
+    const [st] = automatonToST(DES_2R, 'des');
+    for (const [dQ, dB] of [[20, 30], [20, 19], [20, 20], [7, 6]]) {
+      const prog = new StProgram(st.content);
+      const ops: Record<string, [string, string, number]> = { A_Pick: ['START_RA_P', 'DONE_RA_P', 5], A_Place: ['START_RA_Q', 'DONE_RA_Q', dQ], B_Work: ['START_RB_W', 'DONE_RB_W', dB] };
+      const srv = Object.fromEntries(Object.keys(ops).map((k) => [k, { state: 'idle', busy: 0 }]));
+      const doneAt: Record<string, number> = {};
+      for (let k = 0; k < 300; k++) {
+        for (const [n, [sv, dv, d]] of Object.entries(ops)) {
+          const s = srv[n];
+          if (s.state === 'idle' && prog.vars[sv]) { s.state = 'run'; s.busy = d; }
+          else if (s.state === 'run' && --s.busy <= 0) { s.state = 'done'; prog.vars[dv] = true; doneAt[n] = k; }
+          else if (s.state === 'done' && !prog.vars[sv]) { s.state = 'idle'; prog.vars[dv] = false; }
+        }
+        prog.scan(0.05);
+      }
+      expect({ RA: prog.vars.RA_state, RB: prog.vars.RB_state, starts: Object.values(srv).map((s) => s.state) }, `A_Place ${dQ} / B_Work ${dB} scans (DONE at ${JSON.stringify(doneAt)})`).toEqual({ RA: 4, RB: 2, starts: ['idle', 'idle', 'idle'] });
+    }
+  });
+});

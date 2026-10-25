@@ -14,7 +14,8 @@ import { unzipSync } from 'fflate';
 import { Station, Camera, SceneObject, Frame } from '../src/core/items/item';
 import { createRobotFromLibrary } from '../src/core/items/library';
 import { mul, transl, rotx, roty, rotz, DEG, Mat4, multiply, invert } from '../src/core/math/pose';
-import { generateRosVisionPackage, rosVisionPackageZip, cameraInfoMsg, depthImageMsg, imageMsg, cameraTfMsg, publishCameraFrame, rosRpy, LINK_TO_OPTICAL } from '../src/vision/vision_ros';
+import { generateRosVisionPackage, rosVisionPackageZip, cameraInfoMsg, depthImageMsg, imageMsg, cameraTfMsg, publishCameraFrame, rosRpy, LINK_TO_OPTICAL, studioCameraTopics } from '../src/vision/vision_ros';
+import { RosTwin, cameraHasColour } from '../src/ros/twin';
 import { setVisionStack, getVisionStack, VisionStackConfig } from '../src/vision/stack';
 import { renderCamera } from '../src/vision/sensing';
 
@@ -180,6 +181,73 @@ describe('studio camera → ROS 2 messages', () => {
   });
 });
 
+// V5 F12 / V6 F5: an RGB-D camera (wizard rgbd / stereo / ToF -> kind 'depth') has a colour stream in the ROS twin, on the
+// topics the exported perception package subscribes to with source:=studio; the launch survives missing packages
+describe('RGB-D camera: studio twin topics = exported perception package topics', () => {
+  function cell() {
+    const st = new Station('cell');
+    const box = st.addChild(new SceneObject('Box'));
+    box.geometry = [{ primitive: { kind: 'box', size: [200, 200, 100] }, color: '#3366ff' }];
+    box.setPose(transl(0, 0, 50));
+    const cam = st.addChild(new Camera('Cell camera'));
+    cam.kind = 'depth'; cam.fov = 60; cam.width = 160; cam.height = 120; cam.near = 100; cam.far = 4000;
+    cam.setPose(mul(transl(0, 0, 1200), rotx(180 * DEG)));
+    setVisionStack(cam, cfgOf({ tasks: ['detect', 'pose'] }));
+    return { st, cam };
+  }
+  it('the twin publishes colour (rgb8) + 32FC1 depth for a kind "depth" camera; a depth-only device publishes no colour', () => {
+    const { st, cam } = cell();
+    const sent: Array<{ topic: string; type: string; msg: any }> = [];
+    const twin = new RosTwin(st, { publish: (topic, type, msg) => sent.push({ topic, type, msg }), subscribe: () => undefined }, { cameras: true });
+    twin.start();
+    const topics = twin.publishCameras();
+    const t = studioCameraTopics(cam);
+    expect(t.image).toBe('/cell_camera/image_raw');
+    expect(topics).toEqual(expect.arrayContaining([t.image, t.info, t.depth, t.depthInfo]));
+    const img = sent.find((x) => x.topic === t.image)!.msg;
+    expect([img.encoding, img.width, img.height, img.header.frame_id]).toEqual(['rgb8', 160, 120, 'cell_camera_optical_frame']);
+    const px = new Uint8Array(Buffer.from(img.data, 'base64'));
+    const c = (60 * 160 + 80) * 3; // image centre: the blue box top
+    expect(px[c + 2]).toBeGreaterThan(px[c]);
+    expect(sent.find((x) => x.topic === t.depth)!.msg.encoding).toBe('32FC1');
+    // a Webots RangeFinder / Gazebo depth_camera has no colour stream (like webots_ros2 / ros_gz)
+    for (const p of [{ webotsDevice: 'RangeFinder' }, { sensorType: 'depth_camera' }, { depthOnly: true }]) {
+      const c2 = cell();
+      Object.assign(c2.cam.params, p);
+      expect(cameraHasColour(c2.cam)).toBe(false);
+      const sent2: string[] = [];
+      const tw2 = new RosTwin(c2.st, { publish: (topic) => sent2.push(topic), subscribe: () => undefined }, { cameras: true });
+      tw2.start();
+      tw2.publishCameras();
+      expect(sent2).not.toContain(t.image);
+      expect(sent2).toContain(t.depth);
+    }
+    expect(cameraHasColour(Object.assign(new Camera('rgbd'), { kind: 'depth' as const }))).toBe(true);
+  });
+
+  it('exported launch: source:=studio remaps to the twin topics, the driver / yolo_ros are optional, yolo_ros is declared', () => {
+    for (const sensor of ['realsense_d455', 'zivid']) {
+      const { cam } = cell();
+      setVisionStack(cam, cfgOf({ sensor, tasks: ['detect', 'track', 'pose', 'grasp'] }));
+      const pkg = generateRosVisionPackage(cam, getVisionStack(cam)!);
+      const launch = pkg.files['launch/perception.launch.py'];
+      const t = studioCameraTopics(cam);
+      expect(launch).toContain(`'studio': {'image': '${t.image}', 'info': '${t.info}', 'depth': '${t.depth}', 'depth_info': '${t.depthInfo}'}`);
+      expect(launch).toMatch(/DeclareLaunchArgument\('source', default_value='driver', choices=\['driver', 'studio'\]/);
+      // every non-core package behind opt(): a stock Jazzy install launches (static TFs) and logs what is missing
+      const driver = sensor === 'zivid' ? 'zivid_camera' : 'realsense2_camera';
+      expect(launch).toContain(`nodes += opt('${driver}', lambda:`);
+      for (const ex of ['yolo_node', 'tracking_node', 'detect_3d_node', 'debug_node']) expect(launch).toMatch(new RegExp(`opt\\('yolo_ros', lambda: Node\\(package='yolo_ros', executable='${ex}'`));
+      expect(launch).not.toMatch(/^\s*nodes\.append\(Node\(package='(yolo_ros|zivid_camera|realsense2_camera)'/m);
+      expect(launch).toContain("remappings=[('image_raw', T['image'])]");
+      expect(launch).toContain("remappings=[('depth_image', T['depth']), ('depth_info', T['depth_info'])]");
+      expect(pkg.files['package.xml']).toContain('<exec_depend>yolo_ros</exec_depend>');
+      expect(pkg.files['package.xml']).toContain(`<exec_depend>${driver}</exec_depend>`);
+      expect(pkg.files['README.md']).toContain('source:=studio');
+    }
+  });
+});
+
 // ------------------------------------------------------------------------------------------------
 // colcon build in WSL ROS 2 Jazzy (ground truth for "ros2 run / launch find the executables")
 // ------------------------------------------------------------------------------------------------
@@ -200,5 +268,38 @@ it.skipIf(!wslOk)('WSL ROS 2 Jazzy: colcon builds the exported package and ros2 
     const out = execFileSync('wsl.exe', ['-d', 'Ubuntu-22.04', '--', 'bash', `${wdir}/run.sh`], { timeout: 240000, env: { ...process.env, MSYS_NO_PATHCONV: '1' } }).toString();
     for (const n of ['cloud_pipeline', 'vlm_bridge']) expect(out).toContain(`${pkg.name} ${n}`);
     expect(out).toContain('SYNTAX_OK');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+}, 300000);
+
+// V5 F12: "ros2 launch <pkg> perception.launch.py" on a stock Jazzy (no zivid_camera, no yolo_ros) used to die with
+// "package 'zivid_camera' not found"; now it starts the static TFs and logs the missing packages, in both sources
+it.skipIf(!wslOk)('WSL ROS 2 Jazzy: the exported perception launch starts without the driver / yolo_ros installed (source driver and studio)', () => {
+  const cam = new Station().addChild(new Camera('Camera 1'));
+  cam.kind = 'depth';
+  setVisionStack(cam, cfgOf({ sensor: 'zivid', tasks: ['detect', 'track', 'pose', 'grasp'] }));
+  const pkg = generateRosVisionPackage(cam, getVisionStack(cam)!);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vbs-rosvision-launch-'));
+  try {
+    fs.writeFileSync(path.join(dir, 'pkg.zip'), rosVisionPackageZip(pkg));
+    const wdir = '/mnt/' + dir.replace(/\\/g, '/').replace(/^([A-Za-z]):/, (_, d: string) => d.toLowerCase());
+    const script = [
+      'set -e', 'source /opt/ros/jazzy/setup.bash', 'export ROS_DOMAIN_ID=87 ROS_LOCALHOST_ONLY=1', 'W=$(mktemp -d)', 'mkdir -p $W/src', 'cd $W/src',
+      `python3 -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall('.')" '${wdir}/pkg.zip'`, 'cd $W',
+      `colcon build --packages-select ${pkg.name} > build.log 2>&1 || (cat build.log; exit 1)`, 'source install/setup.bash',
+      'set +e',
+      `echo "=== driver"; timeout -s INT 12 ros2 launch ${pkg.name} perception.launch.py 2>&1 | head -40`,
+      `echo "=== studio"; timeout -s INT 12 ros2 launch ${pkg.name} perception.launch.py source:=studio 2>&1 | head -40`,
+      'rm -rf $W', 'echo DONE',
+    ].join('\n');
+    fs.writeFileSync(path.join(dir, 'run.sh'), script);
+    const out = execFileSync('wsl.exe', ['-d', 'Ubuntu-22.04', '--', 'bash', `${wdir}/run.sh`], { timeout: 280000, env: { ...process.env, MSYS_NO_PATHCONV: '1' } }).toString();
+    const [driver, studio] = out.split('=== studio');
+    expect(out).toContain('DONE');
+    expect(out).not.toMatch(/not found|Caught exception|Traceback/);
+    expect(driver).toMatch(/package 'zivid_camera' is not installed: skipped/);
+    expect(driver).toMatch(/static_transform_publisher-\d+\]: process started|process started with pid/);
+    expect(studio).toMatch(/perception source: studio \(image \/camera_1\/image_raw, depth \/camera_1\/depth\/image_raw\)/);
+    expect(studio).not.toMatch(/zivid_camera/);
+    expect(out).toMatch(/package 'yolo_ros' is not installed: skipped/);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 }, 300000);

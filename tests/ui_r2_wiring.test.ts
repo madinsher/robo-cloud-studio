@@ -288,8 +288,9 @@ describe('API requests of the vision track (T9)', () => {
     cam.width = 640; cam.height = 480; cam.fov = 40; cam.near = 10; cam.far = 3000;
     const rdk = new Robolink(st);
     const item = rdk.Item('Cell camera');
-    expect(item.setParam('Settings')).toBe('FOV=40 FAR_LENGTH=3000 NEAR_LENGTH=10 SIZE=640x480');
-    expect(item.setParam('Settings', 'FOV=32 FAR_LENGTH=5000 SIZE=1280x720')).toBe('FOV=32 FAR_LENGTH=5000 NEAR_LENGTH=10 SIZE=1280x720');
+    // RoboDK 5.9.4's settings format (focal length 5 mm and a white background by default; V6 cam2d_robodk)
+    expect(item.setParam('Settings')).toBe('FOV=40.000 PixelSize=7.582713 Size=640x480 SHOW_LIMITS FOCAL_LENGTH=5.00 FAR_LENGTH=3000.00 BG_COLOR=#ffffff Persp WindowResize');
+    expect(item.setParam('Settings', 'FOV=32 FAR_LENGTH=5000 SIZE=1280x720')).toBe('FOV=32.000 PixelSize=3.982575 Size=1280x720 SHOW_LIMITS FOCAL_LENGTH=5.00 FAR_LENGTH=5000.00 BG_COLOR=#ffffff Persp WindowResize');
     expect([cam.fov, cam.far, cam.width, cam.height, cam.fovAxis]).toEqual([32, 5000, 1280, 720, 'vertical']);
     // no vision stack on the camera: both report the same error
     await expect(rdk.Cam2D_Detect(item)).rejects.toThrow('camera "Cell camera" has no vision st');

@@ -5,7 +5,7 @@ import { robotLibraryDialog, onlineLibraryDialog, mobileRobotDialog, orchardDial
 import { ItemType, Folder } from '../core/items/item';
 import { demos } from '../demos';
 import { t, getLang, setLang } from './i18n';
-import { collisionMapDialog, measureDialog, cameraDialog, VideoRecorder, exportHtml3D, exportGlb, exportAnimationGltf, exportUrdfPackage, importRoboDKPosts, saveForBlender } from './tools';
+import { collisionMapDialog, measureDialog, cameraDialog, VideoRecorder, exportHtml3D, exportGlb, exportAnimationGltf, exportUrdfPackage, exportMoveItPackage, importRoboDKPosts, saveForBlender } from './tools';
 import { Camera as CameraItem } from '../core/items/item';
 import { Robot } from '../core/items/robot';
 import { murkaMenu } from './murka_ui';
@@ -29,9 +29,11 @@ export class MenuBar {
         { label: 'Export program (post processor)…', action: () => exportDialog(app) },
         { label: 'Export station as RoboDK API script (.py)', action: () => downloadText(`${app.station.name.replace(/\W+/g, '_')}_robodk.py`, app.exportRoboDKScript()) },
         { label: 'Export URDF package (robot / station, zip)…', action: () => exportUrdfPackage(app) },
+        { label: 'Export MoveIt 2 config (robot, zip)…', action: () => exportMoveItPackage(app) },
         { label: 'Save for Blender add-on (.vbstation + animation)', action: () => saveForBlender(app) },
         { label: 'Export station JSON (for rdk_export.py / server)', action: () => downloadText(`${app.station.name.replace(/\W+/g, '_')}.vbstation`, app.saveToJSON(), 'application/json') },
         { label: 'Export screenshot (PNG)', action: () => { const a = document.createElement('a'); a.href = app.renderer.screenshot(); a.download = 'station.png'; a.click(); } },
+        { label: 'Files saved by scripts…', action: () => this.savedFilesDialog() },
       ]],
       ['Edit', () => [
         { label: 'Undo', shortcut: 'Ctrl+Z', action: () => app.undo() },
@@ -204,11 +206,28 @@ export class MenuBar {
   /** Play a scripted fleet (agromarca scripted_fleet JSON) on the world clock; default: MURKA Mission B. */
   async scriptedFleetDialog(): Promise<void> { const { scriptedFleetDialog } = await import('./murka_ui'); return scriptedFleetDialog(this.app); }
 
+  /** Files written by API calls / station scripts in this browser session (Cam2D_Snapshot, MakeProgram, Save, CSV). */
+  savedFilesDialog(): void {
+    const fs = (window as any).savedFiles as { list(): Array<{ path: string; data: Uint8Array; time: number }> } | undefined;
+    const files = fs?.list() ?? [];
+    const save = (f: { path: string; data: Uint8Array }) => {
+      const url = URL.createObjectURL(new Blob([f.data as BlobPart]));
+      const a = document.createElement('a'); a.href = url; a.download = f.path.replace(/^.*\//, ''); a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    };
+    const body = h('div', { class: 'help' },
+      h('p', null, files.length ? `${files.length} file(s) written by API calls and station scripts in this session (they are kept in memory, like the files RoboDK writes to disk).` : 'No file was written by API calls or station scripts in this session.'),
+      ...files.slice(-200).reverse().map((f) => h('div', { class: 'btn-row' }, h('button', { class: 'btn', onClick: () => save(f) }, 'Download'), h('span', null, ` ${f.path} (${(f.data.length / 1024).toFixed(1)} KB, ${new Date(f.time).toLocaleTimeString()})`))));
+    dialog('Files saved by scripts', [], { body, width: 720 });
+  }
+
   serverInfo(): void {
     const body = h('div', { class: 'help' },
       h('p', null, 'The studio server exposes the RoboDK-compatible API over WebSocket (port 20500) and relays calls to this browser tab.'),
       h('pre', { class: 'code-preview' }, `cd studio\nnpm run server              # ws://localhost:20500\n# open the studio with ?server=ws://localhost:20500\npython python/examples/hello_studio.py`),
-      h('p', null, 'Python: put studio/python on PYTHONPATH — `from robodk.robolink import *` then works without RoboDK installed. Existing RoboDK scripts run unchanged for the supported API subset (see docs/robodk-compatibility.md).'));
+      h('p', null, 'Python: put studio/python on PYTHONPATH — `from robodk.robolink import *` then works without RoboDK installed. Existing RoboDK scripts run unchanged for the supported API subset (see docs/robodk-compatibility.md).'),
+      h('p', null, 'The page connects only when asked: open it with ?server=ws://host:port (or ?server=auto), or connect now:'),
+      h('div', { class: 'btn-row' }, h('button', { class: 'btn primary', onClick: () => { const c = (window as any).connectStudioServer as ((u?: string) => Promise<unknown>) | undefined; c?.().then(() => toast('Connected to the studio server', 'ok')).catch((e: any) => toast(`Studio server not reachable: ${e?.message ?? e}`, 'warn')); } }, `Connect to ws://${location.hostname || 'localhost'}:20500`)));
     dialog('Studio server', [], { body, width: 640 });
   }
 

@@ -9,7 +9,10 @@ import { demos } from '../src/demos';
 import { ItemType, SceneObject } from '../src/core/items/item';
 import { MobileRobot } from '../src/mobile/items';
 import { FleetItem, FleetManager } from '../src/fleet/fleet';
-import { FieldItem } from '../src/agri/items';
+import { FieldItem, CropRow, MissionItem } from '../src/agri/items';
+import { planMission } from '../src/agri/missions';
+import { armOf, armLift } from '../src/agri/harvest';
+import { fruitWorldPositions } from '../src/agri/orchard';
 import { RailNetwork, railRoute, locateOnRails, projectOnSegment } from '../src/mobile/rails';
 import { fruitCounts } from './agri_helpers';
 
@@ -45,8 +48,24 @@ describe('greenhouse demo: gutters, heating-pipe rails, rail-constrained trolley
     let off = 0, turnOnRail = 0, samples = 0;
     const prev = new Map(robots.map((r) => [r.id, { x: r.state.x, y: r.state.y, th: r.state.theta }]));
     const onRailOnly = (x: number, y: number) => { const loc = locateOnRails(net, [x, y]); const c = projectOnSegment([x, y], net.corridor[0], net.corridor[1]); return loc.rail >= 0 && c.d > net.corridorWidth / 2; };
-    while (fm.time < 2400) {
+    // the pickers on their scissor lifts: TCP at every fruit when it is removed, lift travel, joint configurations
+    const arms = robots.map((r) => armOf(r)!);
+    const dirty = new Set<CropRow>();
+    st.events.on('changed', ({ item, what }: { item: unknown; what: string }) => { if (what === 'plants' && item instanceof CropRow) dirty.add(item); });
+    const seen = new Set<unknown>();
+    const tcpMiss: number[] = [];
+    const configs = new Set<string>();
+    let liftMax = 0;
+    while (fm.time < 3600) {
       fm.step(0.2);
+      for (const a of arms) { configs.add(`${a.id}:${a.joints().map((v) => v.toFixed(0)).join(',')}`); liftMax = Math.max(liftMax, armLift(a).h); }
+      for (const row of dirty) for (const w of fruitWorldPositions(row, false)) {
+        if (!w.fruit.picked || seen.has(w.fruit)) continue;
+        seen.add(w.fruit);
+        const d = Math.min(...arms.map((a) => { const t = a.poseTCPAbs(); return Math.hypot(t[12] - w.p[0], t[13] - w.p[1], t[14] - w.p[2]); }));
+        if (d > 20) tcpMiss.push(Math.round(d));
+      }
+      dirty.clear();
       for (const r of robots) {
         samples++;
         const loc = locateOnRails(net, [r.state.x, r.state.y]);
@@ -66,5 +85,30 @@ describe('greenhouse demo: gutters, heating-pipe rails, rail-constrained trolley
     expect(k.fruitPicked).toBe(after.picked - before.picked);
     expect(fleet.tasks.filter((t) => t.status === 'done').length).toBeGreaterThan(0);
     expect(k.contacts.robotRobotSteps).toBe(0);
+    // V3 F2: the pickers move to every tomato they remove and use their lifts
+    expect(seen.size).toBe(k.fruitPicked);
+    expect(tcpMiss).toEqual([]);
+    expect(liftMax).toBeGreaterThan(1500);
+    expect(configs.size).toBeGreaterThan(1000);
+  }, 300000);
+
+  it('unloading trips mid-row: the trolley keeps its rail reserved until it is out, the other trolley is not let in head-on', () => {
+    // two rows sharing the rail between them (Row 9 R / Row 10 L) and small bins: frequent unloading trips back along
+    // the rail; before, a trip released the rail reservation while the trolley was still on it and both stalled head-on
+    const st = demos.find((d) => d.id === 'greenhouse')!.build();
+    const fleet = st.itemsOfType<FleetItem>(ItemType.FLEET)[0];
+    fleet.tasks.length = 0;
+    st.itemsOfType<MissionItem>(ItemType.MISSION)[0].delete();
+    const field = st.itemsOfType<FieldItem>(ItemType.FIELD)[0];
+    const fm = new FleetManager(st, fleet);
+    const m = st.addChild(new MissionItem('Rows 9-10'));
+    m.missionType = 'harvest'; m.fieldId = field.id; m.fleetId = fleet.id; m.rowIds = field.rows().slice(8, 10).map((r) => r.id);
+    m.settings = { workSpeed: 300, bothSides: true, sideOffset: field.crop.rowSpacing / 2, secondsPerFruit: 1, animateArm: false, binCapacityKg: 5 };
+    planMission(st, m, fm);
+    expect(fleet.tasks).toHaveLength(4);
+    while (fm.time < 14000 && fleet.tasks.some((t) => t.status !== 'done')) fm.step(0.2);
+    expect(fleet.tasks.map((t) => t.status)).toEqual(['done', 'done', 'done', 'done']);
+    expect(fm.kpis().process.harvest.unloads).toBeGreaterThan(10);
+    expect(fm.kpis().contacts.robotRobotSteps).toBe(0);
   }, 300000);
 });

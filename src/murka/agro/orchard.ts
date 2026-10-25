@@ -290,7 +290,7 @@ export interface HarvestFleetOptions {
   /** Fleet allocator (default 'auction'; 'murka' = the MuRKA contract net). */
   allocation?: string;
   secondsPerFruit?: number;
-  /** Move the arm joints to every fruit while picking (IK per fruit, linear joint motion; agri process `animateArm`). */
+  /** Move the arm joints to every fruit while picking (agri process `animateArm`, on by default; false = timing only). */
   animateArm?: boolean;
 }
 
@@ -331,7 +331,7 @@ export function addHarvestFleet(o: OrchardStationResult, opts: HarvestFleetOptio
   mission.fieldId = field.id;
   mission.fleetId = fleet.id;
   mission.rowIds = o.fields.flatMap((f) => f.rows().map((r) => r.id));
-  mission.settings = { workSpeed: 300, bothSides: true, sideOffset: field.crop.rowSpacing / 2, secondsPerFruit: opts.secondsPerFruit ?? 3, ...(opts.animateArm ? { animateArm: true } : {}) };
+  mission.settings = { workSpeed: 300, bothSides: true, sideOffset: field.crop.rowSpacing / 2, secondsPerFruit: opts.secondsPerFruit ?? 3, ...(opts.animateArm !== undefined ? { animateArm: opts.animateArm } : {}) };
   planMission(st, mission, fm);
   return { fleet, fm, robots, mission };
 }

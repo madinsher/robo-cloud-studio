@@ -39,8 +39,8 @@ export function listModels(): string[] {
 export async function handleVisionHttp(req: http.IncomingMessage, res: http.ServerResponse, readJson: () => Promise<any>): Promise<boolean> {
   const url = req.url ?? '';
   if (!url.startsWith('/vision/')) return false;
-  const send = (code: number, body: unknown) => { res.writeHead(code, { 'content-type': 'application/json', 'access-control-allow-origin': '*' }); res.end(JSON.stringify(body)); };
-  if (req.method === 'OPTIONS') { res.writeHead(204, { 'access-control-allow-origin': '*', 'access-control-allow-headers': '*', 'access-control-allow-methods': 'GET,POST,OPTIONS' }); res.end(); return true; }
+  const send = (code: number, body: unknown) => { res.writeHead(code, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); };
+  if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return true; }   // CORS headers: server/index.ts (src/api/security.ts)
   if (url === '/vision/models' && req.method === 'GET') { send(200, { models: listModels(), backends: await checkBackends(), external: process.env.STUDIO_VISION_URL ?? null }); return true; }
   if (url === '/vision/infer' && req.method === 'POST') {
     let body: any;

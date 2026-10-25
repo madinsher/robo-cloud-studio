@@ -47,6 +47,10 @@ export class TreePanel {
     app.events.on('activeRobot', () => this.scheduleRepaint());
     this.bind();
     this.render();
+    // badges that follow the simulation without item events (fleet robot status / battery): repainted twice a second
+    // while the world or a program runs (only rows whose badge text changed are redrawn)
+    const live = setInterval(() => { if (this.app.worldRunning || this.app.isPlaying()) this.vlist.repaint(); }, 500);
+    (live as unknown as { unref?: () => void }).unref?.();
   }
 
   private bind() {

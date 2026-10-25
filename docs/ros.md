@@ -38,11 +38,21 @@ from the top-level URDF / xacro files when there is no launch file. Macro-only a
 only meshes referenced by the imported robot are registered (under their `package://` URI, STL / OBJ in metres,
 COLLADA by its `<unit>`); expansion errors are reported instead of a 0-DOF robot; an SRDF of the same robot adds
 planning groups, named poses (`params.namedPoses`) and the disabled collision pairs.
+A launch entry that expands to something other than a URDF `<robot>` (the SDF / world xacros a Gazebo launch file
+spawns, e.g. `gz_waffle.sdf.xacro` in nav2_minimal_tb3_sim) is skipped with a report line, and when no launch robot can
+be imported the package's other robot descriptions are imported instead. The same robot reached twice (its xacro with
+the launch arguments and its pre-expanded URDF from another launch file, as in webots_ros2_universal_robot; identity =
+robot name + links + joints) is imported once; an expansion error of a file is only reported when no other entry of
+that file expanded (no spurious "Undefined substitution argument" for the bare top-level expansion).
 Tests: `tests/ros_package.test.ts`.
 
 ## Exports
 
-- **URDF package** (`src/io/urdf/urdf_export.ts`): robots imported from URDF export their kept description — link /
+- **URDF package** (`src/io/urdf/urdf_export.ts`): library robots without meshes export the shapes the 3D view draws
+  as STL visual + collision meshes per link (at the URDF link frames: RViz shows the robot where the studio does), and
+  the root link's estimated inertia moves to a fixed `<root>_inertia` child (KDL rejects an inertia on the root); a
+  whole-station package has `config/<station>.srdf` (one chain group per robot, station link / joint names). Robots
+  imported from URDF export their kept description — link /
   joint names (TF frames such as `utp_g_01/base_link`), inertials, mimic and off-chain joints, `ros2_control` /
   `gazebo` / `transmission` blocks unchanged, meshes copied into the package. Every package has
   `launch/display.launch.py` (robot_state_publisher + joint_state_publisher) and a basic SRDF (`config/*.srdf`: one
@@ -64,7 +74,7 @@ robot get the exact MURKA interface (next section); any other station gets the w
 | Topic | Type | |
 |---|---|---|
 | `/clock` | rosgraph_msgs/Clock | sim time, every step |
-| `/joint_states` | sensor_msgs/JointState | every joint by URDF name (wheels with velocity, mimic joints), 20 Hz |
+| `/joint_states` | sensor_msgs/JointState | every joint by URDF name (wheels with velocity, mimic joints), 20 Hz; in a multi-robot station a joint is prefixed (`<robot>_`) only when its name clashes with another robot's joint |
 | `/robot_description` | std_msgs/String | latched; the kept URDF, or the station URDF with floating mobile bases |
 | `/tf` | tf2_msgs/TFMessage | `odom → <base link>` of each mobile robot, 31 Hz |
 | `/tf_static` | tf2_msgs/TFMessage | `map → odom` when `twin.mapFrame` is set |
@@ -73,7 +83,11 @@ robot get the exact MURKA interface (next section); any other station gets the w
 | `<ns>/scan` | sensor_msgs/LaserScan | sensor-relative angles, 10 Hz (when the navigation stack simulates a 2D LiDAR) |
 | `<ns or /robot>/ground_truth_pose` | geometry_msgs/PoseStamped | map frame |
 | `<ns>/cmd_vel` (sub) | geometry_msgs/Twist | drives the base through the drive model; 0.6 s watchdog |
-| `/<robot>/joint_trajectory`, `/joint_trajectory_controller/joint_trajectory` (sub) | trajectory_msgs/JointTrajectory | linear interpolation, replaces per joint, clamped to limits |
+| `/<robot>/joint_trajectory`, `/joint_trajectory_controller/joint_trajectory` (sub) | trajectory_msgs/JointTrajectory | linear interpolation, replaces per joint, clamped to limits; a joint is found by its `/joint_states` name or, when unique (inside the robot for `/<robot>/…`), by the name in its own URDF |
+
+The combined station description prefixes the *links* of a URDF import whose link names clash with another item's
+(TurtleBot 4 and a UR5e both have `base_link`), so TF frames stay unique, but keeps its *joint* names unless those clash
+too: standard `JointTrajectory` commands with the URDF joint names reach the arm in a multi-robot station.
 
 Mode `publish` mirrors the same state topics (without `/clock` and commands) next to the repository's legacy topics;
 `follow` applies `/joint_states` (by name) and `/odom` to the sim. Tests: `tests/ros_twin.test.ts` (murom.urdf).
@@ -85,7 +99,13 @@ prismatic joints are converted m ↔ mm from the robot_description joint types; 
 
 Camera items of non-MURKA stations are published by the twin in `sim` mode (5 Hz, option `twin.cameras`):
 `<ns>/<cam>/image_raw` (rgb8), `/camera_info` (render K), `/depth/image_raw` (32FC1 metres, NaN = no return) and TF
-`map → <cam>_link → <cam>_optical_frame` (`tests/ros_exports_r5.test.ts`).
+`map → <cam>_link → <cam>_optical_frame` (`tests/ros_exports_r5.test.ts`). A depth camera (the wizard's RGB-D / stereo /
+ToF, a Gazebo `rgbd_camera`) publishes the colour image too; depth-only devices (Webots RangeFinder, Gazebo `depth` /
+`depth_camera`, `params.depthOnly`) publish depth only (`cameraHasColour`). The exported perception package
+(Tools › Export ROS 2 perception package) subscribes to exactly these topics with `ros2 launch <pkg>
+perception.launch.py source:=studio` (`studioCameraTopics`), to the driver's topics by default; the driver and the
+yolo_ros nodes are optional (skipped with a log line when not installed) and yolo_ros is an `exec_depend`
+(`tests/vision_ros.test.ts`; in WSL the launch starts on a stock Jazzy in both sources).
 
 ## Studio as the MURKA simulator backend
 

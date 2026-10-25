@@ -53,8 +53,9 @@ footprint within the safety gap of another robot's footprint or of its stopping 
 path); a robot that is already too close may only move away. Alleys (and zones of kind `lane`) are reserved for
 transit as well as work; robots wait a standoff before the mouth so the robot leaving can get out; a wait-for-graph
 resolver lets a robot back out of the way (straight retreat, else a planned parking pose off the other robot's route)
-— never creep. Idle robots left in an alley clear it. `nogo` zones are never entered, `speed_limit` zones cap the speed
-(with braking before entry). Every step the manager measures robot–tree and robot–robot contacts (KPI `contacts`).
+— never creep. Idle robots left in an alley clear it; a robot leaving its alley for a service trip (unloading, refill)
+keeps it reserved until it is out, so on a one-way pipe rail no robot is let in head-on behind it. `nogo` zones are
+never entered, `speed_limit` zones cap the speed (with braking before entry). Every step the manager measures robot–tree and robot–robot contacts (KPI `contacts`).
 
 **Allocation**: `nearest` (greedy straight-line, one task per idle robot), `auction` (sequential auction on marginal
 completion time including queued work), `hungarian` (optimal one-to-one), `cbba` (bundles with consensus),
@@ -66,7 +67,7 @@ lacks them is only considered if it can be reconfigured at a depot).
 
 | Mission | Model |
 |---|---|
-| harvest | base stops placed so the fruit of the row side are within the arm's reach; the base stands still while the arm picks (`secondsPerFruit` each); each fruit is removed and booked at its pick time; bin capacity with unload trips; unreachable fruit stay on the tree and are counted |
+| harvest | base stops placed so the fruit of the row side are within the arm's reach (an arm on a lift reaches every height of its stroke); the base stands still while the arm picks (`secondsPerFruit` each); the arm moves to every fruit it picks (see *Arm motion*); each fruit is removed and booked at its pick time; bin capacity with unload trips; unreachable fruit stay on the tree and are counted |
 | thin | removes unripe fruit above `keepFruitPerPlant`; books no yield |
 | spray / irrigate | tree-row-volume dose (canopy height × width × `doseLPerM3`, default 0.07 L/m³) or litres per plant; tank / water capacity with refill trips; dose recorded per plant; spraying treats diseased plants |
 | mow / weed | swath area and coverage of the inter-rows; weeding stops per plant |
@@ -98,8 +99,27 @@ a program can wait on a conveyor sensor or stop a conveyor.
   curvature-limited Hybrid A* for every drive (no rotation in place) and regulated pure pursuit (speed × r / 0.9 m on
   tighter curves, anticipated over the braking distance); NavFn + DWB / Smac 2D + MPPI = 2-D footprint grid planner;
   line following = the fixed straight route (blocked = no path); rail = the rail network; no stack = default.
-- **Arm motion during fleet harvest**: mission setting `animateArm` (or `harvestAnimation.enabled`): one IK solve per
-  fruit, linear joint motion that reaches the fruit at its pick time, back to the travel pose between stops.
+- **Arm motion during fleet harvest / thinning** (on by default; mission setting `animateArm: false` or
+  `harvestAnimation.enabled = false` keeps the timing-only model for batch runs): per fruit a collision-free IK
+  configuration (approach from the arm base, horizontal or tilted up to ±80°, every closed-form solution, the travel
+  pose's configuration family first; tested with the simulator's checker against the arm itself, its carrier and lift
+  column, the other robots and the station's objects — `armCollisionCheck: false` skips the test) and a pre-approach pose 250 mm
+  back along the gripper axis; the arm retracts from the last fruit, transfers to the next pre-approach and approaches,
+  linear joint motion per leg timed by the joint speed limits (a pick waits for the arm when it needs longer, the base
+  stands still meanwhile), and reaches the fruit at its pick time; between the stops of a row it stays at the retract
+  pose, it returns to its travel pose at the end of the row and for unloading trips. A fruit with no free configuration
+  stays on the plant (KPI `process.harvest.armUnreachable`).
+- **Lifts** (`mountArmOnLift(arm, stroke)`, `addLiftColumn(arm, stages)`, src/agri/harvest.ts): the arm base rises on a
+  telescopic column under it (params `liftStroke`, `liftBaseZ`; the column stages are scene objects of the carrier, so
+  they are drawn and collision-checked, and nothing of the lift is above the arm base); stops and IK use the whole
+  stroke, a stop's fruit are picked in height order (up at one stop, down at the next) and the lift moves before the
+  joints going up, after them going down. The orchard demo's UR10e arms ride a 2.1 m column (arm base 1.4–3.5 m for
+  the 0.6–4.3 m spindles), the greenhouse trolleys' UR5e a 2.5 m column (0.5–3.0 m for the 0.3–3.2 m crop).
+- **Mission result**: a harvest mission's progress is the crop — fruit picked / (picked + ripe fruit still on the
+  worked row sides) — and when every task has finished it is `done` only if no ripe fruit is left (thinning: no excess
+  fruit out of reach; no failed task), else `incomplete`, with a `Result:` warning that says how many fruit stayed on the
+  plants and why (out of the arms' reach, missed by the camera). Planning already warns when ripe fruit are out of the
+  arm's reach from the alleys (`MissionPlan.unreachableFruit`).
 - **Per-robot FSM** (src/fleet/fleet_fsm.ts, `attachFleetFsm`): a studio `fsm` document is a fleet robot's own
   controller — it gets a task only in a state with `skill=fleet_execute`, charges when its FSM decides
   (`fleet_charge`), waits (`wait=`); the trace is its lifecycle with the task ids.
@@ -113,18 +133,26 @@ a program can wait on a conveyor sensor or stop a conveyor.
 
 ## Limits (honest list)
 
-- The fleet process models time the arm (base stops, seconds per fruit) unless `animateArm` is on; full joint-level
-  picking with collision checks runs through the harvest *program* (step 5).
+- The fleet arm motion tests the pick and pre-approach configurations for collisions, not every intermediate position
+  of the joint-space legs between them: an independent check of every leg of the demos at 4° samples (simulator
+  checker, trunks included) finds a graze in 83 of 47 631 legs in the orchard (0.2 %: link vs lift column / deck / own
+  link) and 317 of 43 475 in the greenhouse (0.7 %: forearm vs the trolley body with the lift low); picking with every
+  joint move checked runs through the harvest *program* (step 5). The gripper is not modelled closing on the fruit (it
+  is removed at its pick time with the TCP on it).
 - Two harvesters in narrow 3 m orchards with short headlands can deadlock in the FleetManager (they keep re-planning
   around each other); MURKA's legacy apple garden is harvested with one platform (docs/murka-agro.md).
-- Greenhouse benches, trolley lifts and rail switching hardware are not modelled (the trolley changes rails on the
-  corridor).
+- Greenhouse benches and rail switching hardware are not modelled (the trolley changes rails on the corridor). With
+  unloading trips every few dozen fruit (bins of a few kg; the demo's 400 kg bin unloads twice per house) two trolleys
+  can still block each other on the corridor near the parking end: the wait-for-graph resolver does not back one out
+  there.
 
 ## Verification
 
 `npx vitest run tests/agri_ tests/mobile_` — among others: the orchard demo as the app loads it finishes all 12 tasks
-with 0 steps of robot–tree or robot–robot contact (independent geometry check), books exactly the fruit it removed
-and keeps the arm within 0.8 × reach of the row it harvests (`agri_orchard_demo`); head-on robots in one alley /
+with 0 steps of robot–tree or robot–robot contact (independent geometry check), books exactly the fruit it removed,
+picks every ripe fruit of rows 1–4 with the TCP on each fruit at its pick time (mission `done`, progress 1) and keeps
+the arm within 0.8 × reach of the row it harvests (`agri_orchard_demo`); arm motion, joint speed limits, collision-free
+pick configurations, the `incomplete` result of a fixed-mount arm and the opt-out (`agri_harvest_arm`); head-on robots in one alley /
 lane, allocators, save–load mid-mission (`mobile_traffic`); Ackermann alley-to-alley turns and wall detours
 (`mobile_kinematics`); docking and program motion (`mobile_navigate`); harvest / spray programs and the detect → pick
 loop (`agri_programs`); process models and generators (`agri_processes`); equipment and depot reconfiguration

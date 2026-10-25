@@ -31,6 +31,8 @@ const POSE_KEYS = ['pose', 'via'] as const;
 export function eventToJSON(e: PostEvent): any {
   const o: any = { ...e };
   for (const k of POSE_KEYS) if (o[k] instanceof Float64Array) o[k] = Array.from(o[k]);
+  // RoboDK passes pose None to its posts for a joint target
+  if (o.jointTarget && (o.kind === 'moveJ' || o.kind === 'moveL')) o.pose = null;
   return o;
 }
 export function eventFromJSON(o: any): PostEvent {

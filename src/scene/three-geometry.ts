@@ -43,9 +43,15 @@ export function smoothTriangleSoup(positions: Float32Array, creaseDeg = CREASE_D
     faceA[t] = area;
     if (area > 1e-12) { faceN[t * 3] = nx / area; faceN[t * 3 + 1] = ny / area; faceN[t * 3 + 2] = nz / area; }
   }
+  // corners are welded on a grid relative to the mesh size (1e-6 of its diagonal): the former fixed 0.05-unit grid
+  // collapsed meshes stored in metres (ROS packages: 50 mm cells, a UR5e shoulder lost 4 mm per side)
+  let lo = Infinity, hi = -Infinity;
+  for (let i = 0; i < positions.length; i++) { const v = positions[i]; if (v < lo) lo = v; if (v > hi) hi = v; }
+  const span = Number.isFinite(hi - lo) && hi > lo ? hi - lo : 1;
+  const inv = 1 / (span * 1e-6);
   const groups = new Map<string, number[]>();
   for (let i = 0; i < corners; i++) {
-    const key = `${Math.round(positions[i * 3] * 20)},${Math.round(positions[i * 3 + 1] * 20)},${Math.round(positions[i * 3 + 2] * 20)}`;
+    const key = `${Math.round(positions[i * 3] * inv)},${Math.round(positions[i * 3 + 1] * inv)},${Math.round(positions[i * 3 + 2] * inv)}`;
     const list = groups.get(key);
     if (list) list.push(i);
     else groups.set(key, [i]);
@@ -98,11 +104,41 @@ export function smoothTriangleSoup(positions: Float32Array, creaseDeg = CREASE_D
   return g;
 }
 
+/** Signed volume of a triangle soup (negative: faces wound inwards, e.g. a mirrored STL) and its bounding-box volume. */
+export function soupVolume(positions: Float32Array): { volume: number; box: number } {
+  let v = 0;
+  const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+  for (let o = 0; o + 8 < positions.length; o += 9) {
+    const ax = positions[o], ay = positions[o + 1], az = positions[o + 2], bx = positions[o + 3], by = positions[o + 4], bz = positions[o + 5], cx = positions[o + 6], cy = positions[o + 7], cz = positions[o + 8];
+    v += ax * (by * cz - bz * cy) - ay * (bx * cz - bz * cx) + az * (bx * cy - by * cx);
+    for (let k = 0; k < 9; k++) { const c = k % 3, x = positions[o + k]; if (x < lo[c]) lo[c] = x; if (x > hi[c]) hi[c] = x; }
+  }
+  const box = Number.isFinite(lo[0]) ? Math.max(0, hi[0] - lo[0]) * Math.max(0, hi[1] - lo[1]) * Math.max(0, hi[2] - lo[2]) : 0;
+  return { volume: v / 6, box };
+}
+
+/** The same soup with every triangle wound the other way. */
+function flipWinding(positions: Float32Array): Float32Array {
+  const out = new Float32Array(positions);
+  for (let o = 0; o + 8 < out.length; o += 9) for (let k = 0; k < 3; k++) { const t = out[o + 3 + k]; out[o + 3 + k] = out[o + 6 + k]; out[o + 6 + k] = t; }
+  return out;
+}
+
 export function meshDataToGeometry(m: MeshData): THREE.BufferGeometry {
   // textured meshes keep their corners (welding by position would merge UV seams)
   const textured = !!m.uvs && !!m.materials?.some((x) => x.map);
-  if (!textured && !authoredSmoothNormals(m)) return addMeshGroups(smoothTriangleSoup(m.positions), m);
+  // a closed mesh wound inwards (mirrored *_l STLs of the MUROM v1 arms) would be culled: turn it outwards; meshes that
+  // cannot be turned (authored normals, textures) or are open (no inside) are drawn double-sided, as Webots / RoboDK do
+  const { volume, box } = soupVolume(m.positions);
+  const closed = box > 0 && Math.abs(volume) > 0.02 * box;
+  const inwards = closed && volume < 0;
+  if (!textured && !authoredSmoothNormals(m)) {
+    const g = addMeshGroups(smoothTriangleSoup(inwards ? flipWinding(m.positions) : m.positions), m);
+    g.userData.doubleSided = !closed;
+    return g;
+  }
   const g = new THREE.BufferGeometry();
+  g.userData.doubleSided = !closed || inwards;
   g.setAttribute('position', new THREE.BufferAttribute(m.positions, 3));
   g.setAttribute('normal', new THREE.BufferAttribute(m.normals, 3));
   if (m.uvs && m.uvs.length === (m.positions.length / 3) * 2) g.setAttribute('uv', new THREE.BufferAttribute(m.uvs, 2));
@@ -197,6 +233,7 @@ export function buildGeometry(refs: GeometryRef[], assets: AssetStore, defaultCo
     // meshes without an explicit colour use the materials of their file (OBJ+MTL, COLLADA, textured Webots meshes)
     const fileMats = r.mesh && !r.color ? (assets.get(r.mesh) ?? findByBasename(assets, r.mesh))?.mesh?.materials : undefined;
     const mesh = new THREE.Mesh(geometry, fileMats?.length ? (fileMats.length === 1 ? fileMaterial(fileMats[0], defaultColor, r.opacity ?? 1) : fileMats.map((fm) => fileMaterial(fm, defaultColor, r.opacity ?? 1))) : materialFor(r.color ?? defaultColor, r.opacity ?? 1));
+    if (geometry.userData.doubleSided) for (const mt of Array.isArray(mesh.material) ? mesh.material : [mesh.material]) mt.side = THREE.DoubleSide;
     mesh.castShadow = true;
     mesh.receiveShadow = true;
     mesh.matrixAutoUpdate = false;

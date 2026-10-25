@@ -283,6 +283,24 @@ export interface DeserializeContext {
   byId: Map<string, Item>;
 }
 
+/**
+ * Item types whose visibility flag hides only the item itself, not its children (RoboDK semantics: hiding a
+ * reference frame hides its triad while the robot / objects under it stay drawn, Library 03.b, 02.b, 06.d, 06.f; a
+ * hidden robot or tool leaves its tools / attached objects visible, 06.e SimulateToolOpen hides the open gripper model
+ * that carries the part). Studio containers (folders, mobile robots, fields, ...) still hide their whole subtree.
+ */
+export const OWN_VISIBILITY_TYPES: ReadonlySet<ItemType> = new Set([
+  ItemType.ROBOT, ItemType.FRAME, ItemType.TOOL, ItemType.OBJECT, ItemType.TARGET, ItemType.CURVE, ItemType.PROGRAM,
+  ItemType.PROGRAM_PYTHON, ItemType.MACHINING, ItemType.CAMERA, ItemType.ROBOT_ARM, ItemType.ROBOT_AXES,
+]);
+
+/** The item is drawn (3D view, simulated cameras): its own flag is set and no hiding container is above it. */
+export function isShown(item: Item): boolean {
+  if (!item.visible) return false;
+  for (let p = item.parent; p && p.type !== ItemType.STATION; p = p.parent) if (!p.visible && !OWN_VISIBILITY_TYPES.has(p.type)) return false;
+  return true;
+}
+
 /** Registry of item constructors by type for deserialization. */
 export const itemFactories = new Map<ItemType, (name: string, id: string) => Item>();
 

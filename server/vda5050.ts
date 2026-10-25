@@ -170,7 +170,7 @@ export class Vda5050Service {
   async handleHttp(req: IncomingMessage, res: ServerResponse, readJson: () => Promise<any>): Promise<boolean> {
     const url = (req.url ?? '').split('?')[0];
     if (!url.startsWith('/vda5050/')) return false;
-    const send = (code: number, body: unknown) => { res.writeHead(code, { 'content-type': 'application/json', 'access-control-allow-origin': '*' }); res.end(JSON.stringify(body)); };
+    const send = (code: number, body: unknown) => { res.writeHead(code, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); };
     try {
       if (req.method === 'GET' && url === '/vda5050/status') return send(200, this.status()), true;
       if (req.method === 'GET' && url === '/vda5050/states') return send(200, this.states()), true;

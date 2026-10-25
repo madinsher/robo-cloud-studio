@@ -124,7 +124,9 @@ export async function importRobodkBinary(data: ArrayBuffer, name = 'RoboDK impor
     const notes = [`RoboDK robot “${robot.name}”: ${robot.dof} DOF, post ${robot.postProcessor}, ${robot.params.rdkMeshes ?? 0} mesh triangles in ${robot.params.rdkMeshLinks} links.`];
     return { station, report: makeReport(bytes.length, compressed, station, notes, dec.notes, { robot: 1, frame: 1 }) };
   }
-  const asTool = /\.tool$/i.test(name);
+  // the table's tool flag [50] makes it a tool whatever the caller named it (the app passes the name without its
+  // extension): RoboDK opens a .tool as a Tool with its TCP [160..175], mounted on the active robot or in the station
+  const asTool = /\.tool$/i.test(name) || r.f64(50 * 8) === 1;
   const dec = decodeObjectTable(r, 0, r.length, name.replace(/\.(tool|sld)$/i, ''), asTool, assets);
   if (!dec) return null;
   station.addChild(dec.item);

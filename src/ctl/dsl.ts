@@ -71,6 +71,18 @@ export function parseAction(words: string[], opts: Opts, n: number, targetIndex 
   const args: ActionBinding['args'] = {}; for (const [k, v] of Object.entries(opts)) if (!['robot', 'done', 'fail', 'timeout', 'component', kind].includes(k)) args[k] = v;
   return { target, kind, value: String(opts[kind]), robot: opts.robot !== undefined ? String(opts.robot) : undefined, done: opts.done !== undefined ? String(opts.done) : undefined, fail: opts.fail !== undefined ? String(opts.fail) : undefined, timeout: opts.timeout !== undefined ? Number(opts.timeout) : undefined, component: opts.component !== undefined ? String(opts.component) : undefined, args };
 }
+/**
+ * `check ltl|ctl ["name"] <formula>`: the optional name is a quoted string right after the kind and followed by the
+ * formula; a quoted atom inside the formula (`G("ok:estop" -> "tick:halt")`) is not a name.
+ */
+export function parseCheckLine(t: string): { kind: string; formula: string; name?: string } {
+  const m = /^check\s+(\w+)\s*([\s\S]*)$/i.exec(t.trim());
+  const kind = (m?.[1] ?? '').toLowerCase(); const rest = (m?.[2] ?? '').trim();
+  const q = /^"([^"]*)"\s+([\s\S]+)$/.exec(rest);
+  // a leading quoted atom followed by a binary operator is the start of the formula, not a name
+  if (q && !/^(->|<->|&|\||U\b|W\b|R\b|M\b|=|!=|<|>)/.test(q[2].trim())) return { kind, formula: q[2].trim(), name: q[1] };
+  return { kind, formula: rest };
+}
 /** Expression of a `guard` / `sensor` line: the quoted text or the rest of the line. */
 const exprOf = (t: string, kw: string, ev: string, quoted: string[]) => quoted[0] ?? t.slice(t.indexOf(ev, kw.length) + ev.length).trim();
 
@@ -91,7 +103,7 @@ export function parseDes(src: string): DesDoc {
     if (kw === 'uncontrollable') { doc.uncontrollable.push(...words.slice(1)); continue; }
     if (kw === 'unobservable') { doc.unobservable.push(...words.slice(1)); continue; }
     if (kw === 'faults' || kw === 'fault') { doc.faults.push(...words.slice(1)); continue; }
-    if (kw === 'check') { const kind = words[1]?.toLowerCase() as 'ltl' | 'ctl'; const name = quoted[0]; const rest = t.replace(/^check\s+\w+\s*/i, '').replace(name ? `"${name}"` : '', '').trim(); if (kind !== 'ltl' && kind !== 'ctl') throw new DslError('check ltl|ctl <formula>', l.n); doc.checks.push({ kind, formula: rest, name }); continue; }
+    if (kw === 'check') { const c = parseCheckLine(t); const kind = c.kind as 'ltl' | 'ctl'; if (kind !== 'ltl' && kind !== 'ctl') throw new DslError('check ltl|ctl <formula>', l.n); doc.checks.push({ kind, formula: c.formula, name: c.name }); continue; }
     if (kw === 'layout') { const auto = words[1]; if (!auto) throw new DslError('layout <automaton> state=x,y …', l.n); (doc.layout ??= {})[auto] = { ...(doc.layout?.[auto] ?? {}), ...layoutOf(opts) }; continue; }
     if (kw === 'action') { doc.actions.push(parseAction(words, opts, l.n)); continue; }
     if (kw === 'guard') { const ev = words[1]; if (!ev) throw new DslError('guard <event> "<expression>"', l.n); (doc.guards ??= {})[ev] = exprOf(t, kw, ev, quoted); continue; }
@@ -143,7 +155,7 @@ export function parsePetri(src: string): PetriParse {
       for (let i = 0; i + 1 < parts.length; i++) for (const a of parts[i]) for (const b of parts[i + 1]) spec.arcs.push({ from: a, to: b, weight: opts.weight as number | undefined, inhibitor: inhibitor && i === 0 ? true : undefined });
       continue;
     }
-    if (kw === 'check') { const kind = words[1]?.toLowerCase() as 'ltl' | 'ctl'; const name = quoted[0]; checks.push({ kind, formula: t.replace(/^check\s+\w+\s*/i, '').replace(name ? `"${name}"` : '', '').trim(), name }); continue; }
+    if (kw === 'check') { const c = parseCheckLine(t); checks.push({ kind: c.kind as 'ltl' | 'ctl', formula: c.formula, name: c.name }); continue; }
     if (kw === 'layout') { layout = { ...layout, ...layoutOf(opts) }; continue; }
     if (kw === 'action') { actions.push(parseAction(words, opts, l.n)); continue; }
     throw new DslError(`cannot parse '${t}'`, l.n);
@@ -221,7 +233,7 @@ export function parseBt(src: string): BtDoc {
     if (kw === 'supervisor') { doc.supervisor = words[1]; continue; }
     if (kw === 'modes') { doc.modes = words[1]; continue; }
     if (kw === 'monitor') { doc.monitors.push(t.replace(/^monitor\s+/i, '')); continue; }
-    if (kw === 'check') { const kind = words[1]?.toLowerCase() as 'ltl' | 'ctl'; const name = quoted[0]; doc.checks.push({ kind, formula: t.replace(/^check\s+\w+\s*/i, '').replace(name ? `"${name}"` : '', '').trim(), name }); continue; }
+    if (kw === 'check') { const c = parseCheckLine(t); doc.checks.push({ kind: c.kind as 'ltl' | 'ctl', formula: c.formula, name: c.name }); continue; }
     const type = BT_TYPES[kw];
     if (!type) throw new DslError(`unknown node type '${kw}'`, l.n);
     const node: BTNodeSpec = { type };
@@ -254,7 +266,7 @@ export function parseStatechart(src: string): StatechartSpec & { checks: DesDoc[
     const t = l.text.trim(); const { words, opts, quoted } = tokenize(t); const kw = words[0]?.toLowerCase();
     if (kw === 'statechart') { spec.name = words.slice(1).join(' ') || spec.name; continue; }
     if (kw === 'state') { spec.states.push({ id: words[1], parent: opts.parent as string | undefined, region: opts.region as string | undefined, initial: words.includes('initial') || opts.initial === true, history: words.includes('history') || opts.history === true, entry: opts.entry as string | undefined, exit: opts.exit as string | undefined }); continue; }
-    if (kw === 'check') { const kind = words[1]?.toLowerCase() as 'ltl' | 'ctl'; const name = quoted[0]; spec.checks.push({ kind, formula: t.replace(/^check\s+\w+\s*/i, '').replace(name ? `"${name}"` : '', '').trim(), name }); continue; }
+    if (kw === 'check') { const c = parseCheckLine(t); spec.checks.push({ kind: c.kind as 'ltl' | 'ctl', formula: c.formula, name: c.name }); continue; }
     const m = /^(\S+)\s*-+\s*(\S+?)(?:\s*\[(.+?)\])?\s*-+>\s*(\S+)(?:\s*\/\s*(.+))?$/.exec(t);
     if (m) { spec.transitions.push({ from: m[1], event: m[2], guard: m[3], to: m[4], action: m[5] }); continue; }
     throw new DslError(`cannot parse '${t}'`, l.n);

@@ -162,7 +162,11 @@ function setColliders(item: Item, refs: GeometryRef[]): void {
 }
 
 interface Collected { visuals: GeometryRef[]; collisions: GeometryRef[]; sensors: KinSensor[]; mass: number; hasCollisions: boolean }
-interface ChainBuild { joints: KinJoint[]; parent: ChainBuild | null; flange: Mat4; name: string; links: Collected[]; robot?: Robot; sideMimics: KinJoint[] }
+interface ChainBuild {
+  joints: KinJoint[]; parent: ChainBuild | null; flange: Mat4; name: string; links: Collected[]; robot?: Robot; sideMimics: KinJoint[];
+  /** A whole mechanism serialised as one chain (cross-chain mimics): its joint definitions and link names, links aligned with `links`. */
+  tour?: { defs: JointDef[]; linkNames: string[]; flangeLink?: number };
+}
 
 /** Wheel radius (mm) of a wheel link about its joint axis (link frame = joint frame): collision, primitive or mesh extent. */
 function wheelRadius(link: Collected, axis: Vec3, assets?: AssetStore): number | undefined {
@@ -281,7 +285,20 @@ export function buildStationItemsFromTree(tree: KinTree, opts: KinBuildOptions =
   let wheels: KinJoint[] = [];
   let steers: KinJoint[] = [];
   const radius = new Map<KinJoint, number>();
-  const wheelCenter = (w: KinJoint) => transformPoint(multiply(T0.get(w.parent) ?? identity(), w.origin), [0, 0, 0]);
+  /**
+   * Wheel centre in the base frame: the point of the wheel axis closest to the centre of the wheel geometry. The joint
+   * origin is only a point of the axis - a Webots HingeJoint anchor (E-puck: anchor 0 0 0.02 for both wheels, the
+   * offset ±26 mm lies in the endPoint translation), a URDF joint usually at the wheel centre.
+   */
+  const wheelCenter = (w: KinJoint) => {
+    const Tj = multiply(T0.get(w.parent) ?? identity(), w.origin);
+    const c = newCollected(); collectStatic(w.child, identity(), c, new Set());
+    const b = geometryBounds(c.visuals.filter((g) => (g.opacity ?? 1) > 0.01), opts.assets) ?? geometryBounds(c.collisions, opts.assets);
+    if (!b) return transformPoint(Tj, [0, 0, 0]);
+    const a = normalize(w.axis); const mid: Vec3 = [(b.min[0] + b.max[0]) / 2, (b.min[1] + b.max[1]) / 2, (b.min[2] + b.max[2]) / 2];
+    const s = mid[0] * a[0] + mid[1] * a[1] + mid[2] * a[2];
+    return transformPoint(Tj, [a[0] * s, a[1] * s, a[2] * s]);
+  };
   if (driveOpt !== 'none') {
     if (override?.wheels?.length) {
       wheels = override.wheels.map((n) => jointByName.get(n)).filter((j): j is KinJoint => !!j);
@@ -358,6 +375,81 @@ export function buildStationItemsFromTree(tree: KinTree, opts: KinBuildOptions =
     for (const c of rest) startChain(c, ch);
   };
   for (const j of nextMovables(base)) startChain(j, null);
+
+  // ---- mechanisms with cross-chain mimics: one serial chain (Euler tour) ---------------------------------------
+  // A linkage whose mimic joints follow masters in other branches (palletizer parallelograms: URDF trees with mimics
+  // that close the loops) cannot be split into independent serial chains. The whole group (a top-level chain and all
+  // chains below it) becomes one Robot whose chain visits every side branch and comes back from it with compensating
+  // joints (the joint's motion undone by a mimic with the opposite multiplier, then the inverse origin), before it
+  // continues along the main path to the tip. Every link keeps its tree pose for any joint values, the mimics follow
+  // their masters, and the DOF are the independent joints of the mechanism.
+  const chainOf = new Map<KinJoint, ChainBuild>();
+  for (const ch of chains) { for (const j of ch.joints) chainOf.set(j, ch); for (const m of ch.sideMimics) for (const d of [m, ...movableBelow(m.child)]) chainOf.set(d, ch); }
+  const rootOf = (ch: ChainBuild): ChainBuild => (ch.parent ? rootOf(ch.parent) : ch);
+  for (const top of chains.filter((c) => !c.parent)) {
+    const group = chains.filter((c) => rootOf(c) === top);
+    const inGroup = new Set(group.flatMap((c) => [...c.joints, ...c.sideMimics.flatMap((m) => [m, ...movableBelow(m.child)])]));
+    const cross = [...inGroup].some((j) => { if (!j.mimic) return false; const m = jointByName.get(j.mimic.joint); return !!m && inGroup.has(m) && chainOf.get(m) !== chainOf.get(j); });
+    if (!cross) continue;
+    for (const j of inGroup) folded.delete(j); // side mimics are toured as moving joints
+    const j0 = top.joints[0];
+    // main path: to a tip link, else the path with the most independent joints
+    const best = (j: KinJoint): KinJoint[] => {
+      if (fixedReach(j.child).some((l) => tips.has(l))) return [j];
+      let pick: KinJoint[] = [];
+      for (const k of nextMovables(j.child)) {
+        const p = best(k); const score = (x: KinJoint[]) => (x.some((y) => fixedReach(y.child).some((l) => tips.has(l))) ? 1e6 : 0) + x.filter((y) => !y.mimic).length * 1000 + x.length;
+        if (!pick.length || score(p) > score(pick)) pick = p;
+      }
+      return [j, ...pick];
+    };
+    const path = best(j0);
+    // a mimic resolved to the independent joint that drives it (mimic of a mimic composed)
+    const resolveMimic = (j: KinJoint, depth = 0): { joint: string; multiplier: number; offset: number } | null => {
+      if (!j.mimic) return null;
+      const m = jointByName.get(j.mimic.joint);
+      if (!m || !inGroup.has(m) || depth > 16) return null;
+      const up = resolveMimic(m, depth + 1);
+      return up ? { joint: up.joint, multiplier: j.mimic.multiplier * up.multiplier, offset: j.mimic.multiplier * up.offset + j.mimic.offset } : { ...j.mimic };
+    };
+    const defs: JointDef[] = []; const links: Collected[] = []; const linkNames: string[] = [];
+    const jointDef = (j: KinJoint, origin: Mat4): JointDef => {
+      const prism = j.type === 'prismatic';
+      const cont = j.type === 'continuous' || (!prism && (j.lower === undefined || j.upper === undefined));
+      const lower = j.lower ?? (prism ? -1000 : cont ? -360 : -180), upper = j.upper ?? (prism ? 1000 : cont ? 360 : 180);
+      const p0 = j.position ?? 0, home = cont && !prism ? p0 - 360 * Math.round(p0 / 360) : Math.max(lower, Math.min(upper, p0));
+      const def: JointDef = { name: j.name, type: prism ? 'prismatic' : cont ? 'continuous' : 'revolute', origin, axis: normalize(j.axis), lower, upper, home };
+      if (j.velocity !== undefined) def.maxVelocity = j.velocity;
+      if (j.mimic) { const r = resolveMimic(j); if (r) def.mimic = r; else report.push(`${name}: mimic joint ${j.name} follows ${j.mimic.joint} outside its mechanism; imported as independent`); }
+      return def;
+    };
+    const enter = (cur: string, j: KinJoint): JointDef => {
+      const def = jointDef(j, multiply(fixedPath(cur, j.parent), j.origin));
+      const c = newCollected(); collectStatic(j.child, identity(), c, folded);
+      defs.push(def); links.push(c); linkNames.push(j.child);
+      return def;
+    };
+    const back = (j: KinJoint, def: JointDef) => {
+      const undo = def.mimic ? { joint: def.mimic.joint, multiplier: -def.mimic.multiplier, offset: -def.mimic.offset } : { joint: def.name, multiplier: -1, offset: 0 };
+      defs.push({ name: `${j.name}__return`, type: def.type === 'prismatic' ? 'prismatic' : 'continuous', origin: identity(), axis: def.axis, post: invert(def.origin), lower: -1e6, upper: 1e6, mimic: undo });
+      links.push(newCollected()); linkNames.push(`${j.child}__return`);
+    };
+    const side = (cur: string, j: KinJoint) => { const def = enter(cur, j); for (const k of nextMovables(j.child)) side(j.child, k); back(j, def); };
+    path.forEach((j, k) => {
+      const cur = k === 0 ? j.parent : path[k - 1].child;
+      if (k > 0) for (const s of nextMovables(cur)) if (s !== j) side(cur, s);
+      enter(cur, j);
+    });
+    const last = path[path.length - 1];
+    const endLink = defs.length; // chain link of the main path's end (links[0] is the base)
+    for (const s of nextMovables(last.child)) side(last.child, s);
+    const tip = fixedReach(last.child).find((l) => tips.has(l));
+    const merged: ChainBuild = { joints: path, parent: null, flange: tip ? fixedPath(last.child, tip) : identity(), name: '', links, sideMimics: [], tour: { defs, linkNames, ...(defs.length > endLink ? { flangeLink: endLink } : {}) } };
+    const at = chains.indexOf(top);
+    for (const c of group) chains.splice(chains.indexOf(c), 1);
+    chains.splice(Math.min(at, chains.length), 0, merged);
+    report.push(`${name}: mechanism ${j0.name}… with cross-chain mimics imported as one chain of ${defs.filter((d) => !d.mimic).length} DOF (${defs.filter((d) => d.mimic && !d.name.endsWith('__return')).length} mimic joints follow their masters)`);
+  }
   for (const ch of chains) for (const m of ch.sideMimics) report.push(`${name}: mimic side branch ${m.name} (follows ${m.mimic?.joint}) is drawn static at its initial value`);
 
   // ---- items -----------------------------------------------------------------------------------------------------
@@ -369,6 +461,25 @@ export function buildStationItemsFromTree(tree: KinTree, opts: KinBuildOptions =
 
   chains.forEach((ch, idx) => {
     ch.name = chains.length === 1 && !makeMobile ? name : `${name}_${chainSuffix(ch.joints, idx)}`;
+    if (ch.tour) {
+      const { defs, linkNames } = ch.tour;
+      const linkDefs: LinkDef[] = [{ name: ch.joints[0].parent, visuals: [] }, ...defs.map((_, k) => {
+        const ld: LinkDef & { collisions?: GeometryRef[] } = { name: linkNames[k], visuals: ch.links[k].visuals.map(toLinkVisual) };
+        if (ch.links[k].hasCollisions) ld.collisions = ch.links[k].collisions;
+        return ld;
+      })];
+      const chain: ChainDef = { name: ch.name, joints: defs, links: linkDefs, flange: ch.flange, dof: defs.filter((d) => !d.mimic).length, ...(ch.tour.flangeLink !== undefined ? { flangeLink: ch.tour.flangeLink } : {}) };
+      const r = new Robot(ch.name, chain);
+      r.params.source = 'kintree';
+      r.params.kinTree = tree.name;
+      r.setJoints(defs.filter((d) => !d.mimic).map((d) => d.home ?? 0));
+      ch.robot = r;
+      robots.push(r);
+      const Tb = T0.get(ch.joints[0].parent) ?? identity();
+      const fk = r.fk(r.joints());
+      ch.links.forEach((c, k) => { for (const v of c.visuals) allVisuals.push(moveGeometry(v, multiply(Tb, fk.linkPoses[k + 1]))); });
+      return;
+    }
     const jset = new Set(ch.joints.map((j) => j.name));
     const jdefs: JointDef[] = ch.joints.map((j, k) => {
       const origin = k === 0 ? j.origin : multiply(fixedPath(ch.joints[k - 1].child, j.parent), j.origin);
@@ -420,22 +531,31 @@ export function buildStationItemsFromTree(tree: KinTree, opts: KinBuildOptions =
     const rs = wheels.map((w) => radius.get(w)).filter((v): v is number => v !== undefined);
     if (rs.length) kin.wheelRadius = mean(rs);
     const steered = new Set(steers.flatMap((s) => movableBelow(s.child)));
+    // driving axes from the wheels: lateral = the wheel axes (in the ground plane), forward = lateral x up; for a
+    // steered base forward points from the rear to the steered axle (a URDF may drive along -Y of its base frame)
+    let lat: Vec3 = [0, 0, 0];
+    for (const w of wheels) { const a = normalize(transformDir(multiply(T0.get(w.parent) ?? identity(), w.origin), w.axis)); const sg = lat[0] * a[0] + lat[1] * a[1] < 0 ? -1 : 1; lat = [lat[0] + sg * a[0], lat[1] + sg * a[1], 0]; }
+    if (Math.hypot(lat[0], lat[1]) < 1e-6) lat = [0, 1, 0];
+    lat = normalize(lat);
+    let fwd: Vec3 = [lat[1], -lat[0], 0];
+    const front = wheels.filter((w) => steered.has(w)), rear = wheels.filter((w) => !steered.has(w));
+    const along = (w: KinJoint, d: Vec3) => { const c = centers.get(w)!; return c[0] * d[0] + c[1] * d[1]; };
+    if (steers.length && rear.length ? mean(front.map((w) => along(w, fwd))) < mean(rear.map((w) => along(w, fwd))) : fwd[0] < -1e-9 || (Math.abs(fwd[0]) <= 1e-9 && fwd[1] < 0)) { fwd = [-fwd[0], -fwd[1], 0]; lat = [-lat[0], -lat[1], 0]; }
     if (steers.length) {
-      const front = wheels.filter((w) => steered.has(w)), rear = wheels.filter((w) => !steered.has(w));
       kin.drive = 'ackermann';
-      kin.wheelBase = Math.abs(mean(front.map((w) => centers.get(w)![0])) - (rear.length ? mean(rear.map((w) => centers.get(w)![0])) : 0));
+      kin.wheelBase = Math.abs(mean(front.map((w) => along(w, fwd))) - (rear.length ? mean(rear.map((w) => along(w, fwd))) : 0));
       const axle = rear.length >= 2 ? rear : front;
-      const ys = axle.map((w) => centers.get(w)![1]);
+      const ys = axle.map((w) => along(w, lat));
       kin.track = Math.max(...ys) - Math.min(...ys);
       const lim = steers.map((s) => (unlimited(s) ? 30 : Math.max(Math.abs(s.lower!), Math.abs(s.upper!))));
       kin.maxSteer = Math.min(...lim);
       kin.minTurnRadius = kin.wheelBase / Math.tan(kin.maxSteer * DEG);
     } else if (wheels.length >= 2) {
       kin.drive = 'differential';
-      const left = wheels.filter((w) => centers.get(w)![1] > 0).map((w) => centers.get(w)![1]);
-      const right = wheels.filter((w) => centers.get(w)![1] <= 0).map((w) => centers.get(w)![1]);
-      kin.track = left.length && right.length ? mean(left) - mean(right) : 2 * Math.abs(mean([...left, ...right]));
-      const xs = wheels.map((w) => centers.get(w)![0]);
+      const ls = wheels.map((w) => along(w, lat)); const m = mean(ls);
+      const left = ls.filter((v) => v > m + 1e-6), right = ls.filter((v) => v <= m + 1e-6);
+      kin.track = left.length && right.length ? mean(left) - mean(right) : 2 * Math.abs(m);
+      const xs = wheels.map((w) => along(w, fwd));
       kin.wheelBase = Math.max(...xs) - Math.min(...xs);
       kin.minTurnRadius = 0;
     } else {
@@ -456,6 +576,10 @@ export function buildStationItemsFromTree(tree: KinTree, opts: KinBuildOptions =
     mobile.kin = { ...mobile.kin, ...kin, ...kinOverride };
     mobile.params.wheelJoints = wheels.map((w) => w.name);
     mobile.params.steerJoints = steers.map((s) => s.name);
+    if (wheels.length >= 2) {
+      mobile.params.forwardAxis = [Number(fwd[0].toFixed(6)), Number(fwd[1].toFixed(6)), 0];
+      if (fwd[0] < 0.99) report.push(`${name}: the wheels drive along (${fwd[0].toFixed(2)}, ${fwd[1].toFixed(2)}) of the base frame, not its +X (wheel base / track measured along that axis)`);
+    }
     if (floating) mobile.params.floatingBase = floating.type;
     root = mobile;
     report.push(`${name}: MobileRobot ${mobile.kin.drive}${wheels.length ? ` (${wheels.length} wheels, radius ${(mobile.kin.wheelRadius).toFixed(1)} mm, track ${mobile.kin.track.toFixed(1)} mm${mobile.kin.drive === 'ackermann' ? `, wheel base ${mobile.kin.wheelBase.toFixed(1)} mm, max steer ${mobile.kin.maxSteer.toFixed(2)} deg` : ''})` : floating ? ' (floating base)' : ' (kinematic platform)'}`);
@@ -527,7 +651,7 @@ export function buildStationItemsFromTree(tree: KinTree, opts: KinBuildOptions =
   for (const ch of chains) {
     ch.links.forEach((c, k) => {
       for (const s of c.sensors) {
-        if (k !== ch.links.length - 1) report.push(`${name}: sensor ${s.name} sits on intermediate link ${ch.joints[k].child} of ${ch.name}; it is attached to the flange at the initial pose`);
+        if (k !== ch.links.length - 1) report.push(`${name}: sensor ${s.name} sits on intermediate link ${ch.tour ? ch.tour.linkNames[k] : ch.joints[k].child} of ${ch.name}; it is attached to the flange at the initial pose`);
         let pose = multiply(invert(ch.flange), s.pose);
         if (k !== ch.links.length - 1) {
           const r = ch.robot!;

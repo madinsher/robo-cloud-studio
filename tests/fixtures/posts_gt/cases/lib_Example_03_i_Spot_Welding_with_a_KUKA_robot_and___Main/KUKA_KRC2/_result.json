@@ -3,9 +3,6 @@
  "error": null,
  "log": "",
  "files": [
-  "Main.src",
-  "WeldPair1.src",
-  "WeldPair2.src",
-  "WeldPair3.src"
+  "Main.src"
  ]
 }

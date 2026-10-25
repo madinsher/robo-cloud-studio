@@ -38,7 +38,7 @@ function itemLinkPoses(robots: Robot[]): Map<string, Mat4> {
   const out = new Map<string, Mat4>();
   for (const r of robots) {
     const fk = r.fk(r.joints());
-    r.chain.links.forEach((l, i) => { if (i > 0) out.set(l.name, multiply(r.poseAbs(), fk.linkPoses[i])); });
+    r.chain.links.forEach((l, i) => { if (i > 0 && !l.name.endsWith('__return')) out.set(l.name, multiply(r.poseAbs(), fk.linkPoses[i])); }); // __return: the way back from a side branch of a mechanism
   }
   return out;
 }
@@ -216,14 +216,16 @@ describe('buildStationItemsFromTree', () => {
     expect(forced.mobile!.kin.wheelBase).toBe(2000);
   });
 
-  it('reports cross-chain mimics and sensors on intermediate links', () => {
+  it('a mimic of a joint in another branch makes one mechanism (the mimic follows its master); sensors on intermediate links are reported', () => {
     const tree: KinTree = {
       name: 't', root: 'b', links: ['b', 'c', 'x1', 'x2', 'z1', 'y1'].map((n) => link(n)),
       joints: [rev('yaw', 'b', 'c', transl(0, 0, 100), [0, 0, 1]), rev('x1', 'c', 'x1', transl(0, 100, 0), [0, 1, 0]), rev('x2', 'x1', 'x2', transl(0, 0, 100), [0, 1, 0]), rev('z1', 'c', 'z1', transl(0, -100, 0), [0, 1, 0]), rev('y1', 'z1', 'y1', transl(0, 0, 100), [0, 1, 0], -90, 90, { mimic: { joint: 'x1', multiplier: 1, offset: 0 } })],
     };
     tree.links.find((l) => l.name === 'x1')!.sensors = [{ kind: 'camera', name: 'mid', pose: identity() }];
     const res = buildStationItemsFromTree(tree);
-    expect(res.report.some((l) => l.includes('mimic joint y1 follows x1 of another chain'))).toBe(true);
+    expect(res.report.some((l) => l.includes('imported as independent'))).toBe(false);
+    expect(res.report.some((l) => /with cross-chain mimics imported as one chain of 4 DOF/.test(l))).toBe(true);
+    expect(res.robots).toHaveLength(1); expect(res.robots[0].jointNames().sort()).toEqual(['x1', 'x2', 'yaw', 'z1']);
     expect(res.report.some((l) => l.includes('sensor mid sits on intermediate link x1'))).toBe(true);
     const cam = res.cameras[0] as Camera;
     const x = res.robots.find((r) => r.jointNames().includes('x2'))!;
@@ -233,5 +235,6 @@ describe('buildStationItemsFromTree', () => {
     expectSamePose(cam.poseAbs(), ref.get('x1')!);
     expect(transformDir(cam.poseAbs(), [0, 0, 1])).toBeTruthy();
     void (cam as Item);
+    checkFK(tree, res.robots, 7); // every link of the mechanism at random joint values, y1 following x1 on its own branch
   });
 });

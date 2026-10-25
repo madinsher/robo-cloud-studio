@@ -214,6 +214,11 @@ export class ApiExec {
   private scriptRunner: ScriptRunner | null = null;
   /** >0 while a synchronous (in-process) transport call runs: waits must complete synchronously. */
   syncDepth = 0;
+  /**
+   * >0 while a call from a caller that can await promises runs (a Pyodide script suspended through WebAssembly JSPI):
+   * waits and blocking moves are realtime (promises, own ticker) even when `mode` is 'virtual'.
+   */
+  asyncDepth = 0;
   /** true once a shared runtime was attached (attach()). */
   attachedRuntime = false;
   /** Called after every simulation step this layer performs (spray deposition, ...). */
@@ -258,7 +263,9 @@ export class ApiExec {
     }
     return this.runtime;
   }
-  private get virtual(): boolean { return this.mode === 'virtual' || this.syncDepth > 0; }
+  private get virtual(): boolean { return this.isVirtual(); }
+  /** Waits complete synchronously (virtual clock) for the current caller. */
+  isVirtual(): boolean { return this.syncDepth > 0 || (this.mode === 'virtual' && this.asyncDepth === 0); }
 
   start(program: Item, opts: { robot?: Item | null; startJoints?: number[]; args?: string[] } = {}, rt: StationRuntimeLike = this.rt()): RunHandleLike {
     const h = rt.start(program, opts);
@@ -392,7 +399,7 @@ export class ApiExec {
   }
 
   private ensureTicker(): void {
-    if (this.mode !== 'realtime' || this.external || this.timer) return;
+    if ((this.mode !== 'realtime' && this.asyncDepth === 0) || this.external || this.timer) return;
     this.last = Date.now();
     this.timer = setInterval(() => {
       const now = Date.now();

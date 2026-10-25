@@ -49,6 +49,8 @@ function protoParams(n: WNode, out: Record<string, ParamValue>): void {
 export class WebotsSceneBuilder {
   readonly ctx: BuildCtx;
   readonly robots: WebotsBuildResult['robots'] = [];
+  /** Contact materials of mecanum / omni wheels (WorldInfo contactProperties with an anisotropic, rotated friction). */
+  readonly omniMaterials = new Set<string>();
   constructor(public reg: ProtoRegistry, src: WebotsSource, opts: WebotsBuildOptions) {
     this.ctx = { reg, src, assets: opts.assets, report: [], loadMeshes: opts.loadMeshes ?? true, meshes: new Map(), warned: new Set() };
   }
@@ -74,7 +76,13 @@ export class WebotsSceneBuilder {
           webots.gravity = fNum1(n, 'gravity', 9.81);
           webots.coordinateSystem = fStr(n, 'coordinateSystem', 'ENU');
           webots.FPS = fNum1(n, 'FPS', 60);
-          webots.contactProperties = fNodes(n, 'contactProperties').map((c) => ({ material1: fStr(c, 'material1', 'default'), material2: fStr(c, 'material2', 'default'), coulombFriction: fNum(c, 'coulombFriction', [1]), bounce: fNum1(c, 'bounce', 0.5), softCFM: fNum1(c, 'softCFM', 0.001) }));
+          webots.contactProperties = fNodes(n, 'contactProperties').map((c) => ({ material1: fStr(c, 'material1', 'default'), material2: fStr(c, 'material2', 'default'), coulombFriction: fNum(c, 'coulombFriction', [1]), frictionRotation: fNum(c, 'frictionRotation', [0, 0]), bounce: fNum1(c, 'bounce', 0.5), softCFM: fNum1(c, 'softCFM', 0.001) }));
+          // mecanum / omni wheels are modelled in Webots by an anisotropic contact (one coulombFriction direction 0,
+          // the friction directions rotated by frictionRotation, the KUKA youBot: ±45°)
+          for (const c of fNodes(n, 'contactProperties')) {
+            const mu = fNum(c, 'coulombFriction', [1]), rot = fNum(c, 'frictionRotation', [0, 0]);
+            if (mu.length >= 2 && mu.some((v) => v === 0) && mu.some((v) => v > 0) && rot.some((v) => Math.abs(v) > 1e-3)) for (const m of [fStr(c, 'material1', 'default'), fStr(c, 'material2', 'default')]) if (m !== 'default') this.omniMaterials.add(m);
+          }
           station.settings.gravity = -fNum1(n, 'gravity', 9.81);
           const info = fStrs(n, 'info');
           if (info.length) { const notes = new Notes('World info'); notes.text = info.join('\n'); station.addChild(notes); }
@@ -249,7 +257,17 @@ export class WebotsSceneBuilder {
         }
       }
     }
-    const res = buildStationItemsFromTree(tree, { name: info.name, assets: this.ctx.assets, drive });
+    let res = buildStationItemsFromTree(tree, { name: info.name, assets: this.ctx.assets, drive });
+    // wheels on a mecanum contact material: a holonomic base, not a differential one
+    if (res.mobile && drive === 'auto' && this.omniMaterials.size) {
+      const wj = (res.mobile.params.wheelJoints as string[] | undefined) ?? [];
+      const mats = wj.map((jn) => { const j = tree.joints.find((x) => x.name === jn); const l = j ? tree.links.find((x) => x.name === j.child) : undefined; return String(l?.params?.contactMaterial ?? ''); });
+      if (wj.length >= 3 && mats.every((m) => this.omniMaterials.has(m))) {
+        const k = res.mobile.kin;
+        res = buildStationItemsFromTree(tree, { name: info.name, assets: this.ctx.assets, drive: { wheels: wj, drive: 'omni', wheelBase: k.wheelBase, track: k.track, wheelRadius: k.wheelRadius, minTurnRadius: 0, maxLateralSpeed: k.maxSpeed, ...(k.track + k.wheelBase > 0 ? { maxYawRate: (k.maxSpeed / ((k.track + k.wheelBase) / 2)) * (180 / Math.PI) } : {}) } });
+        res.report = res.report.map((l) => l.replace(/MobileRobot \w+ \(/, 'MobileRobot omni (mecanum wheels on contact materials ' + [...new Set(mats)].join(', ') + '; '));
+      }
+    }
     for (const l of res.report) this.ctx.report.push(l);
     const root = res.root;
     for (const [k, v] of Object.entries(info.params)) root.params[k] = v;

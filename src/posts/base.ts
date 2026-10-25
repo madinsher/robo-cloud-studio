@@ -1,13 +1,19 @@
 import { Station, Target, Tool, Item, ItemType } from '../core/items/item';
 import { Robot } from '../core/items/robot';
-import { Program, Instruction } from '../core/items/program';
+import { Program, Instruction, describeInstruction } from '../core/items/program';
 import { Mat4, multiply, invert, fromArray, identity, poseToXyzrpw } from '../core/math/pose';
 import { actuatedIndices } from '../core/kinematics/chain';
+import { configFlags } from '../core/kinematics/ik_analytic';
 
 /** Flat, resolved representation of a program that post processors consume. */
 export type PostEvent =
-  | { kind: 'moveJ'; joints: number[]; pose: Mat4 | null; name: string; speed?: number; rounding?: number; conf?: number[] }
-  | { kind: 'moveL'; joints: number[] | null; pose: Mat4; name: string; speed?: number; rounding?: number; conf?: number[] }
+  /**
+   * jointTarget: the target is a joint target (or inline joints). RoboDK hands its posts pose = None for it (a MoveL
+   * then becomes movel(joints) / MoveL CalcRobT / LMOVE #[..] or a "not supported" comment, by post); `pose` keeps the
+   * forward kinematics for the studio's own consumers, robopost.replayEvents and toPostJob pass null.
+   */
+  | { kind: 'moveJ'; joints: number[]; pose: Mat4 | null; name: string; speed?: number; rounding?: number; conf?: number[]; jointTarget?: boolean }
+  | { kind: 'moveL'; joints: number[] | null; pose: Mat4; name: string; speed?: number; rounding?: number; conf?: number[]; jointTarget?: boolean }
   | { kind: 'moveC'; joints: number[] | null; via: Mat4; pose: Mat4; name: string; viaName: string; viaJoints?: number[] | null; viaConf?: number[]; conf?: number[]; speed?: number; rounding?: number }
   | { kind: 'setFrame'; pose: Mat4; name: string; frameId?: number }
   | { kind: 'setTool'; pose: Mat4; name: string; toolId: string | null; toolNum?: number }
@@ -125,6 +131,9 @@ function armGeometry(robot: Robot, q: number[]): ArmGeo | null {
  */
 export function confRLF(robot: Robot | null, q: number[] | null): number[] {
   if (!robot || !q || robot.dof < 6) return [0, 0, 0];
+  // closed-form 6R arms: RoboDK's own JointsConfig rules (joint senses honoured, e.g. a Fanuc J5 > 0 is FLIP), checked
+  // against RoboDK 5.9.4 in tests/kin_ik.test.ts; the geometric estimate below covers the other chains
+  try { const cf = configFlags(robot.chain, q); if (cf) return [...cf]; } catch { /* fall through */ }
   try {
     const g = armGeometry(robot, q);
     if (!g) return [0, 0, 0];
@@ -145,14 +154,24 @@ export function confRLF(robot: Robot | null, q: number[] | null): number[] {
   }
 }
 
-/** RoboDK frame/tool index from the item name ("Frame 3" -> 3, "Spindle" -> -1). */
+/**
+ * RoboDK frame/tool index from the item name: the last number standing as a word of its own ("Frame 3" -> 3,
+ * "USER - CONE - 10MM  X  45 DEG" -> 45, "USER - ENGRAVE - 30 DEG POINT END" -> 30; "BALL END - 10MM" and "Spindle"
+ * -> -1, RoboDK 5.9.4 Motoman output of Library 02.i), else trailing digits ("Tool2" -> 2).
+ */
 export function nameIndex(name: string): number {
+  const words = name.split(/[\s\-_,;:()]+/).filter((w) => /^\d+$/.test(w));
+  if (words.length) return Number(words[words.length - 1]);
   const m = name.match(/(\d+)\s*$/);
   return m ? Number(m[1]) : -1;
 }
 
 export interface CompileOptions {
-  /** Emit the program's frame and tool before the first move when the program does not set them (default true for the exported program; sub-programs inherit the caller's). */
+  /**
+   * Emit the program's frame and tool before the first move when the program does not set them. Default: only for a
+   * program-level frame / tool (Program.frameId / toolId); like RoboDK's MakeProgram, a program without "Set reference
+   * frame" / "Set tool" instructions gets no implicit $BASE / $TOOL / ref_frame lines. true = always; false = never.
+   */
   initialFrameTool?: boolean;
   /** Subsample recorded joint paths to at most this many rows (default: keep all). */
   maxJointPathRows?: number;
@@ -217,20 +236,21 @@ export function compileForPost(station: Station, program: Program, options: Comp
     problems.push(`${label}: unreachable (${r.posError.toFixed(1)} mm), joints kept from the target`);
     return seed && seed.length >= dof ? seed.slice(0, Math.max(dof, seed.length)) : r.joints?.length ? r.joints : q;
   };
-  const resolveTarget = (target: Target | null, d: Extract<Instruction['data'], { kind: 'move' }>, viaPart: boolean): { pose: Mat4 | null; joints: number[] | null } => {
+  const resolveTarget = (target: Target | null, d: Extract<Instruction['data'], { kind: 'move' }>, viaPart: boolean): { pose: Mat4 | null; joints: number[] | null; jointTarget?: boolean } => {
     const tool = toolPose();
     if (target) {
       if (target.isJointTarget && target.joints) {
         const pose = robot ? multiply(invert(framePoseInBase()), robot.solveFK(target.joints.slice(0, dof), tool)) : null;
-        return { pose, joints: target.joints.slice() };
+        return { pose, joints: target.joints.slice(), jointTarget: true };
       }
       const pose = targetPose(target);
       return { pose, joints: solve(pose, target.joints, `${target.name}`) };
     }
     const jj = viaPart ? undefined : d.joints;
     const pp = viaPart ? d.viaPose : d.pose;
-    if (jj) return { pose: robot ? multiply(invert(framePoseInBase()), robot.solveFK(jj.slice(0, dof), tool)) : null, joints: jj.slice() };
-    if (pp) { const pose = fromArray(pp); return { pose, joints: solve(pose, null, 'inline pose') }; }
+    // an inline target with a pose is Cartesian (its joints only pick the configuration); joints alone: a joint target
+    if (pp) { const pose = fromArray(pp); return { pose, joints: solve(pose, jj ? jj.slice() : null, 'inline pose') }; }
+    if (jj) return { pose: robot ? multiply(invert(framePoseInBase()), robot.solveFK(jj.slice(0, dof), tool)) : null, joints: jj.slice(), jointTarget: true };
     return { pose: null, joints: null };
   };
 
@@ -247,6 +267,10 @@ export function compileForPost(station: Station, program: Program, options: Comp
     if ((d.rounding !== undefined || effRound !== undefined) && wantR !== effRound) { events.push({ kind: 'setRounding', radius: wantR }); effRound = wantR; }
   };
   const compileSub = (p: Program): string => {
+    // a program of another robot or mechanism (turntable, gripper, conveyor) is only called, like RoboDK does: its
+    // motions belong to that robot's controller program and must never be generated as moves of this robot
+    const callee = p.robot();
+    if (robotItem && callee && callee !== robotItem) return p.name;
     if (!compiled.has(p.name)) {
       const placeholder = { name: p.name } as PostProgram;
       compiled.set(p.name, placeholder);
@@ -268,7 +292,8 @@ export function compileForPost(station: Station, program: Program, options: Comp
     switch (d.kind) {
       case 'move': {
         const target = d.targetId ? (station.findById(d.targetId) as Target | null) : null;
-        const { pose, joints } = resolveTarget(target, d, false);
+        const { pose, joints, jointTarget } = resolveTarget(target, d, false);
+        const jt = jointTarget ? { jointTarget: true } : {};
         const name = target?.name ?? insn.name;
         if (d.moveType === 'MoveJ') {
           let j = joints && joints.length ? joints : null;
@@ -278,12 +303,12 @@ export function compileForPost(station: Station, program: Program, options: Comp
           }
           applyOverrides(d, false);
           q = j;
-          events.push({ kind: 'moveJ', joints: j, pose, name, speed: d.speed, rounding: d.rounding, conf: conf(j) });
+          events.push({ kind: 'moveJ', joints: j, pose, name, speed: d.speed, rounding: d.rounding, conf: conf(j), ...jt });
         } else if (d.moveType === 'MoveL') {
           if (!pose) { problems.push(`${name}: MoveL without a pose skipped`); break; }
           applyOverrides(d, true);
           if (joints) q = joints;
-          events.push({ kind: 'moveL', joints, pose, name, speed: d.speed, rounding: d.rounding, conf: conf(joints) });
+          events.push({ kind: 'moveL', joints, pose, name, speed: d.speed, rounding: d.rounding, conf: conf(joints), ...jt });
         } else {
           const via = d.viaTargetId ? (station.findById(d.viaTargetId) as Target | null) : null;
           const v = resolveTarget(via, d, true);
@@ -312,7 +337,10 @@ export function compileForPost(station: Station, program: Program, options: Comp
         break;
       case 'tool':
         toolItem = d.toolId ? station.findById(d.toolId) : null;
-        events.push({ kind: 'setTool', pose: toolPose(), name: toolItem?.name ?? 'Flange', toolId: d.toolId, toolNum: nameIndex(toolItem?.name ?? '') });
+        // a "Set Tool" whose tool item was deleted in RoboDK keeps only its TCP: RoboDK names that tool after the
+        // instruction ("Set Tool: Tool RDK Ry15" -> ABB tooldata SetToolToolRDKRy15, 05.b); the importer recreated it
+        const toolName = toolItem?.params?.rdkFromInstruction === true && insn.name ? insn.name : toolItem?.name ?? 'Flange';
+        events.push({ kind: 'setTool', pose: toolPose(), name: toolName, toolId: d.toolId, toolNum: nameIndex(toolName) });
         break;
       case 'speed':
         events.push({ kind: 'setSpeed', speedLinear: d.speedLinear, speedJoints: d.speedJoints, accelLinear: d.accelLinear, accelJoints: d.accelJoints });
@@ -341,10 +369,14 @@ export function compileForPost(station: Station, program: Program, options: Comp
         break;
       case 'event': {
         const obj = d.objectId ? station.findById(d.objectId) : null;
-        const who = toolItem?.name ?? 'Tool';
-        if (d.action === 'attach' || d.action === 'gripper_close') events.push({ kind: 'gripper', close: true, text: d.action === 'attach' ? `Attach to ${who}` : 'gripper close' });
-        else if (d.action === 'detach' || d.action === 'gripper_open') events.push({ kind: 'gripper', close: false, text: d.action === 'detach' ? `Detach from ${who}` : 'gripper open' });
-        else events.push({ kind: 'comment', text: `${d.action === 'custom' ? d.name ?? 'event' : d.action} ${obj?.name ?? d.name ?? ''}`.trim() });
+        const evTool = (d as { toolId?: string | null }).toolId ? station.findById((d as { toolId?: string }).toolId!) : null;
+        const who = evTool?.name ?? toolItem?.name ?? 'Tool';
+        // RoboDK writes a simulation event as a comment holding the instruction's name ("Attach to GripperOpened",
+        // "Replace objects", "Show Part Done 1"); a nameless event gets a generated one
+        const label = insn.name && insn.name !== describeInstruction(d) ? insn.name.trim() : '';
+        if (d.action === 'attach' || d.action === 'gripper_close') events.push({ kind: 'gripper', close: true, text: label || (d.action === 'attach' ? `Attach to ${who}` : 'gripper close') });
+        else if (d.action === 'detach' || d.action === 'gripper_open') events.push({ kind: 'gripper', close: false, text: label || (d.action === 'detach' ? `Detach from ${who}` : 'gripper open') });
+        else events.push({ kind: 'comment', text: label || (d.action === 'custom' ? d.name ?? 'event' : `${d.action} ${obj?.name ?? d.name ?? ''}`.trim()) });
         break;
       }
       case 'call': {
@@ -396,13 +428,14 @@ export function compileForPost(station: Station, program: Program, options: Comp
         break;
     }
   }
-  // the exported program starts in its own frame / with its own tool (sub-programs inherit the caller's)
+  // a program-level frame / tool (no RoboDK equivalent) is stated before the first move; sub-programs inherit the caller's
   if (!isSub && options.initialFrameTool !== false) {
+    const wantFrame = options.initialFrameTool === true || !!program.frameId, wantTool = options.initialFrameTool === true || !!program.toolId;
     const firstMove = events.findIndex((e) => e.kind === 'moveJ' || e.kind === 'moveL' || e.kind === 'moveC' || e.kind === 'callProgram' || e.kind === 'loop' || e.kind === 'if');
     const before = firstMove < 0 ? events : events.slice(0, firstMove);
     const pre: PostEvent[] = [];
-    if (firstMove >= 0 && !before.some((e) => e.kind === 'setFrame')) pre.push({ kind: 'setFrame', pose: initialFrame.pose, name: initialFrame.name, frameId: nameIndex(initialFrame.name) });
-    if (firstMove >= 0 && !before.some((e) => e.kind === 'setTool')) pre.push({ kind: 'setTool', pose: initialTool.pose, name: initialTool.name, toolId: toolItem?.id ?? null, toolNum: nameIndex(initialTool.name) });
+    if (wantFrame && firstMove >= 0 && !before.some((e) => e.kind === 'setFrame')) pre.push({ kind: 'setFrame', pose: initialFrame.pose, name: initialFrame.name, frameId: nameIndex(initialFrame.name) });
+    if (wantTool && firstMove >= 0 && !before.some((e) => e.kind === 'setTool')) pre.push({ kind: 'setTool', pose: initialTool.pose, name: initialTool.name, toolId: toolItem?.id ?? null, toolNum: nameIndex(initialTool.name) });
     events.unshift(...pre);
   }
   const out: PostProgram = {
@@ -424,8 +457,27 @@ export function compileForPost(station: Station, program: Program, options: Comp
     const walk = (p: PostProgram) => { for (const s of p.subprograms) if (!all.includes(s) && s !== out) { all.push(s); walk(s); } };
     walk(out);
     out.subprograms = all;
+    dropRepeatedFrameTool([out, ...all]);
   }
   return out;
+}
+
+/**
+ * RoboDK's generator hands a "Set reference frame" / "Set tool" to the post only when it changes the frame / tool it
+ * sent last. The state runs through the whole generation, the program first and then its sub-programs in the order
+ * they are generated; calls do not change it (RoboDK 5.9.4 MakeProgram of the Library stations, e.g. 06.f MainProgram
+ * and 01.a MainProg: tests/posts_library_code.test.ts).
+ */
+export function dropRepeatedFrameTool(programs: PostProgram[]): void {
+  const key = (e: { pose: Mat4; name: string }) => `${e.name}|${Array.from(e.pose, (v) => v.toFixed(6)).join(',')}`;
+  let frame: string | null = null, tool: string | null = null;
+  for (const p of programs) {
+    p.events = p.events.filter((e) => {
+      if (e.kind === 'setFrame') { const k = key(e); if (k === frame) return false; frame = k; }
+      else if (e.kind === 'setTool') { const k = key(e); if (k === tool) return false; tool = k; }
+      return true;
+    });
+  }
 }
 
 // ---- helpers shared by posts -------------------------------------------------

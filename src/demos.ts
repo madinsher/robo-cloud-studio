@@ -9,6 +9,7 @@ import { FieldItem, MissionItem, cropParams } from './agri/items';
 import { generateOrchard, buildFieldMap, rectPolygon, makeHeadlandZones, makeCanopyZones } from './agri/orchard';
 import { planMission } from './agri/missions';
 import { buildGreenhouse, useRails } from './agri/greenhouse';
+import { mountArmOnLift, addLiftColumn } from './agri/harvest';
 import { makeConveyor, makeFeeder, makeProcess, makeSink, makeBuffer, Component } from './vc/component';
 import { multiply, invert } from './core/math/pose';
 
@@ -174,9 +175,12 @@ function orchard(): Station {
     m.setPose2D(-6000, 14000 + i * 4000, 0);
     m.home = { x: -6000, y: 14000 + i * 4000, theta: 0 };
     fm.addRobot(m);
-    // a picking arm on each platform
+    // a picking arm on each platform, on a telescopic lift column at the row-side edge (arm base 1.4–3.5 m above the
+    // ground: with the UR10e's 1.3 m reach it covers the 0.6–4.3 m tall spindle canopy from the alley)
     const arm = m.addChild(createRobotFromLibrary('UR10e', `Arm ${i + 1}`));
     arm.setPose(mul(transl(0, -900, 1400), rotz(-90 * DEG)));
+    mountArmOnLift(arm, 2100);
+    addLiftColumn(arm, 4, 85);
     const g = arm.addChild(new Tool('Soft gripper'));
     g.toolKind = 'gripper';
     g.setPoseTool(transl(0, 0, 180));
@@ -195,7 +199,8 @@ function orchard(): Station {
   mission.fieldId = field.id;
   mission.fleetId = fleet.id;
   mission.rowIds = field.rows().slice(0, 4).map((r) => r.id);
-  mission.settings = { workSpeed: 400, bothSides: true, sideOffset: field.crop.rowSpacing / 2, secondsPerFruit: 4 };
+  // the arms move to every fruit they pick (IK per fruit, lift + joint motion; src/agri/process.ts)
+  mission.settings = { workSpeed: 400, bothSides: true, sideOffset: field.crop.rowSpacing / 2, secondsPerFruit: 4, animateArm: true };
   try { planMission(st, mission, fm); } catch { /* fleet may be empty */ }
   const sprayMission = st.addChild(new MissionItem('Spray rows 5-8'));
   sprayMission.missionType = 'spray';
@@ -222,7 +227,7 @@ function greenhouse(): Station {
   const fm = new FleetManager(st, fleet);
   for (let i = 0; i < 2; i++) {
     const m = st.addChild(new MobileRobot(`Rail trolley ${i + 1}`));
-    Object.assign(m.kin, { drive: 'differential', wheelBase: 900, track: 550, wheelRadius: 120, maxSpeed: 800, footprint: [1400, 700, 900] });
+    Object.assign(m.kin, { drive: 'differential', wheelBase: 900, track: 550, wheelRadius: 120, maxSpeed: 800, footprint: [1400, 700, 500] });
     m.capabilities = ['harvest', 'prune', 'scout'];
     m.color = '#f08c00';
     // parked on the corridor axis beyond its south end, facing the corridor
@@ -231,8 +236,12 @@ function greenhouse(): Station {
     m.home = { x: cA[0], y: hy, theta: 90 };
     useRails(m, house.network);
     fm.addRobot(m);
+    // turret arm on a telescopic lift column on the trolley deck (arm base 0.5–3.0 m: the UR5e reaches the 0.3–3.2 m
+    // crop of both rows of the path)
     const arm = m.addChild(createRobotFromLibrary('UR5e', `Picker ${i + 1}`));
-    arm.setPose(mul(transl(0, 0, 900), rotz(-90 * DEG)));
+    arm.setPose(mul(transl(0, 0, 500), rotz(-90 * DEG)));
+    mountArmOnLift(arm, 2500);
+    addLiftColumn(arm, 6, 70);
     const g = arm.addChild(new Tool('Cutter gripper'));
     g.toolKind = 'shears';
     g.setPoseTool(transl(0, 0, 150));
@@ -245,7 +254,7 @@ function greenhouse(): Station {
   mission.missionType = 'harvest';
   mission.fieldId = field.id;
   mission.fleetId = fleet.id;
-  mission.settings = { workSpeed: 300, bothSides: true, sideOffset: field.crop.rowSpacing / 2, secondsPerFruit: 5 };
+  mission.settings = { workSpeed: 300, bothSides: true, sideOffset: field.crop.rowSpacing / 2, secondsPerFruit: 5, animateArm: true };
   try { planMission(st, mission, fm); } catch { /* ignore */ }
   return st;
 }
@@ -408,7 +417,7 @@ export const demos: Demo[] = [
   { id: 'tutorial', name: 'Tutorial — first station (UR5e)', description: 'The station built in the documentation tutorial: UR5e on a pedestal, table frame, part and bin, gripper, pick-and-place program. Follow docs › Getting started › Your first station.', build: tutorialCell },
   { id: 'welding', name: 'Multi-robot welding cell', description: 'Two robots with torches following a seam on a fixture; positioner as external axis.', build: weldingCell },
   { id: 'packing', name: 'Packing line (process flow)', description: 'Visual-Components-style feeder → conveyor → grader (with failures) → conveyor → pallet buffer → truck. Start the world clock.', build: packingLine },
-  { id: 'orchard', name: 'Apple orchard with harvesting fleet', description: 'Field with rows/trees/fruit, occupancy map, 3 tracked platforms with UR10e arms and a sprayer; harvest + spray missions. Start the world clock and watch the fleet.', build: orchard },
-  { id: 'greenhouse', name: 'Greenhouse tomato gutters', description: 'Indoor gutters with pipe-rail trolleys carrying UR5e pickers.', build: greenhouse },
+  { id: 'orchard', name: 'Apple orchard with harvesting fleet', description: 'Field with rows/trees/fruit, occupancy map, 3 tracked platforms with UR10e arms on lift columns and a sprayer; harvest + spray missions (the arms move to every fruit they pick). Start the world clock and watch the fleet.', build: orchard },
+  { id: 'greenhouse', name: 'Greenhouse tomato gutters', description: 'Indoor gutters with pipe-rail trolleys carrying UR5e pickers on lift columns (the arms move to every fruit they pick).', build: greenhouse },
   { id: 'verticalbot', name: 'VerticalBot palletizer (this repo)', description: 'Placeholder for the vertical_bot_ros palletizer on an omni base. Import the URDF + meshes for exact geometry; export with the ROS 2 post.', build: verticalBot },
 ];

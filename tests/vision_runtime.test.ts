@@ -10,10 +10,11 @@ import path from 'node:path';
 import { demos } from '../src/demos';
 import { Station, Camera, ItemType, SceneObject } from '../src/core/items/item';
 import { createRobotFromLibrary } from '../src/core/items/library';
-import { mul, transl, rotx, DEG } from '../src/core/math/pose';
+import { mul, transl, rotx, DEG, transformPoint } from '../src/core/math/pose';
 import { setVisionStack, getVisionStack, VisionStackConfig } from '../src/vision/stack';
-import { VisionRuntime, solveTcpAbs } from '../src/vision/pipeline';
-import { ByteTracker, letterbox, applyVlaAction, UnavailableModel, SimulatedModel } from '../src/vision/models';
+import { VisionRuntime, solveTcpAbs, fpText } from '../src/vision/pipeline';
+import { ByteTracker, letterbox, applyVlaAction, UnavailableModel, SimulatedModel, iou } from '../src/vision/models';
+import { VISION_MODELS } from '../src/vision/stack';
 
 function cell() {
   const st = demos.find((d) => d.id === 'pickplace')!.build();
@@ -47,6 +48,16 @@ describe('tracker', () => {
       for (const b of o) { const s = byCls.get(b.cls) ?? new Set(); s.add(b.id!); byCls.set(b.cls, s); }
     }
     expect([...byCls.values()].map((s) => s.size)).toEqual([1, 1]);
+  });
+  // V6 F6 (Vision tab overlay 24-64 px off a part): a 34x15 false-positive track 120 px away captured the 246x228 box of a
+  // part detected for the first time, and the α-filter pulled the part's box towards the false positive
+  it('a small false-positive track does not capture a large part detected next to it', () => {
+    const tr = new ByteTracker({ minHits: 1 });
+    tr.update([{ x: 1000, y: 432, w: 34, h: 15, score: 0.5, cls: 'box' }], 1 / 15);
+    const out = tr.update([{ x: 825, y: 427, w: 246, h: 228, score: 0.7, cls: 'box' }], 1 / 15);
+    const part = out.find((b) => b.w > 100)!;
+    expect([part.x, part.y, part.w, part.h]).toEqual([825, 427, 246, 228]);
+    expect(part.id).toBe(2); // a new track, not the false positive's
   });
 });
 
@@ -91,6 +102,30 @@ describe('real-model runtimes', () => {
     expect(n).toBe(30);
     expect(jit).toBe(0);
   });
+  it('default simulated detector (noise on): boxes stay on the parts like a trained detector (V6 F6: 40-64 px off)', async () => {
+    // a 300 px part, the wizard's YOLOv10 (COCO mAP 0.46): IoU with the truth box ~0.9+, edges within a few % of the box
+    const spec = VISION_MODELS.find((m) => m.id === 'yolov10')!;
+    const model = new SimulatedModel(spec, 1);
+    const truth = { id: 'object:a', cls: 'box', box: { x: 400, y: 300, w: 300, h: 300 }, p: [0, 0, 0] as [number, number, number], z: 1000, size: 150, visible: true };
+    const ious: number[] = [], edges: number[] = [];
+    for (let k = 0; k < 200; k++) {
+      const r = await model.run({ width: 1280, height: 1024, K: { fx: 1000, fy: 1000, cx: 640, cy: 512, width: 1280, height: 1024 }, camWorld: new Float64Array(16) as any, time: k, truth: [truth] }, { task: 'detect', classes: ['box'], confidence: 0.4, iou: 0.5, seed: k, simulate: true });
+      const d = r.boxes.find((b) => b.truthId === 'object:a');
+      if (!d) continue;
+      ious.push(iou(d, truth.box));
+      edges.push(Math.max(Math.abs(d.x - 400), Math.abs(d.y - 300), Math.abs(d.x + d.w - 700), Math.abs(d.y + d.h - 600)));
+    }
+    expect(ious.length).toBeGreaterThan(120); // recall ≈ 0.76 (missed detections remain part of the model)
+    const mean = ious.reduce((a, b) => a + b, 0) / ious.length;
+    expect(mean).toBeGreaterThan(0.9);
+    edges.sort((a, b) => a - b);
+    expect(edges[Math.floor(0.9 * edges.length)]).toBeLessThan(25); // 90 % of the boxes: every edge within 25 px (8 %)
+  });
+  it('the run statistics name the false positives that got a 3D position (Vision tab)', () => {
+    expect(fpText({ fp: 0, fp3d: 0 })).toBe(' · 0 false positives');
+    expect(fpText({ fp: 2, fp3d: 0 })).toMatch(/2 false positives \(none got a 3D position\)/);
+    expect(fpText({ fp: 3, fp3d: 1 })).toMatch(/1 with a 3D position/);
+  });
   it('letterbox of a 1280-px render for a 1920-px camera reads inside the buffer (0 NaN) and keeps the image', () => {
     const camW = 1920, camH = 1080, w = 1280, h = Math.round((w * camH) / camW);
     const rgba = new Uint8ClampedArray(w * h * 4);
@@ -103,16 +138,25 @@ describe('real-model runtimes', () => {
     expect(data[row * 640 + info.padX + Math.round(info.scale * camW) - 10]).toBeCloseTo(0, 5);
   });
   it('ONNX model on an RGB-D camera: the studio provides the depth image, so real detections get 3D and targets', async () => {
-    const { st, cam, cfg } = cell();
+    const { st, cam, cfg, boxes } = cell();
+    // the fixture model always answers [270,120,100,80] "b" and [80,0,40,40] "a": put Box 2 under the first one (its top
+    // face projects to u 291..349, v 131..189); the second one stays on the bare table
+    boxes[1].setPose(transl(320, 357, 500));
     const url = path.join(process.cwd(), 'tests', 'fixtures', 'fake_yolo.onnx');
     setVisionStack(cam, { ...cfg, runtime: 'onnx', modelUrl: url, classes: ['a', 'b'], simulate: false });
     const rt = new VisionRuntime(cam, getVisionStack(cam)!);
     const out = await rt.step(st, { time: 0, rgba: new Uint8ClampedArray(640 * 480 * 4).fill(128) });
     expect(out.frame.depth).toBeDefined();
     expect(out.frame.truth).toBeUndefined(); // real runtime: no ground truth used
-    expect(out.detections.length).toBeGreaterThan(0);
-    expect(out.detections.every((d) => d.p && d.z! > 0)).toBe(true);
-    expect(out.targets.length).toBe(out.detections.length);
+    expect(out.detections.length).toBe(2);
+    const onBox = out.detections.find((d) => d.cls === 'b')!, onTable = out.detections.find((d) => d.cls === 'a')!;
+    // the real detection gets 3D: the top face of Box 2 (no truth, no object model: the face centre)
+    const top = transformPoint(boxes[1].poseAbs(), [0, 0, 120]);
+    expect(Math.hypot(onBox.p![0] - top[0], onBox.p![1] - top[1], onBox.p![2] - top[2])).toBeLessThan(10);
+    expect(onBox.z!).toBeGreaterThan(0);
+    // a box on the bare table: the surface continues all around it, nothing stands out of the table: no 3D, no target
+    expect(onTable.p).toBeUndefined();
+    expect(out.targets.map((t) => t.cls)).toEqual(['b']);
   }, 60000);
   it('the ONNX Runtime WASM the browser loads is a local package asset (no CDN)', () => {
     const src = fs.readFileSync(path.join(process.cwd(), 'src', 'vision', 'models.ts'), 'utf8');

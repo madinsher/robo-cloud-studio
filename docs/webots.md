@@ -31,7 +31,17 @@ Every import returns a `report` (one line per approximation or unsupported featu
   (world, proto, id, coordinate_system, webots_version, ...), the `wbgeometry` / `wbrotation` / `wbvector2` / `wbvector3` /
   `wbutility` / `wbrandom` modules with Webots' API and formulas (same circles, B-splines and LCG random sequence;
   compared call by call with Webots' own modules in tests/webots_template_modules.test.ts), template `console.error`
-  lines in the report, isolated from studio globals and stopped after a step budget. Lua templates are reported.
+  lines in the report. Lua templates are reported.
+  **Isolation** (a template is code that comes with the opened files): it runs in a separate JavaScript realm, never in
+  the studio's - a fresh `node:vm` context per expansion in Node, a detached iframe per import in the browser. The engine
+  itself is evaluated inside that realm and disables code generation there before any template runs (the Function /
+  generator / async function constructors and `eval` throw), every global of the realm except the pure built-ins
+  (`Math`, `JSON`, `Number`, `String`, `Array`, `Object`, ...) is shadowed, dynamic `import()` is rejected, and only
+  strings cross the boundary (fields / context as JSON in, the output as JSON out). Every loop condition carries a guard
+  (iteration and time budget), the output is size-limited, and in Node the vm timeout stops the expansion. Escapes tried
+  in tests/webots_template_sandbox.test.ts (both realms): `({}).constructor.constructor("return process")()`, generator
+  / async constructors, direct and indirect eval, stack-trace hooks, prototype pollution. Residual risk in the browser:
+  a regular expression with catastrophic backtracking can still hang the tab (no timeout for a same-thread realm).
 * Built-in equivalents (written from the documented interfaces, no Webots asset source): `Floor`, `RectangleArena`,
   `TexturedBackground`, `TexturedBackgroundLight`, `SolidBox` and ~30 appearances (`Parquetry`, `BrushedAluminium`,
   `GalvanizedMetal`, ...; textures replaced by representative colours). Like Webots, non-positive sizes
@@ -47,8 +57,8 @@ Every import returns a `report` (one line per approximation or unsupported featu
 | Solid-derived devices outside robots (`Charger`, `Connector`, ...), `Fluid` | `SceneObject` (`params.webotsType`); a Fluid's boundingObject is its immersion volume, not a collider |
 | `boundingObject` | `SceneObject.colliders` (I9: collision uses them instead of the visuals; Plane bounds tag the ground) |
 | `Physics` | `mass`, `params.physics` |
-| `Box`, `Cylinder`, `Sphere`, `Cone`, `Capsule`, `Plane`, `Mesh`, `CadShape`, `IndexedFaceSet`, `ElevationGrid` | primitives / registered meshes (mm); OBJ+MTL and COLLADA materials, UVs and textures kept |
-| `Robot` with joints | link/joint tree -> `MobileRobot` (differential / Ackermann / omni detected from wheel motors: wheel radius, track, wheel base, max steer) + one `Robot` per maximal actuated serial chain (mounted on the flange of its parent chain); motor names = joint names; limits / velocities from the motors |
+| `Box`, `Cylinder`, `Sphere`, `Cone`, `Capsule`, `Plane`, `Mesh`, `CadShape`, `IndexedFaceSet`, `ElevationGrid` | primitives / registered meshes (mm); OBJ+MTL and COLLADA materials, UVs and textures kept. An `ImageTexture` / `baseColorMap` on a primitive, an IndexedFaceSet (its `texCoord`, else a bounding-box projection) or an ElevationGrid (grid coordinates) is drawn as a textured mesh (a primitive keeps its exact shape for collision; Box: the image on each face; Cylinder / Cone: wrapped around the side, planar caps; Sphere: longitude / latitude); an image that cannot be read is reported and the base colour kept |
+| `Robot` with joints | link/joint tree -> `MobileRobot` (differential / Ackermann / omni detected from wheel motors: wheel radius, track, wheel base, max steer) + one `Robot` per maximal actuated serial chain (mounted on the flange of its parent chain); motor names = joint names; limits / velocities from the motors. The wheel centre is the point of the wheel axis at the wheel geometry (a HingeJoint `anchor` is only a point of the axis: E-puck track 52 mm); wheel base and track are measured along the axes the wheels drive (`params.forwardAxis`, reported when it is not +X); wheels whose contact material has an anisotropic, rotated friction in `WorldInfo.contactProperties` (KUKA youBot `InteriorWheelMat` / `ExteriorWheelMat`, `frictionRotation` ±45°) make a holonomic (`omni`) base. A linkage whose mimic joints follow joints of other branches (URDF palletizers) becomes one Robot whose chain visits every branch (compensating `__return` joints), so the mimics follow their masters |
 | `Camera`, `RangeFinder` | `Camera` with `fovAxis: 'horizontal'` (I4), the Webots +X optical axis converted to the studio +Z |
 | `Lidar`, `GPS`, `InertialUnit`, `Gyro`, `Accelerometer`, ... | sensors on the right link (`params.webotsDevice`) |
 | supervisor robots without geometry | frames (controller name kept) |

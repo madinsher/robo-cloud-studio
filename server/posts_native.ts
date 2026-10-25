@@ -74,9 +74,8 @@ export function runNativePost(post: string, job: unknown, opts: { source?: strin
 export async function handlePostsHttp(req: IncomingMessage, res: ServerResponse, readJson: () => Promise<any>): Promise<boolean> {
   const url = req.url ?? '';
   if (!url.startsWith('/posts/native')) return false;
-  res.setHeader('access-control-allow-origin', '*');
-  // CORS preflight of the browser's JSON POST (/posts/native/run from the studio page)
-  if (req.method === 'OPTIONS') { res.writeHead(204, { 'access-control-allow-headers': '*', 'access-control-allow-methods': 'GET,POST,OPTIONS' }); res.end(); return true; }
+  // origin / host checks and the CORS headers of the studio page are applied by server/index.ts (src/api/security.ts)
+  if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return true; }
   const json = (code: number, body: unknown) => { res.writeHead(code, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); };
   if (url === '/posts/native' && req.method === 'GET') {
     json(200, { available: !!roboDKPython() && !!roboDKPostsDir(), python: roboDKPython(), postsDir: roboDKPostsDir(), posts: listNativePosts() });

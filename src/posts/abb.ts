@@ -127,8 +127,9 @@ export class AbbPost extends RoboPost {
     this.addline(`MoveAbsJ [[${[0, 1, 2, 3, 4, 5].map((i) => fx(joints[i] ?? 0, 6)).join(',')}],${this.extax(joints)}],${this.tail()}`);
   }
   MoveL(pose: Mat4 | null, joints: number[], conf: number[]): void {
-    if (!pose) { this.MoveJ(null, joints); return; }
     this.splitIfNeeded();
+    // a linear move to a joint target: RoboDK writes MoveL CalcRobT(jointtarget, tool \WObj)
+    if (!pose) { this.addline(`MoveL CalcRobT([[${[0, 1, 2, 3, 4, 5].map((i) => fx(joints[i] ?? 0, 6)).join(',')}],${this.extax(joints)}],${this.tool} \\WObj:=${this.wobj}),${this.tail()}`); return; }
     this.addline(`MoveL ${this.robtarget(pose, joints, conf)},${this.tail()}`);
   }
   override MoveC(pose1: Mat4 | null, joints1: number[], pose2: Mat4 | null, joints2: number[], conf1: number[], conf2: number[]): void {

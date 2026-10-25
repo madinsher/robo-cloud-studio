@@ -19,10 +19,66 @@ import json, math, sys, time
 ` + PY_ROBODK_IMPORT + String.raw`
 DT = 0.05
 T0 = None
+CLOCK = [None]
+
+
+class Clock(object):
+    """The run clock = the station's simulation time: RoboDK's SimulationTime() follows the simulation speed, so
+    delay= / wait= / timeout= keep their ratio to the program durations at any speed and however long one tick (one
+    robolink round trip per Busy() call) takes. A link without that call (stand-ins, the ROS link) runs on wall time
+    times its SimulationSpeed() (1 when it has none)."""
+
+    def __init__(self, rdk):
+        self.rdk, self.sim, self.speed = rdk, False, 1.0
+        f = getattr(rdk, 'SimulationTime', None)
+        if callable(f):
+            try:
+                float(f())
+                self.sim = True
+            except Exception:
+                self.sim = False
+        s = getattr(rdk, 'SimulationSpeed', None)
+        try:
+            self.speed = float(s()) if callable(s) else 1.0
+        except Exception:
+            self.speed = 1.0
+        if not self.speed > 0:
+            self.speed = 1.0
+        self.t0 = self.raw()
+        self.last = (time.time(), 0.0)
+
+    def raw(self):
+        if self.sim:
+            return float(self.rdk.SimulationTime())
+        return time.time() * self.speed
+
+    def __call__(self):
+        """Read the clock (one robolink round trip on RoboDK)."""
+        t = self.raw() - self.t0
+        self.last = (time.time(), t)
+        return t
+
+    def est(self):
+        """The last reading advanced by the wall time since, at the simulation speed (no round trip)."""
+        w, t = self.last
+        return t + (time.time() - w) * self.speed
+
+
+def start_clock(rdk):
+    global T0
+    T0 = time.time()
+    CLOCK[0] = Clock(rdk)
+    return CLOCK[0]
 
 
 def now():
-    return time.time() - T0
+    """Run time (simulation seconds) without a robolink round trip: traces, Busy() observation times."""
+    return CLOCK[0].est() if CLOCK[0] is not None else time.time() - T0
+
+
+def read_clock():
+    """Run time read from the station (the time of a control step)."""
+    return CLOCK[0]() if CLOCK[0] is not None else time.time() - T0
 
 
 def trace(kind, label):
@@ -62,12 +118,37 @@ class World(object):
         self.events = []
         self.owner = {}
         self.waiting = {}
+        self.stale = False
 
     def sense(self):
+        allp = getattr(self.rdk, 'getParams', None)
+        if self.signals and callable(allp):
+            # one round trip for every station parameter (and no 'unknown parameter' warning per tick for a
+            # signal no program has set yet, as getParam prints)
+            try:
+                vals = dict((str(k), v) for k, v in allp())
+            except Exception:
+                vals = None
+            if vals is not None:
+                for n in self.signals:
+                    v = vals.get(n)
+                    if v is not None and v != '':
+                        self.bb[n] = _num(v)
+                self.stale = False
+                return self.bb
         for n in self.signals:
             v = self.rdk.getParam(n)
             if v is not None and v != '':
                 self.bb[n] = _num(v)
+        self.stale = False
+        return self.bb
+
+    def fresh(self):
+        """The blackboard for a guard / condition / decision: signals are read again when a program or move ended
+        since the last read (its outputs, e.g. SetDO Ready, are set by the time it reports done - as in the studio,
+        where the program step runs before the control tick)."""
+        if self.stale:
+            self.sense()
         return self.bb
 
     def acquire(self, robot, key):
@@ -119,6 +200,8 @@ class Action(object):
         self.result = None
         self.outcome = None   # named outcome reported by the skill (item.Outcome()), if any
         self.timed_out = False
+        self.busy_at = t      # run time of the last Busy() call that saw the program / move running (it ends later)
+        self.done_at = t      # run time after the Busy() call that saw it finished (it ended before)
 
     def tick(self, t):
         b, w = self.b, self.w
@@ -144,9 +227,13 @@ class Action(object):
                 trace('program', name)
                 self.state = 'run'
                 return 'running'
+            t_call = now()
             if self.item.Busy():
+                self.busy_at = t_call
                 return 'running'
+            self.done_at = now()
             w.release(self.key)
+            w.stale = True
             oc = getattr(self.item, 'Outcome', None)
             self.outcome = oc() if callable(oc) else None
             failed = getattr(self.item, 'Failed', None)
@@ -169,9 +256,13 @@ class Action(object):
                 trace('move', b['value'])
                 self.state = 'run'
                 return 'running'
+            t_call = now()
             if self.robot.Busy():
+                self.busy_at = t_call
                 return 'running'
+            self.done_at = now()
             w.release(self.key)
+            w.stale = True
             failed = getattr(self.robot, 'Failed', None)
             return 'failure' if failed is not None and failed() else 'success'
         if k == 'signal':
@@ -185,9 +276,9 @@ class Action(object):
             w.bb[b['value']] = evaluate(b['py'], w.bb) if b.get('py') else v
             return 'success'
         if k == 'await':
-            return 'success' if evaluate(b['py'], w.bb) else 'running'
+            return 'success' if evaluate(b['py'], w.fresh()) else 'running'
         if k == 'check':
-            return 'success' if evaluate(b['py'], w.bb) else 'failure'
+            return 'success' if evaluate(b['py'], w.fresh()) else 'failure'
         if k == 'event':
             w.events.append(b['value'])
             return 'success'
@@ -316,7 +407,7 @@ class AutomatonRun(object):
                 if not all(e not in d['sigma'] or (d['name'] in self.settled and self.nxt(d, self.state[d['name']], e) is not None) for d in self.m['comps']):
                     continue
                 g = self.m['guards'].get(e)
-                if g and not evaluate(g, self.w.bb):
+                if g and not evaluate(g, self.w.fresh()):
                     continue
                 if self.sup and not self.sup.allowed(e):
                     continue
@@ -326,8 +417,10 @@ class AutomatonRun(object):
     def waiting_for_world(self):
         return any(c['name'] not in self.blocked and any(e in self.uc for e, _ in c['delta'].get(self.state[c['name']], [])) for c in self.m['comps'])
 
-    def tick(self, dt):
+    def tick(self, t):
+        """One control step at run-clock time t (simulation seconds since the start)."""
         w = self.w
+        self.time = t
         w.bb.update(w.sense())
         evs = w.events[:]
         del w.events[:]
@@ -355,7 +448,6 @@ class AutomatonRun(object):
         if evs:
             evs.sort(key=lambda e: self.last.get(e, -1))
             self.fire(evs[0], 'auto')
-        self.time += dt
         self.ticks += 1
         marked = all(self.state[c['name']] in c['marked'] for c in self.m['comps']) and (not self.sup or self.sup.marked())
         if not self.running and not self.enabled_auto() and (not self.waiting_for_world() or (self.m.get('terminate') == 'marked' and marked and self.last and not self.blocked)):
@@ -400,7 +492,7 @@ class PetriRun(object):
                 continue
             if t.get('on') and t['on'] not in evs:
                 continue
-            if t.get('guard') and not evaluate(t['guard'], self.w.bb):
+            if t.get('guard') and not evaluate(t['guard'], self.w.fresh()):
                 continue
             out.append(j)
         imm = [j for j in out if self.m['transitions'][j].get('immediate')]
@@ -422,12 +514,18 @@ class PetriRun(object):
             return random.expovariate(t['rate'])
         return 0.0
 
-    def tick(self, dt):
+    def tick(self, now_t):
+        """One control step at run-clock time now_t. Firings that end in this step are applied in time order: a
+        timer (delay=) that ended while a program was still seen running ends first and its successors fire
+        before the program's end is applied - one robolink round trip per Busy() makes a step longer than DT, and
+        the race between a timer and a program must not depend on that."""
         w = self.w
+        self.time = now_t
         w.bb.update(w.sense())
         evs = w.events[:]
         del w.events[:]
         evs += self.sensors.poll(w.bb)
+        ended, progs = [], []
         for a in list(self.active):
             t, act, end = a
             if act is not None:
@@ -439,21 +537,48 @@ class PetriRun(object):
                     self.faulted.add(self.m['transitions'].index(t))
                     trace('fail', t['id'])
                     continue
-                done = st == 'success' and self.time >= end - 1e-9
-            else:
-                done = self.time >= end - 1e-9
-            if done:
-                for p, wt in t['post'].items():
-                    self.mk[p] += wt
-                self.active.remove(a)
-                trace('end', t['id'])
-        n = 0
+                if st == 'success' and self.time >= end - 1e-9:
+                    ended.append(a)
+                    # the program ended after the last Busy() call that saw it running and before the call that
+                    # saw it finished; when slow round trips make that window much longer than DT, its middle is
+                    # the estimate (with steps of DT it is the last running observation, as in the studio)
+                    seen, gone = act.busy_at, max(act.done_at, act.busy_at)
+                    progs.append(max(seen + (gone - seen) / 2.0 if gone - seen > 1.5 * DT else seen, end))
+            elif self.time >= end - 1e-9:
+                ended.append(a)
+        early = min(progs) if progs else None
+        first = [a for a in ended if a[1] is None and early is not None and a[2] <= early + 1e-9]
+        count = [0]
         pending = list(evs)
+        if first:
+            for a in first:
+                self.finish(a)
+            self.fire_enabled(pending, count)
+        for a in ended:
+            if a not in first:
+                self.finish(a)
+        self.fire_enabled(pending, count)
+        self.ticks += 1
+        waits = any(j not in self.faulted and (t.get('on') or t.get('guard')) and self.enabled(t) and self.in_progress(t) < t.get('servers', 1) for j, t in enumerate(self.m['transitions']))
+        if not self.active and not self.candidates([]) and not waits:
+            self.status = 'idle'
+            self.verdict = ('failed' if self.faulted else 'done') if self.is_final() else ('failed' if self.faulted else 'deadlock')
+
+    def finish(self, a):
+        t = a[0]
+        for p, wt in t['post'].items():
+            self.mk[p] += wt
+        self.active.remove(a)
+        trace('end', t['id'])
+
+    def fire_enabled(self, pending, count):
+        w = self.w
         while True:
             en = self.candidates(pending)
-            if not en or n >= 20:
+            if not en or count[0] >= 20:
                 break
-            n += 1
+            count[0] += 1
+            n = count[0]
             j = en[0]
             t = self.m['transitions'][j]
             b = self.m['actions'].get(t['id'])
@@ -476,12 +601,6 @@ class PetriRun(object):
                 st = act.tick(self.time)
                 if st != 'running':
                     act.result = st
-        self.time += dt
-        self.ticks += 1
-        waits = any(j not in self.faulted and (t.get('on') or t.get('guard')) and self.enabled(t) and self.in_progress(t) < t.get('servers', 1) for j, t in enumerate(self.m['transitions']))
-        if not self.active and not self.candidates([]) and not waits:
-            self.status = 'idle'
-            self.verdict = ('failed' if self.faulted else 'done') if self.is_final() else ('failed' if self.faulted else 'deadlock')
 
     def is_final(self):
         finals = self.m.get('finals') or []
@@ -569,8 +688,9 @@ class FsmRun(object):
         self.outcome, self.status, self.verdict = outcome, 'idle', verdict
         del self.frames[:]
 
-    def tick(self, dt):
+    def tick(self, t):
         w = self.w
+        self.time = t
         w.bb.update(w.sense())
         evs = w.events[:]
         del w.events[:]
@@ -591,7 +711,7 @@ class FsmRun(object):
                 o = 'ok'
             elif s['kind'] == 'decision':
                 for expr, oc in s['when']:
-                    if evaluate(expr, w.bb):
+                    if evaluate(expr, w.fresh()):
                         o = oc
                         break
                 if o is None:
@@ -606,7 +726,6 @@ class FsmRun(object):
             if o is None:
                 break
             self.resolve(i, o)
-        self.time += dt
 
     def where(self):
         return (self.frames[-1]['path'] + '/' + self.frames[-1]['s']['name']) if self.frames else ('= ' + str(self.outcome))
@@ -658,12 +777,12 @@ class BtRun(object):
     def tick_node(self, n):
         t, bb = n['type'], self.w.bb
         if t == 'condition':
-            st = 'success' if evaluate(n.get('py'), bb) else 'failure'
+            st = 'success' if evaluate(n.get('py'), self.w.fresh()) else 'failure'
         elif t == 'action':
             self.ticked.add(id(n))
             args = n.get('args', {})
             if n['status'] != 'running':
-                if n.get('pre_py') and not evaluate(n['pre_py'], bb):
+                if n.get('pre_py') and not evaluate(n['pre_py'], self.w.fresh()):
                     n['status'] = 'failure'
                     return 'failure'
                 ev = args.get('event')
@@ -683,7 +802,7 @@ class BtRun(object):
             if st == 'running' and n.get('timeout') is not None and self.time - n['start'] >= n['timeout']:
                 self.halt(n)
                 st = 'failure'
-            if st == 'success' and n.get('post_py') and not evaluate(n['post_py'], bb):
+            if st == 'success' and n.get('post_py') and not evaluate(n['post_py'], self.w.fresh()):
                 st = 'failure'
             if st == 'success':
                 for key in ('ok', 'put', 'arrive'):
@@ -782,8 +901,9 @@ class BtRun(object):
         n['status'] = st
         return st
 
-    def tick(self, dt):
+    def tick(self, t):
         w = self.w
+        self.time = t
         w.bb.update(w.sense())
         for e in w.events:
             self.observe(e)
@@ -793,7 +913,6 @@ class BtRun(object):
         for k in self.prev:
             if k not in self.ticked and k in self.nodes:
                 self.halt(self.nodes[k])
-        self.time += dt
         if st != 'running' and not (self.m.get('loop') and st == 'success' and not w.bb.get('reported')):
             self.status, self.verdict = 'idle', 'done' if st == 'success' else 'failed'
             trace('tree', st)
@@ -802,17 +921,39 @@ class BtRun(object):
         return self.status
 
 
+def set_speed(rdk, speed):
+    """Simulation speed for the run (the studio runs a model in real time: 1); returns the previous speed, or None
+    when the link has no speed call or speed <= 0 (RoboDK's own speed is kept)."""
+    get, put = getattr(rdk, 'SimulationSpeed', None), getattr(rdk, 'setSimulationSpeed', None)
+    if not (speed > 0) or not callable(put):
+        return None
+    try:
+        old = float(get()) if callable(get) else None
+        put(speed)
+        return old
+    except Exception:
+        return None
+
+
 def main(model):
-    global T0
+    """python script.py [SECONDS] [SPEED]: run for at most SECONDS of simulation time at simulation speed SPEED
+    (default 1 = real time, as the studio runs it; 0 keeps RoboDK's speed - its start-up value is 5). Delays, waits
+    and timeouts run on the station's simulation clock either way."""
     rdk = Robolink()
     world = World(rdk, model.get('signals', []))
-    T0 = time.time()
-    run = {'des': AutomatonRun, 'petri': PetriRun, 'fsm': FsmRun, 'bt': BtRun}[model['kind']](model['model'], world)
     limit = float(sys.argv[1]) if len(sys.argv) > 1 else model.get('limit', 3600)
-    while run.status == 'running' and now() < limit:
-        t_tick = now()
-        run.tick(DT)
-        time.sleep(max(0.0, DT - (now() - t_tick)))
+    speed = float(sys.argv[2]) if len(sys.argv) > 2 else model.get('speed', 1.0)
+    old = set_speed(rdk, speed)
+    start_clock(rdk)
+    run = {'des': AutomatonRun, 'petri': PetriRun, 'fsm': FsmRun, 'bt': BtRun}[model['kind']](model['model'], world)
+    try:
+        while run.status == 'running' and now() < limit:
+            t_tick = time.time()
+            run.tick(read_clock())
+            time.sleep(max(0.0, DT - (time.time() - t_tick)))
+    finally:
+        if old is not None and old != speed:
+            set_speed(rdk, old)
     print('RESULT\t%s\t%.2f\t%s%s' % (run.verdict if run.status != 'running' else 'timeout', now(), run.where(), ('\t' + str(run.outcome)) if getattr(run, 'outcome', None) else ''))
     return run
 `;

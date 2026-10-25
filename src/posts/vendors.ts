@@ -32,7 +32,7 @@ export class KawasakiPost extends RoboPost {
   override ProgFinish(): void { this.addline('BASE NULL'); this.PROG.push('.END'); }
   override ProgSave(name: string): PostFile[] { return [{ name: `${name}.${this.PROG_EXT}`, content: this.PROG.join('\r\n') + '\r\n' }]; }
   MoveJ(_pose: Mat4 | null, joints: number[]): void { this.addline(`JMOVE #[${joints.slice(0, this.nAxes).map((v) => fx(v, 5)).join(', ')}]`); }
-  MoveL(pose: Mat4 | null, joints: number[]): void { if (!pose) { this.MoveJ(null, joints); return; } this.addline(`LMOVE ${this.trans(pose)}`); }
+  MoveL(pose: Mat4 | null, joints: number[]): void { if (!pose) { this.addline(`LMOVE #[${joints.slice(0, this.nAxes).map((v) => fx(v, 5)).join(', ')}]`); return; } this.addline(`LMOVE ${this.trans(pose)}`); }
   override MoveC(pose1: Mat4 | null, joints1: number[], pose2: Mat4 | null, joints2: number[], conf1: number[], conf2: number[]): void {
     if (!pose1 || !pose2) { super.MoveC(pose1, joints1, pose2, joints2, conf1, conf2); return; }
     this.addline(`C1MOVE ${this.trans(pose1)}`);
@@ -138,8 +138,8 @@ export class ComauPost extends RoboPost {
     this.addline(`MOVE TO {${joints.slice(0, this.nAxes).map((v) => fx(v, 5)).join(',')}}`);
   }
   MoveL(pose: Mat4 | null, joints: number[]): void {
-    if (!pose) { this.MoveJ(null, joints); return; }
-    const p = this.pos(pose, joints);
+    // a linear move to a joint target: MOVE LINEAR TO {joints} (RoboDK's Comau_C5G post)
+    const p = pose ? this.pos(pose, joints) : `{${joints.slice(0, this.nAxes).map((v) => fx(v, 5)).join(',')}}`;
     const key = p.replace(/, '[^']*'\)$/, '');
     if (key === this.lastLin) return;
     this.splitIfNeeded();
@@ -216,7 +216,7 @@ export class MecademicPost extends RoboPost {
   override ProgSave(name: string): PostFile[] { return [{ name: `${name}.${this.PROG_EXT}`, content: this.PROG.join('\r\n') + '\r\n' }]; }
   protected xyzabc(m: Mat4) { return pose2Staubli(m).map((v) => fx(v)).join(', '); }
   MoveJ(pose: Mat4 | null, joints: number[]): void { this.addline(`MoveJoints(${joints.slice(0, this.nAxes).map((v) => fx(v, 6)).join(', ')})`); this.last = pose; }
-  MoveL(pose: Mat4 | null, joints: number[]): void { if (!pose) { this.MoveJ(null, joints); return; } this.addline(`MoveLin(${this.xyzabc(pose)})`); this.last = pose; }
+  MoveL(pose: Mat4 | null, joints: number[]): void { if (!pose) { this.addline('// Linear movement using joint targets is not supported. Change the target type to cartesian or use a joint movement.'); return; } this.addline(`MoveLin(${this.xyzabc(pose)})`); this.last = pose; }
   override MoveC(pose1: Mat4 | null, joints1: number[], pose2: Mat4 | null, joints2: number[], conf1: number[], conf2: number[]): void {
     const arc = this.last && pose1 && pose2 ? arcPoses(this.last, pose1, pose2) : null;
     if (!arc) { super.MoveC(pose1, joints1, pose2, joints2, conf1, conf2); return; }
@@ -273,7 +273,7 @@ export class CsvPost extends RoboPost {
   }
   override ProgFinish(name: string): void { this.addline(`Program Finish,${name}`); }
   override ProgSave(name: string): PostFile[] { return [{ name: `${name}.${this.PROG_EXT}`, content: this.PROG.join('\r\n') + '\r\n' }]; }
-  protected p6(m: Mat4 | null) { return (m ? pose2Staubli(m) : [0, 0, 0, 0, 0, 0]).map((v) => fx(v)).join(','); }
+  protected p6(m: Mat4 | null) { return m ? pose2Staubli(m).map((v) => fx(v)).join(',') : ',,,,,'; }
   protected row(kind: string, pose: Mat4 | null, joints: number[]) { this.addline(`${kind},${this.p6(pose)},${joints.slice(0, this.nAxes).map((v) => fx(v, 6)).join(',')}`); }
   MoveJ(pose: Mat4 | null, joints: number[]): void { this.row('Move Joints', pose, joints); }
   MoveL(pose: Mat4 | null, joints: number[]): void { this.row('Move Linear', pose, joints); }
@@ -309,7 +309,7 @@ export class DoosanPost extends RoboPost {
   override ProgSave(name: string): PostFile[] { return [{ name: `${name}.${this.PROG_EXT}`, content: this.PROG.join('\r\n') + '\r\n' }]; }
   protected posx(m: Mat4) { const [x, y, z, a, b, c] = pose2Adept(m); return `posx(${fx(x)},${fx(y)},${fx(z)},${fx(a, 4)},${fx(b, 4)},${fx(c, 4)})`; }
   MoveJ(_pose: Mat4 | null, joints: number[]): void { this.addline(`movej(posj(${joints.slice(0, this.nAxes).map((v) => fx(v, 6)).join(',')}))`); }
-  MoveL(pose: Mat4 | null, joints: number[]): void { if (!pose) { this.MoveJ(null, joints); return; } this.addline(`movel(${this.posx(pose)})`); }
+  MoveL(pose: Mat4 | null, joints: number[]): void { if (!pose) { this.addline(`movel(posj(${joints.slice(0, this.nAxes).map((v) => fx(v, 6)).join(',')}))`); return; } this.addline(`movel(${this.posx(pose)})`); }
   override MoveC(pose1: Mat4 | null, joints1: number[], pose2: Mat4 | null, joints2: number[], conf1: number[], conf2: number[]): void {
     if (!pose1 || !pose2) { super.MoveC(pose1, joints1, pose2, joints2, conf1, conf2); return; }
     this.addline(`movec(${this.posx(pose1)},${this.posx(pose2)})`);
@@ -356,10 +356,10 @@ export class TechmanPost extends RoboPost {
   protected p6(m: Mat4) { return pose2Techman(m).map((v) => fx(v)).join(', '); }
   protected tail() { return `${this.blend},${this.precise ? 'True' : 'False'})`; }
   MoveJ(pose: Mat4 | null, joints: number[]): void {
-    if (!pose) { this.addline(`PTP("JPP", ${joints.slice(0, 6).map((v) => fx(v)).join(', ')},100,200,${this.tail()}`); return; }
+    if (!pose) { this.addline(`PTP("JPP", ${joints.slice(0, 6).map((v) => fx(v, 6)).join(',')},100,200,${this.tail()} `); return; }
     this.addline(`PTP("CPP", ${this.p6(pose)},100,200,${this.tail()}`);
   }
-  MoveL(pose: Mat4 | null, joints: number[]): void { if (!pose) { this.MoveJ(null, joints); return; } this.addline(`Line("CPP", ${this.p6(pose)},${this.speed},200,${this.tail()}`); }
+  MoveL(pose: Mat4 | null, joints: number[]): void { if (!pose) { this.addline('// Linear movement using joint targets is not supported. Change the target type to cartesian or use a joint movement.'); return; } this.addline(`Line("CPP", ${this.p6(pose)},${this.speed},200,${this.tail()}`); }
   override MoveC(pose1: Mat4 | null, joints1: number[], pose2: Mat4 | null, joints2: number[], conf1: number[], conf2: number[]): void {
     if (!pose1 || !pose2) { super.MoveC(pose1, joints1, pose2, joints2, conf1, conf2); return; }
     this.addline(`Circle("CPP", ${this.p6(pose1)}, ${this.p6(pose2)}, ${this.speed}, 200, ${this.blend}, 0, ${this.precise ? 'True' : 'False'}) `);
@@ -393,7 +393,7 @@ export class DensoPost extends RoboPost {
   override ProgSave(name: string): PostFile[] { return [{ name: `${name}.${this.PROG_EXT}`, content: this.PROG.join('\r\n') + '\r\n' }]; }
   protected p(m: Mat4) { return `P(${pose2xyzrpw(m).map((v) => fx(v)).join(',')})`; }
   MoveJ(_pose: Mat4 | null, joints: number[]): void { this.addline(`MOVE P, ${this.pass} J(${joints.slice(0, this.nAxes).map((v) => fx(v, 5)).join(',')}), Speed=${this.jspeed}`); }
-  MoveL(pose: Mat4 | null, joints: number[]): void { if (!pose) { this.MoveJ(null, joints); return; } this.addline(`MOVE L, ${this.pass} ${this.p(pose)}, Speed=Mps(${fx(this.speed, 2)})`); }
+  MoveL(pose: Mat4 | null, joints: number[]): void { if (!pose) { this.addline(`MOVE L, ${this.pass} J(${joints.slice(0, this.nAxes).map((v) => fx(v, 5)).join(',')}), Speed=${this.jspeed}`); return; } this.addline(`MOVE L, ${this.pass} ${this.p(pose)}, Speed=Mps(${fx(this.speed, 2)})`); }
   override MoveC(pose1: Mat4 | null, joints1: number[], pose2: Mat4 | null, joints2: number[], conf1: number[], conf2: number[]): void {
     if (!pose1 || !pose2) { super.MoveC(pose1, joints1, pose2, joints2, conf1, conf2); return; }
     this.addline(`MOVE C, ${this.p(pose1)},${this.pass} ${this.p(pose2)}, Speed=Mps(${fx(this.speed, 2)})`);
@@ -428,7 +428,7 @@ export class EpsonPost extends RoboPost {
   override ProgSave(name: string): PostFile[] { return [{ name: `${name}.${this.PROG_EXT}`, content: this.PROG.join('\r\n') + '\r\n' }]; }
   protected xy(m: Mat4) { const [x, y, z, r, p, w] = pose2xyzrpw(m); return `XY(${[x, y, z, w, p, r].map((v) => fx(v)).join(', ')})`; }
   MoveJ(_pose: Mat4 | null, joints: number[]): void { this.addline(`Go JA(${joints.slice(0, this.nAxes).map((v) => fx(v)).join(',')})${this.cp ? ' CP' : ''}`); }
-  MoveL(pose: Mat4 | null, joints: number[]): void { if (!pose) { this.MoveJ(null, joints); return; } this.addline(`Move ${this.xy(pose)}${this.local ? ` /${this.local}` : ''}${this.cp ? ' CP' : ''}`); }
+  MoveL(pose: Mat4 | null, joints: number[]): void { if (!pose) { this.addline(`Move JA(${joints.slice(0, this.nAxes).map((v) => fx(v)).join(',')})${this.cp ? ' CP' : ''}`); return; } this.addline(`Move ${this.xy(pose)}${this.local ? ` /${this.local}` : ''}${this.cp ? ' CP' : ''}`); }
   override MoveC(pose1: Mat4 | null, joints1: number[], pose2: Mat4 | null, joints2: number[], conf1: number[], conf2: number[]): void {
     if (!pose1 || !pose2) { super.MoveC(pose1, joints1, pose2, joints2, conf1, conf2); return; }
     this.addline(`Arc ${this.xy(pose1)}, ${this.xy(pose2)} `);
@@ -493,7 +493,7 @@ export class NachiPost extends RoboPost {
   }
   protected tail() { return `S=${fx(this.speed, 2)},H=${this.tool},MS`; }
   MoveJ(_pose: Mat4 | null, joints: number[]): void { this.move(`MOVEX M1J,P,(${joints.slice(0, this.nAxes).map((v) => fx(v, 5)).join(',')}),${this.tail()}`); }
-  MoveL(pose: Mat4 | null, joints: number[]): void { if (!pose) { this.MoveJ(null, joints); return; } this.move(`MOVEX ${this.sm}M1X,L,${this.p(pose)},${this.tail()}`); }
+  MoveL(pose: Mat4 | null, joints: number[]): void { if (!pose) { this.move(`MOVEX ${this.sm}M1J,L,(${joints.slice(0, this.nAxes).map((v) => fx(v, 5)).join(',')}),${this.tail()}`); return; } this.move(`MOVEX ${this.sm}M1X,L,${this.p(pose)},${this.tail()}`); }
   override MoveC(pose1: Mat4 | null, joints1: number[], pose2: Mat4 | null, joints2: number[], conf1: number[], conf2: number[]): void {
     if (!pose1 || !pose2) { super.MoveC(pose1, joints1, pose2, joints2, conf1, conf2); return; }
     this.move(`MOVEX ${this.sm}M1X,C1,${this.p(pose1)},${this.tail()}`);
@@ -592,8 +592,15 @@ export class MitsubishiPost extends RoboPost {
     this.last = pose ? { pose, joints, conf: [0, 0, 0] } : null;
   }
   MoveL(pose: Mat4 | null, joints: number[], conf: number[]): void {
-    if (!pose) { this.MoveJ(null, joints); return; }
     this.splitIfNeeded();
+    if (!pose) {
+      // a linear move to a joint target: Mvs to a joint variable (RoboDK's Mitsubishi post)
+      const n = `J${this.cur.name}${++this.nPos}`;
+      this.cur.decl.push(`${n}=(${joints.slice(0, this.nAxes).map((v) => this.fmt(v, 6)).join(',')})`);
+      this.addline(`Mvs ${n}`);
+      this.last = null;
+      return;
+    }
     this.addline(`Mvs ${this.pvar(pose, joints, conf)}`);
     this.last = { pose, joints, conf };
   }
@@ -647,7 +654,7 @@ export class DobotPost extends RoboPost {
   protected c6(m: Mat4) { return `{coordinate={${pose2xyzrpw(m).map((v) => fx(v, 4)).join(',')}}}`; }
   protected pct(v: number) { return Math.min(100, pyRound(v)); }
   MoveJ(_pose: Mat4 | null, joints: number[]): void { this.addline(`MoveJ({joint={${joints.slice(0, this.nAxes).map((v) => fx(v, 6)).join(', ')}}})`); }
-  MoveL(pose: Mat4 | null, joints: number[]): void { if (!pose) { this.MoveJ(null, joints); return; } this.addline(`Move(${this.c6(pose)},'User=9 Tool=9')`); }
+  MoveL(pose: Mat4 | null, joints: number[]): void { if (!pose) { this.addline('-- Linear movement using joint targets is not supported. Change the target type to cartesian or use a joint movement.'); return; } this.addline(`Move(${this.c6(pose)},'User=9 Tool=9')`); }
   override MoveC(pose1: Mat4 | null, joints1: number[], pose2: Mat4 | null, joints2: number[], conf1: number[], conf2: number[]): void {
     if (!pose1 || !pose2) { super.MoveC(pose1, joints1, pose2, joints2, conf1, conf2); return; }
     this.addline(`Arc3(${this.c6(pose1)},${this.c6(pose2)},'User=9 Tool=9')`);
@@ -684,7 +691,7 @@ export class HcrPost extends RoboPost {
   protected obj(m: Mat4) { const [x, y, z, rx, ry, rz] = pose2Staubli(m); return `{x: ${fx(x)}, y: ${fx(y)}, z: ${fx(z)}, rx: ${fx(rx)}, ry: ${fx(ry)}, rz: ${fx(rz)}}`; }
   protected base(m: Mat4) { return this.frame ? multiply(this.frame, m) : m; }
   MoveJ(_pose: Mat4 | null, joints: number[]): void { this.addline(`moveJoint([${joints.slice(0, this.nAxes).map((v) => fx(v, 6)).join(', ')}], ${pyStrNum(this.vj)}, ${pyStrNum(this.aj)});`); }
-  MoveL(pose: Mat4 | null, joints: number[]): void { if (!pose) { this.MoveJ(null, joints); return; } this.addline(`moveLinear('tcp', ${this.obj(this.base(pose))}, ${pyStrNum(this.v)}, ${pyStrNum(this.a)});`); }
+  MoveL(pose: Mat4 | null, joints: number[]): void { if (!pose) { this.addline(`moveLinear('tcp', convertJointToPose('tcp', [${joints.slice(0, this.nAxes).map((v) => fx(v, 6)).join(', ')}]));`); return; } this.addline(`moveLinear('tcp', ${this.obj(this.base(pose))}, ${pyStrNum(this.v)}, ${pyStrNum(this.a)});`); }
   override MoveC(pose1: Mat4 | null, joints1: number[], pose2: Mat4 | null, joints2: number[], conf1: number[], conf2: number[]): void {
     if (!pose1 || !pose2) { super.MoveC(pose1, joints1, pose2, joints2, conf1, conf2); return; }
     this.addline(`moveArc('tcp', ${this.obj(this.base(pose1))}, ${this.obj(this.base(pose2))});`);
@@ -723,13 +730,15 @@ export class JakaPost extends RoboPost {
   override ProgSave(name: string): PostFile[] { return [{ name: `${name}.${this.PROG_EXT}`, content: this.PROG.join('\r\n') + '\r\n' }]; }
   protected n(v: number) { return String(+v.toFixed(6)); }
   protected list(vals: number[]) { return `[${vals.map((v) => this.n(v)).join(', ')}]`; }
-  MoveJ(_pose: Mat4 | null, joints: number[]): void {
+  MoveJ(pose: Mat4 | null, joints: number[]): void {
     this.addline(`endPosJ=${this.list(joints.slice(0, 6))}`);
+    // a joint target is never blended, and the next joint move starts unblended too (RoboDK's JAKA post)
+    if (!pose) { this.addline(`movj(endPosJ,0,${this.n(this.vj)},${this.n(this.aj)},0)`); this.moved = false; return; }
     this.addline(`movj(endPosJ,0,${this.n(this.vj)},${this.n(this.aj)},${this.moved ? this.n(this.blend) : '0.0'})`);
     this.moved = true;
   }
   MoveL(pose: Mat4 | null, joints: number[]): void {
-    if (!pose) { this.MoveJ(null, joints); return; }
+    if (!pose) { this.addline('# Linear movement using joint targets is not supported. Change the target type to cartesian or use a joint movement.'); return; }
     this.addline(`endPosJ = ${this.list(joints.slice(0, 6))}`);
     this.addline(`endPosL = ${this.list(pose2xyzrpw(pose))}`);
     this.addline(`movl(endPosL,0,${this.n(this.v)},${this.n(this.a)},${this.n(this.blend)})`);
@@ -902,13 +911,15 @@ export class ElitePost extends RoboPost {
   protected tail() { return `CR=${fx(Math.min(7, Math.max(0, pyRound(this.cr))), 1)}MM ACC=50 DEC=50`; }
   protected pose(m: Mat4, angDec = 5) { const [x, y, z, r, p, w] = pose2xyzrpw(m); return [x, y, z].map((v) => String(v)).concat([r, p, w].map((a) => fx((a * Math.PI) / 180, angDec))).join(','); }
   protected newV(m: Mat4): string { const v = `V${String(this.nV).padStart(3, '0')}`; this.def(`SETPOSE ${v} ${this.pose(m)}`); this.nV++; return v; }
-  MoveJ(_pose: Mat4 | null, joints: number[]): void {
+  MoveJ(pose: Mat4 | null, joints: number[]): void {
+    // RoboDK's Elite_Robots_EC_V3 post writes no motion for a joint target (pose None), MoveJ or MoveL alike
+    if (!pose) return;
     const p = `P${String(this.nP++).padStart(3, '0')}`;
     this.def(`SETJOINT ${p} ${joints.slice(0, this.nAxes).map((v) => fx(v, 5)).join(',')}`);
     this.move(`MOVJ ${p} VJ=${Math.min(100, pyRound(this.vj))}% ${this.tail()}`);
   }
   MoveL(pose: Mat4 | null, joints: number[]): void {
-    if (!pose) { this.MoveJ(null, joints); return; }
+    if (!pose) return;
     const v = this.newV(pose);
     this.move(`MOVL ${v} ${this.speed} ${this.tail()}`);
     this.lastV = v;

@@ -137,13 +137,22 @@ export class URPost extends RoboPost {
     return [{ name: `${name}.script`, content: script }, { name: `${name}.urp`, content: toBase64(gzipStore(utf8(urp), name)), encoding: 'base64', mime: 'application/gzip' }];
   }
   protected pos(m: Mat4 | null) { return m ? [m[12], m[13], m[14]] : null; }
+  protected jointList(joints: number[]): string { return `[${[0, 1, 2, 3, 4, 5].map((i) => fx((joints[i] ?? 0) * DEG, 6)).join(', ')}]`; }
+  /** A move to a joint target (pose null, RoboDK passes None) is written without blending (RoboDK: blend 0). */
+  protected addJointMotion(text: string): void {
+    this.cur.lines.push(this.ind + text);
+    this.lastMotion = null;
+    this.traceOpen = false;
+  }
   MoveJ(pose: Mat4 | null, joints: number[]): void {
-    const j = `[${[0, 1, 2, 3, 4, 5].map((i) => fx((joints[i] ?? 0) * DEG, 6)).join(', ')}]`;
+    const j = this.jointList(joints);
+    if (!pose) { this.addJointMotion(`movej(${j},accel_radss,speed_rads,0,0)`); this.lastPos = null; return; }
     this.addMotion((b) => `movej(${j},accel_radss,speed_rads,0,${b})`);
     this.lastPos = this.pos(pose);
   }
   MoveL(pose: Mat4 | null, joints: number[]): void {
-    if (!pose) { this.MoveJ(null, joints); return; }
+    // a linear move to a joint target: movel with the joint values (RoboDK's Universal_Robots post)
+    if (!pose) { this.addJointMotion(`movel(${this.jointList(joints)},accel_mss,speed_ms,0,0)`); this.lastPos = null; return; }
     const p = urPose(pose);
     this.addMotion((b) => `movel(pose_trans(ref_frame,${p}),accel_mss,speed_ms,0,${b})`);
     this.lastPos = this.pos(pose);

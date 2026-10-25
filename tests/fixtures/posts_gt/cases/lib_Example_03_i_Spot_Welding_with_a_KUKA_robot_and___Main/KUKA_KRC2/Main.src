@@ -8,6 +8,7 @@ DEF Main ( )
 EXT WeldPair1()
 EXT WeldPair2()
 EXT WeldPair3()
+EXT DoWeld()
 
 EXT BAS (BAS_COMMAND :IN,REAL :IN )
 

@@ -177,9 +177,14 @@ export class MotionGroup {
     if (!info) return this.absCache.get(item)!;
     return multiply(multiply(this.extAbs[info.k], this.ext[info.k].solveFKFlange(this.extJoints(e, info.k))), info.rel);
   }
-  /** Joint speed limit used for joint interpolation (deg/s or mm/s). */
+  /**
+   * Joint speed limit used for joint interpolation (deg/s, or mm/s for linear axes). RoboDK applies the joint speed
+   * to every axis of a joint move, linear ones included (mm/s): Library 05.d, the Gudel axes of the Comau's MoveJ
+   * travel 3847 mm in about 21 s at speed joints 200 (RoboDK 5.9.4 playback) where the linear speed (16.7 mm/s)
+   * would take 231 s; Item.Update() uses the same rule (updateMoveTime: largest joint travel at vj).
+   */
   jointSpeed(i: number, s: MotionSettings): number {
-    return this.prismatic[i] ? Math.min(this.vmax[i], s.speedLinear) : Math.min(this.vmax[i], s.speedJoints);
+    return Math.min(this.vmax[i], s.speedJoints);
   }
 }
 
@@ -702,7 +707,8 @@ export function planChain(g: MotionGroup, q0: number[], specs: ChainMoveSpec[], 
       if (dt > 0) {
         for (let j = 0; j < g.n; j++) {
           if (dq[j] < 1e-12) continue;
-          const aj = p.cart ? g.amax[j] : Math.min(g.amax[j], g.prismatic[j] ? s.accelLinear : s.accelJoints);
+          // joint moves: the joint acceleration on every axis, linear ones included (RoboDK, see jointSpeed)
+          const aj = p.cart ? g.amax[j] : Math.min(g.amax[j], s.accelJoints);
           if (aj > 0 && Number.isFinite(aj)) acc = Math.min(acc, (aj * dt) / dq[j]);
         }
         if (p.cart && dx > 1e-9 && s.accelLinear > 0) acc = Math.min(acc, (s.accelLinear * dt) / dx);

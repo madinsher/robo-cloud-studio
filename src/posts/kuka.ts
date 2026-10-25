@@ -69,7 +69,10 @@ export class KukaPost extends RoboPost {
 
   override ProgStart(name: string): void {
     this.PROG_NAME = this.safe(name);
-    this.cur = { name: this.PROG_NAME, lines: [], calls: [], first: true };
+    // EXT declarations: every program called by this program and by the sub-programs generated with it (RoboDK)
+    const calls: string[] = [];
+    for (const c of this.ctx.callsOf?.(name) ?? []) { const m = c.match(/^([^(]*)/); const n = this.callName((m?.[1] ?? c).trim()); if (n && !calls.includes(n)) calls.push(n); }
+    this.cur = { name: this.PROG_NAME, lines: [], calls, first: true };
     this.parts.push(this.cur);
   }
   override ProgFinish(): void { /* END written by ProgSave */ }
@@ -122,7 +125,8 @@ export class KukaPost extends RoboPost {
   }
   MoveL(pose: Mat4 | null, joints: number[]): void {
     this.splitIfNeeded();
-    if (!pose) { this.MoveJ(null, joints); return; }
+    // RoboDK's KUKA posts cannot write a LIN to a joint target: they leave a comment (the robot does not move there)
+    if (!pose) { this.addline('; Linear movement using joint targets is not supported. Change the target type to cartesian or use a joint movement.'); return; }
     this.addline(`LIN ${this.target(pose, joints)}${this.zone >= 0 ? ' C_DIS' : ''}`);
   }
   override MoveC(pose1: Mat4 | null, joints1: number[], pose2: Mat4 | null, joints2: number[]): void {

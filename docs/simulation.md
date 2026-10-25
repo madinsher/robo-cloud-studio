@@ -26,12 +26,19 @@ One runtime per station (`StationRuntime.of(station)`), one shared simulation cl
   ("Run on a separate thread") start child runs. Calls that name a station Python program, and code calls such as
   `SetRPM(70)`, go through the script runners (`registerScriptRunner`, contract I5: Pyodide in the browser, CPython on
   the server, the vision runner). Runners are tried in order; a runner that resolves `false` does not handle the call.
+  A runner may declare `handles(name)` (the vision runner: VisionDetect, ...) so validation does not report those
+  calls as ignored, and `loading()` (Pyodide downloading): the live clock of a run waiting for it holds. A script that
+  answered without waiting (`ctx.elapsed = 0`) resumes its run at the call, not one animation frame later. A run that
+  stops while its script still runs sets `ctx.abort.aborted` (background loops end with it).
 - Events: attach takes the object closest to the TCP whose bounding box is within the tool's reach; a hidden object
   only as the twin (same pose) of a part the tool already holds (RoboDK stations carry a visible part and its hidden
-  twin with two Attach events); detach puts the object back under the frame it came from; show / hide; RoboDK
+  twin with two Attach events); detach puts the object under the Detach instruction's reference frame (RoboDK "Detach
+  from <tool>" frame; 06.e stores the parts on TableReference), else back under the frame it came from; show / hide; RoboDK
   "Replace objects" restores the stored placements. A held part does not collide with the gripper mechanism holding it.
 - Mobile robots: Navigate / Follow path ask the registered planner (`setMobileMotionPlanner`, contract I2; default:
-  straight line / path polyline at the instruction speed).
+  straight line / path polyline at the instruction speed). A drive that ends off its goal is still played (the base
+  stops where its drive model stopped) before the instruction fails, like an arm motion that plays up to its failing
+  point; an Ackermann base drives its last leg to the end and is accepted within 5° of the goal heading.
 
 ## Program simulator (`ProgramSimulator`)
 
@@ -67,7 +74,12 @@ The result has two times:
   targets.
 - Validity like RoboDK: a linear / circular move that passes within 2.5° of the wrist singularity of a spherical wrist
   fails (03.a Oil MoveL 312 at 2.42°, 03.d Polish MoveL 424 at 1.8° fail in RoboDK, 2.52° passes); Comau arms (J2/J3
-  parallelogram) check the J3 limits on q3 − q2 (09.c).
+  parallelogram) check the J3 limits on q3 − q2 (09.c). RoboDK 5.9.4 cannot play 03.a Oil as saved either: Update()
+  validates 317 of 782 instructions and RunProgram stops there ("Joint 5 is too close to a singularity", joints
+  [17.5, 63.2, -46.1, -72.9, -2.5, -196.3]); the studio stops at instruction 317 at [17.5, 63.3, -46.0, -71.2, -2.5, -198.0].
+- Joint moves apply the joint speed / acceleration to every axis, linear external axes included (mm/s): 05.d's Gudel
+  gantry travels 3847 mm in 20.6 s at the Comau's speed joints 200 (RoboDK playback ~21 s; Simulation 200.82 s =
+  RoboDK Update), not at its linear speed 16.7 mm/s (231 s).
 - MoveL / MoveC: Cartesian path relative to the reference frame; IK is solved at adaptive knots (a knot interval is
   accepted when the joint-interpolated midpoint stays within 0.1 mm / 0.1 deg), so dense machining programs stay cheap.
 - Rounding (blending): a zone of radius min(r, L/2) around the corner (quadratic Bézier, Cartesian between Cartesian

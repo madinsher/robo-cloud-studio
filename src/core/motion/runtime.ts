@@ -210,9 +210,24 @@ export interface StartOptions {
   /** Start at this top-level instruction ("Run from here"); the speed / rounding / tool / frame set before it apply. */
   fromIndex?: number;
 }
-export interface ScriptContext { station: Station; runtime: StationRuntime; name: string; args: string[]; robot: Robot | Item | null; program: Program | Item | null }
+export interface ScriptContext {
+  station: Station; runtime: StationRuntime; name: string; args: string[]; robot: Robot | Item | null; program: Program | Item | null;
+  /** Set when the run that launched the script stops (Stop / Reset / error) while the script still runs: runners end it. */
+  abort?: { aborted: boolean };
+  /**
+   * Simulated seconds the script took, when the runner knows it (an in-page script that never yielded: 0). The calling
+   * run resumes at launch time + elapsed instead of at the clock time when the runner's promise settled (that clock
+   * already moved on by the frame in which the asynchronous answer arrived).
+   */
+  elapsed?: number;
+}
 /** A script runner resolves `false` when it does not handle the call: the next registered runner is tried. */
-export type ScriptRunner = (ctx: ScriptContext) => Promise<void | boolean>;
+export type ScriptRunner = ((ctx: ScriptContext) => Promise<void | boolean>) & {
+  /** true while the runner cannot run scripts yet (an interpreter downloading): the live clock holds meanwhile. */
+  loading?: () => boolean;
+  /** The runner executes calls of this name in live playback (validation does not report them as ignored). */
+  handles?: (name: string) => boolean;
+};
 export interface Problem { instructionId: string; message: string; severity: 'error' | 'warning'; runId?: string; /** Simulation time at which it happened. */ t?: number }
 
 export interface RuntimeEvents extends Record<string, unknown> {
@@ -286,6 +301,10 @@ const globalRunners: ScriptRunner[] = [];
 export function registerScriptRunner(fn: ScriptRunner): () => void {
   globalRunners.unshift(fn);
   return () => { const i = globalRunners.indexOf(fn); if (i >= 0) globalRunners.splice(i, 1); };
+}
+/** A registered runner is still loading its interpreter (Pyodide download / start-up). */
+export function scriptRunnersLoading(extra: ScriptRunner[] = []): boolean {
+  return [...extra, ...globalRunners].some((r) => { try { return !!r.loading?.(); } catch { return false; } });
 }
 
 const runtimes = new WeakMap<Station, StationRuntime>();
@@ -487,6 +506,8 @@ export class StationRuntime {
     if (c.handle.status !== 'running' && c.handle.status !== 'queued') return;
     c.handle.status = status;
     if (error) c.handle.error = error;
+    // a script this run is still waiting for ends with it (RoboDK stops the Python programs a stopped program started)
+    for (const a of ((c as any).scriptAborts as Array<{ aborted: boolean }> | undefined) ?? []) a.aborted = true;
     c.handle.endTime = c.cursor;
     c.handle.estimate = c.estimate;
     c.block = null;
@@ -522,6 +543,13 @@ export class StationRuntime {
   }
   /** Queued or running runs. */
   active(): RunHandle[] { return [...this.ctxs, ...this.queue].map((c) => c.handle); }
+  /**
+   * The live clock should stand still: a run waits for a station script whose runner is still loading its interpreter
+   * (the download time is not simulation time; RoboDK's scripts start at once).
+   */
+  holding(): boolean {
+    return this.mode === 'live' && this.ctxs.some((c) => c.block?.kind === 'script' && !c.block.state.done) && scriptRunnersLoading(this.runners);
+  }
   /** Any run active (optionally: on a robot / for a program). */
   busy(what?: Robot | Item | null): boolean {
     if (!what) return this.ctxs.length + this.queue.length > 0;
@@ -832,7 +860,7 @@ export class StationRuntime {
       case 'event': {
         fr.pc++;
         const toolId = robot ? this.robotState(robot).toolId : null;
-        const fn = this.eventAction(robot, toolId, d.action, d.objectId ?? null, d.name ?? null, (d as { restore?: ObjectPlacement[] }).restore);
+        const fn = this.eventAction(robot, toolId, d.action, d.objectId ?? null, d.name ?? null, (d as { restore?: ObjectPlacement[] }).restore, (d as { frameId?: string | null }).frameId ?? null);
         this.instant(c, ins, robot, fn);
         return;
       }
@@ -922,13 +950,16 @@ export class StationRuntime {
         const start: Pose2D = { x: s.x ?? mob.pose()[12], y: s.y ?? mob.pose()[13], heading: s.theta ?? (Math.atan2(mob.pose()[1], mob.pose()[0]) * 180) / Math.PI };
         let plan;
         try { plan = getMobileMotionPlanner()(this.station, mob, d, start); } catch (e) { return this.fail(c, ins, `Mobile planner failed: ${(e as Error).message}`); }
-        if (!plan.ok) return this.fail(c, ins, plan.error ?? 'Mobile motion failed');
+        // a drive that did not end at the goal still drives (the base stops where the drive model stopped, like an arm
+        // motion plays up to its failing point) and fails afterwards; a plan without a trajectory fails at once
+        if (!plan.ok && !(plan.duration > 0)) return this.fail(c, ins, plan.error ?? 'Mobile motion failed');
+        const fail = plan.ok ? undefined : { ins, message: plan.error ?? 'Mobile motion failed' };
         const dur = Math.max(0, plan.duration);
         const mobile = { item: mob, sample: plan.sample, duration: dur };
         this.record(c, ins, robot, c.cursor, c.cursor + dur, { mobile });
         this.distance += Math.hypot(plan.sample(dur).x - start.x, plan.sample(dur).y - start.y);
         this.addEstimate(c, dur);
-        c.block = { kind: 'motion', t1: c.cursor + dur, segs: [{ t0: c.cursor, t1: c.cursor + dur, mobile }], events: [], ei: 0 };
+        c.block = { kind: 'motion', t1: c.cursor + dur, segs: [{ t0: c.cursor, t1: c.cursor + dur, mobile }], events: [], ei: 0, ...(fail ? { fail } : {}) };
         return;
       }
     }
@@ -958,7 +989,9 @@ export class StationRuntime {
     if (item instanceof Program) { this.pushCall(c, fr, ins, item); return; }
     if (item && item.type === ItemType.PROGRAM_PYTHON) { this.runScript(c, ins, fr.robot, name, args, item); return; }
     if (this.runnersFor().length && this.mode === 'live') { this.runScript(c, ins, fr.robot, name, args, null); return; }
-    this.warnOnce(c, ins, `call:${name}`, `Call ${text}: no program or script named ${name} in the station (ignored in simulation)`);
+    // record mode (validation / preview): a call a registered runner declares it handles (VisionDetect, ...) runs in live
+    // playback, so it is not reported as ignored
+    if (!this.runnersFor().some((r) => { try { return !!r.handles?.(name); } catch { return false; } })) this.warnOnce(c, ins, `call:${name}`, `Call ${text}: no program or script named ${name} in the station (ignored in simulation)`);
     this.record(c, ins, fr.robot, c.cursor, c.cursor);
   }
 
@@ -988,17 +1021,25 @@ export class StationRuntime {
       return;
     }
     const robot = c.robot;
-    const ctx: ScriptContext = { station: this.station, runtime: this, name, args, robot, program: item ?? c.handle.program };
+    const abort = { aborted: false };
+    const aborts: Array<{ aborted: boolean }> = ((c as any).scriptAborts ??= []);
+    aborts.push(abort);
+    const launchedAt = c.cursor;
+    const ctx: ScriptContext = { station: this.station, runtime: this, name, args, robot, program: item ?? c.handle.program, abort };
+    // the run resumes when the script returned: at the clock time then, or at launch + the script's own duration when
+    // the runner reports it (a script answered in the same page task took no simulated time)
+    const doneAt = () => (typeof ctx.elapsed === 'number' && ctx.elapsed >= 0 ? Math.min(this.time, launchedAt + ctx.elapsed) : this.time);
+    const settle = () => { const k = aborts.indexOf(abort); if (k >= 0) aborts.splice(k, 1); };
     // runners in order (per-runtime first, then global); a runner resolving `false` does not handle the call
     const tryAt = (i: number): void => {
       if (i >= runners.length) {
         this.events.emit('message', { text: item ? `No script runner handled ${name}: not executed` : `Call ${name}: no program or script named ${name} in the station (ignored in simulation)`, level: 'warn', handle: c.handle });
-        state.done = true; state.at = this.time;
+        state.done = true; state.at = this.time; settle();
         return;
       }
       let p: Promise<void | boolean>;
       try { p = Promise.resolve(runners[i](ctx)); } catch (e) { p = Promise.reject(e); }
-      p.then((r) => { if (r === false) tryAt(i + 1); else { state.done = true; state.at = this.time; } }, (e) => { state.done = true; state.error = e ?? 'error'; state.at = this.time; });
+      p.then((r) => { if (r === false) tryAt(i + 1); else { state.done = true; state.at = doneAt(); settle(); } }, (e) => { state.done = true; state.error = e ?? 'error'; state.at = doneAt(); settle(); });
     };
     tryAt(0);
   }
@@ -1162,7 +1203,7 @@ export class StationRuntime {
 
   // -- events (attach / detach / show / hide) -----------------------------------------------------------------------
 
-  private eventAction(robot: Robot | null, toolId: string | null, action: string, objectId: string | null, label: string | null, restore?: ObjectPlacement[]): (() => void) | undefined {
+  private eventAction(robot: Robot | null, toolId: string | null, action: string, objectId: string | null, label: string | null, restore?: ObjectPlacement[], frameId: string | null = null): (() => void) | undefined {
     const st = this.station;
     const toolOf = (): Tool | null => {
       let tool = (toolId ? st.findById(toolId) : robot?.activeTool()) as Tool | null;
@@ -1189,7 +1230,9 @@ export class StationRuntime {
         return () => {
           if (tool && action === 'gripper_open') tool.closed = false;
           const ids = objectId ? [objectId] : tool ? [...tool.attached] : [...st.walk()].filter((t): t is Tool => t instanceof Tool).flatMap((t) => t.attached);
-          for (const oid of ids) this.detachObject(oid);
+          // RoboDK "Detach from <tool>" places the objects in the instruction's reference frame (when it names one)
+          const dest = frameId ? st.findById(frameId) : null;
+          for (const oid of ids) this.detachObject(oid, dest);
         };
       }
       case 'show':
@@ -1234,14 +1277,17 @@ export class StationRuntime {
     if (!tool.attached.includes(obj.id)) tool.attached.push(obj.id);
     this.sink.attach?.(obj.id, tool);
   }
-  /** Detach: the object goes back to the frame it was attached from (station root if unknown), keeping its absolute pose. */
-  detachObject(id: string): void {
+  /**
+   * Detach: the object goes to `to` (the Detach instruction's reference frame), else back to the frame it was attached
+   * from (station root if unknown), keeping its absolute pose.
+   */
+  detachObject(id: string, to: Item | null = null): void {
     const obj = this.station.findById(id);
     if (!obj) return;
     const tool = obj.parent;
     if (tool instanceof Tool) {
       tool.attached = tool.attached.filter((x) => x !== id);
-      const dest = this.homeParents.get(id);
+      const dest = to && to.station === this.station && !obj.isAncestorOf(to) && to !== obj ? to : this.homeParents.get(id);
       obj.setParentStatic(dest && dest.station === this.station ? dest : this.station);
     } else for (const t of this.station.walk()) if (t instanceof Tool && t.attached.includes(id)) t.attached = t.attached.filter((x) => x !== id);
     this.homeParents.delete(id);

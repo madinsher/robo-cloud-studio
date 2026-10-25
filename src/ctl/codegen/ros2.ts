@@ -22,7 +22,7 @@ import { runtimeModel } from './robodk';
 import { PY_RUNTIME, PY_ROBODK_IMPORT } from './py_runtime';
 import { GenFile, ident, xmlEsc, translateExpr, ECMA_DIALECT, exprIds, parseXml, XmlNode } from './common';
 
-export interface Ros2Options { /** topic / service namespace (default: the package name) */ namespace?: string; supervisorSource?: string; /** simulated skill durations (s) by program / skill name */ durations?: Record<string, number>; /** program → robot (lanes of the runtime: one action per robot) */ robots?: Record<string, string>; maintainer?: string }
+export interface Ros2Options { /** topic / service namespace (default: the package name) */ namespace?: string; supervisorSource?: string; /** simulated skill durations (s) by program / skill name */ durations?: Record<string, number>; /** program → robot (lanes of the runtime: one action per robot) */ robots?: Record<string, string>; /** signals a program sets (SetDO / setParam instructions of the station program), applied by the simulated skill server when the program ends */ outputs?: Record<string, Array<[string, number | boolean | string]>>; maintainer?: string }
 
 const pkgName = (name: string) => (ident(name).toLowerCase().replace(/_+/g, '_').replace(/^_|_$/g, '') || 'control').replace(/^(\d)/, 'm$1');
 
@@ -88,6 +88,8 @@ class RosItem(object):
             return True
         r = f.result()
         self.failed = r is None or not r.success
+        if r is not None:
+            self.link.apply_signals(r.message)
         if self.failed:
             self.link.node.get_logger().warn('%s failed: %s' % (self.name, r.message if r is not None else 'no response'))
         self.future = None
@@ -132,6 +134,20 @@ class RosLink(object):
         v = self.values.get(name)
         return None if v is None else str(v)
 
+    def apply_signals(self, message):
+        """Signals a skill reports with its response (a line 'SIGNALS name=value;...' of the Trigger message): they
+        are known before the runtime sees the skill finished, as the program outputs in the studio / RoboDK."""
+        for line in str(message or '').splitlines():
+            if not line.startswith('SIGNALS '):
+                continue
+            for kv in line[8:].split(';'):
+                if '=' in kv:
+                    k, v = kv.split('=', 1)
+                    try:
+                        self.values[k.strip()] = json.loads(v)
+                    except ValueError:
+                        self.values[k.strip()] = v
+
     def setParam(self, name, value):
         self.values[name] = value
         self.set_pub.publish(String(data=json.dumps({'name': name, 'value': value})))
@@ -169,7 +185,7 @@ class SupervisorNode(Node):
         if SERVICES:
             time.sleep(1.5)  # let the servers match our clients: a request sent before that is lost
         self.world = rt.World(self.link, MODEL.get('signals', []))
-        rt.T0 = time.time()
+        rt.start_clock(self.link)
         self.run = {'des': rt.AutomatonRun, 'petri': rt.PetriRun, 'fsm': rt.FsmRun, 'bt': rt.BtRun}[MODEL['kind']](MODEL['model'], self.world)
         self.done = False
         self.timer = self.create_timer(rt.DT, self.step)
@@ -177,7 +193,7 @@ class SupervisorNode(Node):
     def step(self):
         if self.done:
             return
-        self.run.tick(rt.DT)
+        self.run.tick(rt.read_clock())
         self.state_pub.publish(String(data=str(self.run.where())))
         if self.run.status != 'running' or rt.now() >= self.limit:
             verdict = self.run.verdict if self.run.status != 'running' else 'timeout'
@@ -217,7 +233,7 @@ from rclpy.node import Node
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
 
-from .model import DURATIONS, MODEL, SERVICES
+from .model import DURATIONS, MODEL, OUTPUTS, SERVICES
 
 
 class SkillServer(Node):
@@ -229,6 +245,7 @@ class SkillServer(Node):
         self.speed = float(self.get_parameter('speed').value)
         self.values = {}
         self.pub = self.create_publisher(String, ns + '/signals', 10)
+        self.updates = self.create_publisher(String, ns + '/signal_updates', 10)
         self.create_subscription(String, ns + '/signals/set', self.on_set, 10)
         group = ReentrantCallbackGroup()
         for s in SERVICES:
@@ -238,11 +255,19 @@ class SkillServer(Node):
     def handler(self, srv):
         key = srv.split('/', 2)[-1]
         seconds = float(DURATIONS.get(key, DURATIONS.get(srv.rsplit('/', 1)[-1], 1.0)))
+        outputs = OUTPUTS.get(key, OUTPUTS.get(srv.rsplit('/', 1)[-1], []))
 
         def run(req, res):
             self.get_logger().info('serving %s (%.2f s)' % (srv, seconds))
             time.sleep(seconds / max(self.speed, 1e-3))
-            res.success, res.message = True, '%s done in %.2f s' % (srv, seconds)
+            # the station program's outputs (SetDO Ready, 1 ...): published and reported with the response
+            for name, value in outputs:
+                self.values[name] = value
+                self.updates.publish(String(data='%s=%s' % (name, json.dumps(value))))
+            if outputs:
+                self.publish()
+            res.success = True
+            res.message = '%s done in %.2f s' % (srv, seconds) + (('\nSIGNALS ' + ';'.join('%s=%s' % (n, json.dumps(v)) for n, v in outputs)) if outputs else '')
             self.get_logger().info('done %s' % srv)
             return res
         return run
@@ -250,6 +275,7 @@ class SkillServer(Node):
     def on_set(self, msg):
         d = json.loads(msg.data)
         self.values[d['name']] = d['value']
+        self.updates.publish(String(data='%s=%s' % (d['name'], json.dumps(d['value']))))
         self.publish()
 
     def publish(self):
@@ -682,7 +708,21 @@ class TriggerSkill : public BT::StatefulActionNode {
   }
   BT::NodeStatus onRunning() override {
     if (future_.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return BT::NodeStatus::RUNNING;
-    return future_.get()->success ? BT::NodeStatus::SUCCESS : BT::NodeStatus::FAILURE;
+    auto res = future_.get();
+    // "SIGNALS name=value;..." in the response: the program's outputs, on the blackboard before the skill reports done
+    const auto at = res->message.find("SIGNALS ");
+    if (at != std::string::npos) {
+      std::string list = res->message.substr(at + 8); list = list.substr(0, list.find('\\n'));
+      size_t p = 0;
+      while (p <= list.size()) {
+        const size_t q = std::min(list.find(';', p), list.size()); const std::string kv = list.substr(p, q - p); p = q + 1;
+        const auto eq = kv.find('='); if (eq == std::string::npos) continue;
+        const std::string k = kv.substr(0, eq); std::string v = kv.substr(eq + 1);
+        if (v == "true" || v == "false") config().blackboard->set<bool>(k, v == "true");
+        else { try { config().blackboard->set<double>(k, std::stod(v)); } catch (...) { if (v.size() >= 2 && v.front() == '"') v = v.substr(1, v.size() - 2); config().blackboard->set<std::string>(k, v); } }
+      }
+    }
+    return res->success ? BT::NodeStatus::SUCCESS : BT::NodeStatus::FAILURE;
   }
   void onHalted() override {}
  protected:
@@ -795,6 +835,7 @@ export function ros2Packages(kind: ControlKind, source: string, name: string, op
   const model: Record<string, unknown> = { kind: m.kind, model: m.model, signals: m.signals, namespace: ns };
   if (kind === 'fsm') model.yasmin = yasminData(source);
   const durations: Record<string, number> = {}; for (const s of services) { const key = s.split('/').slice(2).join('/'); const d = opts.durations?.[key] ?? Object.entries(opts.durations ?? {}).find(([k]) => k.replace(/[^A-Za-z0-9_]/g, '_') === key)?.[1]; durations[key] = d ?? 1; }
+  const outputs: Record<string, Array<[string, number | boolean | string]>> = {}; for (const s of services) { const key = s.split('/').slice(2).join('/'); const o = opts.outputs?.[key] ?? Object.entries(opts.outputs ?? {}).find(([k]) => k.replace(/[^A-Za-z0-9_]/g, '_') === key)?.[1]; if (o?.length) outputs[key] = o; }
   const robots: Record<string, string> = {}; for (const [p, r] of Object.entries(opts.robots ?? {})) robots[p] = r;
   const py = (o: unknown) => JSON.stringify(o);
   const modelPy = `"""Model data generated by VerticalBot Studio from "${name.replace(/"/g, "'")}" (${kind})."""
@@ -805,6 +846,7 @@ SERVICES = json.loads(r'''${py(services)}''')
 PROGRAMS = json.loads(r'''${py(Object.keys(opts.durations ?? {}).length ? [...new Set([...programs, ...Object.keys(opts.durations ?? {})])] : programs)}''')
 ROBOTS = json.loads(r'''${py(robots)}''')
 DURATIONS = json.loads(r'''${py(durations)}''')
+OUTPUTS = json.loads(r'''${py(outputs)}''')
 `;
   const entry = [`supervisor = ${pkg}.supervisor_node:main`, `skill_server = ${pkg}.skill_server:main`, ...(kind === 'fsm' ? [`yasmin_fsm = ${pkg}.yasmin_fsm:main`] : [])];
   const setupPy = `import os

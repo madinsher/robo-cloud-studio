@@ -14,8 +14,8 @@ import { MobileRobot } from '../mobile/items';
 import { orderRowsNearest, headlandTurns } from '../mobile/planner';
 import { minTurnRadius } from '../mobile/controller';
 import { transl, add, scale } from '../core/math/pose';
-import { armOf, armMount, armReach } from './harvest';
-import './process';
+import { armOf, armMount, armReach, armLift } from './harvest';
+import { planStops } from './process';
 import './collision_world';
 import './equipment';
 
@@ -32,6 +32,8 @@ export interface MissionPlan {
   estimatedHours: number;
   rows: number;
   fruitTargets?: number;
+  /** Ripe fruit of the mission rows out of the arm's reach from the alleys (harvest with an arm on the carriers). */
+  unreachableFruit?: number;
   /** Planner warnings (headland too short for an Ackermann robot, …). */
   warnings: string[];
 }
@@ -110,12 +112,20 @@ export function planMission(station: Station, mission: MissionItem, fleet: Fleet
     if (best && best.depth > field.crop.headland) warnings.push(`${r.name}: a ${best.kind} turn needs ${(best.depth / 1000).toFixed(1)} m of headland, the field has ${(field.crop.headland / 1000).toFixed(1)} m`);
   }
   if (armMission && robots.length && !arm) warnings.push('No arm mounted on the capable robots: picking time is simulated without reach limits');
+  // reach check at planning time: ripe fruit the arm cannot reach from the alleys will stay on the plants
+  let unreachableFruit = 0;
+  const carrier = arm ? robots.find((r) => armOf(r) === arm) ?? null : null;
+  if (type === 'harvest' && arm && carrier) {
+    for (const t of tasks) unreachableFruit += planStops(fleet, t, carrier, (f) => f.ripe >= 0.5 && !f.picked).unreachable;
+    const stroke = armLift(arm).stroke;
+    if (unreachableFruit) warnings.push(`${unreachableFruit} of ${fruitTargets} ripe fruit are out of the arm's reach from the alleys (${arm.name} on ${carrier.name}, ${stroke ? `${stroke} mm lift` : 'fixed mount'}) and will stay on the plants`);
+  }
   mission.taskIds = tasks.map((t) => t.id);
   mission.status = 'planned';
   mission.warnings = warnings;
   const n = Math.max(1, robots.length || allRobots.length);
   const est = (total / workSpeed + fruitTargets * spf) / n / 3600;
-  return { tasks, totalPathLength: total, estimatedHours: est, rows: rows.length, fruitTargets, warnings };
+  return { tasks, totalPathLength: total, estimatedHours: est, rows: rows.length, fruitTargets, unreachableFruit, warnings };
 }
 
 /** Approximate fruit mass from diameter (sphere, density ~0.9 g/cm³). */
@@ -145,14 +155,56 @@ export function installHarvestHook(station: Station, fleet: FleetManager): void 
   };
 }
 
-/** Update mission progress from the fleet task states. */
+/** Ripe fruit still on the plants of the row sides worked by a set of tasks (side 0 = both sides of the row). */
+function ripeLeftOn(station: Station, tasks: FleetTask[]): number {
+  const sides = new Map<string, Set<number>>();
+  for (const t of tasks) if (t.meta?.rowId) (sides.get(t.meta.rowId) ?? sides.set(t.meta.rowId, new Set()).get(t.meta.rowId)!).add(t.meta.side ?? 0);
+  let n = 0;
+  for (const [rowId, s] of sides) {
+    const row = station.findById(rowId);
+    if (!(row instanceof CropRow)) continue;
+    const both = s.has(0) || (s.has(1) && s.has(-1));
+    for (const p of row.plants) for (const f of p.fruit) if (f.ripe >= 0.5 && !f.picked && (both || s.has(f.p[1] >= 0 ? 1 : -1))) n++;
+  }
+  return n;
+}
+
+/**
+ * Update mission progress and status from the fleet task states. A harvest mission measures the crop, not the task
+ * list: progress = fruit picked / (picked + ripe fruit still on the worked row sides). When every task has finished
+ * the mission is `done` only if its goal is met — no ripe fruit left (harvest), no excess fruit out of reach (thinning),
+ * no failed task — else `incomplete`, with a warning that says what stayed on the plants and why.
+ */
 export function updateMissionProgress(mission: MissionItem, fleet: FleetManager): void {
   const tasks = fleet.fleet.tasks.filter((t) => mission.taskIds.includes(t.id) || t.meta?.missionId === mission.id);
   if (!tasks.length) return;
   const done = tasks.filter((t) => t.status === 'done').length;
-  mission.progress = done / tasks.length;
-  if (mission.progress >= 1) mission.status = 'done';
-  else if (tasks.some((t) => t.status !== 'pending')) mission.status = 'running';
+  const finished = tasks.every((t) => t.status === 'done' || t.status === 'failed' || t.status === 'cancelled');
+  const sum = (k: string) => tasks.reduce((a, t) => a + (Number(t.meta?.[k]) || 0), 0);
+  let goalMet = done === tasks.length;
+  const notes: string[] = [];
+  if (mission.missionType === 'harvest' || mission.missionType === 'thin') {
+    const picked = sum(mission.missionType === 'harvest' ? 'harvested' : 'removed');
+    const unreachable = sum('unreachable') + sum('armUnreachable');
+    const missedByVision = sum('missedByVision');
+    const left = mission.missionType === 'harvest' ? ripeLeftOn(fleet.station, tasks) : unreachable;
+    mission.fruit = { picked, left, unreachable, missedByVision };
+    mission.progress = mission.missionType === 'harvest' && picked + left > 0 ? picked / (picked + left) : done / tasks.length;
+    if (finished && left > 0) {
+      goalMet = false;
+      const why = [unreachable ? `${unreachable} out of the arms' reach from the alleys` : '', missedByVision ? `${missedByVision} not detected by the camera` : ''].filter(Boolean).join(', ');
+      notes.push(mission.missionType === 'harvest'
+        ? `${left} of ${picked + left} ripe fruit (${Math.round((100 * left) / (picked + left))} %) stayed on the plants${why ? ` (${why})` : ''}`
+        : `${left} excess fruit stayed on the plants (out of the arms' reach)`);
+    }
+  } else mission.progress = done / tasks.length;
+  if (finished) {
+    const failed = tasks.length - done;
+    if (failed) notes.push(`${failed} of ${tasks.length} tasks failed or were cancelled`);
+    mission.status = goalMet ? 'done' : 'incomplete';
+    const warnings = [...mission.warnings.filter((w) => !w.startsWith('Result: ')), ...notes.map((n) => `Result: ${n}`)];
+    if (warnings.join('|') !== mission.warnings.join('|')) mission.warnings = warnings;
+  } else if (tasks.some((t) => t.status !== 'pending')) mission.status = 'running';
 }
 
 /** Spray mission helper: emit a program for a boom sprayer mounted on a mobile robot (signals on/off along rows). */

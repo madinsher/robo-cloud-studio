@@ -191,7 +191,9 @@ export interface ModelContext extends BaseModelContext {
   assets?: AssetStore | null;
 }
 
-export interface PipelineStats { frames: number; tp: number; fp: number; fn: number; posErrSum: number; posErrN: number; fps: number; lastLatencyMs: number }
+/** Detection quality vs truth (simulation). The position error covers true positives; false positives that still got a 3D
+ *  position (they could become pick targets) are counted separately in `fp3d` — they have no truth to measure against. */
+export interface PipelineStats { frames: number; tp: number; fp: number; fn: number; posErrSum: number; posErrN: number; fps: number; lastLatencyMs: number; fp3d: number }
 
 export interface CloudAnalysis { cloud: PointCloud; ground: PointCloud; objects: PointCloud; clusters: Cluster[]; rows: Line2D[]; classes: string[] }
 
@@ -201,6 +203,8 @@ export interface VisionTarget {
   grasp: Mat4; approach: Mat4;
   /** Object centre estimate (world, mm) and its camera depth. */
   p: Vec3; z: number; sigmaMm: number; trackId?: number;
+  /** Detector confidence of the detection the target was computed on. */
+  score?: number;
   /** Station object id when known (simulation truth or the object under the grasp). */
   objectId?: string;
   surface?: Box2D['surface'];
@@ -231,7 +235,7 @@ function sensorOf(cfg: VisionStackConfig) { return VISION_SENSORS.find((x) => x.
 export class VisionRuntime {
   models = new Map<VisionTask, VisionModel>();
   tracker = new ByteTracker({ minHits: 1 });
-  stats: PipelineStats = { frames: 0, tp: 0, fp: 0, fn: 0, posErrSum: 0, posErrN: 0, fps: 0, lastLatencyMs: 0 };
+  stats: PipelineStats = { frames: 0, tp: 0, fp: 0, fn: 0, posErrSum: 0, posErrN: 0, fps: 0, lastLatencyMs: 0, fp3d: 0 };
   last: PipelineOutput | null = null;
   private lastTime = 0;
   private seedCounter = 0;
@@ -242,7 +246,7 @@ export class VisionRuntime {
     if (!m) { m = createModel(this.cfg, task, this.ctx); this.models.set(task, m); }
     return m;
   }
-  reset(): void { for (const m of this.models.values()) m.dispose?.(); this.models.clear(); this.tracker.reset(); this.stats = { frames: 0, tp: 0, fp: 0, fn: 0, posErrSum: 0, posErrN: 0, fps: 0, lastLatencyMs: 0 }; this.last = null; }
+  reset(): void { for (const m of this.models.values()) m.dispose?.(); this.models.clear(); this.tracker.reset(); this.stats = { frames: 0, tp: 0, fp: 0, fn: 0, posErrSum: 0, posErrN: 0, fps: 0, lastLatencyMs: 0, fp3d: 0 }; this.last = null; }
 
   /** Depth modalities (stereo / RGB-D / ToF) always produce a metric depth image. */
   get depthModality(): boolean { const m = this.cfg.modality; return m === 'stereo' || m === 'rgbd' || m === 'tof'; }
@@ -409,7 +413,7 @@ export class VisionRuntime {
         if (!b.p || !b.z) continue;
         const { grasp, approach } = b.surface ? graspFromSurface(b.surface, { approachMm: cfg.approachMm ?? 100, standoffMm: cfg.graspStandoffMm ?? 2 }) : targetPoseFromPoint(b.p, frame.camWorld, { approachMm: cfg.approachMm ?? 100 });
         const objectId = b.truthId?.startsWith('object:') ? b.truthId.slice(7) : undefined;
-        targets.push({ name: `${b.cls}${b.id !== undefined ? `#${b.id}` : `_${++i}`}`, cls: b.cls, grasp, approach, p: b.p, z: b.z, sigmaMm: sigma(b.z), trackId: b.id, objectId, surface: b.surface });
+        targets.push({ name: `${b.cls}${b.id !== undefined ? `#${b.id}` : `_${++i}`}`, cls: b.cls, grasp, approach, p: b.p, z: b.z, sigmaMm: sigma(b.z), trackId: b.id, score: b.score, objectId, surface: b.surface });
       }
     }
     // stats vs truth
@@ -420,6 +424,7 @@ export class VisionRuntime {
       this.stats.tp += visible.filter((t) => matched.has(t.id)).length;
       this.stats.fn += visible.filter((t) => !matched.has(t.id)).length;
       this.stats.fp += boxes.filter((b) => !b.truthId).length;
+      this.stats.fp3d += boxes.filter((b) => !b.truthId && b.p).length;
     }
     const lat = (typeof performance !== 'undefined' ? performance.now() : Date.now()) - t0;
     this.stats.frames++; this.stats.lastLatencyMs = lat; this.stats.fps = lat > 0 ? Math.min(1000 / lat, 1 / dt) : 0;
@@ -549,7 +554,7 @@ export function detectionsToPickTargets(station: Station, robot: Robot, targets:
 
 /**
  * Create (or refresh) a "Vision <camera>" frame with grasp/approach targets from a pipeline output. Targets are updated
- * in place by name (stable ids for programs), and `Pick` / `Pick approach` always hold the first feasible target, so a
+ * in place by name (stable ids for programs), and `Pick` / `Pick approach` always hold the best feasible target (highest detector score), so a
  * program can MoveJ(Pick approach) → MoveL(Pick) after a VisionDetect call. With a robot (`robotId`) only targets the
  * robot reaches without collision are kept, unless `keepInfeasible`.
  */
@@ -576,11 +581,14 @@ export function createTargetsFromOutput(station: Station, cam: CameraItem, out: 
     return t;
   };
   const targets: Target[] = [];
+  // Pick: the most confident feasible detection (ties: the nearest to the camera, the top of a pile), not simply the
+  // first one in detector order
   let first: { t: VisionTarget; f?: PickTarget } | null = null;
+  const better = (a: VisionTarget, b: VisionTarget) => (a.score ?? 0) > (b.score ?? 0) + 1e-9 || (Math.abs((a.score ?? 0) - (b.score ?? 0)) <= 1e-9 && a.z < b.z);
   list.forEach((t, k) => {
     const f = feas?.[k];
     if (f && !(f.reachable && f.collisionFree) && !opts.keepInfeasible) return;
-    if (!first && (!f || (f.reachable && f.collisionFree))) first = { t, f };
+    if ((!f || (f.reachable && f.collisionFree)) && (!first || better(t, (first as { t: VisionTarget }).t))) first = { t, f };
     const app = put(`${t.name} approach`, t.approach, f?.approachJoints);
     const g = put(t.name, t.grasp, f?.joints);
     g.setParam('vision', { cls: t.cls, z: t.z, sigmaMm: t.sigmaMm, trackId: t.trackId ?? null, objectId: t.objectId ?? f?.objectId ?? null, feasible: f ? f.reachable && f.collisionFree : null, reason: f?.reason ?? null } as any);
@@ -651,6 +659,12 @@ export async function runVisionOnce(station: Station, cam: CameraItem, opts: { r
   const targets = opts.createTargets === false ? [] : createTargetsFromOutput(station, cam, output, { robotId: opts.robot?.id ?? null, frameName: opts.frameName });
   const found = picks ? picks.filter((p) => p.reachable && p.collisionFree).length : output.targets.length || output.detections.filter((d) => d.p).length;
   return { found, targets, output, picks, warnings: output.warnings };
+}
+
+/** False positives of the run statistics; those with a 3D position are named, since they could become pick targets. */
+export function fpText(st: { fp: number; fp3d?: number }): string {
+  if (!st.fp) return ' · 0 false positives';
+  return ` · ${st.fp} false positive${st.fp > 1 ? 's' : ''}${st.fp3d ? ` (${st.fp3d} with a 3D position — check the targets)` : ' (none got a 3D position)'}`;
 }
 
 /** Human-readable summary line for logs / the Vision tab. */

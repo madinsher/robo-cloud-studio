@@ -29,7 +29,8 @@ import { makeStationWorld, StationWorld, stationFsmExecutor } from '../ctl/world
 import { synthesizeSupervisor, applyDeadlockMonitors } from '../ctl/supervisor';
 import { buildCourseStationA, buildCourseStationB, YOUBOT_STATION_DES, YOUBOT_STATION_BT, CELL_STATION_PETRI } from '../ctl/course_stations';
 import { controlExports, ExportEntry, GenFile } from '../ctl/codegen';
-import { zipStore, utf8 } from '../posts/zip';
+import { genFileBytes } from '../ctl/codegen/common';
+import { zipStore } from '../posts/zip';
 import { ProgramSimulator } from '../core/motion/simulator';
 import { Robot } from '../core/items/robot';
 import { Program } from '../core/items/program';
@@ -320,10 +321,11 @@ export function startMission(app: App, model: ControlModelItem, robot: MobileRob
   rt.bb.targets = opts.targets ?? 1;
   const maxSeconds = opts.maxSeconds ?? 600;
   // A tree whose root returns success per cycle (the course mission) keeps being ticked until it reports; a tree
-  // without a report action stops at its first success. Failures stop the run when they persist (~0.5 s) or come
-  // from a supervisor denial.
+  // without a report action stops at its first success or failure of the root (as the generated RoboDK / ROS
+  // runtimes do). A reporting tree stops when a failure persists (~0.5 s), when 3 cycles in a row failed, or on a
+  // supervisor denial.
   const hasReport = JSON.stringify(bt.root).includes('"report"');
-  let failTicks = 0;
+  let failTicks = 0, failCycles = 0, prevStatus = 'running';
   const finish = (why: string, level: 'ok' | 'warn' | 'error') => {
     run.done = true; stopMission(app, run);
     const s = rt.summary();
@@ -336,8 +338,11 @@ export function startMission(app: App, model: ControlModelItem, robot: MobileRob
       rt.tick(dt);
       if (robot && modes) { if (typeof rt.bb.vmax === 'number') robot.params.vmaxOverride = rt.bb.vmax; else delete robot.params.vmaxOverride; }
       failTicks = rt.status === 'failure' ? failTicks + 1 : 0;
-      const finished = rt.bb.reported === true || (rt.status === 'success' && !hasReport) || (rt.status === 'failure' && (failTicks * dt >= 0.5 || rt.bb.lastDenied !== undefined)) || rt.time >= maxSeconds;
-      if (finished) { const s = rt.summary(); finish(rt.bb.reported ? 'mission reported' : rt.time >= maxSeconds ? 'time limit' : rt.status, rt.status === 'failure' || s.violations || s.supervisorErrors || rt.time >= maxSeconds ? 'warn' : 'ok'); }
+      if (rt.status === 'failure' && prevStatus !== 'failure') failCycles++;
+      if (rt.status === 'success') failCycles = 0;
+      prevStatus = rt.status;
+      const finished = rt.bb.reported === true || (rt.status === 'success' && !hasReport) || (rt.status === 'failure' && (!hasReport || failTicks * dt >= 0.5 || failCycles >= 3 || rt.bb.lastDenied !== undefined)) || rt.time >= maxSeconds;
+      if (finished) { const s = rt.summary(); finish(rt.bb.reported ? 'mission reported' : rt.time >= maxSeconds ? 'time limit' : rt.status === 'failure' && hasReport && failCycles >= 3 ? 'failure (3 cycles in a row)' : rt.status, rt.status === 'failure' || s.violations || s.supervisorErrors || rt.time >= maxSeconds ? 'warn' : 'ok'); }
     } catch (e) { finish(`stopped by an error: ${(e as Error).message}`, 'error'); }
   } };
   app.worldHooks.push(run.hook);
@@ -349,16 +354,37 @@ export function startMission(app: App, model: ControlModelItem, robot: MobileRob
 /** Code generators of a model with the station's data (program durations and robots for the ROS 2 skill server, the supervisor model of a tree). */
 export function controlExportsFor(app: App, m: ControlModelItem): ExportEntry[] {
   const progs = app.station.itemsOfType<Program>(ItemType.PROGRAM).filter((p) => m.source.includes(p.name));
-  const durations: Record<string, number> = {}; const robots: Record<string, string> = {};
-  for (const p of progs) { const r = p.robot(); if (r) robots[p.name] = r.name; try { const s = new ProgramSimulator(app.station); s.collisionOptions = { enabled: false }; const res = s.compile(p); if (res.ok) durations[p.name] = Number(s.duration.toFixed(3)); } catch { /* duration unknown: 1 s in the skill server */ } }
+  const durations: Record<string, number> = {}; const robots: Record<string, string> = {}; const outputs: Record<string, Array<[string, number | boolean | string]>> = {};
+  for (const p of progs) { const r = p.robot(); if (r) robots[p.name] = r.name; try { const s = new ProgramSimulator(app.station); s.collisionOptions = { enabled: false }; const res = s.compile(p); if (res.ok) durations[p.name] = Number(s.duration.toFixed(3)); } catch { /* duration unknown: 1 s in the skill server */ } const o = programOutputs(p); if (o.length) outputs[p.name] = o; }
   let supervisorSource: string | undefined;
   if (m.kind === 'bt') { const bt = (() => { try { return parseBt(m.source); } catch { return null; } })(); const des = controlModels(app.station).find((x) => x.kind === 'des' && (!bt?.supervisor || x.name === bt.supervisor)); if (bt?.supervisor && des) supervisorSource = des.source; }
-  return controlExports(m.kind, m.source, m.name, app.station, { supervisorSource, ros: { durations, robots } });
+  return controlExports(m.kind, m.source, m.name, app.station, { supervisorSource, ros: { durations, robots, outputs } });
+}
+/** Signals a program sets (SetDO / setAO / set signal instructions, called programs included) in program order: the simulated ROS skill server applies them when the program ends. */
+export function programOutputs(p: Program, depth = 0): Array<[string, number | boolean | string]> {
+  const out: Array<[string, number | boolean | string]> = [];
+  for (const ins of p.instructions()) {
+    if (!ins.enabled) continue;
+    const d = ins.data;
+    if (d.kind === 'io' && !d.wait) out.push([d.io, d.value]);
+    else if (d.kind === 'signal' && !d.wait) out.push([d.signal, d.value]);
+    else if (d.kind === 'call' && depth < 8) { const c = (d.programId ? p.station?.findById(d.programId) : null) ?? (d.programName ? p.station?.itemsOfType<Program>(ItemType.PROGRAM).find((x) => x.name === d.programName) : null); if (c instanceof Program) out.push(...programOutputs(c, depth + 1)); }
+  }
+  return out;
+}
+/** The archive of several generated files (binary files - UR .urp - written as their bytes, not as their base64 text). */
+export function exportArchive(files: GenFile[]): Uint8Array {
+  return zipStore(files.map((f) => ({ name: f.name, data: genFileBytes(f) })));
 }
 /** One file → download it; several → a zip. */
 function downloadFiles(base: string, files: GenFile[]): void {
-  if (files.length === 1) { downloadText(files[0].name.replace(/^.*\//, ''), files[0].content, files[0].mime ?? 'text/plain'); return; }
-  downloadBlob(`${base}.zip`, new Blob([zipStore(files.map((f) => ({ name: f.name, data: utf8(f.content) }))) as Uint8Array<ArrayBuffer>], { type: 'application/zip' }));
+  if (files.length === 1) {
+    const f = files[0]; const name = f.name.replace(/^.*\//, '');
+    if (f.encoding === 'base64') downloadBlob(name, new Blob([genFileBytes(f) as Uint8Array<ArrayBuffer>], { type: f.mime ?? 'application/octet-stream' }));
+    else downloadText(name, f.content, f.mime ?? 'text/plain');
+    return;
+  }
+  downloadBlob(`${base}.zip`, new Blob([exportArchive(files) as Uint8Array<ArrayBuffer>], { type: 'application/zip' }));
 }
 
 /** Mobile skills (goto, dock, reach…) used by a behavior tree: they need a mobile robot; program / move / signal / wait / set… do not. */

@@ -33,7 +33,7 @@ describe('MenuBar', () => {
   it('has 13 menus with the expected entries', () => {
     expect(menu.el.querySelectorAll('.menu-btn').length).toBe(13);
     expect(menu.el.querySelector('.menu-title')!.textContent).toBe('VerticalBot Studio');
-    const expected: Record<string, [number, number]> = { File: [12, 2], Edit: [4, 1], Add: [12, 2], Program: [11, 2], Robot: [9, 2], 'Mobile & Fleet': [10, 2], Agriculture: [5, 1], Control: [7, 2], Group: [7, 2], Tools: [12, 2], Connect: [5, 2], View: [12, 2], Help: [4, 0] };
+    const expected: Record<string, [number, number]> = { File: [14, 2], Edit: [4, 1], Add: [12, 2], Program: [11, 2], Robot: [9, 2], 'Mobile & Fleet': [10, 2], Agriculture: [5, 1], Control: [7, 2], Group: [7, 2], Tools: [12, 2], Connect: [5, 2], View: [12, 2], Help: [4, 0] };
     for (const [name, [items, seps]] of Object.entries(expected)) {
       const m = openMenu(name);
       expect(m.querySelectorAll('.ctx-item').length, name).toBe(items);
@@ -88,7 +88,8 @@ describe('MenuBar', () => {
   it('Program: new / teach / run / pause / stop / validate / export', async () => {
     pickplace();
     clickMenu('Program', 'New program'); const p = app.activeProgram!; expect(p.name).toBe('Prog 2'); expect(p.robot()).toBe(app.activeRobot);
-    clickMenu('Program', 'Teach MoveJ'); clickMenu('Program', 'Teach MoveL'); expect(p.instructions().length).toBe(2);
+    // the first move taught into an empty program brings "Set reference frame" / "Set tool" (RoboDK)
+    clickMenu('Program', 'Teach MoveJ'); clickMenu('Program', 'Teach MoveL'); expect(p.instructions().map((i) => i.data.kind)).toEqual(['frame', 'tool', 'move', 'move']);
     clickMenu('Program', 'Run'); expect(app.sim.playing).toBe(true);
     clickMenu('Program', 'Pause'); expect(app.sim.playing).toBe(false);
     clickMenu('Program', 'Stop'); expect(app.sim.time).toBe(0);

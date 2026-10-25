@@ -140,8 +140,31 @@ function brandOf(name: string, convention: number): RobotBrand {
   if (convention === 2 || /fanuc/.test(n)) return 'Fanuc';
   if (convention === 3 || /motoman|yaskawa/.test(n)) return 'Yaskawa';
   if (convention === 5 || /\bkuka\b/.test(n)) return 'KUKA';
+  if (convention === 11 || /\bcomau\b/.test(n)) return 'Comau';
   const table: Array<[RegExp, RobotBrand]> = [[/universal robots|^ur\d|\bur\d+e?\b/, 'UR'], [/st(a|ä)ubli/, 'Staubli'], [/doosan/, 'Doosan'], [/kawasaki/, 'Kawasaki'], [/denso/, 'Denso'], [/mecademic|meca500/, 'Mecademic']];
   for (const [re, b] of table) if (re.test(n)) return b;
+  return 'Generic';
+}
+
+/**
+ * Post processor RoboDK uses for a robot whose file stores none (Item.getParam('PostProcessor') == ''): the brand's
+ * default post, recognised from the robot name / joint convention. Library GT: RoboDK 5.9.4 wrote .LS (Fanuc 06.d),
+ * .mod (ABB 06.b), .src (KUKA 08.a), .pdl (Comau 05.d) for robots without a stored post. Mechanisms (turntables,
+ * rails, grippers: no brand) keep the generic one, like RoboDK (which writes a license placeholder for them).
+ */
+export function defaultPostOf(name: string, convention: number, dof: number): string {
+  const n = name.toLowerCase();
+  const brand = brandOf(name, convention);
+  const byBrand: Partial<Record<RobotBrand, string>> = {
+    ABB: 'ABB_RAPID_IRC5', Fanuc: 'Fanuc_R30i', Yaskawa: 'Motoman', KUKA: 'KUKA_KRC2', Comau: 'Comau_C5G', UR: 'Universal_Robots',
+    Staubli: 'Staubli_VAL3', Doosan: 'Doosan_Robotics', Kawasaki: 'Kawasaki', Denso: 'Denso_RC8', Mecademic: 'Mecademic',
+  };
+  if (byBrand[brand] && dof >= 4) return byBrand[brand]!;
+  const byName: Array<[RegExp, string]> = [
+    [/techman|\btm\d/, 'Techman_TM'], [/\bepson\b/, 'Epson_RC'], [/\bnachi\b/, 'Nachi_AX_FD'], [/mitsubishi|\bmelfa\b/, 'Mitsubishi_Melfa'],
+    [/\bdobot\b/, 'Dobot_CR'], [/hanwha|\bhcr-/, 'Hanwha_HCR'], [/\bjaka\b/, 'JAKA'], [/\baubo\b/, 'AUBO'], [/\belite\b/, 'Elite_EC'], [/kinova/, 'Kinova_Kortex'],
+  ];
+  if (dof >= 4) for (const [re, id] of byName) if (re.test(n)) return id;
   return 'Generic';
 }
 
@@ -238,7 +261,9 @@ export function decodeRobotTable(r: RdkBytes, at: number, end: number, fallbackN
   const robot = new Robot(name, chain);
   robot.brand = brandOf(name, conv);
   robot.model = name;
-  if (post) robot.postProcessor = post;
+  // the file's post, else RoboDK's choice for a robot without one (the brand's default post)
+  robot.postProcessor = post || defaultPostOf(name, conv, dof);
+  robot.params.rdkPostProcessor = post;
   const reach = t(101);
   if (reach > 50 && reach < 20000) robot.reach = reach;
   const cur: number[] = [];

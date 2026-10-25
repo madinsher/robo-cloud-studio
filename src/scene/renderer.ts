@@ -5,7 +5,7 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { TransformControls } from 'three/addons/controls/TransformControls.js';
-import { Station, Item, ItemType, Frame, Target, Tool, SceneObject, Camera as CameraItem } from '../core/items/item';
+import { Station, Item, ItemType, Frame, Target, Tool, SceneObject, Camera as CameraItem, isShown } from '../core/items/item';
 import { Robot } from '../core/items/robot';
 import { PathItem, Program } from '../core/items/program';
 import { MobileRobot, MapItem, ZoneItem } from '../mobile/items';
@@ -38,9 +38,26 @@ interface Entry {
   meshKeys?: string[];
   /** showFrames/showTargets flags last applied to the subtree (avoids a traverse per frame). */
   flags?: string;
+  /** Fields: the fruit instances (updated in place when fruit are picked, without rebuilding the field). */
+  fieldFruit?: THREE.InstancedMesh | null;
 }
 
 export type SelectCallback = (item: Item | null, additive: boolean) => void;
+
+/** Daylight sky for Webots' textured backgrounds (noon_cloudy_countryside, ...): a vertical gradient (zenith -> horizon). */
+function skyGradient(name: string): THREE.Texture | THREE.Color {
+  const n = name.toLowerCase();
+  const [top, horizon] = /night|dark|space/.test(n) ? ['#05070d', '#1b2233'] : /dusk|sunset|dawn|evening|morning/.test(n) ? ['#4a6fa5', '#f2b880'] : /cloud|overcast|fog|mist/.test(n) ? ['#8fa3b8', '#dfe5ea'] : ['#5d8fd0', '#cfe1f2'];
+  if (typeof document === 'undefined') return new THREE.Color(horizon);
+  const c = document.createElement('canvas'); c.width = 4; c.height = 256;
+  const g = c.getContext('2d');
+  if (!g || typeof g.createLinearGradient !== 'function') return new THREE.Color(horizon);
+  const grad = g.createLinearGradient(0, 0, 0, 256); grad.addColorStop(0, top); grad.addColorStop(1, horizon);
+  g.fillStyle = grad; g.fillRect(0, 0, 4, 256);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
 export type PoseEditCallback = (item: Item, pose: Mat4) => void;
 
 export class SceneRenderer {
@@ -52,6 +69,15 @@ export class SceneRenderer {
   private entries = new Map<string, Entry>();
   private dirty = true;
   private structural = new Set<string>();
+  private sun!: THREE.DirectionalLight;
+  private hemi!: THREE.HemisphereLight;
+  private defaultBackground = 0x1e2229;
+  /** Item the camera follows (Webots Viewpoint `follow`): the camera translates with it. */
+  private followItem: Item | null = null;
+  private followLast: THREE.Vector3 | null = null;
+  /** Fields whose rows changed (fruit picked, plants sprayed): their fruit instances are refreshed at most every 100 ms. */
+  private fieldsDirty = new Set<string>();
+  private fieldRefreshAt = 0;
   private station: Station;
   private raycaster = new THREE.Raycaster();
   private pointer = new THREE.Vector2();
@@ -112,6 +138,7 @@ export class SceneRenderer {
     this.scene.add(hemi);
     const sun = new THREE.DirectionalLight(0xffffff, 1.6);
     sun.position.set(20000, -15000, 30000);
+    this.sun = sun; this.hemi = hemi; this.defaultBackground = opts.background ?? 0x1e2229;
     sun.castShadow = true;
     sun.shadow.mapSize.set(2048, 2048);
     sun.shadow.camera.left = -20000; sun.shadow.camera.right = 20000; sun.shadow.camera.top = 20000; sun.shadow.camera.bottom = -20000;
@@ -157,11 +184,14 @@ export class SceneRenderer {
     this.offTree.push(station.events.on('changed', ({ item, what }) => {
       this.dirty = true;
       if (!/^pose$|^joints$|^visible$|^name$|^selection$|^batch$/.test(what)) this.structural.add(item.id);
+      // a row of a field changed (harvest picks fruit, spray, growth): the field draws the row's fruit
+      if (item instanceof CropRow && item.parent instanceof FieldItem) this.fieldsDirty.add(item.parent.id);
       if (what === 'batch') this.rebuildAll();
     }));
     this.offTree.push(station.events.on('childAdded', () => { this.dirty = true; this.rebuildAll(); }));
     this.offTree.push(station.events.on('childRemoved', ({ child }) => { this.removeEntry(child); this.dirty = true; }));
     this.offTree.push(station.events.on('selection', () => { this.dirty = true; }));
+    this.applyEnvironment(station);
     this.rebuildAll();
   }
 
@@ -421,7 +451,10 @@ export class SceneRenderer {
     let e = this.entries.get(item.id);
     const sig = this.signature(item);
     if (e && e.sig === sig && !this.structural.has(item.id)) return e;
-    if (e) { this.scene.remove(e.root); this.unindexMeshes(e); if (e.selectionBox) { this.scene.remove(e.selectionBox); } }
+    if (e) {
+      this.scene.remove(e.root); this.unindexMeshes(e); if (e.selectionBox) { this.scene.remove(e.selectionBox); }
+      if (e.item instanceof FieldItem) e.root.traverse((o) => { if (o instanceof THREE.InstancedMesh) { o.geometry.dispose(); o.dispose(); } });
+    }
     const root = new THREE.Group();
     root.matrixAutoUpdate = false;
     root.userData.itemId = item.id;
@@ -507,6 +540,11 @@ export class SceneRenderer {
       cam.rotateX(Math.PI); // look down +Z of the item with image Y down (same frame as renderFromItem)
       const helper = new THREE.CameraHelper(cam);
       root.add(cam);
+      // CameraHelper draws with camera.matrixWorld as its own matrix; under the item root that applies the root transform
+      // twice (frustums floated metres away from their robots). Use the camera's matrix relative to the root instead.
+      cam.updateMatrix();
+      helper.matrix = cam.matrix;
+      helper.userData.cameraHelper = true;
       root.add(helper);
     } else if (item.type === ItemType.MISSION || item.type === ItemType.FLEET || item.type === ItemType.PROGRAM || item.type === ItemType.INSTRUCTION || item.type === ItemType.FOLDER || item.type === ItemType.NOTES) {
       // no 3D representation
@@ -664,6 +702,89 @@ export class SceneRenderer {
     root.add(pathLine);
   }
 
+  /**
+   * Background, fog and sun of an imported Webots world (station.settings.background / fog / lights): the sky colour (a
+   * textured Webots background gets a daylight sky gradient), LINEAR fog up to visibilityRange, the world's first
+   * DirectionalLight as the sun direction. Stations without these settings get the studio defaults back.
+   */
+  applyEnvironment(station: Station = this.station): void {
+    if (!this.sun) return;
+    const st = station.settings as Record<string, any>;
+    const bg = st.background as { skyColor?: number[]; luminosity?: number; texture?: string } | undefined;
+    const fog = st.fog as { color?: number[]; visibilityRange?: number } | undefined;
+    const lights = (st.lights as Array<{ type: string; direction?: number[]; intensity?: number; color?: number[]; attached?: boolean }> | undefined) ?? [];
+    if (bg?.texture) this.scene.background = skyGradient(String(bg.texture));
+    else if (bg?.skyColor && bg.skyColor.length >= 3) this.scene.background = new THREE.Color(bg.skyColor[0], bg.skyColor[1], bg.skyColor[2]);
+    else this.scene.background = new THREE.Color(this.defaultBackground);
+    const bgColor = this.scene.background instanceof THREE.Color ? this.scene.background : new THREE.Color(0xb8c7d6);
+    this.scene.fog = fog && Number(fog.visibilityRange) > 0
+      ? new THREE.Fog(new THREE.Color(fog.color?.[0] ?? 1, fog.color?.[1] ?? 1, fog.color?.[2] ?? 1), 0, Number(fog.visibilityRange))
+      : new THREE.Fog(bgColor, 60000, 250000);
+    const dl = lights.find((l) => l.type === 'DirectionalLight' && !l.attached && Array.isArray(l.direction));
+    if (dl) {
+      const d = new THREE.Vector3(dl.direction![0], dl.direction![1], dl.direction![2]).normalize();
+      this.sun.position.copy(d.multiplyScalar(-40000));   // three's light shines from its position towards the origin
+      this.sun.intensity = 1.6 * Math.max(0, Number(dl.intensity ?? 1));
+      if (dl.color) this.sun.color.setRGB(dl.color[0], dl.color[1], dl.color[2]);
+    } else { this.sun.position.set(20000, -15000, 30000); this.sun.intensity = 1.6; this.sun.color.set(0xffffff); }
+    if (this.hemi) this.hemi.intensity = 0.9 * (bg?.luminosity !== undefined ? Math.max(0.2, Number(bg.luminosity)) : 1);
+    this.dirty = true;
+  }
+
+  /** Follow an item with the camera (null stops): the view keeps its orbit around the item while the item moves. */
+  setFollow(item: Item | null): void { this.followItem = item; this.followLast = null; }
+  followed(): Item | null { return this.followItem; }
+  /** Camera and orbit target translate by the followed item's motion since the last frame. */
+  private updateFollow(): void {
+    const it = this.followItem;
+    if (!it) return;
+    if (it.station !== this.station) { this.followItem = null; this.followLast = null; return; }
+    const m = it.poseAbs();
+    const p = new THREE.Vector3(m[12], m[13], m[14]);
+    if (this.followLast) {
+      const d = p.clone().sub(this.followLast);
+      if (d.lengthSq() > 1e-6) { this.camera.position.add(d); this.controls.target.add(d); this.controls.update(); this.dirty = true; }
+    }
+    this.followLast = p;
+  }
+
+  /** Fruit of the dirty fields: picked fruit disappear at once (instances rewritten in place, no field rebuild). */
+  private refreshFields(): void {
+    this.fieldRefreshAt = performance.now();
+    for (const id of this.fieldsDirty) {
+      const e = this.entries.get(id);
+      if (!e || !(e.item instanceof FieldItem)) continue;
+      if (this.structural.has(id) || !this.writeFieldFruit(e.item, e.fieldFruit ?? null)) { this.structural.add(id); continue; }
+      e.sig = this.signature(e.item);
+      this.dirty = true;
+    }
+    this.fieldsDirty.clear();
+  }
+
+  /** Write the visible (ripe, not picked) fruit into the instanced mesh; false when they do not fit (rebuild needed). */
+  private writeFieldFruit(f: FieldItem, mesh: THREE.InstancedMesh | null): boolean {
+    const m = new THREE.Matrix4(), q = new THREE.Quaternion(), v = new THREE.Vector3(), sc = new THREE.Vector3();
+    let fi = 0;
+    const cap = mesh ? (mesh.instanceMatrix.count ?? mesh.instanceMatrix.array.length / 16) : 0;
+    for (const r of f.rows()) {
+      const [dx, dy] = r.direction();
+      for (const p of r.plants) {
+        let x = 0, y = 0, at = false;
+        for (const fr of p.fruit) {
+          if (fr.ripe < 0.5 || fr.picked) continue;
+          if (!mesh || fi >= cap) return false;
+          if (!at) { [x, y] = r.pointAt(p.s); at = true; }
+          v.set(x + dx * fr.p[0] - dy * fr.p[1], y + dy * fr.p[0] + dx * fr.p[1], fr.p[2]);
+          sc.setScalar(fr.d / 2);
+          m.compose(v, q, sc);
+          mesh.setMatrixAt(fi++, m);
+        }
+      }
+    }
+    if (mesh) { mesh.count = fi; mesh.instanceMatrix.needsUpdate = true; }
+    return true;
+  }
+
   private buildField(f: FieldItem, e: Entry) {
     const root = e.root;
     if (f.polygon.length >= 3) {
@@ -707,6 +828,7 @@ export class SceneRenderer {
     trunk.castShadow = canopy.castShadow = true;
     root.add(trunk, canopy);
     if (fruitMesh) { fruitMesh.count = fi; fruitMesh.instanceMatrix.needsUpdate = true; root.add(fruitMesh); }
+    e.fieldFruit = fruitMesh;
     // row lines
     for (const r of rows) root.add(polylineObject([r.start, r.end], 0x94d82d, false, 3));
   }
@@ -741,6 +863,8 @@ export class SceneRenderer {
     const dt = Math.min(0.1, this.timer.getDelta());
     for (const fn of this.animHandlers) fn(dt);
     this.controls.update();
+    if (this.fieldsDirty.size && (this.structural.size || performance.now() - this.fieldRefreshAt > 100)) this.refreshFields();
+    this.updateFollow();
     if (this.structural.size) {
       for (const id of [...this.structural]) {
         const it = this.entries.get(id)?.item ?? this.station.findById(id);
@@ -766,9 +890,8 @@ export class SceneRenderer {
     const selectedIds = new Set(this.station.selection.map((s) => s.id));
     for (const e of this.entries.values()) {
       const item = e.item;
-      let visible = item.visible;
-      let p: Item | null = item.parent;
-      while (visible && p && p !== this.station) { if (!p.visible) visible = false; p = p.parent; }
+      // RoboDK: a hidden frame / robot / tool / object hides only itself (isShown), containers hide their subtree
+      const visible = isShown(item);
       e.root.visible = visible;
       if (!visible) continue;
       if (item instanceof Tool) e.root.matrix.copy(mat4ToThree(item.flangeAbs()));

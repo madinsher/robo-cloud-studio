@@ -35,13 +35,39 @@ export function exportMoveItConfig(robot: Robot, assets?: AssetStore, opts: URDF
   const descPkg = sanitizeName(opts.packageName ?? `${robot.name}_description`).toLowerCase();
   const pkg = sanitizeName(opts.moveitPackage ?? `${robot.name}_moveit_config`).toLowerCase();
   const desc = exportRobotURDF(robot, assets, { ...opts, packageName: descPkg, extras: true });
-  const srdf = String(desc.files[`config/${rn}.srdf`] ?? '');
-  const group = /<group name="([^"]+)"/.exec(srdf)?.[1] ?? 'manipulator';
-  const controller = `${group}_controller`;
+  // the description names its SRDF after its URDF (config/murom.srdf for a robot "murom_left_arm"): take the one written
+  const srdfKey = desc.files[`config/${rn}.srdf`] !== undefined ? `config/${rn}.srdf` : Object.keys(desc.files).find((k) => /^config\/[^/]+\.srdf$/.test(k));
+  const srdf = String((srdfKey ? desc.files[srdfKey] : '') ?? '');
+  let group = /<group name="([^"]+)"/.exec(srdf)?.[1] ?? 'manipulator';
   // the group joints = the movable, non-mimic joints of the URDF (chain order)
   const doc = parseXML(desc.urdf);
   const urdfJoints = childElements(doc, 'joint').filter((j) => ['revolute', 'continuous', 'prismatic'].includes(j.attrs.type) && !childElements(j, 'mimic').length);
   const joints = urdfJoints.map((j) => j.attrs.name);
+  // the planning group / trajectory controller: the joints of the SRDF chain (base_link -> tip_link), not every joint
+  // of the URDF (a mobile manipulator's wheels, head and other arm made move_group reject the group)
+  const byChild = new Map(childElements(doc, 'joint').map((j) => [childElements(j, 'child')[0]?.attrs.link, j]));
+  const chainJoints = (base: string, tip: string): string[] | null => {
+    const out: string[] = [];
+    for (let link: string | undefined = tip, guard = 0; link && link !== base && guard < 1000; guard++) {
+      const j = byChild.get(link);
+      if (!j) return null;
+      if (joints.includes(j.attrs.name)) out.unshift(j.attrs.name);
+      link = childElements(j, 'parent')[0]?.attrs.link;
+    }
+    return out;
+  };
+  // of the SRDF's groups (a MUROM description has head, arms, wrists) the one that moves this robot's own joints
+  const own = new Set(robot.chain.joints.filter((j) => j.type !== 'fixed' && !j.mimic).map((j) => frameName(j.name)));
+  let groupJoints = joints;
+  let best = -1;
+  for (const m of srdf.matchAll(/<group name="([^"]+)">([\s\S]*?)<\/group>/g)) {
+    const c = /<chain base_link="([^"]+)" tip_link="([^"]+)"\/>/.exec(m[2]);
+    const js = c ? chainJoints(c[1], c[2]) : null;
+    if (!js?.length) continue;
+    const score = js.filter((n) => own.has(n)).length * 1000 + (m[1] === rn ? 500 : 0) + js.length;
+    if (score > best) { best = score; group = m[1]; groupJoints = js; }
+  }
+  const controller = `${group}_controller`;
   const indep = robot.chain.joints.filter((j) => j.type !== 'fixed' && !j.mimic);
   const home = robot.jointsHome();
   const vmax = robot.jointMaxVelocities(), amax = robot.jointMaxAccelerations();
@@ -67,14 +93,14 @@ export function exportMoveItConfig(robot: Robot, assets?: AssetStore, opts: URDF
   const y = (o: unknown, ints: string[] = []) => toRosYaml(o, { intKeys: ints });
   const cfg: Record<string, string> = {
     [`config/${rn}.urdf.xacro`]: urdfXacro,
-    [`config/${rn}.srdf`]: srdf,
+    [`config/${rn}.srdf`]: srdf,   // MoveItConfigsBuilder('<robot>') reads config/<robot>.srdf
     'config/kinematics.yaml': y({ [group]: { kinematics_solver: 'kdl_kinematics_plugin/KDLKinematicsPlugin', kinematics_solver_search_resolution: 0.005, kinematics_solver_timeout: 0.005 } }),
     'config/joint_limits.yaml': `# rad/s, rad/s² (m/s for prismatic joints); MoveIt scales trajectories by the default factors\n${y({ default_velocity_scaling_factor: 0.1, default_acceleration_scaling_factor: 0.1, joint_limits: limits })}`,
     'config/ros2_controllers.yaml': y({
       controller_manager: { ros__parameters: { update_rate: 100, [controller]: { type: 'joint_trajectory_controller/JointTrajectoryController' }, joint_state_broadcaster: { type: 'joint_state_broadcaster/JointStateBroadcaster' } } },
-      [controller]: { ros__parameters: { joints, command_interfaces: ['position'], state_interfaces: ['position', 'velocity'], allow_nonzero_velocity_at_trajectory_end: true } },
+      [controller]: { ros__parameters: { joints: groupJoints, command_interfaces: ['position'], state_interfaces: ['position', 'velocity'], allow_nonzero_velocity_at_trajectory_end: true } },
     }, ['update_rate']),
-    'config/moveit_controllers.yaml': y({ moveit_controller_manager: 'moveit_simple_controller_manager/MoveItSimpleControllerManager', moveit_simple_controller_manager: { controller_names: [controller], [controller]: { type: 'FollowJointTrajectory', action_ns: 'follow_joint_trajectory', default: true, joints } } }),
+    'config/moveit_controllers.yaml': y({ moveit_controller_manager: 'moveit_simple_controller_manager/MoveItSimpleControllerManager', moveit_simple_controller_manager: { controller_names: [controller], [controller]: { type: 'FollowJointTrajectory', action_ns: 'follow_joint_trajectory', default: true, joints: groupJoints } } }),
     'config/initial_positions.yaml': y({ initial_positions: Object.fromEntries(joints.map((n) => [n, si(idx(n), home[idx(n)] ?? 0)])) }),
     'config/pilz_cartesian_limits.yaml': y({ cartesian_limits: { max_trans_vel: 1.0, max_trans_acc: 2.25, max_trans_dec: -5.0, max_rot_vel: 1.57 } }),
   };
@@ -122,5 +148,5 @@ ${[descPkg, 'moveit_ros_move_group', 'moveit_kinematics', 'moveit_planners', 'mo
   const files: Record<string, Uint8Array | string> = {};
   for (const [p, c] of Object.entries(desc.files)) files[`${descPkg}/${p}`] = c;
   for (const [p, c] of Object.entries(cfg)) files[`${pkg}/${p}`] = c;
-  return { files, packages: { description: descPkg, moveit: pkg }, robotName: rn, group, controller, joints, warnings: desc.warnings };
+  return { files, packages: { description: descPkg, moveit: pkg }, robotName: rn, group, controller, joints: groupJoints, warnings: desc.warnings };
 }

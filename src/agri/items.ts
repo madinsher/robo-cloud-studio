@@ -124,7 +124,8 @@ export class CropRow extends Item {
 }
 
 export type MissionType = 'harvest' | 'spray' | 'mow' | 'prune' | 'scout' | 'transport' | 'pollinate' | 'weed' | 'thin' | 'irrigate';
-export type MissionStatus = 'draft' | 'planned' | 'running' | 'paused' | 'done' | 'aborted';
+/** `incomplete`: every task finished but the mission goal is not met (ripe fruit left on the plants, failed tasks). */
+export type MissionStatus = 'draft' | 'planned' | 'running' | 'paused' | 'done' | 'incomplete' | 'aborted';
 
 /** Mission: a high-level agricultural job over rows/zones executed by a fleet. */
 export class MissionItem extends Item {
@@ -137,7 +138,10 @@ export class MissionItem extends Item {
   settings: Record<string, any> = { workSpeed: 500, sideOffset: 1500, bothSides: true };
   /** Generated task ids (fleet tasks). */
   taskIds: string[] = [];
+  /** 0–1: harvest missions = fruit picked / (picked + ripe fruit still on the worked row sides); others = tasks done. */
   progress = 0;
+  /** Fruit balance of harvest / thinning missions (updateMissionProgress). */
+  fruit: { picked: number; left: number; unreachable: number; missedByVision: number } | null = null;
   /** Scouting observations (plant health) and process results, persisted with the station. */
   observations: Array<{ t: number; rowId: string; plant: number; health: number; diseased: boolean; robot: string }> = [];
   /** Follow-up task keys already created (row:type). */
@@ -148,11 +152,12 @@ export class MissionItem extends Item {
     super(ItemType.MISSION, name, id);
   }
   protected override serializeExtra() {
-    return { missionType: this.missionType, fieldId: this.fieldId, fleetId: this.fleetId, rowIds: this.rowIds, status: this.status, settings: this.settings, taskIds: this.taskIds, progress: this.progress, observations: this.observations, followUps: this.followUps, warnings: this.warnings };
+    return { missionType: this.missionType, fieldId: this.fieldId, fleetId: this.fleetId, rowIds: this.rowIds, status: this.status, settings: this.settings, taskIds: this.taskIds, progress: this.progress, fruit: this.fruit, observations: this.observations, followUps: this.followUps, warnings: this.warnings };
   }
   override deserializeExtra(d: SerializedItem, _ctx: DeserializeContext) {
     this.missionType = (d.missionType as MissionType) ?? 'harvest'; this.fieldId = (d.fieldId as any) ?? null; this.fleetId = (d.fleetId as any) ?? null; this.rowIds = (d.rowIds as string[]) ?? [];
     this.status = (d.status as MissionStatus) ?? 'draft'; this.settings = (d.settings as any) ?? {}; this.taskIds = (d.taskIds as string[]) ?? []; this.progress = (d.progress as number) ?? 0;
+    this.fruit = (d.fruit as any) ?? null;
     this.observations = (d.observations as any) ?? []; this.followUps = (d.followUps as string[]) ?? []; this.warnings = (d.warnings as string[]) ?? [];
   }
 }

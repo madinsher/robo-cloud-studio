@@ -56,7 +56,9 @@ export function buildCourseStationA(st: Station = new Station('Course example A 
   arm.setJoints(stow);
   jointProgram(st, arm, 'Reach', [['A stow', stow], ['A reach', reach]]);
   jointProgram(st, arm, 'Stow', [['A reach', reach], ['A stow', stow]]);
-  // Holding / Delivered are written last: the signal reports a completed grasp / release (the guards read it)
+  // Holding / Delivered are written last: the signal reports a completed grasp / release (the guards read it). The
+  // part is attached by name (the UR3e does not reach the table top from the base): the models grasp only when the
+  // base camera sees a part at the table (`parts_here`, see the sensor / condition below)
   const grasp = st.addChild(new Program('Grasp')); grasp.setRobot(arm); grasp.pause(500); grasp.event('attach', part.id); grasp.pause(300); grasp.setDO('Holding', 1);
   const release = st.addChild(new Program('Release')); release.setRobot(arm); release.pause(300); release.event('detach', part.id); release.setDO('Holding', 0); release.setDO('Delivered', 1);
   return { station: st, base, arm, part };
@@ -75,7 +77,7 @@ action Arm.R program=Reach done=a_reached timeout=30
 action Arm.W program=Stow done=a_stowed timeout=30
 action Grip.C program=Grasp done=g_ok fail=g_miss timeout=20
 action Object.Bx program=Release timeout=20
-sensor v_detect "zone == 'table' && Holding == 0"
+sensor v_detect "zone == 'table' && Holding == 0 && parts_here > 0"
 sensor v_lost "zone != 'table'"
 guard b_go_table "Delivered == 0 && Holding == 0 && zone != 'table'"
 guard b_go_box "Holding == 1"
@@ -99,6 +101,7 @@ fallback root
       sequence "collect one" memory
         action select_target
         action goto zone=table event=b_go_table arrive=b_arrive timeout=120
+        condition "parts_here > 0"
         action event emit=v_detect
         action reach event=a_reach done=a_reached timeout=30
         retry 2
@@ -113,6 +116,7 @@ fallback root
         action stow event=a_stow done=a_stowed timeout=30
         action set next=1 event=o_next
     sequence finish memory
+      condition "targets <= 0 && !held"
       action goto zone=home event=b_go_home arrive=b_arrive timeout=120
       action report
 supervisor youBot_cell`;

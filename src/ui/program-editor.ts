@@ -112,7 +112,8 @@ export class ProgramEditor {
   private renderFoot() {
     const res = this.program?.lastResult;
     if (!this.foot) return;
-    this.foot.textContent = res ? `Cycle time ${res.duration.toFixed(2)} s · TCP distance ${(res.distance / 1000).toFixed(2)} m · ${res.ok ? 'valid' : `${res.problems.filter((x) => x.severity === 'error').length} error(s)`}` : '';
+    // RoboDK's cycle time (Item.Update()), plus the playback time when programmed speeds make it differ
+    this.foot.textContent = res ? `Cycle time ${(res.updateTime ?? res.duration).toFixed(2)} s${res.updateTime !== undefined && Math.abs(res.updateTime - res.duration) > 0.005 ? ` (playback ${res.duration.toFixed(2)} s)` : ''} · TCP distance ${(res.distance / 1000).toFixed(2)} m · ${res.ok ? 'valid' : `${res.problems.filter((x) => x.severity === 'error').length} error(s)`}` : '';
     this.foot.style.display = res ? '' : 'none';
   }
 

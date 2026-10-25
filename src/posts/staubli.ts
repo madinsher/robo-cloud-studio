@@ -112,7 +112,7 @@ export class StaubliPost extends RoboPost {
   protected xyz(m: Mat4) { const v = pose2Staubli(m); return v.map((x) => fx(x)).join(','); }
   MoveJ(_pose: Mat4 | null, joints: number[]): void { this.moveLine(`call MoveJoint(${joints.slice(0, Math.max(6, this.nAxes)).map((v) => fx(v, 5)).join(',')})`); }
   MoveL(pose: Mat4 | null, joints: number[], conf: number[]): void {
-    if (!pose) { this.MoveJ(null, joints); return; }
+    if (!pose) { this.addline('// Linear movement using joint targets is not supported. Change the target type to cartesian or use a joint movement.'); return; }
     this.setConf('pPointRx', conf);
     this.moveLine(`call MoveLine(${this.xyz(pose)})`);
   }

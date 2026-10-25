@@ -113,7 +113,10 @@ function run(mobile: MobileRobot, scratch: MobileRobot, path: number[][], goal: 
   const end = goal ?? { x: path[path.length - 1][0], y: path[path.length - 1][1], heading: undefined };
   const err = Math.hypot(tr.X[n] - end.x, tr.Y[n] - end.y);
   const herr = end.heading !== undefined ? Math.abs(wrap180(tr.H[n] - end.heading)) : 0;
-  const ok = !tr.timedOut && err <= o.tol && herr <= Math.max(3, o.headTol * 2);
+  // heading acceptance at the goal: 3° (5° for an Ackermann base, which cannot correct its heading on the spot and
+  // arrives on the Reeds–Shepp approach arc with the steering-rate lag; Nav2's default yaw tolerance is 14°)
+  const headAccept = Math.max(scratch.kin.drive === 'ackermann' ? 5 : 3, o.headTol * 2);
+  const ok = !tr.timedOut && err <= o.tol && herr <= headAccept;
   void mobile;
   return {
     ok,

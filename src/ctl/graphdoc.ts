@@ -84,6 +84,42 @@ export function desToDsl(doc: DesDoc): string {
   return out.join('\n');
 }
 
+/** Sensor lines as editable text: `event "expression"; …` (diagram inspector). */
+export function sensorsText(list: SensorSpec[] | undefined): string { return (list ?? []).map((s) => `${s.event} "${s.expr.replace(/"/g, "'")}"`).join('; '); }
+export function parseSensorsText(text: string): SensorSpec[] {
+  const out: SensorSpec[] = [];
+  for (const part of text.split(';').map((x) => x.trim()).filter(Boolean)) {
+    const m = /^(\S+)\s+"([^"]*)"$/.exec(part) ?? /^(\S+)\s+(.+)$/.exec(part);
+    if (!m) throw new Error(`sensor "${part}": event "expression"`);
+    out.push({ event: m[1], expr: m[2].trim() });
+  }
+  return out;
+}
+/** Final markings as editable text: `xA d2; xB a2` (a place, or place=n tokens). */
+export function finalsText(finals: Array<Record<string, number>> | undefined): string { return (finals ?? []).map((f) => Object.entries(f).map(([p, n]) => (n === 1 ? p : `${p}=${n}`)).join(' ')).join('; '); }
+export function parseFinalsText(text: string, places: string[]): Array<Record<string, number>> {
+  return text.split(';').map((x) => x.trim()).filter(Boolean).map((part) => Object.fromEntries(part.split(/\s+/).map((w) => {
+    const [p, n] = w.split('='); if (!places.includes(p)) throw new Error(`final marking: no place ${p}`);
+    const k = n === undefined ? 1 : Number(n); if (!Number.isInteger(k) || k < 0) throw new Error(`final marking: ${w}`);
+    return [p, k];
+  })));
+}
+
+/** Rename an automaton where the document refers to it by name: bindings `A.state` and check atoms `A=state`. */
+export function renameAutomatonRefs(doc: DesDoc, from: string, to: string): void {
+  if (from === to) return;
+  for (const a of doc.actions ?? []) if (a.target.startsWith(`${from}.`)) a.target = `${to}.${a.target.slice(from.length + 1)}`;
+  const re = new RegExp(`(^|[^\\w.:'"])${from.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?=\\s*(?:==|!=|=))`, 'g');
+  for (const c of doc.checks ?? []) c.formula = c.formula.replace(re, `$1${to}`);
+}
+/** Rename a state of automaton `automaton` in check atoms `automaton=state` (bindings are retargeted by the editor). */
+export function renameStateRefs(doc: DesDoc, automaton: string, from: string, to: string): void {
+  if (from === to) return;
+  const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const re = new RegExp(`(^|[^\\w.:'"])(${esc(automaton)}\\s*(?:==|!=|=)\\s*['"]?)${esc(from)}(?![\\w.:])`, 'g');
+  for (const c of doc.checks ?? []) c.formula = c.formula.replace(re, `$1$2${to}`);
+}
+
 export function newAutomaton(name: string): AutomatonSpec { return { name, events: [], initial: 'q0', marked: ['q0'], transitions: [], states: ['q0'] }; }
 
 export function addState(a: AutomatonSpec, name?: string): string {
@@ -220,7 +256,9 @@ export function btWalk(root: BTNodeSpec): Array<{ node: BTNodeSpec; parent: BTNo
 export const btParentOf = (root: BTNodeSpec, node: BTNodeSpec): BTNodeSpec | null => btWalk(root).find((e) => e.node === node)?.parent ?? null;
 export const btIsAncestor = (a: BTNodeSpec, b: BTNodeSpec): boolean => a === b || (a.children ?? []).some((c) => btIsAncestor(c, b));
 export function newBtNode(type: BTNodeType): BTNodeSpec {
-  if (type === 'action') return { type, fn: 'wait', args: { seconds: 1 }, timeout: 5 };
+  // no default timeout: a timeout is a contract the user sets for the bound program / skill (a default shorter than the
+  // program would fail it on every run)
+  if (type === 'action') return { type, fn: 'wait', args: { seconds: 1 } };
   if (type === 'condition') return { type, fn: 'true' };
   const n: BTNodeSpec = { type, name: type, children: [] };
   if (type === 'parallel') n.threshold = 1; if (type === 'retry' || type === 'repeat') n.count = 2; if (type === 'timeout') n.seconds = 10;

@@ -252,7 +252,7 @@ function parseSensors(model: URDFModel): URDFSensor[] {
       if ((type === 'camera' || type === 'depth' || type === 'depth_camera' || type === 'rgbd_camera' || type === 'multicamera') && cam) {
         const img = childElement(cam, 'image'), clip = childElement(cam, 'clip');
         const hfov = num(cam, 'horizontal_fov');
-        out.push({ link, kind: type === 'camera' || type === 'multicamera' ? 'camera' : 'depth', name, pose: multiply(T, toOptical), fov: hfov !== undefined ? hfov * RAD : undefined, fovAxis: 'horizontal', width: num(img, 'width'), height: num(img, 'height'), near: num(clip, 'near') !== undefined ? num(clip, 'near')! * M2MM : undefined, far: num(clip, 'far') !== undefined ? num(clip, 'far')! * M2MM : undefined });
+        out.push({ link, kind: type === 'camera' || type === 'multicamera' ? 'camera' : 'depth', name, pose: multiply(T, toOptical), fov: hfov !== undefined ? hfov * RAD : undefined, fovAxis: 'horizontal', width: num(img, 'width'), height: num(img, 'height'), near: num(clip, 'near') !== undefined ? num(clip, 'near')! * M2MM : undefined, far: num(clip, 'far') !== undefined ? num(clip, 'far')! * M2MM : undefined, params: { sensorType: type } }); // depth / depth_camera: depth only; rgbd_camera: colour + depth (Gazebo)
       } else if (type === 'ray' || type === 'gpu_ray' || type === 'lidar' || type === 'gpu_lidar') {
         const ray = childElement(s, 'ray') ?? childElement(s, 'lidar');
         const scan = ray ? childElement(ray, 'scan') : undefined;

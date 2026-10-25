@@ -11,7 +11,7 @@ import { Station } from '../core/items/item';
 import { StationRuntime } from '../core/motion/runtime';
 import { AssetStore } from '../scene/assets';
 import { Robolink, ApiFileSystem } from './robolink';
-import { startApiServer, ApiServer } from './api_server';
+import { startApiServer, ApiServer, ApiServerOptions } from './api_server';
 import { createCPythonRunner, CPythonRunner } from './runner_cpython';
 import type { RpcRequest, RpcResponse } from './rpc';
 import type { StationRuntimeLike } from './exec';
@@ -47,6 +47,10 @@ export interface NodeHostOptions {
   port?: number;
   /** TCP JSON-lines port (0 = ephemeral, -1 = disabled). */
   tcpPort?: number;
+  /** Bind address of the sockets the host opens itself (default 127.0.0.1). */
+  host?: string;
+  /** WebSocket upgrade filter (src/api/security.ts; default: local pages and non-browser clients only). */
+  verifyClient?: ApiServerOptions['verifyClient'];
   mode?: 'realtime' | 'virtual';
   /** Simulation speed factor of the realtime clock. */
   speed?: number;
@@ -97,7 +101,7 @@ export async function createNodeHost(opts: NodeHostOptions = {}): Promise<NodeHo
   let port = 0;
   const runner = createCPythonRunner({ url: () => `ws://127.0.0.1:${port}`, python: opts.python, timeoutS: opts.scriptTimeoutS, headlessGui: opts.headlessGui, onOutput: (name, line, stream) => log(`${name}${stream === 'stderr' ? ' !' : ':'} ${line}`) });
   rdk.exec.setScriptRunner(runner);
-  const api = startApiServer({ server: opts.server, port: opts.server ? undefined : opts.port ?? 0, tcpPort: opts.tcpPort ?? -1, getRDK: () => rdk, special: opts.special, afterHeadless: opts.afterHeadless, log });
+  const api = startApiServer({ server: opts.server, port: opts.server ? undefined : opts.port ?? 0, tcpPort: opts.tcpPort ?? -1, host: opts.host, verifyClient: opts.verifyClient, getRDK: () => rdk, special: opts.special, afterHeadless: opts.afterHeadless, log });
   const r = await api.ready;
   port = r.port;
   return {

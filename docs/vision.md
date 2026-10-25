@@ -43,7 +43,11 @@ targets.
 - Depth modalities (stereo, RGB-D, ToF) always produce a depth image (catalogue noise σ(z) when `simulate`), so real
   detectors get 3D too.
 - `simulate: false` is an exact detector (truth boxes and masks, no false positives); without ground truth a simulated
-  model reports nothing.
+  model reports nothing. With `simulate` on (the wizard default) boxes jitter like a detector trained on the task
+  (corner σ = 4 % × (1 − mAP) of the box + 0.5 px, size σ = 5 % × (1 − mAP): IoU ≈ 0.9+ for a YOLOv10 on a 300 px
+  part), small objects are missed and about 2 × (1 − mAP) false positives per frame appear on the background. The
+  Vision tab statistics give the position error of the true positives and count the false positives, naming those that
+  got a 3D position (`stats.fp3d`).
 - A real runtime that is not configured (no ONNX model, no server, no topic, no VLM URL) fails with an explicit warning
   (`UnavailableModel`) instead of silently simulating.
 - ONNX Runtime Web loads its WASM from the bundled package asset (no CDN).
@@ -52,14 +56,22 @@ targets.
 layer filling the box centre is kept (object, not table or leaves). Planes are fitted (RANSAC + least squares; thin
 slivers rejected), the face a top grasp uses is chosen, grown beyond a loose box, and outlined with a minimum-area
 rectangle. With an object model (truth dims or `objectDims`) truncated faces are completed and the centre is pushed
-back by half the thickness. Fruit (size prior only) take the centre one radius behind the visible surface. The face
-axis is folded by symmetry (90° square / 180° rectangle) towards the robot X axis — the "lazy" wrist of RoboDK
+back by half the thickness. An object known only by a size prior is a face when its visible surface is one plane (a
+box: the grasp is normal to the face) and round otherwise (fruit: the centre one radius behind the visible surface). The
+face axis is folded by symmetry (90° square / 180° rectangle) towards the robot X axis — the "lazy" wrist of RoboDK
 Example 06.c.
+
+A detection gets no 3D position, hence no target, when nothing stands out of its support, whatever the detector
+(simulated false positives, ONNX, server, ROS): the surface it lies on continues all around the box (in a ring of pixels
+around it nothing lies behind the surface and most of it lies on it: a box on the bare table or inside a part's top
+face), the face runs on past the detection window on three sides (a box across a part's edge), or the box / face is far
+smaller than the object model or size prior (< 40 %, not cut by the image border).
 
 Targets (`graspFromSurface`): TCP on the face centre + 2 mm, tool Z into the part, approach 100 mm back along the tool
 axis. `detectionsToPickTargets(station, robot, targets)` checks IK (base-relative) and collisions at the grasp and
 approach joints before anything is created; `createTargetsFromOutput` refreshes the frame "Vision <camera>" (in the
-robot's active reference frame) and keeps `Pick` / `Pick approach` on the first feasible target.
+robot's active reference frame) and keeps `Pick` / `Pick approach` on the most confident feasible target (detector
+score, then nearest to the camera), not on the first one in detector order.
 
 ## Vision in programs and the API
 

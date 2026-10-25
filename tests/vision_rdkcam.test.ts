@@ -41,7 +41,8 @@ describe('RoboDK Cam2D parity', () => {
     expect(RDK.Item(c.name, ITEM_TYPE_CAMERA).Valid()).toBe(true);
     // Settings string (Open3D_Depth_Camera.py parses it): FOV / FAR_LENGTH / SIZE round trip
     const s = RDK.Cam2D_Settings(cam);
-    expect(s).toMatch(/FOV=32(\s|$)/); expect(s).toMatch(/FAR_LENGTH=1000/); expect(s).toMatch(/SIZE=640x480/);
+    // RoboDK 5.9.4 wrote "FOV=32.000 PixelSize=7.168635 Size=640x480 SHOW_LIMITS FOCAL_LENGTH=6.00 FAR_LENGTH=1000.00 BG_COLOR=#000000 Persp WindowResize"
+    expect(s).toBe('FOV=32.000 PixelSize=7.168635 Size=640x480 SHOW_LIMITS FOCAL_LENGTH=6.00 FAR_LENGTH=1000.00 BG_COLOR=#000000 Persp WindowResize');
   });
 
   it('FOCAL_LENGTH (mm) + PIXELSIZE (µm) give the focal length in pixels', () => {

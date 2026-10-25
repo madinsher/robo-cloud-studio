@@ -5,7 +5,7 @@ import { PropertiesPanel } from './ui/properties';
 import { BottomPanel } from './ui/bottom';
 import { MenuBar } from './ui/menu';
 import { h, toast, contextMenu } from './ui/dom';
-import { itemContextMenu } from './ui/dialogs';
+import { itemContextMenu, importChoiceDialogs } from './ui/dialogs';
 import { demos } from './demos';
 import { Robolink, robomath } from './api/robolink';
 import { connectToStudioServer } from './api/ws-client';
@@ -14,8 +14,11 @@ import { installVisionRunnerGlobal } from './vision/program_vision';
 import { setNativePostServer, registerNativePosts } from './posts/native_client';
 import { StationTabs, measureDialog } from './ui/tools';
 import { Station } from './core/items/item';
+import { MemoryFileSystem } from './api/memory_fs';
 
 const app = new App();
+// import choices (world of a multi-world folder, Webots vs ROS, ROS entry point / xacro args) are asked with dialogs
+app.importUi = importChoiceDialogs();
 const viewport = h('div', { class: 'viewport' });
 const bottom = new BottomPanel(app);
 (app as any).bottom = bottom;
@@ -131,6 +134,12 @@ RDK.onRunProgram = (p) => app.runProgram(p);
 RDK.onRender = () => {};
 RDK.onMessage = (m, popup) => (popup ? toast(m, 'info', 6000) : app.log(m));
 RDK.assets = app.assets;
+// files written through the API (Cam2D_Snapshot, MakeProgram, Save, script CSVs) stay in memory for the session, like
+// RoboDK's calls they succeed; File › Files saved by scripts downloads them
+const savedFiles = new MemoryFileSystem();
+RDK.fileSystem = savedFiles;
+savedFiles.onWrite = (f) => app.log(`Saved ${f.path} (${f.data.length < 1024 ? `${f.data.length} B` : `${(f.data.length / 1024).toFixed(1)} KB`}) — File › Files saved by scripts`);
+(window as any).savedFiles = savedFiles;
 RDK.onSnapshot = (cam, w, h) => { const c = document.createElement('canvas'); c.width = w; c.height = h; app.renderer.renderFromItem(cam, c, (cam as any).fov ?? 60); return c.toDataURL('image/png'); };
 RDK.onViewPose = { get: () => app.renderer.getViewPose(), set: (m) => app.renderer.setViewPose(m) };
 RDK.onStations = { list: () => app.stations, setActive: (s) => app.setStation(s), add: (n) => app.addStation(n), close: () => app.closeStation() };
@@ -154,10 +163,15 @@ const pyRunner = installPyodideRunner(RDK, { app, onOutput: (name, line, stream)
 
 // Optional WebSocket bridge to the studio server (python clients)
 const params = new URLSearchParams(location.search);
-const wsUrl = params.get('server') ?? (location.hostname ? `ws://${location.hostname}:20500` : '');
-if (wsUrl && params.get('server') !== 'off') connectToStudioServer(app, RDK, wsUrl).catch(() => {});
+// Connected only when asked for (?server=ws://host:port, as the server's start message says, or Connect › Studio server):
+// probing ws://<host>:20500 on every page load logged a connection-refused console error whenever no server ran.
+// ?server (no value) or ?server=auto use the default port on this host.
+const serverParam = params.get('server');
+const wsUrl = serverParam === null || serverParam === 'off' ? '' : serverParam === '' || serverParam === 'auto' ? (location.hostname ? `ws://${location.hostname}:20500` : '') : serverParam;
+if (wsUrl) connectToStudioServer(app, RDK, wsUrl).catch(() => {});
+(window as any).connectStudioServer = (url = `ws://${location.hostname || 'localhost'}:20500`) => connectToStudioServer(app, RDK, url);
 // RoboDK's own post processors (compiled ones included) run on the studio server: list them in the post selectors
-if (params.get('server') && params.get('server') !== 'off') {
+if (wsUrl) {
   setNativePostServer(wsUrl);
   registerNativePosts().then((ids) => { if (ids.length) app.log(`${ids.length} RoboDK post processors available through the studio server`); }).catch(() => {});
 }

@@ -16,7 +16,7 @@ import { parseFsm, fsmToDsl, fsmMachines, initialState, stateOutcomes, FsmDoc, F
 import type { AutomatonSpec } from '../ctl/des';
 import type { PlaceKind } from '../ctl/petri';
 import type { GraphView } from '../ctl/analysis';
-import { desToDsl, petriToDsl, PetriDoc, Layout, XY, automatonStates, automatonEdges, addState, removeState, renameState, setInitial, toggleMarked, setEdgeEvents, edgeEvents, setAlphabet, newAutomaton, uniqueName, addPlace, addPetriTransition, removePetriNode, renamePetriNode, setArc, removeArc, isPlace, petriIds, setAction, actionOf, retargetActions } from '../ctl/graphdoc';
+import { desToDsl, petriToDsl, PetriDoc, Layout, XY, automatonStates, automatonEdges, addState, removeState, renameState, setInitial, toggleMarked, setEdgeEvents, edgeEvents, setAlphabet, newAutomaton, uniqueName, addPlace, addPetriTransition, removePetriNode, renamePetriNode, setArc, removeArc, isPlace, petriIds, setAction, actionOf, retargetActions, renameAutomatonRefs, renameStateRefs, sensorsText, parseSensorsText, finalsText, parseFinalsText } from '../ctl/graphdoc';
 import { layoutGraph } from './graph_layout';
 
 export type EditorKind = 'des' | 'petri' | 'fsm';
@@ -193,9 +193,11 @@ export function buildGraphEditor(opts: { onChange: (source: string) => void; cat
         inspector.append(title('Document'), field('Name', text(d.name, (v) => guarded(() => { d.name = v.trim() || d.name; }))),
           field('Uncontrollable', text(d.uncontrollable.join(' '), (v) => guarded(() => { d.uncontrollable = v.split(/[\s,]+/).filter(Boolean); }), 'events')),
           field('Unobservable', text(d.unobservable.join(' '), (v) => guarded(() => { d.unobservable = v.split(/[\s,]+/).filter(Boolean); }), 'events')),
-          field('Faults', text(d.faults.join(' '), (v) => guarded(() => { d.faults = v.split(/[\s,]+/).filter(Boolean); }), 'events')));
+          field('Faults', text(d.faults.join(' '), (v) => guarded(() => { d.faults = v.split(/[\s,]+/).filter(Boolean); }), 'events')),
+          field('Sensors', text(sensorsText(d.sensors), (v) => guarded(() => { const s = parseSensorsText(v); if (s.length) d.sensors = s; else delete d.sensors; }), 'v_detect "zone == \'table\'"; …')),
+          check('Terminate when marked', d.terminate === 'marked', (b) => guarded(() => { if (b) d.terminate = 'marked'; else delete d.terminate; })));
         if (a) inspector.append(title(blocks()[block].spec ? 'Specification' : 'Automaton'),
-          field('Name', text(a.name, (v) => guarded(() => { const nm = v.trim(); if (!nm || /\s/.test(nm)) throw new Error('a name without spaces'); if (blocks().some((b) => b.a !== a && b.a.name === nm)) throw new Error(`${nm} exists`); const L = d.layout?.[a.name]; if (d.layout && L) { delete d.layout[a.name]; d.layout[nm] = L; } a.name = nm; }))),
+          field('Name', text(a.name, (v) => guarded(() => { const nm = v.trim(); if (!nm || /\s/.test(nm)) throw new Error('a name without spaces'); if (blocks().some((b) => b.a !== a && b.a.name === nm)) throw new Error(`${nm} exists`); const L = d.layout?.[a.name]; if (d.layout && L) { delete d.layout[a.name]; d.layout[nm] = L; } renameAutomatonRefs(d, a.name, nm); a.name = nm; }))),
           field('Alphabet', text(a.events.join(' '), (v) => guarded(() => setAlphabet(a, v.split(/[\s,]+/))), 'events')),
           h('div', { class: 'hint' }, t('Events used by transitions are always in the alphabet; declare extra ones here (e.g. a spec that forbids an event).')));
         inspector.append(h('div', { class: 'hint' }, `${d.checks.length} check line(s) are kept as text.`));
@@ -208,6 +210,8 @@ export function buildGraphEditor(opts: { onChange: (source: string) => void; cat
       } else if (petri) {
         const p = petri;
         inspector.append(title('Petri net'), field('Name', text(p.spec.name, (v) => guarded(() => { p.spec.name = v.trim() || p.spec.name; }))), field('Horizon (s)', num(p.horizon, (v) => guarded(() => { p.horizon = v ?? 300; }))),
+          field('Final markings', text(finalsText(p.finals), (v) => guarded(() => { const f = parseFinalsText(v, p.spec.places.map((x) => x.id)); if (f.length) p.finals = f; else delete p.finals; }), 'xA d2; xB a2')),
+          field('Sensors', text(sensorsText(p.sensors), (v) => guarded(() => { const s = parseSensorsText(v); if (s.length) p.sensors = s; else delete p.sensors; }), 'part_in "count > 0"; …')),
           h('div', { class: 'hint' }, `${p.spec.places.length} places · ${p.spec.transitions.length} transitions · ${p.spec.arcs.length} arcs · ${p.checks.length} check line(s) kept as text`));
       }
       return;
@@ -224,7 +228,7 @@ export function buildGraphEditor(opts: { onChange: (source: string) => void; cat
       const id = sel.id;
       if (kind === 'des') {
         const a = cur()!;
-        inspector.append(title('State'), field('Name', text(id, (v) => guarded(() => { const L = layout(); renameState(a, id, v.trim()); if (L[id]) { L[v.trim()] = L[id]; delete L[id]; } retargetActions(actions(), actionKey(id), actionKey(v.trim())); sel = { type: 'node', id: v.trim() }; }))),
+        inspector.append(title('State'), field('Name', text(id, (v) => guarded(() => { const L = layout(); renameState(a, id, v.trim()); if (L[id]) { L[v.trim()] = L[id]; delete L[id]; } retargetActions(actions(), actionKey(id), actionKey(v.trim())); if (des) renameStateRefs(des, a.name, id, v.trim()); sel = { type: 'node', id: v.trim() }; }))),
           check('Initial', a.initial === id, () => guarded(() => setInitial(a, id))), check('Marked', a.marked.includes(id), (b) => guarded(() => toggleMarked(a, id, b))),
           h('div', { class: 'hint' }, `${a.transitions.filter((tr) => tr.from === id).length} outgoing · ${a.transitions.filter((tr) => tr.to === id).length} incoming`), del, actionPanel(actionKey(id), true));
       } else {
@@ -234,13 +238,16 @@ export function buildGraphEditor(opts: { onChange: (source: string) => void; cat
           field('Kind', (() => { const sl = h('select', { onChange: (e: Event) => guarded(() => { const v = (e.target as HTMLSelectElement).value; pl.kind = v ? (v as PlaceKind) : undefined; }) }, h('option', { value: '' }, '—'), ...PLACE_KINDS.map((k) => h('option', { value: k, selected: pl.kind === k }, k))); return sl; })()),
           field('Capacity', num(pl.capacity, (v) => guarded(() => { pl.capacity = v; }), '1')), field('Label', text(pl.label ?? '', (v) => guarded(() => { pl.label = v.trim() || undefined; }))), del);
         if (tr) inspector.append(title('Transition'), field('Name', text(id, rename)), field('Delay (s)', num(tr.delay, (v) => guarded(() => { tr.delay = v; }))), field('Rate (1/s)', num(tr.rate, (v) => guarded(() => { tr.rate = v; }))),
-          check('Immediate', !!tr.immediate, (b) => guarded(() => { tr.immediate = b || undefined; })), field('Weight', num(tr.weight, (v) => guarded(() => { tr.weight = v; }))), field('Priority', num(tr.priority, (v) => guarded(() => { tr.priority = v; }), '1')), field('Label', text(tr.label ?? '', (v) => guarded(() => { tr.label = v.trim() || undefined; }))), del, actionPanel(id, false));
+          check('Immediate', !!tr.immediate, (b) => guarded(() => { tr.immediate = b || undefined; })), field('Weight', num(tr.weight, (v) => guarded(() => { tr.weight = v; }))), field('Priority', num(tr.priority, (v) => guarded(() => { tr.priority = v; }), '1')), field('Label', text(tr.label ?? '', (v) => guarded(() => { tr.label = v.trim() || undefined; }))),
+          field('Guard (expression)', text(tr.guard ?? '', (v) => guarded(() => { tr.guard = v.trim() || undefined; }), 'Ready == 1')), field('Input event (on=)', text(tr.on ?? '', (v) => guarded(() => { const e = v.trim(); if (/\s/.test(e)) throw new Error('one event name'); tr.on = e || undefined; }), 'part_arrived')), del, actionPanel(id, false));
       }
     } else {
       const { from, to } = sel;
       if (kind === 'des') {
         const a = cur()!;
+        const d = des!;
         inspector.append(title('Edge'), h('div', { class: 'hint' }, `${from} → ${to}`), field('Events', text(edgeEvents(a, from, to).join(', '), (v) => guarded(() => { setEdgeEvents(a, from, to, v.split(/[\s,]+/)); if (!edgeEvents(a, from, to).length) sel = null; }), 'e1, e2')),
+          ...edgeEvents(a, from, to).filter((e) => !d.uncontrollable.includes(e)).map((e) => field(`Guard of ${e}`, text(d.guards?.[e] ?? '', (v) => guarded(() => { const g = v.trim(); if (g) (d.guards ??= {})[e] = g; else if (d.guards) { delete d.guards[e]; if (!Object.keys(d.guards).length) delete d.guards; } }), 'Ready == 1'))),
           h('div', { class: 'hint' }, t('Uncontrollable events are drawn dashed; edit the list in the document properties.')), del);
       } else {
         const s = petri!.spec; const arc = s.arcs.find((x) => x.from === from && x.to === to)!;

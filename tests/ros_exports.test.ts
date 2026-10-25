@@ -21,6 +21,8 @@ import { AssetStore } from '../src/scene/assets';
 import { Station } from '../src/core/items/item';
 import { transl, RAD } from '../src/core/math/pose';
 import { createRobotFromLibrary } from '../src/core/items/library';
+import { sceneMeshes } from '../src/vision/sensing';
+import { parseSTL } from '../src/io/mesh/stl';
 import { FIX, read } from './ros_gt_util';
 
 /** Parameters ROS nodes declare as double (rclcpp throws InvalidParameterTypeException on an integer literal). */
@@ -139,13 +141,71 @@ describe('URDF package export keeps the imported description', () => {
       if (res.robots.length) {
         const srdf = parseSRDF(exp.files[`config/${a.name.replace(/[^A-Za-z0-9_]+/g, '_')}.srdf`] as string);
         expect(srdf.groups.length).toBe(res.robots.length);
-        for (const r of res.robots) expect(srdf.groups.some((g) => srdfGroupJoints(srdf, b, g.name).join() === r.chain.joints.filter((j) => !j.mimic).map((j) => j.name).join()), r.name).toBe(true);
+        // the group's independent joints are the robot's (a mechanism with cross-chain mimics adds its off-chain joints to the chain group)
+        const indepOf = (names: string[]) => names.filter((n) => { const j = b.joints.find((x) => x.name === n); return j && j.type !== 'fixed' && !j.mimic; }).sort().join();
+        for (const r of res.robots) expect(srdf.groups.some((g) => indepOf(srdfGroupJoints(srdf, b, g.name)) === r.chain.joints.filter((j) => !j.mimic).map((j) => j.name).sort().join()), r.name).toBe(true);
         expect(srdf.states.filter((s) => s.name === 'home').length).toBe(res.robots.length);
       }
       if (a.meshes.length) expect(exp.warnings.some((w) => /not loaded/.test(w))).toBe(true);
       expect(exp.files['CMakeLists.txt']).not.toMatch(/meshes/); // no mesh folder -> not installed (colcon would fail)
     });
   }
+
+  // V5 F13: Add › Robot from library › UR10e (drawn procedurally) exported with 0 <visual> / 0 <collision> — invisible
+  // in RViz — and an inertia on the root link (KDL warning); station packages had no SRDF
+  it('library robot without meshes: every link gets the visual + collision the 3D view draws, no root inertia; station packages carry an SRDF', () => {
+    for (const model of ['UR10e', 'KUKA_KR6_R900', 'GENERIC_PALLETIZER_4']) {
+      const st = new Station('Cell');
+      const robot = st.addChild(createRobotFromLibrary(model, model)) as any;
+      if (!robot.chain.links.every((l: any) => !l.visuals.length)) continue; // not a procedural robot
+      const exp = exportRobotURDF(robot, new AssetStore());
+      const m = parseURDF(exp.urdf);
+      // every chain link (not the flange / inertia helper frames) has a mesh visual and the same mesh as collision
+      for (const l of robot.chain.links) {
+        const ln = String(l.name).replace(/[^A-Za-z0-9_/]+/g, '_');
+        const link = m.links.get(ln)!;
+        expect(link, ln).toBeDefined();
+        expect(link.visuals.length, `${model} ${ln} visual`).toBeGreaterThan(0);
+        expect(exp.urdf).toMatch(new RegExp(`<link name="${ln}">[\\s\\S]*?<collision>[\\s\\S]*?</link>`));
+      }
+      // KDL: the root link has no <inertial>; its mass sits on a fixed child link
+      expect(m.links.get(m.rootLink)!.inertial).toBeFalsy();
+      expect(m.links.get(`${m.rootLink}_inertia`)!.inertial!.mass).toBeGreaterThan(0);
+      // the exported meshes, placed by the URDF FK, cover the same volume as the studio drawing, at two poses
+      const qs = [robot.joints().map(() => 0), robot.joints().map((_: number, i: number) => [20, -35, 50, -40, 60, 30][i] ?? 0)];
+      for (const q of qs) {
+        robot.setJoints(q);
+        const studio = sceneMeshes(st, {}).filter((x) => x.kind === 'robot');
+        const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+        for (const s of studio) { const W = s.world, T = s.tris; for (let i = 0; i + 2 < T.length; i += 3) { const p = [W[0] * T[i] + W[4] * T[i + 1] + W[8] * T[i + 2] + W[12], W[1] * T[i] + W[5] * T[i + 1] + W[9] * T[i + 2] + W[13], W[2] * T[i] + W[6] * T[i + 1] + W[10] * T[i + 2] + W[14]]; for (let k = 0; k < 3; k++) { lo[k] = Math.min(lo[k], p[k]); hi[k] = Math.max(hi[k], p[k]); } } }
+        const indep = robot.chain.joints.filter((j: any) => !j.mimic);
+        const qn = Object.fromEntries(indep.map((j: any, i: number) => [j.name, q[i]]));
+        const poses = urdfLinkPoses(m, qn);
+        const lo2 = [Infinity, Infinity, Infinity], hi2 = [-Infinity, -Infinity, -Infinity];
+        for (const [ln, link] of m.links) for (const v of link.visuals) {
+          const file = String(v.mesh).replace(/^package:\/\/[^/]+\//, '');
+          const bytes = exp.files[file] as Uint8Array;
+          const mesh = parseSTL(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer);
+          const T = poses.get(ln)!;
+          for (let i = 0; i < mesh.positions.length; i += 3) {
+            const x = mesh.positions[i] * 1000, y = mesh.positions[i + 1] * 1000, z = mesh.positions[i + 2] * 1000;
+            const p = [T[0] * x + T[4] * y + T[8] * z + T[12], T[1] * x + T[5] * y + T[9] * z + T[13], T[2] * x + T[6] * y + T[10] * z + T[14]];
+            for (let k = 0; k < 3; k++) { lo2[k] = Math.min(lo2[k], p[k]); hi2[k] = Math.max(hi2[k], p[k]); }
+          }
+        }
+        for (let k = 0; k < 3; k++) { expect(Math.abs(lo2[k] - lo[k]), `${model} q=${q} min[${k}]`).toBeLessThan(1); expect(Math.abs(hi2[k] - hi[k]), `${model} max[${k}]`).toBeLessThan(1); }
+      }
+      // whole-station package: config/<station>.srdf with one chain group per robot, joints and links of the URDF
+      const se = exportStationURDF(st, new AssetStore());
+      const srdfText = se.files['config/Cell.srdf'] as string;
+      expect(srdfText, Object.keys(se.files).join()).toBeDefined();
+      const sm = parseURDF(se.urdf), srdf = parseSRDF(srdfText);
+      expect(srdf.groups.length).toBe(1);
+      const gj = srdfGroupJoints(srdf, sm, srdf.groups[0].name).filter((n) => { const j = sm.joints.find((x) => x.name === n); return j && j.type !== 'fixed' && !j.mimic; });
+      expect(gj.length).toBe(robot.chain.joints.filter((j: any) => !j.mimic).length);
+      expect(srdf.states.find((s) => s.name === 'home')).toBeDefined();
+    }
+  });
 
   it('copies the original mesh files into the package and rewrites the URIs; station export keeps TF names', () => {
     const text = '<robot name="r"><link name="ns/base_link"><inertial><mass value="2"/><inertia ixx="1" ixy="0" ixz="0" iyy="1" iyz="0" izz="1"/></inertial><visual><geometry><mesh filename="package://src_pkg/meshes/body.stl" scale="0.001 0.001 0.001"/></geometry></visual></link>'

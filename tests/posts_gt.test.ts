@@ -29,7 +29,7 @@ describe('posts GT (RoboDK original posts vs studio posts)', () => {
         const d = diffPrograms(normBoth(c.post, exp), normBoth(c.post, f!.content));
         expect(d, `${name}: ${d}`).toBeNull();
       }
-      const extra = files.filter((f) => !c.files.some((n) => n.toLowerCase() === f.name.toLowerCase()) && !allowedExtra(c.post, f.name));
+      const extra = files.filter((f) => !c.files.some((n) => n.toLowerCase() === f.name.toLowerCase()) && !allowedExtra(c.post, f.name, c.job));
       expect(extra.map((f) => f.name), `extra files (RoboDK wrote ${c.files.join(', ')})`).toEqual([]);
     });
   }

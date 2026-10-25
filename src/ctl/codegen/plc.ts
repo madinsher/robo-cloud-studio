@@ -17,18 +17,36 @@ import { PetriNet } from '../petri';
 import { synthesizeSupervisor } from '../supervisor';
 import { GenFile, ident, translateExpr, ST_DIALECT, exprIds, xmlEsc } from './common';
 
-export interface IoPoint { name: string; dir: 'out' | 'in'; addr: string; robot?: string; op?: string; note: string }
+export interface IoPoint { name: string; dir: 'out' | 'in'; addr: string; robot?: string; op?: string; note: string; /** X = BOOL bit (default), W = 16-bit word (INT), D = 32-bit double word (REAL) */ size?: 'X' | 'W' | 'D' }
+/**
+ * Directly represented addresses of the I/O points, without overlaps in both address models: CODESYS (word / dword
+ * index: %IWn = bytes 2n..2n+1, %IDn = bytes 4n..4n+3) and Siemens (byte offset: %IWn = bytes n..n+1, %IDn = bytes
+ * n..n+3). Per area (I / Q): bits packed from byte 0, then words at even byte offsets after the bit bytes, then double
+ * words at offsets that are multiples of 4 after the words - a Siemens offset k maps to CODESYS bytes >= k, so the
+ * regions stay disjoint in both models.
+ */
+export function allocIo(points: IoPoint[]): IoPoint[] {
+  for (const dir of ['in', 'out'] as const) {
+    const area = dir === 'in' ? 'I' : 'Q'; const ps = points.filter((p) => p.dir === dir);
+    const bits = ps.filter((p) => (p.size ?? 'X') === 'X'), words = ps.filter((p) => p.size === 'W'), dwords = ps.filter((p) => p.size === 'D');
+    bits.forEach((p, k) => { p.addr = `%${area}X${Math.floor(k / 8)}.${k % 8}`; });
+    let off = Math.ceil(bits.length / 8); off += off % 2;
+    words.forEach((p) => { p.addr = `%${area}W${off}`; off += 2; });
+    off = Math.ceil(off / 4) * 4;
+    dwords.forEach((p) => { p.addr = `%${area}D${off}`; off += 4; });
+  }
+  return points;
+}
 const isOp = (b?: ActionBinding) => !!b && ['program', 'target', 'goto', 'skill'].includes(b.kind);
 const stTime = (s: number) => `T#${Math.round(s * 1000)}MS`;
 const stVal = (v: unknown) => (typeof v === 'boolean' ? (v ? 'TRUE' : 'FALSE') : typeof v === 'number' ? (Number.isInteger(v) ? `${v}` : `${v}`) : v === 'true' ? 'TRUE' : v === 'false' ? 'FALSE' : Number.isFinite(Number(v)) ? String(Number(v)) : `'${String(v)}'`);
 function ioMap(points: IoPoint[]): GenFile {
   return { name: 'io_map.csv', mime: 'text/csv', content: ['signal,direction,address,robot,operation,description', ...points.map((p) => [p.name, p.dir === 'out' ? 'PLC output → robot input' : 'robot output → PLC input', p.addr, p.robot ?? '', p.op ?? '', p.note].map((c) => (/[,"]/.test(c) ? `"${c.replace(/"/g, '""')}"` : c)).join(','))].join('\n') + '\n' };
 }
-const addr = (dir: 'out' | 'in', k: number) => `%${dir === 'out' ? 'Q' : 'I'}X${Math.floor(k / 8)}.${k % 8}`;
-/** Variables read by guards / sensors: BOOL when only used as truth values, LREAL otherwise. */
-function inputVars(exprs: string[], local: Set<string>): Array<{ name: string; type: 'BOOL' | 'LREAL' }> {
-  const out = new Map<string, 'BOOL' | 'LREAL'>();
-  for (const e of exprs) for (const id of exprIds(e)) { if (local.has(id)) continue; const numeric = new RegExp(`\\b${id.replace(/\./g, '\\.')}\\s*(<|>|<=|>=|==|!=|=|\\+|-|\\*|/)|(<|>|<=|>=|==|!=|=|\\+|-|\\*|/)\\s*${id.replace(/\./g, '\\.')}\\b`).test(e); out.set(id, numeric || out.get(id) === 'LREAL' ? 'LREAL' : 'BOOL'); }
+/** Variables read by guards / sensors: BOOL when only used as truth values, REAL (a 32-bit %ID input) otherwise. */
+export function inputVars(exprs: string[], local: Set<string>): Array<{ name: string; type: 'BOOL' | 'REAL' }> {
+  const out = new Map<string, 'BOOL' | 'REAL'>();
+  for (const e of exprs) for (const id of exprIds(e)) { if (local.has(id)) continue; const numeric = new RegExp(`\\b${id.replace(/\./g, '\\.')}\\s*(<|>|<=|>=|==|!=|=|\\+|-|\\*|/)|(<|>|<=|>=|==|!=|=|\\+|-|\\*|/)\\s*${id.replace(/\./g, '\\.')}\\b`).test(e); out.set(id, numeric || out.get(id) === 'REAL' ? 'REAL' : 'BOOL'); }
   return [...out].map(([name, type]) => ({ name, type }));
 }
 
@@ -52,17 +70,18 @@ export function automatonToST(source: string, name: string): GenFile[] {
   const idOf = (n: string) => ident(n);
   const st = (e: string) => translateExpr(e, ST_DIALECT(idOf));
   // operations and IO
-  const io: IoPoint[] = []; let qo = 0, qi = 0;
+  const io: IoPoint[] = [];
   const ops: Array<{ c: DES; s: string; b: ActionBinding; start: string; done: string }> = [];
   const timers: Array<{ c: DES; s: string; secs: number; t: string }> = [];
   for (const c of comps) for (const s of c.X) {
     const b = actionFor(c, s); if (!b) continue;
-    if (isOp(b)) { const id = ident(`${c.name}_${s}`); ops.push({ c, s, b, start: `START_${id}`, done: `DONE_${id}` }); io.push({ name: `START_${id}`, dir: 'out', addr: addr('out', qo++), robot: b.robot, op: `${b.kind} ${b.value}`, note: `${c.name} in ${s}` }, { name: `DONE_${id}`, dir: 'in', addr: addr('in', qi++), robot: b.robot, op: `${b.kind} ${b.value}`, note: `rises when the operation finished` }); }
+    if (isOp(b)) { const id = ident(`${c.name}_${s}`); ops.push({ c, s, b, start: `START_${id}`, done: `DONE_${id}` }); io.push({ name: `START_${id}`, dir: 'out', addr: '', robot: b.robot, op: `${b.kind} ${b.value}`, note: `${c.name} in ${s}` }, { name: `DONE_${id}`, dir: 'in', addr: '', robot: b.robot, op: `${b.kind} ${b.value}`, note: `rises when the operation finished` }); }
     else if (b.kind === 'wait') timers.push({ c, s, secs: Number(b.value), t: `T_${ident(`${c.name}_${s}`)}` });
   }
   const sigOuts = [...new Set(doc.actions.filter((a) => a.kind === 'signal').map((a) => a.value))];
-  for (const sg of sigOuts) io.push({ name: ident(sg), dir: 'out', addr: addr('out', qo++), note: 'signal written by the controller' });
-  for (const v of inputs) io.push({ name: ident(v.name), dir: 'in', addr: v.type === 'BOOL' ? addr('in', qi++) : `%IW${qi++}`, note: `${v.type === 'BOOL' ? 'sensor / signal' : 'analog value'} read by guards` });
+  for (const sg of sigOuts) io.push({ name: ident(sg), dir: 'out', addr: '', note: 'signal written by the controller' });
+  for (const v of inputs) io.push({ name: ident(v.name), dir: 'in', addr: '', size: v.type === 'BOOL' ? 'X' : 'D', note: `${v.type === 'BOOL' ? 'sensor / signal' : 'numeric value (REAL)'} read by guards` });
+  allocIo(io);
   const sup = doc.specs.length ? synthesizeSupervisor(doc) : null;
   const L: string[] = [];
   L.push(`(* Generated by VerticalBot Studio from the automaton model "${name}". IEC 61131-3 Structured Text.`, `   One state variable per component; ${sup ? `supervisor table of ${sup.table.states.length} states (${sup.table.observer ? 'observer-based: unobservable events do not move it' : 'full observation'})` : 'no supervisor'}.`, `   Robot handshake: START_x is TRUE while the component is in the state; the robot answers DONE_x when finished. *)`);
@@ -81,17 +100,21 @@ export function automatonToST(source: string, name: string): GenFile[] {
   for (const [k, v] of Object.entries(bb)) L.push(`  ${ident(k)} : ${typeof v === 'boolean' ? 'BOOL' : 'LREAL'} := ${stVal(v)};`);
   for (const k of local) if (!(k in bb)) L.push(`  ${ident(k)} : LREAL := 0;`);
   for (const o of ops) L.push(`  R_${o.done} : R_TRIG;`);
+  for (const o of ops) if (o.b.done) L.push(`  P_${o.done} : BOOL := FALSE; (* DONE edge seen, ${o.b.done} not yet taken *)`);
   for (const t of timers) L.push(`  ${t.t} : TON;`);
-  (doc.sensors ?? []).forEach((s, i) => L.push(`  SENS_${i} : R_TRIG; (* ${s.event} on rising ${s.expr} *)`));
+  (doc.sensors ?? []).forEach((s, i) => L.push(`  SENS_${i} : R_TRIG; (* ${s.event} on rising ${s.expr} *)`, `  P_SENS_${i} : BOOL := FALSE;`));
   L.push('END_VAR', '');
   // 1. uncontrollable events
-  L.push('(* 1. inputs: handshakes, timers, sensors → one uncontrollable event per scan *)', 'ev := 0;');
+  // one event per scan: the rising edges of DONE_x / sensors are latched (P_x) until their event is taken, so two
+  // operations finishing in the same scan are both seen (R_TRIG.Q is TRUE for a single scan only)
+  L.push('(* 1. inputs: handshakes, timers, sensors → one uncontrollable event per scan (edges latched until taken) *)', 'ev := 0;');
   for (const o of ops) L.push(`R_${o.done}(CLK := ${o.done});`);
+  for (const o of ops) if (o.b.done) L.push(`IF R_${o.done}.Q AND ${sv(o.c)} = ${codes.get(o.c.name)!.get(o.s)} THEN P_${o.done} := TRUE; END_IF;`);
   for (const t of timers) L.push(`${t.t}(IN := ${sv(t.c)} = ${codes.get(t.c.name)!.get(t.s)}, PT := ${stTime(t.secs)});`);
-  (doc.sensors ?? []).forEach((s, i) => L.push(`SENS_${i}(CLK := ${st(s.expr)});`));
-  for (const o of ops) if (o.b.done) L.push(`IF ev = 0 AND ${sv(o.c)} = ${codes.get(o.c.name)!.get(o.s)} AND R_${o.done}.Q THEN ev := EV_${ident(o.b.done)}; END_IF;`);
+  (doc.sensors ?? []).forEach((s, i) => L.push(`SENS_${i}(CLK := ${st(s.expr)});`, `IF SENS_${i}.Q THEN P_SENS_${i} := TRUE; END_IF;`));
+  for (const o of ops) if (o.b.done) L.push(`IF ev = 0 AND ${sv(o.c)} = ${codes.get(o.c.name)!.get(o.s)} AND P_${o.done} THEN ev := EV_${ident(o.b.done)}; P_${o.done} := FALSE; END_IF;`);
   for (const t of timers) { const b = actionFor(t.c, t.s)!; if (b.done) L.push(`IF ev = 0 AND ${t.t}.Q THEN ev := EV_${ident(b.done)}; END_IF;`); }
-  (doc.sensors ?? []).forEach((s, i) => { if (evId.has(s.event)) L.push(`IF ev = 0 AND SENS_${i}.Q THEN ev := EV_${ident(s.event)}; END_IF;`); });
+  (doc.sensors ?? []).forEach((s, i) => { if (evId.has(s.event)) L.push(`IF ev = 0 AND P_SENS_${i} THEN ev := EV_${ident(s.event)}; P_SENS_${i} := FALSE; END_IF;`); });
   // settled components
   const settled = (c: DES) => { const parts = ops.filter((o) => o.c === c && !o.b.done).map((o) => `(${sv(c)} <> ${codes.get(c.name)!.get(o.s)} OR ${o.done})`); const busy = [...ops.filter((o) => o.c === c && o.b.done), ...timers.filter((t) => t.c === c)].map((o) => `${sv(c)} <> ${codes.get(c.name)!.get(o.s)}`); const all = [...parts, ...busy]; return all.length ? all.join(' AND ') : 'TRUE'; };
   L.push('', '(* 2. controllable events in priority order: enabled in every component (all settled), guard, supervisor *)');
@@ -114,7 +137,8 @@ export function automatonToST(source: string, name: string): GenFile[] {
     for (const x of c.X) { const nx = c.active(x); if (!nx.length) continue; L.push(`    ${codes.get(c.name)!.get(x)}: ${nx.map((e, k) => `${k ? 'ELSIF' : 'IF'} ev = EV_${ident(e)} THEN ${sv(c)} := ${codes.get(c.name)!.get(c.next(x, e)!)};`).join(' ')} END_IF; (* ${x} *)`); }
     L.push('  END_CASE;');
   }
-  L.push('END_IF;', '', '(* 4. outputs and entry actions *)');
+  L.push('END_IF;', '', '(* 4. outputs and entry actions; a latched DONE edge is dropped when its component has left the state *)');
+  for (const o of ops) if (o.b.done) L.push(`IF ${sv(o.c)} <> ${codes.get(o.c.name)!.get(o.s)} THEN P_${o.done} := FALSE; END_IF;`);
   for (const o of ops) L.push(`${o.start} := ${sv(o.c)} = ${codes.get(o.c.name)!.get(o.s)};`);
   for (const c of comps) {
     const entries = [...c.X].map((x) => ({ x, b: actionFor(c, x) })).filter((e) => e.b && (e.b.kind === 'set' || e.b.kind === 'signal'));
@@ -129,14 +153,15 @@ export function automatonToST(source: string, name: string): GenFile[] {
 // Petri nets → ST and PLCopen XML SFC
 // ---------------------------------------------------------------------------------------------
 
-interface NetCode { net: PetriNet; io: IoPoint[]; ops: Map<number, { b: ActionBinding; start: string; done: string }>; name: string; guards: Map<number, string>; inputs: Array<{ name: string; type: 'BOOL' | 'LREAL' }> }
+interface NetCode { net: PetriNet; io: IoPoint[]; ops: Map<number, { b: ActionBinding; start: string; done: string }>; name: string; guards: Map<number, string>; inputs: Array<{ name: string; type: 'BOOL' | 'REAL' }> }
 function netCode(source: string, name: string): NetCode {
   const doc = parsePetri(source); const net = new PetriNet(doc.spec);
-  const io: IoPoint[] = []; let qo = 0, qi = 0; const ops = new Map<number, { b: ActionBinding; start: string; done: string }>();
-  net.transitions.forEach((t, j) => { const b = doc.actions.find((a) => a.target === t.id); if (isOp(b)) { const id = ident(t.id); ops.set(j, { b: b!, start: `START_${id}`, done: `DONE_${id}` }); io.push({ name: `START_${id}`, dir: 'out', addr: addr('out', qo++), robot: b!.robot, op: `${b!.kind} ${b!.value}`, note: `transition ${t.id} running` }, { name: `DONE_${id}`, dir: 'in', addr: addr('in', qi++), robot: b!.robot, op: `${b!.kind} ${b!.value}`, note: 'rises when the operation finished' }); } });
+  const io: IoPoint[] = []; const ops = new Map<number, { b: ActionBinding; start: string; done: string }>();
+  net.transitions.forEach((t, j) => { const b = doc.actions.find((a) => a.target === t.id); if (isOp(b)) { const id = ident(t.id); ops.set(j, { b: b!, start: `START_${id}`, done: `DONE_${id}` }); io.push({ name: `START_${id}`, dir: 'out', addr: '', robot: b!.robot, op: `${b!.kind} ${b!.value}`, note: `transition ${t.id} running` }, { name: `DONE_${id}`, dir: 'in', addr: '', robot: b!.robot, op: `${b!.kind} ${b!.value}`, note: 'rises when the operation finished' }); } });
   const guards = new Map<number, string>(); net.transitions.forEach((t, j) => { if (t.guard) guards.set(j, t.guard); });
   const inputs = inputVars([...guards.values()], new Set());
-  for (const v of inputs) io.push({ name: ident(v.name), dir: 'in', addr: v.type === 'BOOL' ? addr('in', qi++) : `%IW${qi++}`, note: 'read by a transition guard' });
+  for (const v of inputs) io.push({ name: ident(v.name), dir: 'in', addr: '', size: v.type === 'BOOL' ? 'X' : 'D', note: `read by a transition guard${v.type === 'REAL' ? ' (numeric value, REAL)' : ''}` });
+  allocIo(io);
   return { net, io, ops, name, guards, inputs };
 }
 

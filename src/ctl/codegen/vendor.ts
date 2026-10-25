@@ -128,7 +128,7 @@ export function vendorPrograms(st: Station, kind: ControlKind, source: string, n
       const post = getPost(opts.post ?? s.robot.postProcessor) ?? getPost('RoboDK_Python')!;
       const pp = compileForPost(st, s.program);
       const out: PostFile[] = post.generate(pp, {});
-      for (const f of out) files.push({ name: `${ident(s.robot.name)}/${f.name}`, content: f.content, mime: f.encoding === 'base64' ? 'application/octet-stream;base64' : f.mime });
+      for (const f of out) files.push({ name: `${ident(s.robot.name)}/${f.name}`, content: f.content, mime: f.mime ?? (f.encoding === 'base64' ? 'application/octet-stream' : undefined), ...(f.encoding === 'base64' ? { encoding: 'base64' as const } : {}) });
       if (pp.problems.length) files.push({ name: `${ident(s.robot.name)}/PROBLEMS.txt`, content: pp.problems.join('\n') + '\n' });
     }
     if (h.skipped.length) files.push({ name: `${ident(name)}_not_robot_ops.txt`, content: `Operations executed by the cell controller / mobile robot, not by an arm program:\n${h.skipped.join('\n')}\n` });

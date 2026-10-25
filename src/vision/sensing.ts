@@ -13,7 +13,7 @@
  * Camera frame: +Z forward, +X right, +Y down (studio camera item); K from cameraIntrinsics (one camera model).
  */
 import * as THREE from 'three';
-import { Station, Item, SceneObject, Tool, Camera as CameraItem, GeometryRef } from '../core/items/item';
+import { Station, Item, SceneObject, Tool, Camera as CameraItem, GeometryRef, isShown } from '../core/items/item';
 import { Robot } from '../core/items/robot';
 import { MobileRobot } from '../mobile/items';
 import { Component } from '../vc/component';
@@ -189,9 +189,9 @@ export interface SceneMeshOptions {
   exclude?: (it: Item) => boolean;
 }
 
-function shownInView(it: Item, station: Station): boolean {
-  for (let p: Item | null = it; p && p !== station; p = p.parent) if (!p.visible) return false;
-  return true;
+function shownInView(it: Item, _station: Station): boolean {
+  // the same rule as the 3D view (RoboDK: a hidden reference frame does not hide the robot / objects under it)
+  return isShown(it);
 }
 
 const fieldCache = new WeakMap<FieldItem, { key: string; meshes: SceneMesh[] }>();

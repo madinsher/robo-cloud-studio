@@ -151,12 +151,37 @@ export class App {
   }
 
   // -- Logging -------------------------------------------------------------
-  log(text: string, level: 'info' | 'warn' | 'error' = 'info'): void {
+  /** Log line (Log tab); warnings and errors also pop up a toast unless `popup` is false (import reports: one summary toast). */
+  log(text: string, level: 'info' | 'warn' | 'error' = 'info', popup = level !== 'info'): void {
     this.logs.push({ t: Date.now(), text, level });
     if (this.logs.length > 1000) this.logs.shift();
     this.events.emit('log', { text, level });
-    if (level !== 'info') toast(text, level === 'warn' ? 'warn' : 'error');
+    if (popup && level !== 'info') toast(text, level === 'warn' ? 'warn' : 'error');
   }
+
+  /**
+   * Import report lines: what did not come in (skipped robots, PROTOs / meshes not found, remote files not available)
+   * is a warning in the Log, and one toast sums them up.
+   */
+  logImportReport(title: string, lines: string[]): number {
+    const bad = (s: string) => /not available offline|skipped|cannot be resolved|not found|failed|error|unknown node|could not|missing|undefined substitution|no such/i.test(s);
+    let n = 0, first = '';
+    for (const l of lines) { const w = bad(String(l)); if (w) { n++; first ||= String(l); } this.log(String(l), w ? 'warn' : 'info', false); }
+    if (n) toast(`${title}: ${n} part(s) could not be imported — ${first.slice(0, 140)}${n > 1 ? ' … (see the Log tab)' : ''}`, 'warn', 9000);
+    return n;
+  }
+
+  /**
+   * Import choices asked from the user (set by main.ts with dialogs; null headless: the defaults are taken).
+   *  - chooseWorld: several .wbt worlds in an opened folder;
+   *  - chooseKind: a folder that is both a Webots project and a ROS robot description;
+   *  - rosOptions: ROS robot description entry points / xacro args after a first import.
+   */
+  importUi: {
+    chooseWorld?(worlds: string[], def: string): Promise<string | null>;
+    chooseKind?(choices: Array<{ value: 'webots' | 'ros'; label: string }>): Promise<'webots' | 'ros' | null>;
+    rosOptions?(info: { entries: Array<{ file: string; args: Record<string, string>; source: string }>; imported: string[]; errors: string[] }): Promise<{ entries: string[]; args: Record<string, string> } | null>;
+  } | null = null;
 
   // -- Station lifecycle ---------------------------------------------------
   /** Open a new empty station tab and make it active. */
@@ -234,14 +259,19 @@ export class App {
     setTimeout(() => this.applyInitialView(st), 50);
   }
 
-  /** Initial 3D view of a station: the Viewpoint of an imported Webots world (station.settings.viewpoint), else fit all. */
+  /**
+   * Initial 3D view of a station: the Viewpoint of an imported Webots world (station.settings.viewpoint), else fit all.
+   * A Viewpoint `follow "<robot name>"` keeps that robot in view while it drives (the camera translates with it, as
+   * Webots' follow types do; the user can still orbit and zoom around it).
+   */
   applyInitialView(st: Station = this.station): void {
     if (!this.renderer || st !== this.station) return;
-    const vp = st.settings.viewpoint as { position?: number[]; orientation?: number[]; fieldOfView?: number } | undefined;
+    const vp = st.settings.viewpoint as { position?: number[]; orientation?: number[]; fieldOfView?: number; follow?: string; followType?: string } | undefined;
     if (vp && Array.isArray(vp.position) && vp.position.length >= 3 && Array.isArray(vp.orientation) && vp.orientation.length >= 4) {
       const look = viewpointLook({ position: [vp.position[0], vp.position[1], vp.position[2]], orientation: [vp.orientation[0], vp.orientation[1], vp.orientation[2], vp.orientation[3]], fieldOfView: Number(vp.fieldOfView ?? 0.785398) });
       this.renderer.lookAt(look.eye, look.target, look.up, look.fovDeg, 'horizontal');
     } else this.renderer.fitAll();
+    this.renderer.setFollow(followTarget(st, vp?.follow, vp?.followType));
   }
 
   newStation(): void {
@@ -455,6 +485,9 @@ export class App {
     this.cmd(() => {
       let prog = this.activeProgram;
       if (!prog) { prog = this.makeProgram(robot); this.activeProgram = prog; this.events.emit('activeProgram', { program: prog }); }
+      // like RoboDK, the first move taught into an empty program brings the robot's reference frame and tool with it
+      // (the posts then write $BASE / $TOOL, WObj / tooldata, ref_frame / set_tcp for it)
+      if (!prog.instructions().length) { prog.setFrame(robot.activeFrame() ?? null); prog.setTool(robot.activeTool() ?? null); }
       const t = this.makeTarget();
       if (moveType === 'MoveJ') { prog.addMoveJ(t); t.setAsJointTarget(); } else prog.addMoveL(t);
       this.select(t);
@@ -937,7 +970,8 @@ export class App {
 
   private tick(dt: number): void {
     // runToEnd owns the clock while it waits for a script runner: the animation loop must not advance it meanwhile
-    if (this.simState === 'playing' && !this.fastForward) {
+    // ... nor while a run waits for a script runner that is still loading (Pyodide download: not simulation time)
+    if (this.simState === 'playing' && !this.fastForward && !this.runtime.holding()) {
       const step = dt * this.simSpeed;
       this.runtime.tick(step);
       this.simTime += step;
@@ -991,10 +1025,30 @@ export class App {
       if (names.some((n) => /\.wbt$/i.test(n))) zipKind.set(f, 'webots');
       else if (names.some((n) => /(^|\/)package\.xml$/i.test(n))) zipKind.set(f, 'ros');
     }
-    const webots = files.some((f) => /\.(wbt|proto)$/i.test(f.name)) || [...zipKind.values()].includes('webots');
-    const rosPkg = !webots && (files.some((f) => /(^|\/)package\.xml$/i.test(path(f))) || [...zipKind.values()].includes('ros'));
+    let webots = files.some((f) => /\.(wbt|proto)$/i.test(f.name)) || [...zipKind.values()].includes('webots');
+    const hasPkgXml = files.some((f) => /(^|\/)package\.xml$/i.test(path(f))) || [...zipKind.values()].includes('ros');
+    // a robot description folder without package.xml (ur_description copied out of a package): imported as a package
+    // named after the folder instead of file by file (which made 0-DOF robots of the xacro macros and stray meshes)
+    const topDirs = new Set(files.map((f) => path(f).replace(/\\/g, '/').split('/')).filter((s) => s.length > 1).map((s) => s[0]));
+    const descriptionFolder = !hasPkgXml && topDirs.size === 1 && files.some((f) => /\.(urdf|xacro)$/i.test(f.name)) && files.some((f) => /(^|\/)(urdf|meshes|launch|config)\//i.test(path(f)));
+    let rosPkg = hasPkgXml || descriptionFolder;
+    if (webots && rosPkg) {
+      // a ROS package that ships Webots worlds (webots_ros2_*): the world or the robot description
+      const robots = files.filter((f) => /\.(urdf|xacro)$/i.test(f.name)).map((f) => f.name);
+      const worldN = files.filter((f) => /\.wbt$/i.test(f.name)).length;
+      const kind = (await this.importUi?.chooseKind?.([
+        { value: 'webots', label: `Webots world (${worldN} world file${worldN === 1 ? '' : 's'})` },
+        { value: 'ros', label: `ROS robot description (${robots.slice(0, 4).join(', ')}${robots.length > 4 ? ', …' : ''})` },
+      ])) ?? 'webots';
+      if (kind === 'ros') webots = false; else rosPkg = false;
+    } else if (webots) rosPkg = false;
     if (!webots && !rosPkg) return files;
     const map = await App.filesToMap(files);
+    if (rosPkg && descriptionFolder) {
+      const pkg = [...topDirs][0];
+      map.set(`${pkg}/package.xml`, new TextEncoder().encode(`<?xml version="1.0"?>\n<package format="3"><name>${pkg.replace(/[^\w]/g, '_')}</name></package>\n`));
+      this.log(`${pkg}: no package.xml in the folder — imported as ROS package "${pkg}" (package://${pkg}/... resolves to it)`, 'warn', false);
+    }
     if (webots) {
       // the Webots importer reads plain files: expand project zips in place (paths inside the zip kept)
       for (const [f, k] of zipKind) if (k === 'webots') {
@@ -1002,12 +1056,22 @@ export class App {
         map.delete(path(f).replace(/\\/g, '/'));
         for (const [zk, zv] of Object.entries(unzipSync(new Uint8Array(await f.arrayBuffer())))) if (!zk.endsWith('/')) map.set(zk, zv);
       }
+      // several worlds: the user picks one (the importer would take the shallowest, alphabetically first)
+      const worlds = [...map.keys()].filter((p) => /\.wbt$/i.test(p)).sort((a, b) => a.split('/').length - b.split('/').length || a.localeCompare(b));
+      let world: string | undefined;
+      if (worlds.length > 1) world = (await this.importUi?.chooseWorld?.(worlds, worlds[0])) ?? undefined;
       this.events.emit('progress', { label: 'Importing Webots world', detail: `${map.size} files` });
       try {
         const { importWebotsFiles } = await import('./io/webots/index');
-        const { station, report } = await importWebotsFiles(map, this.assets);
+        const { withRemoteWebotsFiles } = await import('./io/library/webots_remote');
+        // standard Webots robots / objects are remote PROTOs (cyberbotics GitHub): downloaded in rounds, then imported
+        const { result: { station, report }, stats } = await withRemoteWebotsFiles((remote) => importWebotsFiles(map, this.assets, { ...(world ? { world } : {}), remote }),
+          { onProgress: (d) => this.events.emit('progress', { label: 'Importing Webots world', detail: d }) });
         this.setStation(station);
-        for (const n of report) this.log(String(n), 'info');
+        const lines = report.map(String);
+        if (stats.fetched.length) lines.push(`${stats.fetched.length} remote Webots file(s) downloaded (PROTOs, meshes, textures from raw.githubusercontent.com)`);
+        if (stats.failed.length) lines.push(`${stats.failed.length} remote Webots file(s) could not be downloaded: ${stats.failed.slice(0, 3).join(', ')}${stats.failed.length > 3 ? ', …' : ''}`);
+        this.logImportReport(`Webots world ${station.name}`, lines);
         this.log(`Opened Webots world ${station.name}`);
       } finally { this.events.emit('progress', { label: 'Importing Webots world', done: true }); }
       return [];
@@ -1015,15 +1079,23 @@ export class App {
     this.events.emit('progress', { label: 'Importing ROS package', detail: `${map.size} files` });
     try {
       const { importRosPackageFiles } = await import('./io/urdf/package');
-      const res = await importRosPackageFiles(map, this.assets);
+      let res = await importRosPackageFiles(map, this.assets);
+      // entry points / xacro args: asked when there is a choice (several descriptions, xacro args, or errors)
+      // descriptions that failed with the defaults (a xacro needing name:=...) are offered too, so args can fix them
+      const offered = [...res.entries.map((e) => ({ file: e.file, args: e.args, source: e.source }))];
+      for (const e of res.errors) { const m = /^(\S+\.(?:urdf|xacro))(?:\s+\(([^)]*)\))?:/i.exec(e); if (m && !offered.some((o) => o.file === m[1])) offered.push({ file: m[1], args: m[2] ? Object.fromEntries(m[2].split(/\s+/).map((kv) => kv.split(':=')).filter((kv) => kv.length === 2)) : {}, source: 'top-level' }); }
+      const choice = this.importUi?.rosOptions && (offered.length > 1 || res.errors.length || offered.some((e) => /\.xacro$/i.test(e.file) && Object.keys(e.args).length))
+        ? await this.importUi.rosOptions({ entries: offered, imported: res.robots.map((r) => r.name), errors: res.errors }) : null;
+      if (choice) res = await importRosPackageFiles(map, this.assets, { entries: choice.entries, args: choice.args });
       const items = res.items as Item[];
       if (items.length) this.cmd(() => { for (const it of items) this.station.addChild(it); const r = items.find((x) => x instanceof Robot) as Robot | undefined; if (r) { this.setActiveRobot(r); this.select(r); } else this.select(items[0]); });
-      for (const n of res.report ?? []) this.log(String(n), 'info');
+      this.logImportReport('ROS package', (res.report ?? []).map(String));
       for (const e of res.errors ?? []) this.log(`ROS package: ${e}`, 'error');
       this.log(`Imported ROS package: ${items.map((x) => x.name).join(', ') || 'no items'}`, items.length ? 'info' : 'warn');
     } finally { this.events.emit('progress', { label: 'Importing ROS package', done: true }); }
     return [];
   }
+
 
   /** Basenames (lower case) of mesh references in the station that no asset resolves yet. */
   private missingMeshNames(): Set<string> {
@@ -1347,6 +1419,21 @@ export class App {
 }
 
 export interface RunOptions { fromIndex?: number; args?: string[] }
+
+/** The item a Webots Viewpoint `follow` names (the robot's name field; DEF names too), or null. */
+export function followTarget(st: Station, follow?: string, followType?: string): Item | null {
+  const name = follow?.trim();
+  if (!name || /^none$/i.test(followType ?? '')) return null;
+  const lc = name.toLowerCase();
+  let best: Item | null = null;
+  for (const it of st.walk()) {
+    if (it === st) continue;
+    const names = [it.name, it.params?.webotsName, it.params?.webotsDef, it.params?.def].filter((x): x is string => typeof x === 'string');
+    if (names.some((n) => n === name)) return it;
+    if (!best && names.some((n) => n.toLowerCase() === lc)) best = it;
+  }
+  return best;
+}
 
 import * as collisionModule from './core/collision/collision';
 function require_collision() { return collisionModule; }

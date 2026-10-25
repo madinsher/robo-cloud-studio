@@ -12,6 +12,10 @@
  *    drop-in on PYTHONPATH (src/api/runner_cpython.ts); the browser asks for them through POST /python/run.
  *  - HTTP: GET /health, GET/POST /station.json, POST /convert/rdk, POST /python/run, /vda5050/*, /vision/*.
  *
+ * Access (src/api/security.ts): binds STUDIO_HOST (default 127.0.0.1, this machine only); browser pages are served only
+ * from local origins or STUDIO_ALLOWED_ORIGINS, Host names are checked against DNS rebinding, STUDIO_TOKEN adds a
+ * shared secret. The API runs code (Python programs, posts), so never expose it to an untrusted network.
+ *
  * Run: npm run server   (node --experimental-strip-types server/index.ts)
  */
 import http from 'node:http';
@@ -32,8 +36,12 @@ import { handlePostsHttp, runNativePost, listNativePosts, roboDKPython, roboDKPo
 import { setLocalNativePosts, registerNativePosts } from '../src/posts/native_client.ts';
 import { installVisionRunnerGlobal } from '../src/vision/program_vision.ts';
 import { setSensingAssets } from '../src/vision/sensing.ts';
+import { bindHost, securityFromEnv, guardHttp, wsVerifyClient, isLoopbackHostname } from '../src/api/security.ts';
 
 const PORT = Number(process.env.STUDIO_PORT ?? 20500);
+const HOST = bindHost();
+const SECURITY = securityFromEnv();
+if (!isLoopbackHostname(HOST)) console.warn(`[studio-server] WARNING: listening on ${HOST}: every host that can reach this address can run code through the API${SECURITY.token ? ' (STUDIO_TOKEN required)' : ' — set STUDIO_TOKEN'}`);
 
 // RoboDK's own posts (compiled ones included) for the headless station: MakeProgram with post "RDK_<name>" (or a
 // RoboDK post name the studio has no built-in equivalent for) runs them in-process with RoboDK's embedded Python
@@ -77,9 +85,10 @@ const special = (req: RpcRequest): Promise<RpcResponse> | undefined => {
 };
 
 const httpServer = http.createServer();
-await new Promise<void>((resolve) => httpServer.listen(PORT, () => resolve()));
+await new Promise<void>((resolve) => httpServer.listen(PORT, HOST, () => resolve()));
 const host = await createNodeHost({
-  station: initial, server: httpServer, tcpPort: Number(process.env.STUDIO_TCP_PORT ?? PORT + 1), special,
+  station: initial, server: httpServer, tcpPort: Number(process.env.STUDIO_TCP_PORT ?? PORT + 1), special, host: HOST,
+  verifyClient: wsVerifyClient(SECURITY, (m) => console.warn(`[studio-server] ${m}`)),
   afterHeadless: (req) => { if (STATION_FILE && !READ_ONLY_METHODS.has(req.method)) { try { writeFileSync(STATION_FILE, JSON.stringify(saveStation(host.station(), host.rdk.assets))); } catch { /* ignore */ } } },
 });
 const station = () => host.station();
@@ -113,12 +122,17 @@ function checkConverter(): { ok: boolean; detail: string } {
   return converterStatus;
 }
 
+/** Endpoints that execute code: JSON bodies only, so a cross-site page always needs a CORS preflight. */
+const needsJson = (req: http.IncomingMessage) => req.method === 'POST' && /^\/(python\/run|posts\/native\/run)/.test(req.url ?? '') && !/^application\/json/i.test(String(req.headers['content-type'] ?? ''));
+
 httpServer.on('request', async (req, res) => {
+  // origin / host / token check first: a foreign web page or a rebinding DNS name gets 403 and nothing runs
+  if (!guardHttp(req, res, SECURITY)) { console.warn(`[studio-server] refused ${req.method} ${req.url} from origin ${req.headers.origin ?? '-'} host ${req.headers.host ?? '-'}`); return; }
+  if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
+  if (needsJson(req)) { res.writeHead(415, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'content-type application/json required' })); return; }
   if ((req.url ?? '').startsWith('/vda5050/') && (await vda.handleHttp(req, res, () => readJson(req)))) return;
   if ((req.url ?? '').startsWith('/vision/') && (await handleVisionHttp(req, res, () => readJson(req)))) return;
   if ((req.url ?? '').startsWith('/posts/native') && (await handlePostsHttp(req, res, () => readJson(req)))) return;
-  if (req.method === 'OPTIONS') { res.writeHead(204, { 'access-control-allow-origin': '*', 'access-control-allow-headers': '*', 'access-control-allow-methods': 'GET,POST,OPTIONS' }); res.end(); return; }
-  res.setHeader('access-control-allow-origin', '*');
   const json = (code: number, body: any) => { res.writeHead(code, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); };
   if (req.url === '/health') {
     let python: string | null = null; try { python = findPython().cmd; } catch { python = null; }
@@ -167,9 +181,9 @@ httpServer.on('request', async (req, res) => {
 
 // Official RoboDK binary protocol (opt-in: the official robodk package / RoboDK C#, C++, MATLAB clients)
 if (process.env.STUDIO_RDK_PORT) {
-  import('../src/api/rdk_protocol.ts').then(({ startRdkProtocolServer }) => startRdkProtocolServer({ port: Number(process.env.STUDIO_RDK_PORT), handle: (req: RpcRequest) => host.api.handle(req) }))
+  import('../src/api/rdk_protocol.ts').then(({ startRdkProtocolServer }) => startRdkProtocolServer({ port: Number(process.env.STUDIO_RDK_PORT), host: HOST, handle: (req: RpcRequest) => host.api.handle(req) }))
     .then((s) => console.log(`[studio-server] RoboDK binary API protocol on port ${s.port}`))
     .catch((e) => console.warn(`[studio-server] RoboDK protocol unavailable: ${e.message}`));
 }
 
-console.log((`[studio-server] listening on ws://localhost:${PORT} (RoboDK-compatible API), TCP JSON-lines on ${host.tcpPort} — open the studio with ?server=ws://localhost:${PORT} to relay to the browser`));
+console.log((`[studio-server] listening on ws://${HOST.includes(':') ? `[${HOST}]` : HOST}:${PORT} (RoboDK-compatible API), TCP JSON-lines on ${host.tcpPort} — open the studio with ?server=ws://localhost:${PORT} to relay to the browser`));

@@ -181,7 +181,13 @@ function motomanPost(id: string, name: string, cartesian: boolean, aliases: stri
   return {
     id, name, brand: 'Yaskawa', extension: 'JBI', aliases,
     description: `INFORM job (RoboDK ${id} compatible${cartesian ? ', Cartesian positions w.r.t. the robot base' : ''}).`,
-    generate(p: PostProgram, options: Record<string, any> = {}): PostFile[] { return runRoboPost((ctx) => new MotomanPost(ctx, cartesian), p, options, true); },
+    generate(p: PostProgram, options: Record<string, any> = {}): PostFile[] {
+      // RoboDK hands its Motoman posts the robot's pulses per degree / mm (robot parameters, imported from the .rdk /
+      // .robot table [980+i] as params.motomanPulses): PULSE positions are joints x ratio (02.i ES200D: J2 2933.67/deg)
+      const pulses = p.robot?.params?.motomanPulses;
+      const opts = options.pulsesPerDeg === undefined && Array.isArray(pulses) && pulses.length ? { ...options, pulsesPerDeg: [...(pulses as number[]), 1, 1, 1, 1, 1, 1] } : options;
+      return runRoboPost((ctx) => new MotomanPost(ctx, cartesian), p, opts, true);
+    },
   };
 }
 export const MOTOMAN = motomanPost('Motoman', 'Yaskawa Motoman (INFORM JBI)', false, []);

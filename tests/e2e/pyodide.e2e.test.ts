@@ -113,7 +113,9 @@ describe('station Python programs in the browser (Pyodide)', () => {
       const dist = verts.map((v) => Math.min(...pts.map((p) => Math.hypot(p[0] - v[0], p[1] - v[1], p[2] - v[2]))));
       return { n: pts.length, dist, q: robot.joints(), qh: home.joints ?? robot.jointsForTarget(home) };
     });
-    expect(res.n).toBeGreaterThan(50);
+    // the moves play in real time beside the page (cooperative runner): one joint sample per animation step at 20x, not
+    // one per 20 ms of virtual time as when the script blocked the page
+    expect(res.n).toBeGreaterThan(12);
     res.dist.forEach((d: number, i: number) => expect(d, `vertex ${i}`).toBeLessThan(1));
     res.q.forEach((q: number, i: number) => expect(q).toBeCloseTo(res.qh[i], 3));
     noErrors();

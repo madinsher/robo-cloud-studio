@@ -78,6 +78,8 @@ export class MobileRobot extends Item {
   battery: BatteryModel = { capacityWh: 2000, levelWh: 2000, idleW: 60, drivePerMps: 400, chargeW: 1500, lowThreshold: 0.25 };
   state: MobileState = { x: 0, y: 0, theta: 0, v: 0, omega: 0, steer: 0, status: 'idle', odometer: 0, path: null, pathIndex: 0, taskId: null };
   geometry: GeometryRef[] = [];
+  /** Collision geometry declared by the source (Webots boundingObject): used by collision checks instead of `geometry`. */
+  colliders?: GeometryRef[];
   /** Sensors: lidar/camera/gnss. */
   sensors: Array<{ kind: 'lidar2d' | 'lidar3d' | 'camera' | 'gnss' | 'imu'; pose: number[]; range?: number; fov?: number }> = [];
   /** Capabilities used by the fleet allocator (e.g. 'harvest', 'spray', 'transport', 'mow'). */
@@ -130,7 +132,7 @@ export class MobileRobot extends Item {
   }
 
   protected override serializeExtra() {
-    return { kin: this.kin, battery: this.battery, state: this.state, geometry: this.geometry, sensors: this.sensors, capabilities: this.capabilities, payloadKg: this.payloadKg, rosNamespace: this.rosNamespace, fleetId: this.fleetId, home: this.home, resources: this.resources, equipment: this.equipment, baseCapabilities: this.baseCapabilities };
+    return { kin: this.kin, battery: this.battery, state: this.state, geometry: this.geometry, ...(this.colliders ? { colliders: this.colliders } : {}), sensors: this.sensors, capabilities: this.capabilities, payloadKg: this.payloadKg, rosNamespace: this.rosNamespace, fleetId: this.fleetId, home: this.home, resources: this.resources, equipment: this.equipment, baseCapabilities: this.baseCapabilities };
   }
   override deserializeExtra(d: SerializedItem, _ctx: DeserializeContext) {
     this.kin = { ...this.kin, ...((d.kin as any) ?? {}) };
@@ -140,6 +142,8 @@ export class MobileRobot extends Item {
     const path = Array.isArray(ds.path) && ds.path.length && ds.path.every((p: unknown) => Array.isArray(p) && p.every((v) => typeof v === 'number')) ? (ds.path as number[][]) : null;
     this.state = { ...this.state, ...ds, path, pathIndex: path ? Math.max(0, Math.min(path.length - 1, ds.pathIndex | 0)) : 0 };
     this.geometry = (d.geometry as GeometryRef[]) ?? [];
+    // boundingObject colliders survive undo snapshots and .vbstation files (else the visual meshes would be used)
+    this.colliders = Array.isArray(d.colliders) ? (d.colliders as GeometryRef[]) : undefined;
     this.sensors = (d.sensors as any) ?? [];
     this.capabilities = (d.capabilities as string[]) ?? ['transport'];
     this.payloadKg = (d.payloadKg as number) ?? 100;

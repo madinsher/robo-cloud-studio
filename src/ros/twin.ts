@@ -34,7 +34,7 @@ import { DEG, RAD, poseToQuat, rotz, transl, mul } from '../core/math/pose';
 import { laserScanMsg, scanHeading } from './publishers';
 import { Camera as CameraItem } from '../core/items/item';
 import { renderCamera } from '../vision/sensing';
-import { publishCameraFrame } from '../vision/vision_ros';
+import { publishCameraFrame, cameraNamespace } from '../vision/vision_ros';
 
 export interface RosIO {
   publish(topic: string, type: string, msg: any, opts?: { latch?: boolean }): void;
@@ -64,7 +64,12 @@ export interface RosTwinOptions {
 }
 
 export interface TwinJoint {
+  /** Name on /joint_states (the URDF name, prefixed only when it clashes with another robot of the station). */
   name: string;
+  /** The joint's name in its own robot description (what a JointTrajectory for that robot names). */
+  local: string;
+  /** URDF import root or native robot the joint belongs to (per-robot trajectory topics resolve names inside it). */
+  owner?: Item;
   kind: 'arm' | 'mimic' | 'wheel' | 'steer';
   prismatic: boolean;
   robot?: Robot;
@@ -86,8 +91,9 @@ const normNs = (s: string | undefined) => (s ? `/${s.replace(/^\/+|\/+$/g, '')}`
 const ZERO36 = new Array(36).fill(0);
 const ZERO9 = new Array(9).fill(0);
 
-/** Robot description for the station + URDF joint names per robot + base link per mobile robot / import root. */
-export function twinDescription(station: Station): { xml: string; jointNames: Map<Robot, string[]>; baseLinks: Map<Item, string> } {
+/** Robot description for the station + URDF joint names per robot + base link per mobile robot / import root (+ the
+ *  joint-name prefix of an import root whose joint names clash with another robot's). */
+export function twinDescription(station: Station): { xml: string; jointNames: Map<Robot, string[]>; baseLinks: Map<Item, string>; jointPrefix: Map<Item, string> } {
   const all = [...station.walk()];
   const trees = all.filter((it) => it.params.source === 'urdf' && typeof it.params.robotDescription === 'string' && urdfTreeRoot(it.parent) === null);
   const natives = all.filter((it) => (it instanceof Robot || it.type === ItemType.MOBILE_ROBOT) && !urdfTreeRoot(it));
@@ -99,10 +105,20 @@ export function twinDescription(station: Station): { xml: string; jointNames: Ma
     const root = childElements(doc, 'link').find((l) => !children.has(l.attrs.name))?.attrs.name ?? 'base_link';
     const jointNames = new Map<Robot, string[]>();
     for (const r of t.walk()) if (r instanceof Robot) jointNames.set(r, r.chain.joints.map((j) => j.name));
-    return { xml: res.urdf, jointNames, baseLinks: new Map([[t, root]]) };
+    return { xml: res.urdf, jointNames, baseLinks: new Map([[t, root]]), jointPrefix: new Map() };
   }
   const res = exportStationURDF(station, undefined, { extras: false, mobileBases: 'floating' });
-  return { xml: res.urdf, jointNames: res.jointNames ?? new Map(), baseLinks: res.baseLinks ?? new Map() };
+  return { xml: res.urdf, jointNames: res.jointNames ?? new Map(), baseLinks: res.baseLinks ?? new Map(), jointPrefix: res.jointPrefix ?? new Map() };
+}
+
+/** Whether a camera item has a colour stream: rgb cameras, and depth cameras except depth-only devices (a Webots
+ *  RangeFinder, a Gazebo `depth` / `depth_camera` sensor, or `params.depthOnly`). RGB-D (wizard rgbd / stereo / ToF,
+ *  Gazebo rgbd_camera) publish colour + depth like their drivers. */
+export function cameraHasColour(cam: CameraItem): boolean {
+  if (cam.kind === 'rgb') return true;
+  if (cam.kind !== 'depth') return false;
+  const p = cam.params as Record<string, unknown>;
+  return !(p.depthOnly === true || p.webotsDevice === 'RangeFinder' || p.sensorType === 'depth' || p.sensorType === 'depth_camera');
 }
 
 export class RosTwin {
@@ -128,18 +144,21 @@ export class RosTwin {
     this.joints = [];
     for (const r of this.station.itemsOfType<Robot>(ItemType.ROBOT)) {
       const names = d.jointNames.get(r) ?? r.chain.joints.map((j) => j.name);
+      const owner = urdfTreeRoot(r) ?? r;
       let k = 0;
-      r.chain.joints.forEach((j, i) => { if (j.type !== 'fixed') this.joints.push({ name: names[i] ?? j.name, kind: j.mimic ? 'mimic' : 'arm', prismatic: j.type === 'prismatic', robot: r, index: i, indep: j.mimic ? -1 : k++, side: 0, angle: 0 }); });
+      r.chain.joints.forEach((j, i) => { if (j.type !== 'fixed') this.joints.push({ name: names[i] ?? j.name, local: j.name, owner, kind: j.mimic ? 'mimic' : 'arm', prismatic: j.type === 'prismatic', robot: r, index: i, indep: j.mimic ? -1 : k++, side: 0, angle: 0 }); });
     }
     const mobiles = this.station.itemsOfType<MobileRobot>(ItemType.MOBILE_ROBOT);
     this.mobiles = mobiles.map((m) => {
       const ns = normNs(m.rosNamespace);
       const frame = mobiles.length > 1 && ns ? `${ns.slice(1)}/` : '';
       const base = d.baseLinks.get(m) ?? `${frame}base_link`;
+      const owner = urdfTreeRoot(m) ?? m;
+      const jp = d.jointPrefix.get(owner) ?? '';
       for (const [kind, key] of [['wheel', 'wheelJoints'], ['steer', 'steerJoints']] as const) {
         for (const n of (m.params[key] as string[] | undefined) ?? []) {
           const side = /(^|[_/])(l|left|fl|rl)([_/]|$)|left/i.test(n) ? 1 : /(^|[_/])(r|right|fr|rr)([_/]|$)|right/i.test(n) ? -1 : 0;
-          this.joints.push({ name: n, kind, prismatic: false, mobile: m, index: -1, indep: -1, side, angle: 0 });
+          this.joints.push({ name: `${jp}${n}`, local: n, owner, kind, prismatic: false, mobile: m, index: -1, indep: -1, side, angle: 0 });
         }
       }
       return { m, ns, frame, odom: `${frame}odom`, base, start: { x: m.state.x, y: m.state.y, theta: m.state.theta }, lastV: m.state.v };
@@ -152,12 +171,12 @@ export class RosTwin {
       for (const c of this.mobiles) {
         this.io.subscribe(`${c.ns}/cmd_vel`, 'geometry_msgs/msg/Twist', (msg) => { c.cmd = { v: (msg?.linear?.x ?? 0) * 1000, vy: (msg?.linear?.y ?? 0) * 1000, omega: (msg?.angular?.z ?? 0) * RAD, t: this.time }; });
       }
-      const topics = new Set<string>(['/joint_trajectory_controller/joint_trajectory', ...(this.opts.trajectoryTopics ?? [])]);
+      const topics = new Map<string, Item | undefined>(['/joint_trajectory_controller/joint_trajectory', ...(this.opts.trajectoryTopics ?? [])].map((t) => [t, undefined]));
       for (const it of this.station.walk()) {
-        if (it.params.source === 'urdf' && typeof it.params.robotDescription === 'string') topics.add(`/${sanitizeName(String(it.params.urdfName ?? it.name))}/joint_trajectory`);
-        else if (it instanceof Robot && !urdfTreeRoot(it)) topics.add(`${normNs(it.connection.rosNamespace) || `/${sanitizeName(it.name)}`}/joint_trajectory`);
+        if (it.params.source === 'urdf' && typeof it.params.robotDescription === 'string') topics.set(`/${sanitizeName(String(it.params.urdfName ?? it.name))}/joint_trajectory`, it);
+        else if (it instanceof Robot && !urdfTreeRoot(it)) topics.set(`${normNs(it.connection.rosNamespace) || `/${sanitizeName(it.name)}`}/joint_trajectory`, it);
       }
-      for (const t of topics) this.io.subscribe(t, 'trajectory_msgs/msg/JointTrajectory', (msg) => this.onTrajectory(msg));
+      for (const [t, owner] of topics) this.io.subscribe(t, 'trajectory_msgs/msg/JointTrajectory', (msg) => this.onTrajectory(msg, owner));
     }
     this.started = true;
   }
@@ -177,12 +196,26 @@ export class RosTwin {
     return j.prismatic ? v / 1000 : v * DEG;
   }
 
-  private onTrajectory(msg: any) {
+  /**
+   * Joint commanded by a JointTrajectory name: the /joint_states name, else the robot's own URDF name when it is unique
+   * (inside `owner` for a per-robot topic, in the whole station for the shared controller topic).
+   */
+  resolveJoint(n: string, owner?: Item): TwinJoint | undefined {
+    const within = (a: Item | undefined): boolean => { for (let p: Item | null | undefined = a; p; p = p.parent) if (p === owner) return true; return false; };
+    const movable = this.joints.filter((x) => x.indep >= 0 && (!owner || within(x.owner)));
+    const exact = movable.find((x) => x.name === n);
+    if (exact) return exact;
+    const local = movable.filter((x) => x.local === n);
+    return local.length === 1 ? local[0] : undefined;
+  }
+
+  private onTrajectory(msg: any, owner?: Item) {
     const names: string[] = msg?.joint_names ?? [];
     const pts: any[] = msg?.points ?? [];
-    names.forEach((n, i) => {
-      const j = this.joints.find((x) => x.name === n && x.indep >= 0);
+    names.forEach((n0, i) => {
+      const j = this.resolveJoint(n0, owner);
       if (!j) return;
+      const n = j.name;
       const seq = [{ t: this.time, v: this.value(j) }];
       for (const p of pts) {
         const v = p?.positions?.[i];
@@ -261,14 +294,15 @@ export class RosTwin {
     }
   }
 
-  /** Render and publish every rgb / depth camera of the station (non-MURKA stations; MURKA: ./murom_sim.ts). */
+  /** Render and publish every rgb / depth camera of the station (non-MURKA stations; MURKA: ./murom_sim.ts). A depth
+   *  camera is an RGB-D / stereo / ToF sensor with a colour stream too, unless it is a depth-only device (Webots
+   *  RangeFinder, Gazebo depth / depth_camera sensor): see cameraHasColour. */
   publishCameras(worldFrame = this.opts.mapFrame ?? 'map'): string[] {
     const topics: string[] = [];
     for (const cam of this.station.itemsOfType<CameraItem>(ItemType.CAMERA)) {
       if (cam.kind !== 'rgb' && cam.kind !== 'depth') continue;
-      const r = renderCamera(this.station, cam, { rgb: cam.kind === 'rgb', ground: true });
-      let ns = '';
-      for (let p: Item | null = cam.parent; p; p = p.parent) { const n = (p as { rosNamespace?: string }).rosNamespace; if (p.type === ItemType.MOBILE_ROBOT && n) { ns = normNs(n); break; } }
+      const r = renderCamera(this.station, cam, { rgb: cameraHasColour(cam), ground: true });
+      const ns = cameraNamespace(cam);
       const io = { publish: (t: string, type: string, msg: any) => this.pub(t, type, msg) };
       topics.push(...publishCameraFrame(io, cam, { rgba: r.rgba, depth: cam.kind === 'depth' ? r.depth : undefined, width: r.width, height: r.height, timeS: this.time }, { namespace: ns, worldFrame }));
     }

@@ -12,13 +12,18 @@ import net from 'node:net';
 import type http from 'node:http';
 import { executeRpcAsync, methodTimeoutMs, RpcRequest, RpcResponse } from './rpc';
 import type { Robolink } from './robolink';
+import { wsVerifyClient } from './security';
 
 export interface ApiServerOptions {
   /** HTTP server to attach the WebSocket endpoint to (or a port to listen on). */
   server?: http.Server;
   port?: number;
-  /** Plain TCP JSON-lines port (0 = disabled). */
+  /** Plain TCP JSON-lines port (0 = ephemeral, -1 / undefined = disabled). */
   tcpPort?: number;
+  /** Address the WebSocket (port mode) and TCP sockets bind to (default 127.0.0.1: this machine only, like RoboDK). */
+  host?: string;
+  /** WebSocket upgrade filter (default: security.ts wsVerifyClient with no extra origins: refuses foreign web pages). */
+  verifyClient?: (info: { origin: string; secure: boolean; req: http.IncomingMessage }, cb: (ok: boolean, code?: number, msg?: string) => void) => void;
   getRDK: () => Robolink;
   /** Extra request handler (e.g. __driver__); return undefined to fall through. */
   special?: (req: RpcRequest) => Promise<RpcResponse> | undefined;
@@ -40,7 +45,9 @@ export interface ApiServer {
 
 export function startApiServer(opts: ApiServerOptions): ApiServer {
   const log = opts.log ?? ((m: string) => console.log(`[studio-server] ${m}`));
-  const wss = opts.server ? new WebSocketServer({ server: opts.server }) : new WebSocketServer({ port: opts.port ?? 0 });
+  const bindHost = opts.host ?? '127.0.0.1';
+  const verify = { verifyClient: opts.verifyClient ?? wsVerifyClient({}, log) };
+  const wss = opts.server ? new WebSocketServer({ server: opts.server, ...verify }) : new WebSocketServer({ port: opts.port ?? 0, host: bindHost, ...verify });
   let host: WebSocket | null = null;
   const pending = new Map<string, { resolve: (r: RpcResponse) => void; timer: any }>();
   let seq = 0;
@@ -110,7 +117,7 @@ export function startApiServer(opts: ApiServerOptions): ApiServer {
       sock.on('close', () => finishOnClose(offline));
       sock.on('error', () => {});
     });
-    tcpReady = new Promise((resolve) => tcp!.listen(opts.tcpPort, () => resolve((tcp!.address() as net.AddressInfo).port)));
+    tcpReady = new Promise((resolve) => tcp!.listen(opts.tcpPort, bindHost, () => resolve((tcp!.address() as net.AddressInfo).port)));
   }
   const wsReady = new Promise<number>((resolve) => {
     if (opts.server) { const a = opts.server.address(); if (a && typeof a === 'object') resolve(a.port); else opts.server.on('listening', () => resolve((opts.server!.address() as net.AddressInfo).port)); }

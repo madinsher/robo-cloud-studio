@@ -43,6 +43,15 @@ afterAll(async () => { await browser?.close(); });
 beforeEach(() => { errors = []; });
 
 describe('studio in the browser', () => {
+  it('the plain URL (no ?server) loads without any console error: no probe of a studio server that is not running', async () => {
+    await page.goto(BASE, { waitUntil: 'load', timeout: 120000 });
+    await page.waitForSelector('.menubar');
+    await page.waitForTimeout(2500);
+    const bad = errors.filter((e) => ![/favicon/i, /WebGL/i, /GPU stall/i, /THREE\.WebGLRenderer: Context Lost/i].some((re) => re.test(e)));
+    expect(bad, bad.join('\n')).toEqual([]);
+    expect(errors.some((e) => /WebSocket connection|20500/.test(e))).toBe(false);
+  });
+
   it('every demo station loads, its program runs to the end without problems and the world clock advances', async () => {
     await load('demo=none');
     const demos: string[] = await ev(() => ((window as any).app && document.querySelectorAll('.menu-btn').length ? ['pickplace', 'tutorial', 'welding', 'packing', 'orchard', 'greenhouse', 'verticalbot'] : []));

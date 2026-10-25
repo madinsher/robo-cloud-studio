@@ -56,12 +56,32 @@ describe('course example A (youBot mobile manipulator) on the station', () => {
   });
 });
 
+describe('course example A: the BT mission after the automaton run (part already delivered)', () => {
+  it('does not report success: the base camera sees no part at the table, nothing is grasped, the part stays in the bin', () => {
+    const { station: st, part } = buildCourseStationA();
+    const rt = new StationRuntime(st); const world = makeStationWorld({ station: st, programs: stationRuntimeBackend(rt) });
+    const x = new AutomatonExecutor({ doc: parseDes(YOUBOT_STATION_DES), world, supervisor: synthesizeSupervisor(YOUBOT_STATION_DES)!.table });
+    for (let i = 0; i < 2400 && x.status === 'running'; i++) x.tick(0.05);
+    expect(x.verdict).toBe('done'); expect(inBin(part.poseAbs())).toBe(true);
+    const runsBefore = rt.runs.length;
+    const w = world.forRobot('youBot')!;
+    const ctl = new ControlRuntime({ bt: parseBt(YOUBOT_STATION_BT), supervisor: synthesizeSupervisor(YOUBOT_STATION_DES)!.table, bindings: { sense: () => world.sense!(), actions: { ...world.host.actions, ...w.actions }, halt: { ...world.host.halt, ...w.halt }, events: () => world.events!(), step: (dt) => world.step!(dt) } });
+    // the mission panel stops a reporting tree after 3 failed cycles in a row (control_ui startMission)
+    ctl.bb.targets = 1; let cycles = 0, prev = 'running';
+    for (let i = 0; i < 2400 && !ctl.bb.reported && cycles < 3; i++) { ctl.tick(0.05); if (ctl.status === 'failure' && prev !== 'failure') cycles++; prev = ctl.status; }
+    expect(ctl.bb.reported).not.toBe(true); expect(cycles).toBe(3); expect(ctl.time).toBeLessThan(60);
+    expect(rt.runs.slice(runsBefore).map((r) => r.program.name)).not.toContain('Grasp');
+    expect(inBin(part.poseAbs())).toBe(true);
+    expect(world.sense!().parts_here).toBe(0);
+  });
+});
+
 describe('course example B (production cell) on the station', () => {
   it('the course net deadlocks at {a1 b1} once M1 holds a part and the AMR is in zone Z: verdict deadlock, robots stopped', () => {
     const { station: st } = buildCourseStationB();
     const rt = new StationRuntime(st); const x = new PetriExecutor({ doc: parsePetri(CELL_STATION_PETRI), world: makeStationWorld({ station: st, programs: stationRuntimeBackend(rt) }) });
     x.run(120, 0.05);
-    expect(x.verdict).toBe('deadlock'); expect(x.where()).toBe('a1 b1');
+    expect(x.verdict).toBe('deadlock'); expect(x.where()).toBe('a1 b1 p3'); // M2's cycle in progress completes (no robot stopped in mid-motion), then nothing new starts
     expect(x.firings).toMatchObject({ t1a: 1, t1b: 1 }); expect(x.firings.t2a).toBeUndefined(); expect(x.firings.t2b).toBeUndefined();
     expect(x.time).toBeGreaterThan(3); expect(x.time).toBeLessThan(10); // A1 (3.2 s) and the AMR drive to Z have ended
     expect(x.log.some((l) => /DEADLOCK \(partial\)/.test(l))).toBe(true);

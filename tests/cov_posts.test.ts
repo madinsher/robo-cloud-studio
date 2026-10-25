@@ -278,8 +278,13 @@ describe('post processor registry', () => {
     expect(compiled.events.filter((e) => e.kind === 'gripper').length).toBe(6);
     expect(compiled.events.filter((e) => e.kind === 'setDO').length).toBe(6);
     expect(compiled.events.filter((e) => e.kind === 'pause').length).toBe(3);
-    // the exported program starts in its own frame with its own tool, then the program's speed instruction
-    expect(compiled.events.slice(0, 3)).toMatchObject([{ kind: 'setFrame', name: 'Table' }, { kind: 'setTool', name: 'Vacuum gripper' }, { kind: 'setSpeed', speedLinear: 600, speedJoints: 120 }]);
+    // like RoboDK's MakeProgram, a program without "Set reference frame" / "Set tool" instructions gets no implicit
+    // frame / tool lines (RoboDK 5.9.4 code of the Library programs, tests/posts_library_code.test.ts): it starts with
+    // the program's speed instruction
+    expect(compiled.events[0]).toMatchObject({ kind: 'setSpeed', speedLinear: 600, speedJoints: 120 });
+    expect(compiled.events.some((e) => e.kind === 'setFrame' || e.kind === 'setTool')).toBe(false);
+    // with initialFrameTool the program's frame and tool are stated first
+    expect(compileForPost(st, prog, { initialFrameTool: true }).events.slice(0, 3)).toMatchObject([{ kind: 'setFrame', name: 'Table' }, { kind: 'setTool', name: 'Vacuum gripper' }, { kind: 'setSpeed', speedLinear: 600, speedJoints: 120 }]);
     // every moveL has a joint solution and its pose is expressed in the Table frame
     const first = compiled.events.find((e) => e.kind === 'moveL') as any;
     expect(first.joints).toBeTruthy();
@@ -387,10 +392,10 @@ describe('compileForPost resolves every instruction kind', () => {
     // RoboDK keeps every move it can express: only the MoveC without via and the MoveL without pose are skipped
     expect(c.problems).toEqual(expect.arrayContaining([expect.stringMatching(/T1: MoveC needs via/), expect.stringMatching(/Far: unreachable/), expect.stringMatching(/MoveJ: no joint values for MoveJ, previous joints kept/), expect.stringMatching(/MoveL without a pose skipped/)]));
     expect(c.problems.length).toBe(4);
-    // the exported program starts with its frame and tool; the per-move override becomes explicit speed / zone events
-    // around the move (posts have no per-move parameters, like RoboDK)
-    expect(kinds.slice(0, 9)).toEqual(['setFrame', 'setTool', 'moveJ', 'setSpeed', 'setRounding', 'moveL', 'setSpeed', 'setRounding', 'moveC']);
-    expect(c.events.slice(3, 8)).toMatchObject([{ speedLinear: 80 }, { radius: 2 }, { kind: 'moveL' }, { speedLinear: 500 }, { radius: -1 }]);
+    // no implicit frame / tool (RoboDK); the per-move override becomes explicit speed / zone events around the move
+    // (posts have no per-move parameters, like RoboDK)
+    expect(kinds.slice(0, 7)).toEqual(['moveJ', 'setSpeed', 'setRounding', 'moveL', 'setSpeed', 'setRounding', 'moveC']);
+    expect(c.events.slice(1, 6)).toMatchObject([{ speedLinear: 80 }, { radius: 2 }, { kind: 'moveL' }, { speedLinear: 500 }, { radius: -1 }]);
     const moveL = moves[1];
     expect(moveL.speed).toBe(80);
     // pose w.r.t. frame F: target is 400 up in F
@@ -409,12 +414,13 @@ describe('compileForPost resolves every instruction kind', () => {
     expect((jp[4] as any).joints[0]).toBe(4);
     expect(kinds).toEqual(expect.arrayContaining(['setFrame', 'setTool', 'setSpeed', 'setRounding', 'pause', 'setDO', 'waitDI', 'runCode', 'message', 'comment', 'gripper', 'callProgram', 'navigate', 'task', 'loop', 'if', 'thread']));
     const frames = c.events.filter((e) => e.kind === 'setFrame') as any[];
-    expect(frames.map((x) => x.name)).toEqual(['F', 'World', 'F']);
-    expect(getPos(frames[1].pose)).toEqual([0, 0, 0]);
-    expect(getPos(frames[2].pose)).toEqual([300, 0, -100]); // frame in robot base
+    // only the program's own frame instructions (no implicit initial frame, like RoboDK)
+    expect(frames.map((x) => x.name)).toEqual(['World', 'F']);
+    expect(getPos(frames[0].pose)).toEqual([0, 0, 0]);
+    expect(getPos(frames[1].pose)).toEqual([300, 0, -100]); // frame in robot base
     const tools = c.events.filter((e) => e.kind === 'setTool') as any[];
-    expect(tools.map((x) => x.name)).toEqual(['T', 'Flange', 'T']);
-    expect(tools[2].toolId).toBe(tool.id);
+    expect(tools.map((x) => x.name)).toEqual(['Flange', 'T']);
+    expect(tools[1].toolId).toBe(tool.id);
     expect(c.events.find((e) => e.kind === 'waitDI' && (e as any).io === 'D2')).toMatchObject({ value: 0, timeoutMs: 500 });
     expect(c.events.filter((e) => e.kind === 'gripper').map((e: any) => e.close)).toEqual([true, false]);
     expect(c.events.filter((e) => e.kind === 'comment').map((e: any) => e.text)).toEqual(['note', 'show Box', 'follow path p1', 'wait move done']);
@@ -448,9 +454,9 @@ describe('compileForPost resolves every instruction kind', () => {
     // without a robot the targets stay relative to their frame and the frame is given w.r.t. the station
     expect(c.frame.name).toBe('F');
     expect(getPos(c.frame.pose)).toEqual([300, 0, 0]);
-    expect(c.events.map((e) => e.kind)).toEqual(['setFrame', 'setTool', 'moveL', 'moveJ']); // target MoveJ has no joints
-    expect(getPos((c.events[2] as any).pose)).toEqual([0, 0, 400]);
-    expect((c.events[3] as any).joints).toEqual([1, 2, 3]);
+    expect(c.events.map((e) => e.kind)).toEqual(['moveL', 'moveJ']); // target MoveJ has no joints
+    expect(getPos((c.events[0] as any).pose)).toEqual([0, 0, 400]);
+    expect((c.events[1] as any).joints).toEqual([1, 2, 3]);
     expect(c.problems).toEqual(['T1: no joint values for MoveJ (no robot), move skipped']);
     const p2 = st.addChild(new Program('Explicit'));
     p2.setRobot(robot);

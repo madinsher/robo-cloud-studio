@@ -14,7 +14,7 @@ export interface RobotMotionParams {
   rounding: number;
 }
 
-export type RobotBrand = 'Generic' | 'KUKA' | 'ABB' | 'Fanuc' | 'UR' | 'Yaskawa' | 'Staubli' | 'Doosan' | 'Kawasaki' | 'Denso' | 'Mecademic' | 'ROS2' | 'Custom';
+export type RobotBrand = 'Generic' | 'KUKA' | 'ABB' | 'Fanuc' | 'UR' | 'Yaskawa' | 'Staubli' | 'Doosan' | 'Kawasaki' | 'Denso' | 'Mecademic' | 'Comau' | 'ROS2' | 'Custom';
 
 export interface RobotState {
   joints: number[];
@@ -414,7 +414,7 @@ export function serializeChain(c: ChainDef): any {
   return {
     name: c.name,
     joints: c.joints.map((j) => ({ ...j, origin: Array.from(j.origin), post: j.post ? Array.from(j.post) : undefined })),
-    links: c.links.map((l) => ({ name: l.name, visuals: l.visuals.map((v) => ({ ...v, origin: Array.from(v.origin) })) })),
+    links: c.links.map((l) => ({ name: l.name, visuals: l.visuals.map((v) => ({ ...v, origin: Array.from(v.origin) })), ...(l.collisions ? { collisions: l.collisions.map((g) => ({ ...g, ...(g.origin ? { origin: Array.from(g.origin) } : {}) })) } : {}) })),
     flange: Array.from(c.flange),
     base: c.base ? Array.from(c.base) : undefined,
     flangeLink: c.flangeLink,
@@ -429,7 +429,8 @@ export function deserializeChain(d: any): ChainDef {
   const c: ChainDef = {
     name: d.name,
     joints: d.joints.map((j: any) => ({ ...j, origin: fromArray(j.origin), post: j.post ? fromArray(j.post) : undefined })),
-    links: d.links.map((l: any) => ({ name: l.name, visuals: (l.visuals ?? []).map((v: any) => ({ ...v, origin: fromArray(v.origin) })) })),
+    // link collision geometry (Webots boundingObject / URDF <collision>) survives undo snapshots and .vbstation files
+    links: d.links.map((l: any) => ({ name: l.name, visuals: (l.visuals ?? []).map((v: any) => ({ ...v, origin: fromArray(v.origin) })), ...(Array.isArray(l.collisions) ? { collisions: l.collisions.map((g: any) => ({ ...g })) } : {}) })),
     flange: fromArray(d.flange),
     dh: d.dh,
     dof: d.dof,

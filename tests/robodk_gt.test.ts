@@ -196,6 +196,8 @@ async function compareFile(file: string): Promise<GtResult> {
   for (const gt4 of gt.tools) {
     const t = byName(4, gt4.name);
     const want = m16(gt4.poseTool);
+    // a RoboDK tool must be a studio Tool (a plain object would silently lose the TCP: V1, Library .tool files)
+    if (t && !(t instanceof Tool)) issues.push(`tool ${gt4.name}: imported as ${t.constructor.name}, not a Tool (no TCP)`);
     if (t instanceof Tool && want && bad(err(t.poseTool(), want))) issues.push(`tool ${gt4.name}: TCP ${fmt(err(t.poseTool(), want))}`);
   }
 

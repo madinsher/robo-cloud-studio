@@ -99,7 +99,11 @@ export function robodkStationScript(kind: ControlKind, source: string, name: str
 Run it from RoboDK (Tools > Run Script, or as a station Python program) or from any Python with the robodk package
 against RoboDK or the studio API server (npm run server). Programs of different robots run concurrently (RunProgram
 is non-blocking); a robot executes one action at a time; signals are station parameters (RDK.setParam / getParam);
-mobile skills / goto call RoboDK programs named after them (goto_<zone>, dock, ...). Usage: python script.py [seconds]
+mobile skills / goto call RoboDK programs named after them (goto_<zone>, dock, ...).
+Usage: python script.py [seconds] [SPEED] - the run sets RoboDK's simulation speed to SPEED (default 1 = real time,
+as the studio runs the model; 0 keeps RoboDK's own speed) and restores it at the end; delays, waits and timeouts run
+on the station's simulation clock (RDK.SimulationTime()), so their race with the program durations does not depend on
+the speed. Guards / conditions / decisions read the signals again after a program ends.
 """`;
   const body = `${header}\n${PY_RUNTIME}\nMODEL = json.loads(r'''${JSON.stringify({ kind: m.kind, model: m.model, signals: m.signals })}''')\n\nif __name__ == '__main__':\n    main(MODEL)\n`;
   return { name: `${ident(name).toLowerCase()}_robodk.py`, content: body, mime: 'text/x-python' };

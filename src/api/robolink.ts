@@ -613,8 +613,38 @@ export class RobolinkItem {
     if (last && o.Name) last.name = String(o.Name);
     return 'OK';
   }
-  setColor(color: string | number[]): this { const it = this.req(); it.color = Array.isArray(color) ? toCss(color) : color; it.notify('color'); return this; }
-  Recolor(color: string | number[], _from?: any, _tol?: any): this { return this.setColor(color); }
+  /**
+   * RoboDK setColor: the item and every shape of it take the colour (an object's / tool's geometry colours and a robot's
+   * link colours, which the 3D view and the simulated cameras draw); [r,g,b,a] with a < 1 makes them transparent.
+   */
+  setColor(color: string | number[]): this { return this.Recolor(color); }
+  /** RoboDK Recolor(tocolor, fromcolor=None, tolerance=None): shapes of `fromcolor` (within `tolerance`, RGB 0..1) or all shapes. */
+  Recolor(color: string | number[], from?: string | number[] | null, tol?: number | null): this {
+    const it = this.req();
+    const css = toCss(color);
+    const alpha = Array.isArray(color) && color.length > 3 ? Math.max(0, Math.min(1, Number(color[3]))) : undefined;
+    const rgb = (c: string | number[] | undefined | null): number[] | null => {
+      if (c == null) return null;
+      if (Array.isArray(c)) return c.slice(0, 3).map(Number);
+      const m = /^#?([0-9a-f]{6})$/i.exec(String(c).trim());
+      return m ? [0, 2, 4].map((k) => parseInt(m[1].slice(k, k + 2), 16) / 255) : null;
+    };
+    const fromRgb = rgb(from ?? null);
+    const t = tol == null ? 0.01 : Math.max(0, Number(tol));
+    const match = (c: string | undefined) => {
+      if (!fromRgb) return true;
+      const v = rgb(c ?? it.color ?? null);
+      return !!v && Math.max(...v.map((x, k) => Math.abs(x - fromRgb[k]))) <= t + 1e-9;
+    };
+    const paint = (r: { color?: string; opacity?: number }) => { r.color = css; if (alpha !== undefined) r.opacity = alpha; };
+    let changed = false;
+    const shapes: Array<{ color?: string; opacity?: number }> = it instanceof SceneObject || it instanceof Tool ? ((it as SceneObject).geometry ?? [])
+      : it instanceof Robot ? it.chain.links.flatMap((l) => l.visuals as Array<{ color?: string; opacity?: number }>) : [];
+    for (const r of shapes) if (match(r.color)) { paint(r); changed = true; }
+    if (!fromRgb || match(it.color)) it.color = css;
+    it.notify(changed ? 'geometry' : 'color');
+    return this;
+  }
   setGeometryPose(p: PoseLike, _apply = false): this { const it = this.req(); if (it instanceof SceneObject) { for (const g of it.geometry) g.origin = Array.from(toMat4(p)); it.notify('geometry'); } return this; }
   /** Robot: moving (API move or program of this robot); program: running. */
   Busy(): boolean {
@@ -1079,13 +1109,13 @@ export class Robolink {
   // ---- execution helpers (exec.ts) ----
   /** Advance simulated time by `seconds` (virtual clock) or wait for it (realtime). */
   Pause(seconds: number): void | Promise<void> {
-    if (this.exec.mode === 'virtual' || this.exec.syncDepth > 0) { this.exec.advance(seconds); return; }
+    if (this.exec.isVirtual()) { this.exec.advance(seconds); return; }
     return new Promise((r) => setTimeout(r, (seconds * 1000) / Math.max(1e-3, this.exec.speed)));
   }
   /** Wait until cond() holds, advancing the simulation (virtual) or polling (realtime). */
   waitUntil(cond: () => boolean, timeoutS: number): void | Promise<void> {
     if (cond()) return;
-    if (this.exec.mode === 'virtual' || this.exec.syncDepth > 0) {
+    if (this.exec.isVirtual()) {
       let t = 0;
       while (!cond() && t < timeoutS) { this.exec.advance(0.05); t += 0.05; if (t > 60 && !this.exec.busy(null)) break; }
       if (!cond()) throw new Error(`StoppedError: timeout waiting for the condition (${timeoutS.toFixed(1)} s simulated)`);
@@ -1272,7 +1302,11 @@ export class Robolink {
   // ---- cameras ----
   Cam2D_Add(item?: RobolinkItem | number | null, params = '', camera_item?: RobolinkItem | null): RobolinkItem {
     if (camera_item?.item instanceof CameraItem) { this.applyCamParams(camera_item.item, params); this.cams.set(camera_item.item.id, camera_item.item); return camera_item; }
-    const cam = new CameraItem('Camera');
+    // RoboDK names simulated cameras "Camera 1", "Camera 2", ... (RDK.Item('Camera 1') finds them)
+    const taken = new Set(this.station.itemsOfType<CameraItem>(ItemType.CAMERA).map((c) => c.name));
+    let n = 1;
+    while (taken.has(`Camera ${n}`)) n++;
+    const cam = new CameraItem(`Camera ${n}`);
     ((item instanceof RobolinkItem ? item.item : null) ?? this.station).addChild(cam);
     this.applyCamParams(cam, params);
     this.cams.set(cam.id, cam);
@@ -1286,6 +1320,7 @@ export class Robolink {
     const fov = get('FOV'); if (fov && Number.isFinite(+fov)) cam.fov = +fov;
     const focal = get('FOCAL_LENGTH') ?? get('FOCAL_LENGHT'), pix = get('PIXELSIZE');
     if (focal && pix && +pix > 0) setFocalLengthPx(cam, (+focal * 1000) / +pix);
+    if (focal && +focal > 0) cam.setParam('cam2dFocalMm', +focal);
     const far = get('FAR_LENGTH') ?? get('FAR_LENGHT') ?? get('FAR'); if (far && +far > 0) cam.far = +far;
     const near = get('NEAR_LENGTH') ?? get('NEAR_LENGHT') ?? get('NEAR'); if (near && +near > 0) cam.near = +near;
     if (/(?:^|\s)DEPTH(?:\s|$)/i.test(params)) cam.kind = 'depth';
@@ -1297,8 +1332,14 @@ export class Robolink {
   Cam2D_Settings(cam?: RobolinkItem | number): string {
     const c = cam instanceof RobolinkItem && cam.item instanceof CameraItem ? cam.item : [...this.cams.values()][0] ?? this.station.itemsOfType<CameraItem>(ItemType.CAMERA)[0];
     if (!c) return '';
+    // RoboDK 5.9.4 format, e.g. "FOV=32.000 PixelSize=7.168635 Size=640x480 SHOW_LIMITS FOCAL_LENGTH=6.00
+    // FAR_LENGTH=1000.00 BG_COLOR=#000000 Persp WindowResize" (focal length 5 mm and a white background by default)
     const fv = cameraFovs(c).v;
-    return `FOV=${+fv.toFixed(4)} FAR_LENGTH=${c.far} NEAR_LENGTH=${c.near} SIZE=${c.width}x${c.height}${c.kind === 'depth' ? ' DEPTH' : ''}`;
+    const fpx = (c.height / 2) / Math.tan(((fv / 2) * Math.PI) / 180);
+    const focal = Number(c.params.cam2dFocalMm) > 0 ? Number(c.params.cam2dFocalMm) : 5;
+    const bgRaw = String(c.params.cam2dBackground ?? '').toLowerCase();
+    const bg = bgRaw === 'black' ? '#000000' : bgRaw === 'white' || !bgRaw ? '#ffffff' : /^#?[0-9a-f]{6}$/.test(bgRaw) ? `#${bgRaw.replace('#', '')}` : '#ffffff';
+    return `FOV=${fv.toFixed(3)} PixelSize=${((focal * 1000) / fpx).toFixed(6)} Size=${c.width}x${c.height} SHOW_LIMITS FOCAL_LENGTH=${focal.toFixed(2)} FAR_LENGTH=${c.far.toFixed(2)} BG_COLOR=${bg}${c.kind === 'depth' ? ' DEPTH' : ''} Persp WindowResize`;
   }
   Cam2D_SetParams(params: string, cam?: RobolinkItem | number): boolean {
     const c = cam instanceof RobolinkItem && cam.item instanceof CameraItem ? cam.item : [...this.cams.values()][0];
@@ -1324,7 +1365,7 @@ export class Robolink {
     const depth = /(?:^|\s)DEPTH(?:\s|$)/i.test(params) || /\.grey32$/i.test(file_save_img);
     const snap = String(it.params.cam2dSnapshot ?? '').split('x').map(Number);
     const w = snap[0] > 0 ? snap[0] : it.width, h = snap[1] > 0 ? snap[1] : it.height;
-    const r = renderCamera(this.station, it, { width: w, height: h, rgb: !depth, ground: false });
+    const r = renderCamera(this.station, it, { width: w, height: h, rgb: !depth, ground: false, ...(this.assets ? { assets: this.assets } : {}) });
     let bytes: Uint8Array;
     if (depth) bytes = encodeGrey32(r.depth, r.width, r.height, it.far);
     else {
@@ -1763,7 +1804,9 @@ export class Robolink {
     const cast = (o: number[], d: number[]) => {
       let best: { point: number[]; distance: number } | null = null;
       for (const s of [1, -1]) {
-        const h = collisionLine(this.station, o as any, [o[0] + s * d[0] * L, o[1] + s * d[1] * L, o[2] + s * d[2] * L], { assets: this.assets, meshAccurate: true });
+        // only the target object's surfaces count (RoboDK projects onto that object: the robot's tool between the
+        // grid and the part must not hide it, Example-07.c Paint gun)
+        const h = collisionLine(this.station, o as any, [o[0] + s * d[0] * L, o[1] + s * d[1] * L, o[2] + s * d[2] * L], { assets: this.assets, meshAccurate: true, ...(target ? { only: target } : {}) });
         if (onTarget(h) && (!best || h!.distance < best.distance)) best = { point: [...h!.point], distance: h!.distance };
       }
       return best;

@@ -3,10 +3,6 @@
  "error": null,
  "log": "",
  "files": [
-  "AppInspectA.src",
-  "GoHome.src",
-  "InspectA.src",
-  "MainProgramA.src",
-  "RetractInspectA.src"
+  "MainProgramA.src"
  ]
 }

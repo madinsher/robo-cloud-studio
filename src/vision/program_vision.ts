@@ -4,7 +4,7 @@
  * A program calls the camera with a code instruction `VisionDetect("<camera>"[, "<robot>"])` (aliases Vision_Run,
  * VisionRun, DetectParts). The StationRuntime hands the call to visionScriptRunner, which runs the camera's pipeline
  * on the current station state (software render in Node, WebGL in the browser), refreshes the targets of the frame
- * "Vision <camera>" — `Pick` / `Pick approach` hold the first target the robot reaches without collision — and sets
+ * "Vision <camera>" — `Pick` / `Pick approach` hold the most confident target the robot reaches without collision — and sets
  * the signals the program branches on with an IF instruction:
  *   VISION_FOUND = number of feasible targets, VISION_<CAMERA>_FOUND = same, VISION_TARGET = name of the picked target.
  * Station parameters with the same names are written as well (RoboDK getParam style for the API / Python).
@@ -58,10 +58,13 @@ export async function visionScriptRunner(ctx: { station: Station; runtime: { sig
 /** Adapter for StationRuntime.registerScriptRunner: vision calls run the pipeline; any other name keeps the runtime's usual
  *  diagnostic (the call is not executed in simulation) — StationRuntime calls only its first runner (see impl_T9.md). */
 function adapter(): ScriptRunner {
-  return async (ctx) => {
+  const fn: ScriptRunner = async (ctx) => {
     if (await visionScriptRunner(ctx as any)) return;
     ctx.runtime.events?.emit('message', { text: `Call ${ctx.name}: no program or script named ${ctx.name} in the station (ignored in simulation)`, level: 'warn' });
   };
+  // validation (record mode) does not report the vision calls as ignored: they run in live playback
+  fn.handles = (name: string) => VISION_CALL.test(name);
+  return fn;
 }
 
 /** Register the vision runner on one runtime (returns the unregister function). */

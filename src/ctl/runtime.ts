@@ -152,12 +152,25 @@ export function stationBindings(o: StationWorldOptions): WorldBindings & { stepR
     if (st === 'success') onOk(); else if (st === 'failure') onFail?.();
     return st;
   };
+  /** Loose parts (visible, not held, largest box side ≤ 300 mm: not tables or bins) standing in a zone - what a camera on the base sees there. */
+  const partsIn = (z: ZoneItem | undefined): number => {
+    if (!z) return 0;
+    let n = 0;
+    for (const it of station.walk()) {
+      if (it.type !== ItemType.OBJECT || !it.visible || it.parent?.type === ItemType.TOOL || it === robot || robot.isAncestorOf(it)) continue;
+      const g = (it as Item & { geometry?: Array<{ primitive?: { kind: string; size?: number[]; radius?: number; length?: number } }> }).geometry ?? [];
+      const sizes = g.map((x) => x.primitive).filter((p): p is NonNullable<typeof p> => !!p).map((p) => (p.kind === 'box' ? Math.max(...(p.size ?? [Infinity])) : p.kind === 'sphere' ? 2 * (p.radius ?? Infinity) : Math.max(2 * (p.radius ?? Infinity), p.length ?? 0)));
+      if (!sizes.length || Math.max(...sizes) > 300) continue;
+      const P = it.poseAbs(); if (z.contains(P[12], P[13])) n++;
+    }
+    return n;
+  };
   const bindings: WorldBindings & { stepRobot(dt: number): void } = {
     sense: () => {
       const z = zones().find((zz) => zz.contains(robot.state.x, robot.state.y));
       const hp = o.humanPosition?.() ?? null;
       const distHuman = hp ? Math.hypot(hp[0] - robot.state.x, hp[1] - robot.state.y) / 1000 : 99;
-      return { battery: robot.batteryLevel(), x: robot.state.x, y: robot.state.y, v: Math.abs(robot.state.v) / 1000, zone: z?.name ?? '', moving: robot.state.status === 'moving', dist_human: distHuman, human: distHuman < 2, held: !!robot.params.holding, placed: !!robot.params.placed, arm_extended: !!robot.params.armExtended, docked: robot.state.status === 'charging' };
+      return { battery: robot.batteryLevel(), x: robot.state.x, y: robot.state.y, v: Math.abs(robot.state.v) / 1000, zone: z?.name ?? '', parts_here: partsIn(z), moving: robot.state.status === 'moving', dist_human: distHuman, human: distHuman < 2, held: !!robot.params.holding, placed: !!robot.params.placed, arm_extended: !!robot.params.armExtended, docked: robot.state.status === 'charging' };
     },
     events: () => { const e = pending.splice(0); if (arrivedLast) { arrivedLast = false; } return e; },
     actions: {
@@ -187,7 +200,21 @@ export function stationBindings(o: StationWorldOptions): WorldBindings & { stepR
       undock: () => { robot.state.status = 'idle'; return 'success'; },
       reach: (ctx, a, node) => viaArm('reach', ctx, a, node, () => { robot.params.armExtended = true; }) ?? timed('reach', dur.reach, ctx, node, () => { robot.params.armExtended = true; }),
       stow: (ctx, a, node) => viaArm('stow', ctx, a, node, () => { robot.params.armExtended = false; }) ?? timed('stow', dur.stow, ctx, node, () => { robot.params.armExtended = false; }),
-      grasp: (ctx, args, node) => viaArm('grasp', ctx, args, node, () => { robot.params.placed = false; robot.params.holding = true; if (typeof args.ok === 'string') pending.push(args.ok); }, () => { robot.params.holding = false; if (typeof args.miss === 'string') pending.push(args.miss); }) ?? timed('grasp', dur.grasp, ctx, node, () => { const p = Number(args.p ?? 1); robot.params.placed = false; robot.params.holding = Math.random() < p; if (robot.params.holding && typeof args.ok === 'string') pending.push(args.ok); else if (!robot.params.holding && typeof args.miss === 'string') pending.push(args.miss); }),
+      grasp: (ctx, args, node) => {
+        // an arm program grasps for real: success only when a gripper of the robot holds an object afterwards (the
+        // program attaches the closest object within reach - nothing when the part is elsewhere)
+        const st = viaArm('grasp', ctx, args, node, () => undefined, () => undefined);
+        if (st !== null) {
+          if (st === 'running') return st;
+          const tools = [...robot.walk()].filter((t): t is Item & { attached: string[] } => t.type === ItemType.TOOL && Array.isArray((t as { attached?: unknown }).attached));
+          const holds = !tools.length || tools.some((t) => t.attached.length > 0);
+          if (st === 'success' && holds) { robot.params.placed = false; robot.params.holding = true; if (typeof args.ok === 'string') pending.push(args.ok); return 'success'; }
+          if (st === 'success') ctx.log?.('grasp: the program ended but the gripper holds nothing — failure');
+          robot.params.holding = false; if (typeof args.miss === 'string') pending.push(args.miss);
+          return 'failure';
+        }
+        return timed('grasp', dur.grasp, ctx, node, () => { const p = Number(args.p ?? 1); robot.params.placed = false; robot.params.holding = Math.random() < p; if (robot.params.holding && typeof args.ok === 'string') pending.push(args.ok); else if (!robot.params.holding && typeof args.miss === 'string') pending.push(args.miss); });
+      },
       place: (ctx, args, node) => viaArm('place', ctx, args, node, () => { robot.params.holding = false; robot.params.placed = true; const n = Number(ctx.bb.targets ?? 0); ctx.bb.targets = Math.max(0, n - 1); if (typeof args.put === 'string') pending.push(args.put); }) ?? timed('place', dur.place, ctx, node, () => { robot.params.holding = false; robot.params.placed = true; const n = Number(ctx.bb.targets ?? 0); ctx.bb.targets = Math.max(0, n - 1); if (typeof args.put === 'string') pending.push(args.put); }),
       set: (ctx, args) => { for (const [k, v] of Object.entries(args)) if (k !== 'event' && k !== 'done') ctx.bb[k] = v; return 'success'; },
       event: (_c, args) => { const e = args.emit ?? args.name; if (typeof e === 'string') pending.push(e); return 'success'; },
@@ -378,7 +405,8 @@ export function simulatedBindings(init: Partial<SimWorldState> = {}, zones: Reco
   const zoneAt = () => Object.entries(zones).find(([, p]) => Math.hypot(p[0] - st.x, p[1] - st.y) < 0.5)?.[0] ?? '';
   return {
     state: st,
-    sense: () => ({ battery: st.battery, estop: st.estop, dist_human: st.humanDist, human: st.humanDist < 2, held: st.held, placed: st.placed, targets: st.targets, docked: st.docked, zone: st.zone, moving: st.moving, x: st.x, y: st.y, arm_extended: st.armExtended }),
+    // parts_here: the objects still waiting at the table (the abstract world keeps them there until they are delivered)
+    sense: () => ({ battery: st.battery, estop: st.estop, dist_human: st.humanDist, human: st.humanDist < 2, held: st.held, placed: st.placed, targets: st.targets, docked: st.docked, zone: st.zone, parts_here: st.zone === 'table' ? Math.max(0, st.targets - (st.held ? 1 : 0)) : 0, moving: st.moving, x: st.x, y: st.y, arm_extended: st.armExtended }),
     events: () => st.events.splice(0),
     step: (dt) => {
       if (target && !st.estop) { const dx = target[0] - st.x, dy = target[1] - st.y; const d = Math.hypot(dx, dy); const s = Math.min(d, speed * dt); if (d > 1e-6) { st.x += (dx / d) * s; st.y += (dy / d) * s; } st.moving = true; st.battery -= 0.002 * dt; if (d <= speed * dt) { target = null; st.moving = false; } }

@@ -3,7 +3,16 @@
  * Python / IEC 61131-3 ST / NuSMV / SCXML ECMAScript), identifiers, XML writing and a small XML reader (PNML import,
  * well-formedness checks of the generated documents).
  */
-export interface GenFile { name: string; content: string; mime?: string }
+export interface GenFile { name: string; content: string; mime?: string; /** 'base64': `content` is base64 of a binary file (UR .urp = gzip) */ encoding?: 'base64' }
+
+/** The bytes of a generated file (base64 content decoded, text as UTF-8). */
+export function genFileBytes(f: GenFile): Uint8Array {
+  if (f.encoding !== 'base64') return new TextEncoder().encode(f.content);
+  const bin = atob(f.content.replace(/\s+/g, ''));
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
 
 export const pyStr = (s: string) => JSON.stringify(s);
 /** Identifier for C / Python / ST / SMV: letters, digits, underscore, not starting with a digit. */

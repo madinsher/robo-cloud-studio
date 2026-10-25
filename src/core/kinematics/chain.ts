@@ -1,3 +1,4 @@
+import type { GeometryRef } from '../items/item';
 import { Mat4, Vec3, identity, multiply, rotAxis, transl, clone, invert, getPos, cross, sub, transformDir, mul, rotz, roty, rotx, DEG } from '../math/pose';
 
 export type JointType = 'revolute' | 'prismatic' | 'fixed' | 'continuous';
@@ -82,6 +83,12 @@ export function visualOrigin(linkPoses: Mat4[], link: number, v: LinkVisual): Ma
 export interface LinkDef {
   name: string;
   visuals: LinkVisual[];
+  /**
+   * Collision geometry declared by the source separately from the visuals (Webots boundingObject, URDF <collision>),
+   * origin relative to the link frame (16 numbers, column-major, or a Mat4). When present it is what collision checks
+   * use for this link instead of the visual meshes.
+   */
+  collisions?: GeometryRef[];
 }
 
 /**

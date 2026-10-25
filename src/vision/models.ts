@@ -209,8 +209,11 @@ export class SimulatedModel implements VisionModel {
       const sizeFactor = 1 / (1 + Math.exp(-(px - 8) / 3)); // ~50 % at 8 px, ~80 % at 12 px, ~98 % at 20 px (640 input)
       const recall = Math.min(0.99, (0.55 + 0.45 * acc) * sizeFactor);
       if (rnd() > recall) continue;
-      const jit = (1 - acc) * 0.15 * px + 0.5;
-      const b: Box2D = { x: t.box.x + gauss(rnd) * jit, y: t.box.y + gauss(rnd) * jit, w: Math.max(2, t.box.w * (1 + gauss(rnd) * (1 - acc) * 0.2)), h: Math.max(2, t.box.h * (1 + gauss(rnd) * (1 - acc) * 0.2)), score: Math.min(0.99, Math.max(opts.confidence, recall * (0.75 + 0.25 * rnd()))), cls: t.cls, truthId: t.id, attr: t.attrs ? { ...t.attrs } : undefined };
+      // box localisation error of a detector trained on the task (IoU ≈ 0.9–0.95 on large objects): corner σ ≈ 2 % and
+      // size σ ≈ 3 % of the box for a COCO-mAP 0.45 model, plus half a pixel — not the COCO average over hard classes
+      const jit = (1 - acc) * 0.04 * px + 0.5;
+      const sj = (1 - acc) * 0.05;
+      const b: Box2D = { x: t.box.x + gauss(rnd) * jit, y: t.box.y + gauss(rnd) * jit, w: Math.max(2, t.box.w * (1 + gauss(rnd) * sj)), h: Math.max(2, t.box.h * (1 + gauss(rnd) * sj)), score: Math.min(0.99, Math.max(opts.confidence, recall * (0.75 + 0.25 * rnd()))), cls: t.cls, truthId: t.id, attr: t.attrs ? { ...t.attrs } : undefined };
       if (b.score < opts.confidence) continue;
       if (opts.task === 'segment') b.mask = t.mask ?? ellipseMask(b, frame.width, frame.height);
       if (opts.task === 'keypoints') { const kps = t.keypoints ?? [[t.box.x + t.box.w / 2, t.box.y]]; b.keypoints = kps.map(([kx, ky]) => [kx + gauss(rnd) * jit, ky + gauss(rnd) * jit, Math.min(0.99, acc + 0.2 * rnd())]); }
@@ -686,6 +689,9 @@ export class ByteTracker {
         const t = this.tracks[ti]; if (t.cls !== d.cls) return;
         const v = iou(t, d);
         if (v >= iouMin) { pairs.push([1 + v, ti, di]); return; }
+        // centre-distance fallback (fast objects before their velocity is known): only for a box of about the same
+        // size — a small false-positive track must not capture a large part detected next to it
+        if (Math.max(t.w / d.w, d.w / t.w, t.h / d.h, d.h / t.h) > 2) return;
         const dist = Math.hypot(d.x + d.w / 2 - (t.x + t.w / 2), d.y + d.h / 2 - (t.y + t.h / 2)), size = Math.max(t.w, t.h, d.w, d.h);
         if (dist < gate * size) pairs.push([1 - dist / (gate * size), ti, di]);
       }));

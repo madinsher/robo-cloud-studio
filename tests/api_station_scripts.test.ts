@@ -80,14 +80,18 @@ async function idle(c: Cell, timeoutS: number): Promise<void> {
   }
 }
 /** Run a program like RoboDK's "Run" and wait for it and everything it started (threads, scripts). */
-async function runProgram(c: Cell, name: string, timeoutS = 180) {
+async function runProgram(c: Cell, name: string, timeoutS = 180, expectError?: { message: RegExp; index: number }) {
   const p = c.station.find(name, ItemType.PROGRAM);
   expect(p, `program ${name}`).toBeTruthy();
   new RobolinkItem(c.host.rdk, p).RunCode();
   const handles = c.host.rdk.exec.handlesOf(p!);
   await idle(c, timeoutS);
   const bad = handles.find((h) => h.status === 'error');
-  expect(bad?.error?.message ?? '', `${name} run error`).toBe('');
+  if (expectError) {
+    // a program RoboDK itself cannot complete stops at the same instruction with the same reason
+    expect(bad?.error?.message ?? '', `${name} run error`).toMatch(expectError.message);
+    expect(bad?.error?.instructionIndex, `${name} failing instruction`).toBe(expectError.index);
+  } else expect(bad?.error?.message ?? '', `${name} run error`).toBe('');
   return handles;
 }
 /** Run a station Python program directly (double-click), with sys.argv arguments; returns its output. */
@@ -115,20 +119,24 @@ const sec = 1000;
 
 describe('RoboDK Library station Python programs (I5, CPython runner)', () => {
   // ---- spray / deposition stations: program calls SprayOn(1)/GunOn ... and material lands on the part ----
-  const SPRAY: Array<[string, string, string[], number?]> = [
+  // 03.a Oil: RoboDK 5.9.4 cannot complete the program as saved in the Library either: Update() validates 317 of 782
+  // instructions and RunProgram stops there ("Joint 5 is too close to a singularity", joints [17.5, 63.2, -46.1,
+  // -72.9, -2.5, -196.3]); GunEnd at the end of the program is never reached
+  const OIL_STOP = { message: /wrist singularity/, index: 317 };
+  const SPRAY: Array<[string, string, string[], number?, { message: RegExp; index: number }?]> = [
     ['Example-01.a-Robot Painting - Universal Robots.rdk', 'MainProg', ['SprayOn']],
     ['Painting-Tutorial-2.rdk', 'MainProg', ['SprayOn']],
     ['Tutorial-UR-Painting.rdk', 'MainProg', ['SprayOn']],
-    ['Example-03.a-Liquid dispensing - Kawasaki.rdk', 'Oil', ['GunStart', 'GunEnd']],
+    ['Example-03.a-Liquid dispensing - Kawasaki.rdk', 'Oil', ['GunStart'], undefined, OIL_STOP],
     ['Example-03.h-Arc Welding - ABB.rdk', 'MainProgram', ['GunOn', 'GunOff']],
     ['Example-10.a-Shader-Customized-Light.rdk', 'MainProgram', ['GunOn', 'GunOff']],
     ['Example-05.b-Glazing with a turntable - ABB.rdk', 'Main', ['GunOn']],
     ['Additive-Manufacturing-and-Machining-with-Mecademic-Meca500-R3.rdk', 'CE3_3DBenchy', ['FilamentStart', 'FilamentEnd'], 200],
   ];
-  for (const [file, prog, scripts, speed] of SPRAY) {
-    it.skipIf(!have(file))(`${file}: ${prog} calls ${scripts.join('/')} and sprays the part`, async () => {
+  for (const [file, prog, scripts, speed, stop] of SPRAY) {
+    it.skipIf(!have(file))(`${file}: ${prog} calls ${scripts.join('/')} and sprays the part${stop ? ' until it stops where RoboDK stops' : ''}`, async () => {
       const c = await load(file, speed ?? 10);
-      await runProgram(c, prog, 240);
+      await runProgram(c, prog, 240, stop);
       for (const s of scripts) expect(calls(c, s).length, `${s} calls`).toBeGreaterThan(0);
       expect(c.host.runner.history.every((h) => h.code === 0)).toBe(true);
       // the gun was switched on by the script and its cone hit the part while the robot moved (material used > 0)
@@ -234,7 +242,9 @@ describe('RoboDK Library station Python programs (I5, CPython runner)', () => {
   const PALLET: Array<[string, number]> = [['Example-06.c-Pick and place with 2D camera.rdk', 12], ['Example-06.d-Pick and place with laser sensor.rdk', 18]];
   for (const [file, nparts] of PALLET) {
     it.skipIf(!have(file))(`${file}: MainSimulation moves all ${nparts} parts from pallet A over the conveyor to pallet B`, async () => {
-      const c = await load(file, 20);
+      // speed 10 (was 20): the scripts poll the camera / sensor in real time like in RoboDK; at 20x a machine loaded by
+      // parallel jobs let a part run past the detection window between two polls and the pick failed (V6: intermittent)
+      const c = await load(file, 10);
       const parts = () => c.station.itemsOfType<SceneObject>(ItemType.OBJECT).filter((o) => /^Part \d+$/.test(o.name));
       const p = c.station.find('MainSimulation', ItemType.PROGRAM)!;
       new RobolinkItem(c.host.rdk, p).RunCode();
@@ -242,7 +252,7 @@ describe('RoboDK Library station Python programs (I5, CPython runner)', () => {
       // the MoveConveyor thread runs for hours (RoboDK too): the cycle is over when MainSimulation returns
       const t0 = Date.now();
       while (h.some((x) => x.status === 'running' || x.status === 'queued') && Date.now() - t0 < 240 * sec) await new Promise((r) => setTimeout(r, 100));
-      expect(h.map((x) => x.status)).toEqual(['done']);
+      expect(h.map((x) => x.status), `${h.map((x) => x.error?.message ?? '').join(' | ')} :: ${c.host.runner.history.filter((x) => x.code !== 0).map((x) => `${x.name}: ${x.output.slice(-400)}`).join(' | ')} :: ${c.logs.slice(-8).join(' | ')}`).toEqual(['done']);
       expect(parts().length).toBe(nparts);                          // PrepareSimulation re-creates the parts (SizePallet)
       expect(parts().every((o) => o.parent?.name === 'PalletB')).toBe(true);
       expect(c.host.runner.history.every((x) => x.code === 0)).toBe(true);

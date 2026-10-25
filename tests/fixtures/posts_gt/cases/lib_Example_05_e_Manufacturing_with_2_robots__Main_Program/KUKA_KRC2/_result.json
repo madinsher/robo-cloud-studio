@@ -3,15 +3,6 @@
  "error": null,
  "log": "",
  "files": [
-  "Chamfer.src",
-  "Drilling.src",
-  "Home_KUKA.src",
-  "Home_Motoman.src",
-  "Main_Program.src",
-  "Paint.src",
-  "onChamfer_Start.src",
-  "onDrilling_Activ.src",
-  "onDrilling_Start.src",
-  "onPaint_Start.src"
+  "Main_Program.src"
  ]
 }

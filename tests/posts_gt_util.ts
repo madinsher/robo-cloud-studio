@@ -97,8 +97,12 @@ export function normBoth(post: string, text: string): string {
 }
 
 /** Files the studio writes and RoboDK omits (RoboDK defect): the start / stop programs every split VAL3 library declares. */
-export function allowedExtra(post: string, file: string): boolean {
-  return post === 'Staubli_VAL3' && /^Main[^/]*\/[^/]+\/(start|stop)\.pgx$/.test(file);
+export function allowedExtra(post: string, file: string, job?: PostJob): boolean {
+  if (post === 'Staubli_VAL3' && /^Main[^/]*\/[^/]+\/(start|stop)\.pgx$/.test(file)) return true;
+  // KUKA: RoboDK writes the main program's .src only; the studio also writes the sub-programs it generated with it
+  const base = file.toLowerCase().replace(/\.src$/, '');
+  if (post.startsWith('KUKA_') && /\.src$/i.test(file) && job?.subprograms?.some((s) => s.name.replace(/[^A-Za-z0-9_]/g, '').toLowerCase().startsWith(base))) return true;
+  return false;
 }
 
 /** RoboDK files the studio does not reproduce (documented gaps): JAKA's Scratch-like .zu project and its zip (random block

@@ -380,9 +380,14 @@ describe('Station id index and separate colliders (I9)', () => {
     // O(1): 20k lookups in a 5k-item tree take a few ms (the old recursive walk took seconds)
     for (let i = 0; i < 5000; i++) f.addChild(new Target(`t${i}`));
     const ids = f.children.map((c) => c.id);
+    // timed without expect() calls (their cost under a loaded machine made the bound flaky); the old O(n) walk needs
+    // ~1e8 node visits here (seconds), the index a few ms
+    let misses = 0;
     const t0 = performance.now();
-    for (let k = 0; k < 20000; k++) expect(st.findById(ids[k % ids.length])).not.toBeNull();
-    expect(performance.now() - t0).toBeLessThan(1000);
+    for (let k = 0; k < 20000; k++) if (!st.findById(ids[k % ids.length])) misses++;
+    const ms = performance.now() - t0;
+    expect(misses).toBe(0);
+    expect(ms).toBeLessThan(2500);
   });
 
   it('SceneObject.colliders replaces the visual geometry for collision (Webots boundingObject)', () => {

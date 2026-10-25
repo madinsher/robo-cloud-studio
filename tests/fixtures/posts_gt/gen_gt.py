@@ -24,6 +24,13 @@ SEPARATE = {'Staubli_VAL3', 'Techman_TMscript', 'Kawasaki', 'Mecademic', 'Denso_
             'Mitsubishi', 'Nachi_AX_FD', 'HCR', 'AUBO', 'CSV', 'Doosan_Robotics', 'Omron', 'Techman', 'Elite_Robots_EC_V3'}
 
 
+# Posts that declare INCLUDE_SUB_PROGRAMS = False but receive the program and its sub-programs in one instance in RoboDK's
+# MakeProgram (RoboDK 5.9.4 Library code: KUKA KRC2 writes the main .src only, with EXT for every program called in
+# the run): the Library cases are replayed in one instance like RoboDK does; the feature / synthetic cases keep one file
+# per program (the importer round trip in tests/posts_import.test.ts reads them).
+ONE_INSTANCE = {'KUKA_KRC2', 'KUKA_KRC4'}
+
+
 def main():
     case_filter = sys.argv[1] if len(sys.argv) > 1 else ''
     post_filter = sys.argv[2] if len(sys.argv) > 2 else ''
@@ -40,6 +47,10 @@ def main():
             shutil.rmtree(out, ignore_errors=True)
             os.makedirs(out)
             jrun = jp
+            if post in ONE_INSTANCE and case.startswith('lib_'):
+                job2 = dict(job, include_sub_programs=True)
+                jrun = out + '.job.json'
+                json.dump(job2, open(jrun, 'w', encoding='utf-8'))
             if post in SEPARATE:
                 job2 = dict(job, include_sub_programs=False)
                 jrun = out + '.job.json'

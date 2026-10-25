@@ -57,6 +57,8 @@ export interface URDFExportResult {
   jointNames?: Map<Robot, string[]>;
   /** URDF base link of every exported mobile robot / URDF import root. */
   baseLinks?: Map<Item, string>;
+  /** Station export: prefix put before the joint names of a URDF import root (empty when its joint names are kept). */
+  jointPrefix?: Map<Item, string>;
 }
 
 const M = 1 / 1000;
@@ -115,6 +117,31 @@ class MeshWriter {
     return uri;
   }
 
+  /** Write triangle soups (9 floats per triangle, mm, each placed by `local` in the link frame) as one STL in metres. */
+  writeSoup(parts: Array<{ tris: ArrayLike<number>; local: ArrayLike<number> }>, baseName: string): string | null {
+    const n = parts.reduce((a, p) => a + Math.floor(p.tris.length / 9), 0);
+    if (!n) return null;
+    const positions = new Float32Array(n * 9);
+    let o = 0;
+    for (const p of parts) {
+      const L = p.local, T = p.tris;
+      for (let i = 0; i + 2 < T.length; i += 3) {
+        const x = T[i], y = T[i + 1], z = T[i + 2];
+        positions[o++] = (L[0] * x + L[4] * y + L[8] * z + L[12]) * M;
+        positions[o++] = (L[1] * x + L[5] * y + L[9] * z + L[13]) * M;
+        positions[o++] = (L[2] * x + L[6] * y + L[10] * z + L[14]) * M;
+      }
+    }
+    const min: [number, number, number] = [Infinity, Infinity, Infinity], max: [number, number, number] = [-Infinity, -Infinity, -Infinity];
+    for (let i = 0; i < positions.length; i += 3) for (let k = 0; k < 3; k++) { min[k] = Math.min(min[k], positions[i + k]); max[k] = Math.max(max[k], positions[i + k]); }
+    const bytes = writeSTL({ positions, normals: new Float32Array(positions.length), min, max, triangles: n });
+    const name = sanitizeName(baseName);
+    let file = `meshes/${name}.stl`;
+    for (let k = 2; this.files[file]; k++) file = `meshes/${name}_${k}.stl`;
+    this.files[file] = bytes;
+    return `package://${this.pkg}/${file}`;
+  }
+
   /** Copy the mesh of a URDF `<mesh filename>` into the package unchanged (same units, the URDF keeps its `scale`). */
   copy(uri: string): string | null {
     const hit = this.written.get(`copy|${uri}`);
@@ -171,14 +198,19 @@ function adjacentPairs(urdf: string): [string, string][] {
 
 /** Basic SRDF: one chain group per robot (base -> last link), `home` + imported named poses, adjacent pairs disabled. */
 function srdfFor(robotName: string, urdf: string, robots: { robot: Robot; base: string; tip: string }[], extra: { link1: string; link2: string; reason: string }[] = []): string {
-  const groups: { name: string; base: string; tip: string }[] = [];
+  const groups: { name: string; base: string; tip: string; joints?: string[] }[] = [];
   const states: { name: string; group: string; joints: Record<string, number> }[] = [];
+  // joint above each link in the URDF (independent joints of a mechanism off the base -> tip path join the group)
+  const up = new Map(childElements(parseXML(urdf), 'joint').map((j) => [childElements(j, 'child')[0]?.attrs.link, { joint: j.attrs.name, parent: childElements(j, 'parent')[0]?.attrs.link }]));
   for (const { robot, base, tip } of robots) {
     let g = ((robot.params.planningGroups as string[] | undefined)?.[0]) ?? (robots.length === 1 ? 'manipulator' : sanitizeName(robot.name).toLowerCase());
     while (groups.some((x) => x.name === g)) g += '_';
-    groups.push({ name: g, base, tip });
     const indep = robot.chain.joints.filter((j) => !j.mimic);
     const names = indep.map((j) => frameName(j.name));
+    const onPath = new Set<string>(); for (let l: string | undefined = tip, n = 0; l && l !== base && n < 1000; n++) { const p = up.get(l); if (!p) break; onPath.add(p.joint); l = p.parent; }
+    const known = new Set([...up.values()].map((p) => p.joint));
+    const off = names.filter((n) => known.has(n) && !onPath.has(n));
+    groups.push({ name: g, base, tip, ...(off.length ? { joints: off } : {}) });
     const conv = (i: number, v: number) => (indep[i]?.type === 'prismatic' ? v * M : v * (Math.PI / 180));
     const poses: Record<string, number[]> = { home: robot.jointsHome(), ...((robot.params.namedPoses as Record<string, number[]> | undefined) ?? {}) };
     for (const [pn, q] of Object.entries(poses)) states.push({ name: pn, group: g, joints: Object.fromEntries(names.map((n, i) => [n, conv(i, q[i] ?? 0)])) });
@@ -223,14 +255,16 @@ function jointXml(j: JointDef, parent: string, child: string): string {
 }
 
 /** URDF for one kinematic chain (robot). Link names are prefixed so several robots can share a package. */
-export function chainToURDF(chain: ChainDef, name: string, mw: MeshWriter, opts: URDFExportOptions, prefix = '', robot?: Robot): { xml: string; rootLink: string; tipLink: string } {
-  // links without meshes are drawn procedurally (capsules from the kinematics): their inertials come from those shapes
-  const solidsOf = (i: number) => (robot && !chain.links.some((l) => l.visuals.length) ? proceduralLink(robot, i) : []);
+export function chainToURDF(chain: ChainDef, name: string, mw: MeshWriter, opts: URDFExportOptions, prefix = '', robot?: Robot, layout: { rootInertia?: boolean } = {}): { xml: string; rootLink: string; tipLink: string } {
   const rn = sanitizeName(name);
   const lname = (i: number) => frameName(`${prefix}${chain.links[i]?.name ?? (i === 0 ? 'base_link' : `link_${i}`)}`);
   // Our chains may carry a static `post` transform after each joint motion (DH robots). URDF has no such
   // thing, so the post of joint i is folded into joint i+1's origin and into link i+1's visual origins.
   const postOf = (i: number): Mat4 | undefined => (i >= 0 && i < chain.joints.length ? chain.joints[i].post : undefined);
+  // links without meshes are drawn procedurally (capsules from the kinematics, studio link frame): the same shapes are
+  // the link's visual + collision meshes and the solids of its estimated inertial (in the URDF link frame: × post)
+  const procedural = !!robot && !chain.links.some((l) => l.visuals.length);
+  const solidsOf = (i: number) => (procedural ? proceduralLink(robot!, i).map((s) => { const post = postOf(i - 1); return post ? { ...s, local: multiply(post, s.local) } : s; }) : []);
   let body = '';
   const visualsOf = (i: number) => { const post = postOf(i - 1); return chain.links[i].visuals.map((v) => (post ? { ...v, origin: multiply(post, v.origin) } : v)); };
   // estimated inertials (uniform solids); density from the total mass when it is known
@@ -239,14 +273,32 @@ export function chainToURDF(chain: ChainDef, name: string, mw: MeshWriter, opts:
     const vol = chain.links.reduce((a, _l, i) => a + (linkMassProps(visualsOf(i), (id) => mw.meshData(id), 1, solidsOf(i))?.mass ?? 0), 0);
     if (vol > 0) density = opts.totalMass / vol;
   }
+  let rootInertial = '';
   for (let i = 0; i < chain.links.length; i++) {
     const l = chain.links[i];
     const vis = visualsOf(i);
     body += `  <link name="${lname(i)}">\n`;
-    if (opts.inertials !== false) { const mp = linkMassProps(vis, (id) => mw.meshData(id), density, solidsOf(i)); if (mp) body += inertialXml(mp); }
+    if (opts.inertials !== false) {
+      const mp = linkMassProps(vis, (id) => mw.meshData(id), density, solidsOf(i));
+      // KDL (robot_state_publisher, MoveIt) does not support an inertia on the root link: like ur_description it moves
+      // to a fixed child link `<root>_inertia`
+      if (mp) { if (i === 0 && layout.rootInertia) rootInertial = inertialXml(mp); else body += inertialXml(mp); }
+    }
     for (const v of vis) body += geometryXml(v, mw, `${rn}_${l.name ?? i}`, opts);
+    if (procedural && opts.meshes !== false) {
+      const parts = solidsOf(i);
+      const col = robot!.color && /^#?[0-9a-f]{6}/i.test(robot!.color) ? robot!.color : '#e8a33d';
+      for (const [dark, color] of [[false, col], [true, '#2f343b']] as const) {
+        const ps = parts.filter((p) => p.dark === dark);
+        const uri = ps.length ? mw.writeSoup(ps, `${rn}_${l.name ?? i}${dark ? '_dark' : ''}`) : null;
+        if (!uri) continue;
+        body += `    <visual><geometry><mesh filename="${uri}"/></geometry>${colorXml(color)}</visual>\n`;
+        if (opts.collisions !== false) body += `    <collision><geometry><mesh filename="${uri}"/></geometry></collision>\n`;
+      }
+    }
     body += '  </link>\n';
   }
+  if (rootInertial) body += `  <link name="${lname(0)}_inertia">\n${rootInertial}  </link>\n  <joint name="${lname(0)}_inertia_joint" type="fixed">\n    <parent link="${lname(0)}"/>\n    <child link="${lname(0)}_inertia"/>\n    <origin xyz="0 0 0" rpy="0 0 0"/>\n  </joint>\n`;
   for (let i = 0; i < chain.joints.length; i++) {
     const src = chain.joints[i];
     const post = postOf(i - 1);
@@ -279,7 +331,7 @@ export function exportRobotURDF(robot: Robot, assets?: AssetStore, opts: URDFExp
   const pkg = sanitizeName(opts.packageName ?? `${robot.name}_description`).toLowerCase();
   const mw = new MeshWriter(assets, pkg);
   const massKg = Number(robot.params.massKg);
-  const { xml, rootLink, tipLink } = chainToURDF(robot.chain, robot.name, mw, { ...opts, totalMass: opts.totalMass ?? (massKg > 0 ? massKg : undefined) }, '', robot);
+  const { xml, rootLink, tipLink } = chainToURDF(robot.chain, robot.name, mw, { ...opts, totalMass: opts.totalMass ?? (massKg > 0 ? massKg : undefined) }, '', robot, { rootInertia: true });
   let body = xml;
   for (const t of robot.tools()) {
     const tn = sanitizeName(t.name);
@@ -309,7 +361,7 @@ export function exportDescriptionURDF(tree: Item, assets?: AssetStore, opts: URD
   const robots = [...tree.walk()].filter((x): x is Robot => x instanceof Robot && x.chain.joints.length > 0);
   const files: Record<string, Uint8Array | string> = { ...mw.files, [`urdf/${fn}.urdf`]: urdf };
   const disabled = ((tree.params.disabledCollisions as string[][] | undefined) ?? []).map(([link1, link2, reason]) => ({ link1, link2, reason }));
-  if (opts.extras !== false) Object.assign(files, displayFiles(pkg, fn, srdfFor(name, urdf, robots.map((r) => ({ robot: r, base: r.chain.links[0].name, tip: r.chain.links[r.chain.links.length - 1].name })), disabled)));
+  if (opts.extras !== false) Object.assign(files, displayFiles(pkg, fn, srdfFor(name, urdf, robots.map((r) => ({ robot: r, base: r.chain.links[0].name, tip: r.chain.links[r.chain.flangeLink ?? r.chain.links.length - 1].name })), disabled)));
   Object.assign(files, packageFiles(pkg, name, files, robots.map((r) => r.name)));
   return { files, urdf, packageName: pkg, warnings: mw.warnings };
 }
@@ -345,28 +397,45 @@ export function exportStationURDF(station: Station, assets?: AssetStore, opts: U
     const mt = mount(m);
     body += `  <link name="${ln}"/>\n  <joint name="${ln}_joint" type="${floating ? 'floating' : 'fixed'}">\n    <parent link="${mt.link}"/>\n    <child link="${ln}"/>\n    ${originXml(mt.pose)}\n  </joint>\n`;
   }
-  // URDF / xacro imports: their kept descriptions, names unchanged unless they clash (then prefixed, with a warning)
+  // URDF / xacro imports: their kept descriptions, names unchanged unless they clash (then prefixed, with a warning).
+  // Links (TF frames) and joints are separate URDF namespaces: two robots that both have a base_link get their links
+  // prefixed but keep their joint names (what /joint_states and JointTrajectory commands use), unless those clash too.
   const trees = [...station.walk()].filter((it) => it.params.source === 'urdf' && typeof it.params.robotDescription === 'string' && urdfTreeRoot(it.parent) === null);
   const treeWarnings: string[] = [];
+  const usedJ = new Set<string>();
+  const jointPrefix = new Map<Item, string>();
+  /** Planning groups of the station SRDF: one chain per robot, with the station URDF names. */
+  const srdfRobots: Array<{ robot: Robot; base: string; tip: string; joints: string[] }> = [];
   for (const t of trees) {
     const { elements, rootLink } = descriptionElements(t.params.robotDescription as string, mw, opts);
     const clash = elements.some((e) => e.name === 'link' && used.has(e.attrs.name));
+    const jclash = elements.some((e) => e.name === 'joint' && usedJ.has(e.attrs.name));
     const pfx = clash ? `${sanitizeName(t.name)}_` : '';
-    if (clash) treeWarnings.push(`${t.name}: link names clash with other items — prefixed with ${pfx}`);
-    const renamed = (n: XNode, k: string) => !!pfx && ((n.name === 'link' && k === 'name') || ((n.name === 'parent' || n.name === 'child') && k === 'link') || (n.name === 'joint' && k === 'name') || (n.name === 'mimic' && k === 'joint'));
-    const rename = (n: XNode): XNode => ({ ...n, attrs: Object.fromEntries(Object.entries(n.attrs).map(([k, v]) => [k, renamed(n, k) ? `${pfx}${v}` : v])), children: n.children.map(rename) });
-    for (const e of elements) { const r = rename(e); if (r.name === 'link') used.add(r.attrs.name); body += serializeXML(r, '  '); }
+    const jpfx = jclash ? `${sanitizeName(t.name)}_` : '';
+    if (clash) treeWarnings.push(`${t.name}: link names clash with other items — prefixed with ${pfx}${jclash ? ' (joint names too)' : ' (joint names kept)'}`);
+    else if (jclash) treeWarnings.push(`${t.name}: joint names clash with another robot — prefixed with ${jpfx}`);
+    const linkAttr = (n: XNode, k: string) => (n.name === 'link' && k === 'name') || ((n.name === 'parent' || n.name === 'child') && k === 'link');
+    const jointAttr = (n: XNode, k: string) => (n.name === 'joint' && k === 'name') || (n.name === 'mimic' && k === 'joint');
+    const rename = (n: XNode): XNode => ({ ...n, attrs: Object.fromEntries(Object.entries(n.attrs).map(([k, v]) => [k, pfx && linkAttr(n, k) ? `${pfx}${v}` : jpfx && jointAttr(n, k) ? `${jpfx}${v}` : v])), children: n.children.map(rename) });
+    for (const e of elements) { const r = rename(e); if (r.name === 'link') used.add(r.attrs.name); if (r.name === 'joint' && r.attrs.name) usedJ.add(r.attrs.name); body += serializeXML(r, '  '); }
     const mt = mount(t);
     const tj = floating && isMobile(t) ? 'floating' : 'fixed';
-    body += `  <joint name="${uniq(`${pfx}${t.name}_base_joint`)}" type="${tj}">\n    <parent link="${mt.link}"/>\n    <child link="${pfx}${rootLink}"/>\n    ${originXml(mt.pose)}\n  </joint>\n`;
+    const bj = uniq(`${pfx}${t.name}_base_joint`);
+    usedJ.add(bj);
+    body += `  <joint name="${bj}" type="${tj}">\n    <parent link="${mt.link}"/>\n    <child link="${pfx}${rootLink}"/>\n    ${originXml(mt.pose)}\n  </joint>\n`;
     baseLinks.set(t, `${pfx}${rootLink}`);
-    for (const r of [...t.walk()]) if (r instanceof Robot) jointNames.set(r, r.chain.joints.map((j) => `${pfx}${j.name}`));
+    jointPrefix.set(t, jpfx);
+    for (const r of [...t.walk()]) if (r instanceof Robot) {
+      jointNames.set(r, r.chain.joints.map((j) => `${jpfx}${j.name}`));
+      if (r.chain.joints.length) srdfRobots.push({ robot: r, base: `${pfx}${r.chain.links[0].name}`, tip: `${pfx}${r.chain.links[r.chain.flangeLink ?? r.chain.links.length - 1].name}`, joints: r.chain.joints.filter((j) => j.type !== 'fixed' && !j.mimic).map((j) => `${jpfx}${j.name}`) });
+    }
   }
   for (const r of robots) {
     if (urdfTreeRoot(r)) continue;
     const prefix = `${uniq(r.name)}_`;
     const { xml, rootLink, tipLink } = chainToURDF(r.chain, r.name, mw, opts, prefix, r);
     jointNames.set(r, r.chain.joints.map((j) => frameName(`${prefix}${j.name}`)));
+    if (r.chain.joints.length) srdfRobots.push({ robot: r, base: rootLink, tip: frameName(`${prefix}${r.chain.links[r.chain.links.length - 1]?.name ?? `link_${r.chain.links.length - 1}`}`), joints: r.chain.joints.filter((j) => j.type !== 'fixed' && !j.mimic).map((j) => frameName(`${prefix}${j.name}`)) });
     body += xml;
     const mt = mount(r);
     body += `  <joint name="${prefix}base_joint" type="fixed">\n    <parent link="${mt.link}"/>\n    <child link="${rootLink}"/>\n    ${originXml(mt.pose)}\n  </joint>\n`;
@@ -398,9 +467,28 @@ export function exportStationURDF(station: Station, assets?: AssetStore, opts: U
   const sn = sanitizeName(station.name);
   const urdf = `<?xml version="1.0"?>\n<!-- Generated by VerticalBot Studio: station "${station.name}" -->\n<robot name="${sn}">\n${body}</robot>\n`;
   const files: Record<string, Uint8Array | string> = { ...mw.files, [`urdf/${sn}.urdf`]: urdf };
-  if (opts.extras !== false) Object.assign(files, displayFiles(pkg, sn, null));
+  if (opts.extras !== false) Object.assign(files, displayFiles(pkg, sn, stationSrdf(sn, urdf, srdfRobots)));
   Object.assign(files, packageFiles(pkg, station.name, files, robots.map((r) => r.name)));
-  return { files, urdf, packageName: pkg, warnings: [...treeWarnings, ...mw.warnings], jointNames, baseLinks };
+  return { files, urdf, packageName: pkg, warnings: [...treeWarnings, ...mw.warnings], jointNames, baseLinks, jointPrefix };
+}
+
+/** SRDF of a station export: one chain group per robot (station URDF link / joint names), `home` and imported named
+ *  poses, every adjacent link pair disabled (MoveIt Setup Assistant starts from it). */
+function stationSrdf(name: string, urdf: string, robots: Array<{ robot: Robot; base: string; tip: string; joints: string[] }>): string {
+  const groups: { name: string; base: string; tip: string }[] = [];
+  const states: { name: string; group: string; joints: Record<string, number> }[] = [];
+  for (const { robot, base, tip, joints } of robots) {
+    let g = ((robot.params.planningGroups as string[] | undefined)?.[0]) ?? (robots.length === 1 ? 'manipulator' : sanitizeName(robot.name).toLowerCase());
+    while (groups.some((x) => x.name === g)) g += '_';
+    groups.push({ name: g, base, tip });
+    const indep = robot.chain.joints.filter((j) => j.type !== 'fixed' && !j.mimic);
+    const conv = (i: number, v: number) => (indep[i]?.type === 'prismatic' ? v * M : v * (Math.PI / 180));
+    const poses: Record<string, number[]> = { home: robot.jointsHome(), ...((robot.params.namedPoses as Record<string, number[]> | undefined) ?? {}) };
+    for (const [pn, q] of Object.entries(poses)) states.push({ name: pn, group: g, joints: Object.fromEntries(joints.map((n, i) => [n, conv(i, q[i] ?? 0)])) });
+  }
+  const seen = new Set<string>();
+  const adj = adjacentPairs(urdf).filter(([a, b]) => { const k = [a, b].sort().join('|'); if (seen.has(k)) return false; seen.add(k); return true; });
+  return exportSRDF(name, groups, states, adj);
 }
 
 /** `launch/display.launch.py` (robot_state_publisher with the URDF, joint_state_publisher when installed) + SRDF. */
