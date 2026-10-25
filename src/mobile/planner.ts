@@ -224,3 +224,79 @@ export function orderRowsNearest(rows: Array<{ start: number[]; end: number[] }>
   }
   return order;
 }
+
+// ---------------------------------------------------------------------------------------------------------------
+// Footprint- and drive-aware planning (pose paths)
+// ---------------------------------------------------------------------------------------------------------------
+import type { MobileRobot } from './items';
+import { CollisionWorld, CircleObstacle, Pose2 } from './footprint';
+import { planGridFootprint, planHybridAStar, PosePathResult } from './hybrid_astar';
+import { minTurnRadius } from './controller';
+
+export interface RobotPlanOptions {
+  world: CollisionWorld;
+  /** Clearance kept between the footprint and obstacles (mm, default 120). */
+  margin?: number;
+  /** Final heading (deg). */
+  goalHeading?: number;
+  /** Polygons not to enter (traffic segments reserved by other robots, no-go zones). */
+  blocked?: number[][][];
+  /** Dynamic obstacles (other robots' footprints as circles). */
+  extra?: CircleObstacle[];
+  allowReverse?: boolean;
+  maxExpand?: number;
+}
+
+/**
+ * Plan a collision-free pose path for a robot: Hybrid A* with Reeds–Shepp shots for Ackermann (curvature ≤ 1/R_min,
+ * reverse allowed), footprint-aware grid A* with oriented smoothing for differential / tracked / legged / omni (falling
+ * back to Hybrid A* with in-place rotations where the turn-then-drive path does not fit), straight flight for aerial.
+ */
+export function planForRobot(robot: MobileRobot, start: Pose2, goal: { x: number; y: number }, o: RobotPlanOptions): PosePathResult {
+  const k = robot.kin;
+  const footprint: [number, number, number] = [k.footprint[0], k.footprint[1], k.footprint[2]];
+  const base = { footprint, margin: o.margin ?? 120, goalHeading: o.goalHeading, blocked: o.blocked, extra: o.extra, maxExpand: o.maxExpand };
+  if (k.drive === 'aerial') {
+    const th = o.goalHeading ?? start.theta;
+    const len = Math.hypot(goal.x - start.x, goal.y - start.y);
+    const n = Math.max(1, Math.ceil(len / 500));
+    const path = [[start.x, start.y, start.theta, 1]];
+    for (let i = 1; i <= n; i++) path.push([start.x + ((goal.x - start.x) * i) / n, start.y + ((goal.y - start.y) * i) / n, th, 1]);
+    return { ok: true, path, length: len, expanded: 0, method: 'straight' };
+  }
+  if (k.drive === 'ackermann') {
+    return planHybridAStar(o.world, start, { x: goal.x, y: goal.y, theta: o.goalHeading }, { ...base, radius: minTurnRadius(k) * 1.15, allowReverse: o.allowReverse ?? true });
+  }
+  const g = planGridFootprint(o.world, start, goal, base);
+  if (g.ok) return g;
+  const h = planHybridAStar(o.world, start, { x: goal.x, y: goal.y, theta: o.goalHeading }, { ...base, radius: Math.max(800, k.footprint[1]), inPlace: true, allowReverse: o.allowReverse ?? true, reverseCost: 1.5 });
+  return h.ok ? h : { ...g, error: `${g.error}; hybrid: ${h.error}` };
+}
+
+export interface HeadlandTurn { kind: 'U' | 'omega' | 'fishtail'; path: number[][]; length: number; /** Depth needed beyond the row-end line (mm), footprint included. */ depth: number }
+
+/**
+ * Headland turns from a row exit pose to the next row's entry pose for a car-like robot with turning radius R:
+ * forward-only (U turn when the row spacing ≥ 2R, else an Ω / bulb turn) and with reverse (fish-tail / 3-point turn).
+ * `depth` is how far the footprint reaches beyond the exit line — compare it with the headland width.
+ */
+export function headlandTurns(exit: { x: number; y: number; theta: number }, entry: { x: number; y: number; theta: number }, R: number, footprint: [number, number]): HeadlandTurn[] {
+  const out: HeadlandTurn[] = [];
+  const u = [Math.cos((exit.theta * Math.PI) / 180), Math.sin((exit.theta * Math.PI) / 180)];
+  const spacing = Math.abs(-(entry.x - exit.x) * u[1] + (entry.y - exit.y) * u[0]);
+  const depthOf = (path: number[][]) => {
+    let d = 0;
+    const [L, W] = footprint;
+    for (const p of path) {
+      const th = (p[2] * Math.PI) / 180, c = Math.cos(th), s = Math.sin(th);
+      for (const [a, b] of [[L / 2, W / 2], [L / 2, -W / 2], [-L / 2, W / 2], [-L / 2, -W / 2]]) d = Math.max(d, (p[0] + c * a - s * b - exit.x) * u[0] + (p[1] + s * a + c * b - exit.y) * u[1]);
+    }
+    return d;
+  };
+  const fwd = reedsSheppPath(exit, entry, R, { allowReverse: false, step: 100 });
+  if (fwd) out.push({ kind: spacing >= 2 * R - 1 ? 'U' : 'omega', path: fwd.poses, length: fwd.length, depth: depthOf(fwd.poses) });
+  const rs = reedsSheppPath(exit, entry, R, { allowReverse: true, step: 100, reverseCost: 1.2 });
+  if (rs && rs.poses.some((p) => p[3] < 0)) out.push({ kind: 'fishtail', path: rs.poses, length: rs.length, depth: depthOf(rs.poses) });
+  return out;
+}
+import { reedsSheppPath } from './reeds_shepp';

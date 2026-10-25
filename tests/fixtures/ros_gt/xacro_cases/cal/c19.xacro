@@ -1,0 +1,4 @@
+<?xml version="1.0"?>
+<robot name="r" xmlns:xacro="http://www.ros.org/wiki/xacro">
+<xacro:include filename="sub/nested.xacro"/><v n="${nested_val}"/>
+</robot>

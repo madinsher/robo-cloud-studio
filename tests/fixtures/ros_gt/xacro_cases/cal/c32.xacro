@@ -1,0 +1,4 @@
+<?xml version="1.0"?>
+<robot name="r" xmlns:xacro="http://www.ros.org/wiki/xacro">
+<xacro:macro name="m" params="a:=1 b:=${a*2}"><o a="${a}" b="${b}"/></xacro:macro><xacro:m/><xacro:m a="5"/>
+</robot>

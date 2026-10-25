@@ -9,7 +9,8 @@ export default defineConfig({
   test: {
     environment: 'node',
     include: ['tests/**/*.test.ts'],
-    exclude: ['tests/e2e/**', 'node_modules/**'],
+    // tests/_probe holds local investigation probes (git-ignored); run them with PROBE=1
+    exclude: ['tests/e2e/**', 'node_modules/**', ...(process.env.PROBE ? [] : ['tests/_probe/**'])],
     testTimeout: 20000,
     coverage: { provider: 'v8', include: ['src/**/*.ts'], exclude: ['src/main.ts', 'src/vite-env.d.ts'], reporter: ['text-summary', 'json-summary', 'html'], reportsDirectory: 'coverage', reportOnFailure: true },
   },

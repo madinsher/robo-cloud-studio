@@ -25,13 +25,29 @@ describe('demo motion and playback regressions', () => {
     const st = demo.build();
     for (const program of st.itemsOfType<Program>(ItemType.PROGRAM)) {
       const sim = simulate(st, program), robot = program.robot() as Robot;
+      // RoboDK rounding: a move followed by another move with rounding r > 0 passes within r of its target
+      // (the step ends at the middle of the blend zone); fine points are reached exactly.
+      const radius = new Map<string, number>();
+      const ins = program.instructions();
+      let r = robot.motion.rounding;
+      ins.forEach((x, i) => {
+        const d = x.data;
+        if (d.kind === 'rounding') r = d.radius;
+        if (d.kind !== 'move') return;
+        const next = ins.slice(i + 1).find((y) => y.enabled && !(['speed', 'rounding', 'print'].includes(y.data.kind) || ((y.data.kind === 'io' || y.data.kind === 'signal') && !y.data.wait)));
+        const rr = d.rounding ?? r;
+        if (rr > 0 && next?.data.kind === 'move') radius.set(x.id, rr);
+      });
       for (const step of sim.steps) {
         const data = step.instruction.data;
         if (data.kind !== 'move' || !data.targetId) continue;
         const target = st.findById(data.targetId) as Target;
         if (target.isJointTarget) continue;
         sim.seek(step.t1);
-        expect(distance(getPos(robot.poseTCPAbs()), getPos(target.poseAbs())), target.name).toBeLessThan(0.1);
+        const blend = radius.get(step.instruction.id);
+        const d = distance(getPos(robot.poseTCPAbs()), getPos(target.poseAbs()));
+        if (blend) { expect(d, target.name).toBeLessThanOrEqual(blend + 1e-6); continue; }
+        expect(d, target.name).toBeLessThan(0.1);
         if (robot.dof === 6) expect(rotationAngle(robot.poseTCPAbs(), target.poseAbs()), target.name).toBeLessThan(0.001);
       }
     }

@@ -173,6 +173,17 @@ export function pickFiles(accept: string, multiple = false): Promise<File[]> {
   });
 }
 
+/** Pick a whole folder (ROS package, Webots project): File objects carry `webkitRelativePath`. */
+export function pickFolder(): Promise<File[]> {
+  return new Promise((resolve) => {
+    const input = h('input', { type: 'file', multiple: true, style: { display: 'none' } }) as HTMLInputElement;
+    input.setAttribute('webkitdirectory', ''); input.setAttribute('directory', '');
+    input.addEventListener('change', () => { resolve([...(input.files ?? [])]); input.remove(); });
+    document.body.appendChild(input);
+    input.click();
+  });
+}
+
 export function fmt(v: number, d = 2): string {
   return Number.isFinite(v) ? v.toFixed(d) : '-';
 }

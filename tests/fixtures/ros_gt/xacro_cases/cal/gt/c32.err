@@ -1,0 +1,4 @@
+error: name 'a' is not defined 
+when evaluating expression 'a*2'
+when instantiating macro: m (c32.xacro)
+in file: c32.xacro

@@ -1,0 +1,1 @@
+<robot name="t" xmlns:xacro="http://www.ros.org/wiki/xacro"><link name="l_$(optenv ROBOT_PROBE_UNSET fallback)"/></robot>

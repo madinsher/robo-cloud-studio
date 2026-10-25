@@ -1,0 +1,2 @@
+error: Xacro conditional "${'abc'}" evaluated to "abc", which is not a boolean expression.
+when processing file: c27.xacro

@@ -1,7 +1,7 @@
 import { Item, ItemType, SerializedItem, DeserializeContext, registerItemType, GeometryRef } from '../core/items/item';
 import { Mat4, transl, rotz, mul, DEG, RAD } from '../core/math/pose';
 
-export type DriveType = 'differential' | 'ackermann' | 'omni' | 'tracked' | 'legged';
+export type DriveType = 'differential' | 'ackermann' | 'omni' | 'tracked' | 'legged' | 'aerial';
 
 export interface MobileKinematics {
   drive: DriveType;
@@ -19,6 +19,17 @@ export interface MobileKinematics {
   footprint: [number, number, number];
   /** Minimum turning radius (mm) — 0 for differential/omni. */
   minTurnRadius: number;
+  /** Ackermann steering-rate limit (deg/s). */
+  maxSteerRate?: number;
+  /** Tracked / skid steer: longitudinal track slip (0-1) and ICR expansion (effective track = track·(1+turnSlip)). */
+  slip?: number;
+  turnSlip?: number;
+  /** Holonomic lateral speed limit (mm/s) for omni / legged / aerial (default: maxSpeed, legged 0.4·maxSpeed). */
+  maxLateralSpeed?: number;
+  /** Aerial: climb rate (mm/s), altitude ceiling and cruise altitude (mm above the parent ground plane). */
+  maxClimbRate?: number;
+  maxAltitude?: number;
+  cruiseAltitude?: number;
 }
 
 export interface BatteryModel {
@@ -31,6 +42,12 @@ export interface BatteryModel {
   chargeW: number;
   /** Threshold (0-1) below which the fleet manager sends the robot to charge. */
   lowThreshold: number;
+  /** Aerial: hover power (W) while airborne and climb power per m/s (W). */
+  hoverW?: number;
+  climbPerMps?: number;
+  /** Extra draw of mounted equipment (W) and drive-cost factor (1 + W_eq/W_max, MURKA energy model) — set by the equipment model. */
+  equipmentW?: number;
+  driveFactor?: number;
 }
 
 export interface MobileState {
@@ -40,9 +57,16 @@ export interface MobileState {
   v: number; // mm/s
   omega: number; // deg/s
   steer: number; // deg (ackermann)
+  /** Body-frame lateral velocity (mm/s, holonomic drives / skid), altitude and climb rate (aerial). */
+  vy?: number;
+  z?: number;
+  vz?: number;
+  /** Altitude the aerial controller holds (mm). */
+  zTarget?: number;
   status: 'idle' | 'moving' | 'working' | 'charging' | 'error' | 'waiting';
   odometer: number; // mm
-  /** Current path being followed (points in parent frame) and progress index. */
+  /** Current path being followed (points in parent frame) and progress index. Points are [x, y] or pose points
+   *  [x, y, headingDeg, dir] with dir = 1 forward, -1 reverse, 0 rotate in place (see controller.followPath). */
   path: number[][] | null;
   pathIndex: number;
   taskId: string | null;
@@ -64,6 +88,8 @@ export class MobileRobot extends Item {
   fleetId: string | null = null;
   /** Home / charging position. */
   home: { x: number; y: number; theta: number } | null = null;
+  /** Consumable / capacity resources used by process models: spray tank (L), water (L), fruit bin (kg), cargo (kg). */
+  resources: Record<string, { capacity: number; level: number; unit: string }> = {};
 
   constructor(name = 'Mobile robot', id?: string) {
     super(ItemType.MOBILE_ROBOT, name, id);
@@ -72,7 +98,7 @@ export class MobileRobot extends Item {
 
   /** Sync the item pose from the 2D state (pose on the ground plane, z from current pose). */
   syncPoseFromState(): void {
-    const z = this._pose[14];
+    const z = this.kin.drive === 'aerial' ? this.state.z ?? this._pose[14] : this._pose[14];
     this._pose = mul(transl(this.state.x, this.state.y, z), rotz(this.state.theta * DEG));
     this.notify('pose');
   }
@@ -82,6 +108,7 @@ export class MobileRobot extends Item {
     this.state.x = this._pose[12];
     this.state.y = this._pose[13];
     this.state.theta = Math.atan2(this._pose[1], this._pose[0]) * RAD;
+    if (this.kin.drive === 'aerial') this.state.z = this._pose[14];
   }
 
   override setPose(m: Mat4): this {
@@ -100,12 +127,15 @@ export class MobileRobot extends Item {
   }
 
   protected override serializeExtra() {
-    return { kin: this.kin, battery: this.battery, state: this.state, geometry: this.geometry, sensors: this.sensors, capabilities: this.capabilities, payloadKg: this.payloadKg, rosNamespace: this.rosNamespace, fleetId: this.fleetId, home: this.home };
+    return { kin: this.kin, battery: this.battery, state: this.state, geometry: this.geometry, sensors: this.sensors, capabilities: this.capabilities, payloadKg: this.payloadKg, rosNamespace: this.rosNamespace, fleetId: this.fleetId, home: this.home, resources: this.resources };
   }
   override deserializeExtra(d: SerializedItem, _ctx: DeserializeContext) {
     this.kin = { ...this.kin, ...((d.kin as any) ?? {}) };
     this.battery = { ...this.battery, ...((d.battery as any) ?? {}) };
-    this.state = { ...this.state, ...((d.state as any) ?? {}), path: null, pathIndex: 0 };
+    // the path being followed and its progress are part of the runtime state: a station saved mid-mission resumes it
+    const ds = (d.state as any) ?? {};
+    const path = Array.isArray(ds.path) && ds.path.length && ds.path.every((p: unknown) => Array.isArray(p) && p.every((v) => typeof v === 'number')) ? (ds.path as number[][]) : null;
+    this.state = { ...this.state, ...ds, path, pathIndex: path ? Math.max(0, Math.min(path.length - 1, ds.pathIndex | 0)) : 0 };
     this.geometry = (d.geometry as GeometryRef[]) ?? [];
     this.sensors = (d.sensors as any) ?? [];
     this.capabilities = (d.capabilities as string[]) ?? ['transport'];
@@ -113,6 +143,7 @@ export class MobileRobot extends Item {
     this.rosNamespace = (d.rosNamespace as string) ?? '';
     this.fleetId = (d.fleetId as string | null) ?? null;
     this.home = (d.home as any) ?? null;
+    this.resources = (d.resources as any) ?? {};
     this.syncStateFromPose();
   }
 }

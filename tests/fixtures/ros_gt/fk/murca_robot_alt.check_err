@@ -1,0 +1,3 @@
+Error:   link 'utp_g_01/lidar_link' is not unique.
+         at line 179 in ./urdf_parser/src/model.cpp
+ERROR: Model Parsing the xml failed

@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { MeshData } from '../io/mesh/stl';
+import { MeshData, MeshMaterial } from '../io/mesh/stl';
 import { GeometryRef } from '../core/items/item';
 import { LinkVisual } from '../core/kinematics/chain';
 import { AssetStore } from './assets';
@@ -99,13 +99,47 @@ export function smoothTriangleSoup(positions: Float32Array, creaseDeg = CREASE_D
 }
 
 export function meshDataToGeometry(m: MeshData): THREE.BufferGeometry {
-  if (!authoredSmoothNormals(m)) return smoothTriangleSoup(m.positions);
+  // textured meshes keep their corners (welding by position would merge UV seams)
+  const textured = !!m.uvs && !!m.materials?.some((x) => x.map);
+  if (!textured && !authoredSmoothNormals(m)) return addMeshGroups(smoothTriangleSoup(m.positions), m);
   const g = new THREE.BufferGeometry();
   g.setAttribute('position', new THREE.BufferAttribute(m.positions, 3));
   g.setAttribute('normal', new THREE.BufferAttribute(m.normals, 3));
+  if (m.uvs && m.uvs.length === (m.positions.length / 3) * 2) g.setAttribute('uv', new THREE.BufferAttribute(m.uvs, 2));
   g.computeBoundingBox();
   g.computeBoundingSphere();
+  return addMeshGroups(g, m);
+}
+
+/** Material groups of a mesh (OBJ usemtl / COLLADA materials); the corner order is kept by both geometry paths. */
+function addMeshGroups(g: THREE.BufferGeometry, m: MeshData): THREE.BufferGeometry {
+  if (m.groups?.length && m.materials?.length) for (const gr of m.groups) g.addGroup(gr.start, gr.count, gr.material);
   return g;
+}
+
+const textureCache = new WeakMap<Uint8Array, THREE.Texture | null>();
+function textureFromBytes(map: NonNullable<MeshMaterial['map']>): THREE.Texture | null {
+  if (textureCache.has(map.data)) return textureCache.get(map.data)!;
+  let tex: THREE.Texture | null = null;
+  if (typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function' && typeof Blob !== 'undefined' && typeof document !== 'undefined') {
+    const url = URL.createObjectURL(new Blob([map.data as BlobPart], { type: map.mime }));
+    tex = new THREE.TextureLoader().load(url, () => URL.revokeObjectURL(url), undefined, () => URL.revokeObjectURL(url));
+    tex.colorSpace = THREE.SRGBColorSpace;
+    tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  }
+  textureCache.set(map.data, tex);
+  return tex;
+}
+
+/** three material for a file material (colour, opacity, emission, base colour texture). */
+export function fileMaterial(fm: MeshMaterial, fallback = '#9aa3ad', opacity = 1): THREE.MeshStandardMaterial {
+  const c = fm.color ? new THREE.Color(fm.color[0], fm.color[1], fm.color[2]) : new THREE.Color(fallback);
+  const m = new THREE.MeshStandardMaterial({ color: c, metalness: fm.metalness ?? 0.1, roughness: fm.roughness ?? 0.6 });
+  const o = (fm.opacity ?? 1) * opacity;
+  if (o < 1) { m.transparent = true; m.opacity = o; }
+  if (fm.emissive) m.emissive = new THREE.Color(fm.emissive[0], fm.emissive[1], fm.emissive[2]);
+  if (fm.map) { const t = textureFromBytes(fm.map); if (t) m.map = t; }
+  return m;
 }
 
 export function mat4ToThree(m: Mat4 | number[] | undefined): THREE.Matrix4 {
@@ -160,7 +194,9 @@ export function buildGeometry(refs: GeometryRef[], assets: AssetStore, defaultCo
       }
     } else if (r.primitive) geometry = primitiveGeometry(r.primitive);
     if (!geometry) continue;
-    const mesh = new THREE.Mesh(geometry, materialFor(r.color ?? defaultColor, r.opacity ?? 1));
+    // meshes without an explicit colour use the materials of their file (OBJ+MTL, COLLADA, textured Webots meshes)
+    const fileMats = r.mesh && !r.color ? (assets.get(r.mesh) ?? findByBasename(assets, r.mesh))?.mesh?.materials : undefined;
+    const mesh = new THREE.Mesh(geometry, fileMats?.length ? (fileMats.length === 1 ? fileMaterial(fileMats[0], defaultColor, r.opacity ?? 1) : fileMats.map((fm) => fileMaterial(fm, defaultColor, r.opacity ?? 1))) : materialFor(r.color ?? defaultColor, r.opacity ?? 1));
     mesh.castShadow = true;
     mesh.receiveShadow = true;
     mesh.matrixAutoUpdate = false;
@@ -173,16 +209,11 @@ export function buildGeometry(refs: GeometryRef[], assets: AssetStore, defaultCo
 }
 
 export function buildLinkVisuals(visuals: LinkVisual[], assets: AssetStore, defaultColor: string): THREE.Group {
-  return buildGeometry(visuals.map((v) => ({ mesh: v.mesh, primitive: v.primitive as any, origin: Array.from(v.origin), color: v.color, scale: v.scale })), assets, defaultColor);
+  return buildGeometry(visuals.map((v) => ({ mesh: v.mesh, primitive: v.primitive as any, origin: Array.from(v.origin), color: v.color, scale: v.scale, opacity: (v as LinkVisual & { opacity?: number }).opacity })), assets, defaultColor);
 }
 
 export function findByBasename(assets: AssetStore, uri: string) {
-  const base = uri.split(/[\\/]/).pop()?.toLowerCase();
-  if (!base) return undefined;
-  for (const [id, a] of assets.entries()) {
-    if (id.split(/[\\/]/).pop()?.toLowerCase() === base || a.name?.toLowerCase() === base) return a;
-  }
-  return undefined;
+  return assets.resolve(uri);
 }
 
 /** Axis triad (X red, Y green, Z blue). */

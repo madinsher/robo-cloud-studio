@@ -412,7 +412,7 @@ export function depthToCloud(depth: Float32Array, K: { fx: number; fy: number; c
   for (let v = 0; v < K.height; v += step) for (let u = 0; u < K.width; u += step) {
     const z = depth[v * K.width + u];
     if (!(z > 0) || !Number.isFinite(z)) continue;
-    const x = ((u - K.cx) / K.fx) * z, y = ((v - K.cy) / K.fy) * z;
+    const x = ((u + 0.5 - K.cx) / K.fx) * z, y = ((v + 0.5 - K.cy) / K.fy) * z; // depth[v·w+u] is sampled at the pixel centre
     if (camWorld) { const p = transformPoint(camWorld, [x, y, z]); pts.push(p[0], p[1], p[2]); } else pts.push(x, y, z);
   }
   return { xyz: Float32Array.from(pts), frame: camWorld ? 'world' : 'sensor' };

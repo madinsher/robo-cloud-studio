@@ -1,0 +1,3 @@
+warning: redefining global symbol: len
+when processing file: sub/inc_ns.xacro
+included from: c11.xacro

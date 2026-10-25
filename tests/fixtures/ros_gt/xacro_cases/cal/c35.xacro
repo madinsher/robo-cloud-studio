@@ -1,0 +1,4 @@
+<?xml version="1.0"?>
+<robot name="r" xmlns:xacro="http://www.ros.org/wiki/xacro">
+<xacro:arg name="b" default="true"/><xacro:property name="pb" value="$(arg b)"/><v a="${pb == 'true'}" b="${pb}" c="${pb == True}" d="${'$(arg b)' == 'true'}"/>
+</robot>

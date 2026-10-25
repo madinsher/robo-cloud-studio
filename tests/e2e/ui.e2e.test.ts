@@ -12,6 +12,7 @@ const BASE = process.env.E2E_BASE ?? 'http://127.0.0.1:4180/';
 /** The browser: E2E_CHROME, else the Chromium Playwright resolves, else any Chromium under PLAYWRIGHT_BROWSERS_PATH (a pinned image may carry another build than the installed playwright expects). */
 const CHROME = (() => {
   if (process.env.E2E_CHROME) return process.env.E2E_CHROME;
+  for (const p of ['C:/Program Files/Google/Chrome/Application/chrome.exe', '/usr/bin/google-chrome']) if (existsSync(p)) return p; // the system Chrome
   try { const p = chromium.executablePath(); if (existsSync(p)) return p; } catch { /* resolved below */ }
   const root = process.env.PLAYWRIGHT_BROWSERS_PATH; if (!root || !existsSync(root)) return undefined;
   for (const d of readdirSync(root).filter((x) => x.startsWith('chromium-')).sort().reverse()) for (const sub of ['chrome-linux64/chrome', 'chrome-linux/chrome']) { const p = join(root, d, sub); if (existsSync(p)) return p; }
@@ -50,11 +51,11 @@ describe('studio in the browser', () => {
       await load(`demo=${demo}`);
       const info = await ev(() => {
         const app = (window as any).app; const out: any = { station: app.station.name, items: [...app.station.walk()].length, program: app.activeProgram?.name ?? null };
-        if (app.activeProgram) { app.runProgram(); app.sim.runToEnd(); out.duration = app.sim.duration; out.problems = app.sim.result.problems.map((p: any) => p.message); }
+        if (app.activeProgram) { const h = app.runProgram(); app.runToEnd(); out.status = h.status; out.duration = app.simTime; out.problems = (app.activeProgram.lastResult?.problems ?? []).filter((p: any) => p.severity === 'error').map((p: any) => p.message); }
         app.simSpeed = 20; app.startWorld(); return out;
       });
       expect(info.items, demo).toBeGreaterThan(1);
-      if (info.program) { expect(info.duration, `${demo} program duration`).toBeGreaterThan(0); expect(info.problems, `${demo} problems`).toEqual([]); }
+      if (info.program) { expect(info.status, `${demo} run status`).toBe('done'); expect(info.duration, `${demo} program duration`).toBeGreaterThan(0); expect(info.problems, `${demo} problems`).toEqual([]); }
       await page.waitForTimeout(1200);
       const world = await ev(() => { const app = (window as any).app; const t = app.worldTime; app.pauseWorld(); return t; });
       expect(world, `${demo} world time`).toBeGreaterThan(0);
@@ -117,8 +118,8 @@ describe('studio in the browser', () => {
     await menu('Program', 'Teach MoveJ');
     await ev(() => { const app = (window as any).app; const r = app.activeRobot; r.setJoints(r.joints().map((j: number, i: number) => j + (i === 0 ? 30 : 0))); });
     await menu('Program', 'Teach MoveL');
-    const run = await ev(() => { const app = (window as any).app; app.runProgram(); app.sim.runToEnd(); return { n: app.activeProgram.instructions().length, dur: app.sim.duration, problems: app.sim.result.problems.map((p: any) => p.message) }; });
-    expect(run.n).toBe(2); expect(run.dur).toBeGreaterThan(0); expect(run.problems).toEqual([]);
+    const run = await ev(() => { const app = (window as any).app; const h = app.runProgram(); app.runToEnd(); return { n: app.activeProgram.instructions().length, dur: app.simTime, status: h.status, problems: (app.activeProgram.lastResult?.problems ?? []).map((p: any) => p.message) }; });
+    expect(run.n).toBe(2); expect(run.dur).toBeGreaterThan(0); expect(run.status).toBe('done'); expect(run.problems).toEqual([]);
     const posts = await ev(() => { const app = (window as any).app; return app.posts().map((p: any) => { const files = app.exportProgram(p.id); return { id: p.id, files: files.length, bytes: files.reduce((s: number, f: any) => s + String(f.content).length, 0) }; }); });
     expect(posts.length).toBeGreaterThan(10);
     for (const p of posts) { expect(p.files, p.id).toBeGreaterThan(0); expect(p.bytes, p.id).toBeGreaterThan(20); }

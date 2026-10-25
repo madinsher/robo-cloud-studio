@@ -9,7 +9,7 @@
 import { Item, ItemType, Station, Folder, registerItemType, SerializedItem, DeserializeContext } from '../core/items/item';
 import { MRS_KINDS, MrsKind } from '../mrs/model';
 
-export type CtlKind = 'des' | 'petri' | 's3pr' | 'smv' | 'bt' | 'statechart' | 'gr1' | 'hybrid' | 'pddl' | 'stn' | 'mdp' | 'pomdp' | 'jobshop' | 'realtime' | 'fta' | 'reliability' | 'mrta' | 'mapf' | 'stl' | 'fmea' | 'acceptance' | 'perf';
+export type CtlKind = 'des' | 'petri' | 'fsm' | 's3pr' | 'smv' | 'bt' | 'statechart' | 'gr1' | 'hybrid' | 'pddl' | 'stn' | 'mdp' | 'pomdp' | 'jobshop' | 'realtime' | 'fta' | 'reliability' | 'mrta' | 'mapf' | 'stl' | 'fmea' | 'acceptance' | 'perf';
 /** All document kinds: the control-design kinds (course *control of robotic complexes*) and the group-control kinds of the multi-robot module (course *control of distributed robotic systems*, src/mrs). */
 export type ControlKind = CtlKind | MrsKind;
 export type ControlGroup = 'discrete' | 'executive' | 'verification' | 'planning' | 'coordination' | 'engineering' | 'multi-robot';
@@ -21,6 +21,7 @@ export const CONTROL_KINDS: Array<{ kind: ControlKind; label: string; chapter: s
   { kind: 'perf', label: 'Performance (bottleneck, cycle time, Little)', chapter: '5', group: 'discrete' },
   { kind: 'bt', label: 'Behavior tree (mission logic)', chapter: '6', group: 'executive' },
   { kind: 'statechart', label: 'Statechart (hierarchical FSM)', chapter: '6', group: 'executive' },
+  { kind: 'fsm', label: 'Executable FSM with outcomes (yasmin-style, nested)', chapter: '6', group: 'executive' },
   { kind: 'hybrid', label: 'Mode automaton + CBF safety filter', chapter: '9', group: 'executive' },
   { kind: 'smv', label: 'Synchronous model + LTL/CTL specs', chapter: '7', group: 'verification' },
   { kind: 'gr1', label: 'GR(1) reactive synthesis', chapter: '8', group: 'verification' },

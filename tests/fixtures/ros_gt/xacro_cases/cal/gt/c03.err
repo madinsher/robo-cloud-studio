@@ -1,0 +1,3 @@
+error: name 'a' is not defined 
+when evaluating expression 'a'
+when processing file: c03.xacro

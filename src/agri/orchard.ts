@@ -16,27 +16,35 @@ export function rectPolygon(w: number, h: number, x0 = 0, y0 = 0): number[][] {
   return [[x0, y0], [x0 + w, y0], [x0 + w, y0 + h], [x0, y0 + h]];
 }
 
-/** Clip a line (infinite, through p with direction d) to a convex polygon; returns [tmin, tmax] or null. */
-function clipLine(p: number[], d: number[], poly: number[][]): [number, number] | null {
-  let tmin = -Infinity, tmax = Infinity;
+/**
+ * Intervals [t0, t1] where the infinite line p + t·d lies inside a simple polygon (convex or concave): the line's
+ * crossings with the edges, sorted and paired (even-odd rule). Vertices on the line are handled by the half-open
+ * edge rule.
+ */
+export function clipLineIntervals(p: number[], d: number[], poly: number[][]): Array<[number, number]> {
   const n = poly.length;
-  // polygon orientation
-  let area = 0;
-  for (let i = 0; i < n; i++) { const a = poly[i], b = poly[(i + 1) % n]; area += a[0] * b[1] - b[0] * a[1]; }
-  const ccw = area > 0;
+  const nrm = [-d[1], d[0]];
+  const side = (q: number[]) => (q[0] - p[0]) * nrm[0] + (q[1] - p[1]) * nrm[1];
+  const ts: number[] = [];
   for (let i = 0; i < n; i++) {
     const a = poly[i], b = poly[(i + 1) % n];
-    const ex = b[0] - a[0], ey = b[1] - a[1];
-    // inward normal
-    let nx = ccw ? -ey : ey, ny = ccw ? ex : -ex;
-    const num = nx * (a[0] - p[0]) + ny * (a[1] - p[1]);
-    const den = nx * d[0] + ny * d[1];
-    if (Math.abs(den) < 1e-12) { if (num > 0) return null; continue; }
-    const t = num / den;
-    if (den > 0) tmin = Math.max(tmin, t); else tmax = Math.min(tmax, t);
-    if (tmin > tmax) return null;
+    const sa = side(a), sb = side(b);
+    if ((sa > 0) === (sb > 0)) continue; // half-open: a vertex exactly on the line counts once
+    const u = sa / (sa - sb);
+    const x = a[0] + (b[0] - a[0]) * u, y = a[1] + (b[1] - a[1]) * u;
+    ts.push((x - p[0]) * d[0] + (y - p[1]) * d[1]);
   }
-  return tmin < tmax ? [tmin, tmax] : null;
+  ts.sort((x, y) => x - y);
+  const out: Array<[number, number]> = [];
+  for (let i = 0; i + 1 < ts.length; i += 2) if (ts[i + 1] > ts[i]) out.push([ts[i], ts[i + 1]]);
+  return out;
+}
+
+/** Clip a line to a polygon: the longest inside interval (kept for callers expecting one interval). */
+export function clipLine(p: number[], d: number[], poly: number[][]): [number, number] | null {
+  const iv = clipLineIntervals(p, d, poly);
+  if (!iv.length) return null;
+  return iv.reduce((a, b) => (b[1] - b[0] > a[1] - a[0] ? b : a));
 }
 
 /** Generate crop rows and plants for a field. Replaces existing rows. */
@@ -57,37 +65,41 @@ export function generateOrchard(field: FieldItem, seed = 1): CropRow[] {
   const rows: CropRow[] = [];
   let idx = 0;
   const firstOff = omin + c.headland;
-  for (let o = firstOff; o <= omax - c.headland * 0.5; o += c.rowSpacing) {
+  let line = 0;
+  for (let o = firstOff; o <= omax - c.headland * 0.5; o += c.rowSpacing, line++) {
     const p = [cx + (o - c0) * nrm[0], cy + (o - c0) * nrm[1]];
-    const clip = clipLine(p, d, poly);
-    if (!clip) continue;
-    let [t0, t1] = clip;
-    t0 += c.headland; t1 -= c.headland;
-    if (t1 - t0 < c.plantSpacing) continue;
-    const row = new CropRow(`Row ${idx + 1}`);
-    row.index = idx;
-    row.start = [p[0] + d[0] * t0, p[1] + d[1] * t0];
-    row.end = [p[0] + d[0] * t1, p[1] + d[1] * t1];
-    row.segmentId = `${field.id}:row${idx}`;
-    const len = t1 - t0;
-    const nPlants = Math.floor(len / c.plantSpacing);
-    const pad = (len - (nPlants - 1) * c.plantSpacing) / 2;
-    for (let k = 0; k < nPlants; k++) {
-      const plant: PlantRecord = { s: pad + k * c.plantSpacing, height: c.canopyHeight * (0.85 + rng() * 0.3), width: c.canopyWidth * (0.85 + rng() * 0.3), fruit: [], health: 0.9 + rng() * 0.1 };
-      const nFruit = Math.round(c.fruitPerPlant * (0.6 + rng() * 0.8));
-      for (let f = 0; f < nFruit && f < 400; f++) {
-        // fruit distributed in the canopy envelope; 2D trellis -> thin in row-normal direction
+    // concave fields: one row per inside interval of the line (headland kept at every boundary crossing)
+    const parts = clipLineIntervals(p, d, poly).map(([a, b]) => [a + c.headland, b - c.headland]).filter(([a, b]) => b - a >= c.plantSpacing);
+    parts.forEach(([t0, t1], part) => {
+      const row = new CropRow(parts.length > 1 ? `Row ${line + 1}${String.fromCharCode(97 + part)}` : `Row ${line + 1}`);
+      row.index = line;
+      row.start = [p[0] + d[0] * t0, p[1] + d[1] * t0];
+      row.end = [p[0] + d[0] * t1, p[1] + d[1] * t1];
+      row.segmentId = `${field.id}:row${idx}`;
+      const len = t1 - t0;
+      const nPlants = Math.floor(len / c.plantSpacing);
+      const pad = (len - (nPlants - 1) * c.plantSpacing) / 2;
+      for (let k = 0; k < nPlants; k++) {
+        const plant: PlantRecord = { s: pad + k * c.plantSpacing, height: c.canopyHeight * (0.85 + rng() * 0.3), width: c.canopyWidth * (0.85 + rng() * 0.3), fruit: [], health: 0.9 + rng() * 0.1 };
+        const nFruit = Math.round(c.fruitPerPlant * (0.6 + rng() * 0.8));
+        // 2-D trellis / gutter canopies are thin across the row
         const thin = c.training === 'trellis_2d' || c.training === 'v_trellis' || c.training === 'greenhouse_gutter' ? 0.35 : 1;
-        const u = rng() * 2 - 1, v = (rng() * 2 - 1) * thin, w = rng();
-        const z = c.canopyBase + w * plant.height;
-        const rad = plant.width / 2 * Math.sqrt(1 - Math.abs(2 * w - 1) * 0.5);
-        plant.fruit.push({ p: [u * rad, v * rad, z], ripe: rng() < c.ripeFraction ? 0.6 + rng() * 0.4 : rng() * 0.5, picked: false, d: c.fruitDiameter * (0.85 + rng() * 0.3) });
+        for (let f = 0; f < nFruit; f++) {
+          // inside the canopy envelope: height fraction w, radius of the canopy at that height (spindle = cone,
+          // others = ellipsoid), uniform in the disk of that radius
+          const w = rng();
+          const env = c.training === 'spindle' ? 1 - 0.7 * w : Math.sqrt(Math.max(0, 1 - (2 * w - 1) * (2 * w - 1)));
+          const rad = (plant.width / 2) * Math.max(0.15, env) * Math.sqrt(rng());
+          const ang = rng() * 2 * Math.PI;
+          const z = c.canopyBase + w * plant.height;
+          plant.fruit.push({ p: [Math.cos(ang) * rad, Math.sin(ang) * rad * thin, z], ripe: rng() < c.ripeFraction ? 0.6 + rng() * 0.4 : rng() * 0.5, picked: false, d: c.fruitDiameter * (0.85 + rng() * 0.3) });
+        }
+        row.plants.push(plant);
       }
-      row.plants.push(plant);
-    }
-    field.addChild(row);
-    rows.push(row);
-    idx++;
+      field.addChild(row);
+      rows.push(row);
+      idx++;
+    });
   }
   return rows;
 }
@@ -116,29 +128,37 @@ export function fruitWorldPositions(row: CropRow, onlyRipe = true): Array<{ p: [
   return out;
 }
 
-/** Rasterise a field into an occupancy map: rows are obstacles, headlands and inter-rows are free. */
-export function buildFieldMap(field: FieldItem, resolution = 250, margin = 10000): MapItem {
+/**
+ * Rasterise a field into an occupancy map: every plant's trunk and — when its canopy starts below `clearHeight` — its
+ * own canopy disk are obstacles (cell value 90 = crop, so planners holding the exact crop circles can skip them);
+ * headlands and inter-rows are free. Pergola canopies above the robots (kiwi, canopyBase 1.8 m) leave the alleys open.
+ */
+export function buildFieldMap(field: FieldItem, resolution = 250, margin = 10000, opts: { clearHeight?: number } = {}): MapItem {
   const poly = field.polygon;
   const xs = poly.map((p) => p[0]), ys = poly.map((p) => p[1]);
   const minX = Math.min(...xs) - margin, maxX = Math.max(...xs) + margin;
   const minY = Math.min(...ys) - margin, maxY = Math.max(...ys) + margin;
   const map = new MapItem(`${field.name} map`);
   map.resize(Math.ceil((maxX - minX) / resolution), Math.ceil((maxY - minY) / resolution), resolution, minX, minY);
-  map.inflation = Math.max(300, field.crop.rowSpacing * 0.2);
+  map.inflation = 400;
   const abs = field.poseAbs();
   map.setPose(abs);
-  const halfW = Math.max(150, field.crop.canopyWidth / 2);
-  const rc = Math.ceil(halfW / resolution);
-  for (const row of field.rows()) {
-    const n = Math.ceil(row.length() / (resolution * 0.5));
-    for (let i = 0; i <= n; i++) {
-      const [x, y] = row.pointAt((row.length() * i) / n);
-      const [cx0, cy0] = map.worldToCell(x, y);
-      for (let cy = cy0 - rc; cy <= cy0 + rc; cy++) for (let cx = cx0 - rc; cx <= cx0 + rc; cx++) {
-        const [wx, wy] = map.cellToWorld(cx, cy);
-        if (Math.hypot(wx - x, wy - y) <= halfW) map.set(cx, cy, 100);
-      }
+  const clear = opts.clearHeight ?? 1500;
+  const c = field.crop;
+  const trunkR = c.trunkDiameter ? c.trunkDiameter / 2 : c.training === 'greenhouse_gutter' ? 15 : 75;
+  const disk = (x: number, y: number, r: number) => {
+    const [cx0, cy0] = map.worldToCell(x, y);
+    const rc = Math.ceil(r / resolution) + 1;
+    for (let cy = cy0 - rc; cy <= cy0 + rc; cy++) for (let cx = cx0 - rc; cx <= cx0 + rc; cx++) {
+      const [wx, wy] = map.cellToWorld(cx, cy);
+      // cell intersects the disk (conservative: centre within r + half a cell)
+      if (Math.hypot(wx - x, wy - y) <= r + resolution * 0.5) map.set(cx, cy, 90);
     }
+  };
+  for (const row of field.rows()) for (const p of row.plants) {
+    const [x, y] = row.pointAt(p.s);
+    disk(x, y, trunkR);
+    if (c.canopyBase < clear) disk(x, y, p.width / 2);
   }
   map.notify('map');
   return map;

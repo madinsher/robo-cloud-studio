@@ -1,0 +1,1 @@
+<robot name="t" xmlns:xacro="http://www.ros.org/wiki/xacro"><xacro:include filename="$(find xc_probe)/sub/inner.xacro"/><link name="top"/><joint name="j" type="fixed"><parent link="top"/><child link="inner_link"/></joint></robot>

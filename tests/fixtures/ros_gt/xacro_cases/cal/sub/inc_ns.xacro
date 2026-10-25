@@ -1,0 +1,1 @@
+<?xml version="1.0"?><robot xmlns:xacro="http://www.ros.org/wiki/xacro"><xacro:property name="len" value="2.5"/><xacro:macro name="mm" params="q"><m q="${q}" l="${len}"/></xacro:macro><xacro:include filename="inner_rel.xacro"/></robot>

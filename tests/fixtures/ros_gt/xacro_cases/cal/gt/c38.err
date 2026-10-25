@@ -1,0 +1,2 @@
+error: <class 'xacro.substitution_args.SubstitutionException'>: Unknown substitution command [arg_text]. Valid commands are ['find', 'env', 'optenv', 'dirname', 'arg'] Unknown substitution command [arg_text]. Valid commands are ['find', 'env', 'optenv', 'dirname', 'arg']
+when processing file: c38.xacro

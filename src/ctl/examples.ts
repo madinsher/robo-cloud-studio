@@ -18,7 +18,8 @@ const GO = ['b_go_table', 'b_go_box', 'b_go_home'];
 
 const T = (list: Array<[string, string, string]>): Transition[] => list.map(([from, event, to]) => ({ from, event, to }));
 
-export function youbotPlant(withGiveup = true): DES[] {
+/** `cyclic`: the object automaton returns to the table with the controllable `o_next` (next object) — the executable mission loops over several objects. */
+export function youbotPlant(withGiveup = true, cyclic = false): DES[] {
   // Base: H home, T table, B bin; m* moving, s* stopped by an obstacle
   const base = new DES('Base', ['b_go_table', 'b_go_box', 'b_go_home', 'b_arrive', 'b_block', 'b_replan', 'g_ok', 'g_put'], T([
     ['H', 'b_go_table', 'mT'], ['B', 'b_go_table', 'mT'], ['T', 'b_go_box', 'mB'], ['T', 'b_go_home', 'mH'], ['B', 'b_go_home', 'mH'], ['T', 'b_go_table', 'mT'],
@@ -41,6 +42,7 @@ export function youbotPlant(withGiveup = true): DES[] {
   const objT: Array<[string, string, string]> = [['Tb', 'g_ok', 'Hn'], ['Hn', 'g_slip', 'Fl'], ['Hn', 'g_put', 'Bx']];
   const objSigma = ['g_ok', 'g_slip', 'g_put'];
   if (withGiveup) { objT.push(['Fl', 'o_giveup', 'Un']); objSigma.push('o_giveup'); }
+  if (cyclic) { objT.push(['Bx', 'o_next', 'Tb']); if (withGiveup) objT.push(['Un', 'o_next', 'Tb']); objSigma.push('o_next'); }
   const obj = new DES('Object', objSigma, T(objT), 'Tb', ['Bx', 'Un']);
   return [base, arm, grip, vis, obj];
 }

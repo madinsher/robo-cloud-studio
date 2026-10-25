@@ -1,7 +1,7 @@
 import { App } from '../app';
 import { MobileRobot } from '../mobile/items';
 import { h, contextMenu, MenuEntry, downloadText, toast, dialog } from './dom';
-import { robotLibraryDialog, onlineLibraryDialog, mobileRobotDialog, orchardDialog, fleetDialog, missionDialog, mapDialog, zoneDialog, componentDialog, exportDialog, importDialog, harvestArmDialog, curveFollowDialog, machiningDialog, railIKDialog, vdaDialog } from './dialogs';
+import { robotLibraryDialog, onlineLibraryDialog, mobileRobotDialog, orchardDialog, fleetDialog, missionDialog, mapDialog, zoneDialog, componentDialog, exportDialog, importDialog, harvestArmDialog, curveFollowDialog, machiningDialog, railIKDialog, vdaDialog, importFolderDialog } from './dialogs';
 import { ItemType, Folder } from '../core/items/item';
 import { demos } from '../demos';
 import { t, getLang, setLang } from './i18n';
@@ -19,6 +19,7 @@ export class MenuBar {
       ['File', () => [
         { label: 'New station', shortcut: 'Ctrl+N', action: () => app.newStation() },
         { label: 'Open / import…', shortcut: 'Ctrl+O', action: () => importDialog(app) },
+        { label: 'Open folder (ROS package / Webots project)…', action: () => importFolderDialog(app) },
         { label: 'Save station (.vbstation)', shortcut: 'Ctrl+S', action: () => this.save() },
         { separator: true },
         { label: 'Demo stations', children: demos.map((d) => ({ label: d.name, action: () => { app.setStation(d.build()); toast(d.description, 'info', 6000); } })) },
@@ -60,8 +61,10 @@ export class MenuBar {
         { separator: true },
         { label: 'Run', shortcut: 'F5', action: () => app.runProgram() },
         { label: 'Pause', action: () => app.pauseProgram() },
+        { label: 'Resume', action: () => app.resumeProgram() },
         { label: 'Stop', action: () => app.stopProgram() },
-        { label: 'Validate (compile)', action: () => { app.previewProgram(); const r = app.activeProgram?.lastResult; if (r) toast(r.ok ? `OK · ${r.duration.toFixed(2)} s` : r.problems.map((p) => p.message).join('; '), r.ok ? 'ok' : 'error', 6000); } },
+        { label: 'Reset simulation (restore home)', action: () => app.resetSimulation() },
+        { label: 'Validate (compile)', action: () => { const r = app.validateProgram(); if (r) toast(r.ok ? `OK · ${r.duration.toFixed(2)} s` : r.problems.map((p) => p.message).join('; '), r.ok ? 'ok' : 'error', 6000); } },
         { separator: true },
         { label: 'Export with post processor…', action: () => exportDialog(app) },
         { label: 'Import RoboDK post processors (.py)…', action: () => importRoboDKPosts(app) },
@@ -75,7 +78,7 @@ export class MenuBar {
         { label: 'Move with external axes (rail / gantry)…', action: () => { const r = app.activeRobot; if (r) railIKDialog(app, r); } },
         { separator: true },
         { label: 'Check collisions now (static)', action: () => app.checkStationCollisions() },
-        { label: 'Check collisions during program validation', checked: app.checkCollisions, action: () => { app.checkCollisions = !app.checkCollisions; app.previewProgram(); } },
+        { label: 'Check collisions during program validation', checked: app.checkCollisions, action: () => { app.checkCollisions = !app.checkCollisions; app.validateProgram(); } },
         { separator: true },
         ...app.station.itemsOfType<Robot>(ItemType.ROBOT).map((r) => ({ label: r.name, checked: r === app.activeRobot, action: () => { app.setActiveRobot(r); app.select(r); } })),
       ]],

@@ -1,0 +1,1 @@
+<robot name="t" xmlns:xacro="http://www.ros.org/wiki/xacro"><link name="l"/><link name="m"/><joint name="j" type="revolute"><parent link="l"/><child link="m"/><origin xyz="${2**3} ${int(3.7)} ${len([1,2,3])}" rpy="${radians(90)} ${pi/2} ${math.pi/4}"/><axis xyz="0 0 1"/><limit lower="${-pi}" upper="${pi}" effort="1" velocity="1"/></joint></robot>

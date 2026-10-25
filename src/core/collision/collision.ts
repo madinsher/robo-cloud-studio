@@ -2,8 +2,11 @@
  * Collision detection (RoboDK-style collision map).
  * Shapes: capsules for procedural robot links, oriented boxes for primitives / mesh bounding boxes,
  * spheres for fruit/points. Pairs of adjacent links and parent/child tool relations are ignored.
- * Mesh-accurate checks use a triangle-vs-triangle test on the stored STL data when both items are meshes
- * and their bounding boxes overlap (bounded by a triangle budget to keep the UI responsive).
+ * Mesh-accurate checks use local-space BVHs built once per mesh: mesh/mesh by triangle intersection, mesh/box,
+ * mesh/sphere and mesh/capsule by triangle tests. Items with a separate collider list (SceneObject.colliders, e.g.
+ * Webots boundingObject) use it instead of their visual geometry; tools without geometry have no collider.
+ * robotCollisionChecker() is the cached robot-vs-station check used along program timelines; it honours the station
+ * collision map (RoboDK Collision_SetPair / imported .rdk maps).
  */
 import { Station, Item, ItemType, SceneObject, Tool } from '../items/item';
 import { Robot } from '../items/robot';
@@ -106,21 +109,15 @@ export function collidersOf(item: Item, opts: CollisionOptions = {}): Collider[]
     return out;
   }
   if (item instanceof Tool) {
+    // a tool without geometry has no collider (RoboDK): only its meshes / primitives collide
     const flange = item.flangeAbs();
-    if (item.geometry.length) for (const g of item.geometry) out.push(...visualColliders(item, item.name, undefined, multiply(flange, Float64Array.from(g.origin ?? identity16())), g, opts));
-    else {
-      const tcp = getPos(item.poseAbs());
-      const fl = getPos(flange);
-      const len = norm(sub(tcp, fl));
-      const r = 30;
-      // end the capsule at the TCP (cap inside), so a tool touching a part at its TCP is not a collision
-      if (len > r + 1) out.push({ item, part: item.name, shape: { kind: 'capsule', a: fl, b: add(fl, scale(sub(tcp, fl), (len - r) / len)), r } });
-    }
+    for (const g of item.colliders ?? item.geometry) out.push(...visualColliders(item, item.name, undefined, multiply(flange, Float64Array.from(g.origin ?? identity16())), g, opts));
     return out;
   }
   if (item instanceof SceneObject || item instanceof Component || item instanceof MobileRobot) {
     const pose = item.poseAbs();
-    const geometry = (item as any).geometry as SceneObject['geometry'];
+    const geometry = ((item as SceneObject).colliders ?? (item as any).geometry) as SceneObject['geometry'];
+    if ((item as SceneObject).colliders && !geometry.length) return out;
     if (geometry?.length) for (const g of geometry) out.push(...visualColliders(item, item.name, undefined, multiply(pose, Float64Array.from(g.origin ?? identity16())), g, opts));
     else if (item instanceof MobileRobot) {
       const [L, W, H] = item.kin.footprint;
@@ -161,13 +158,7 @@ function visualColliders(item: Item, part: string, linkIndex: number | undefined
       const c: [number, number, number] = [(max[0] + min[0]) / 2, (max[1] + min[1]) / 2, (max[2] + min[2]) / 2];
       const obb = obbFromBox(pose, size, c);
       if (opts.meshAccurate && a.mesh.triangles < 400000) {
-        // pre-scale positions
-        let positions = a.mesh.positions;
-        if (s[0] !== 1 || s[1] !== 1 || s[2] !== 1) {
-          positions = new Float32Array(a.mesh.positions.length);
-          for (let i = 0; i < positions.length; i += 3) { positions[i] = a.mesh.positions[i] * s[0]; positions[i + 1] = a.mesh.positions[i + 1] * s[1]; positions[i + 2] = a.mesh.positions[i + 2] * s[2]; }
-        }
-        return [{ item, part, linkIndex, shape: { kind: 'mesh', positions, pose, obb } }];
+        return [{ item, part, linkIndex, shape: { kind: 'mesh', positions: scaledPositions(a.mesh.positions, s), pose, obb } }];
       }
       // A box around a CAD link is much fatter than the shell, so it is only an approximate self-check.
       return [{ item, part, linkIndex, approx: true, shape: obb }];
@@ -337,53 +328,66 @@ export function checkColliders(colliders: Collider[], opts: CollisionOptions = {
   for (let i = 0; i < colliders.length; i++) {
     for (let j = i + 1; j < colliders.length; j++) {
       const A = colliders[i], B = colliders[j];
-      if (A.item === B.item) {
-        // same robot: skip the same link and neighbours (approximate capsules overlap at the shoulder/wrist)
-        if (A.linkIndex !== undefined && B.linkIndex !== undefined) {
-          const lo = Math.min(A.linkIndex, B.linkIndex), hi = Math.max(A.linkIndex, B.linkIndex);
-          if (hi - lo <= 1) continue;
-          // Bounding boxes of imported link shells are much fatter than the metal and overlap
-          // links further along the arm. Exact triangle meshes still test those pairs.
-          if (hi - lo >= 2 && A.approx && B.approx && A.shape.kind === 'obb' && B.shape.kind === 'obb') continue;
-          // Procedural hubs separated only by short wrist spacers are mechanically connected.
-          // Long intervening links must still be tested, even when their indices differ by two.
-          if ((A.approx || B.approx) && A.item instanceof Robot) {
-            let gap = 0;
-            for (let k = lo; k < hi - 1; k++) {
-              const j = A.item.chain.joints[k], next = A.item.chain.joints[k + 1];
-              if (j?.post) gap += Math.hypot(j.post[12], j.post[13], j.post[14]);
-              if (next) gap += Math.hypot(next.origin[12], next.origin[13], next.origin[14]);
-            }
-            const radius = (c: Collider) => c.shape.kind === 'capsule' ? c.shape.r : 0;
-            if (gap <= radius(A) + radius(B)) continue;
-          }
-        }
-        if (A.linkIndex === undefined || B.linkIndex === undefined) continue;
-      }
-      // tool vs its robot's last links; object attached to tool vs tool
-      if (A.item instanceof Tool && A.item.parent === B.item && B.linkIndex !== undefined && B.linkIndex >= (B.item as Robot).chain.links.length - 2) continue;
-      if (B.item instanceof Tool && B.item.parent === A.item && A.linkIndex !== undefined && A.linkIndex >= (A.item as Robot).chain.links.length - 2) continue;
-      if (A.item instanceof Tool && A.item.attached.includes(B.item.id)) continue;
-      if (B.item instanceof Tool && B.item.attached.includes(A.item.id)) continue;
-      // robot base link vs the item it is mounted on (mobile platform / pedestal parent)
-      if ((A.linkIndex === 0 && A.item.parent === B.item) || (B.linkIndex === 0 && B.item.parent === A.item)) continue;
-      if (opts.selfOnly && (rootOf(A.item) !== rootOf(B.item) || !(rootOf(A.item) instanceof Robot))) continue;
-      if (opts.robotsOnly && !(rootOf(A.item) instanceof Robot) && !(rootOf(B.item) instanceof Robot)) continue;
-      // A box around a tool, finger or part mounted on the robot overlaps the arm. The shell usually does not.
-      if ((A.approx || B.approx) && A.item !== B.item && rootOf(A.item) === rootOf(B.item) && rootOf(A.item) instanceof Robot) continue;
-      if (ignore.has(`${A.item.id}|${B.item.id}`) || ignore.has(`${B.item.id}|${A.item.id}`)) continue;
-      // A box around an imported tool is fatter than the shell and crosses the forearm while the triangles do not.
-      const ownedTool = (A.item instanceof Tool && A.item.parent === B.item) || (B.item instanceof Tool && B.item.parent === A.item);
-      if (ownedTool && (A.approx || B.approx)) continue;
-      let d = shapeDistance(A.shape, B.shape) + margin;
-      // self-collision with approximate capsules: shrink both radii by 30% to avoid false positives at the wrist/shoulder
-      if (A.item === B.item && A.shape.kind === 'capsule' && B.shape.kind === 'capsule') d -= 0.3 * (A.shape.r + B.shape.r);
-      if (d <= 0) continue;
-      if (A.shape.kind === 'mesh' && B.shape.kind === 'mesh' && opts.meshAccurate && !meshMesh(A.shape, B.shape)) continue;
-      pairs.push({ a: A, b: B, depth: d });
+      if (skipPair(A, B, opts, ignore)) continue;
+      const d = pairDepth(A, B, opts, margin);
+      if (d > 0) pairs.push({ a: A, b: B, depth: d });
     }
   }
   return pairs;
+}
+
+/** Default collision rules (RoboDK-like): adjacent links, tool vs its flange links, attached parts, mounts. */
+function skipPair(A: Collider, B: Collider, opts: CollisionOptions, ignore: Set<string>): boolean {
+  if (A.item === B.item) {
+    // same robot: skip the same link and neighbours (approximate capsules overlap at the shoulder/wrist)
+    if (A.linkIndex !== undefined && B.linkIndex !== undefined) {
+      const lo = Math.min(A.linkIndex, B.linkIndex), hi = Math.max(A.linkIndex, B.linkIndex);
+      if (hi - lo <= 1) return true;
+      // Bounding boxes of imported link shells are much fatter than the metal and overlap
+      // links further along the arm. Exact triangle meshes still test those pairs.
+      if (hi - lo >= 2 && A.approx && B.approx && A.shape.kind === 'obb' && B.shape.kind === 'obb') return true;
+      // Procedural hubs separated only by short wrist spacers are mechanically connected.
+      // Long intervening links must still be tested, even when their indices differ by two.
+      if ((A.approx || B.approx) && A.item instanceof Robot) {
+        let gap = 0;
+        for (let k = lo; k < hi - 1; k++) {
+          const j = A.item.chain.joints[k], next = A.item.chain.joints[k + 1];
+          if (j?.post) gap += Math.hypot(j.post[12], j.post[13], j.post[14]);
+          if (next) gap += Math.hypot(next.origin[12], next.origin[13], next.origin[14]);
+        }
+        const radius = (c: Collider) => c.shape.kind === 'capsule' ? c.shape.r : 0;
+        if (gap <= radius(A) + radius(B)) return true;
+      }
+    }
+    if (A.linkIndex === undefined || B.linkIndex === undefined) return true;
+  }
+  // tool vs its robot's last links; object attached to tool vs tool
+  if (A.item instanceof Tool && A.item.parent === B.item && B.linkIndex !== undefined && B.linkIndex >= (B.item as Robot).chain.links.length - 2) return true;
+  if (B.item instanceof Tool && B.item.parent === A.item && A.linkIndex !== undefined && A.linkIndex >= (A.item as Robot).chain.links.length - 2) return true;
+  if (A.item instanceof Tool && A.item.attached.includes(B.item.id)) return true;
+  if (B.item instanceof Tool && B.item.attached.includes(A.item.id)) return true;
+  if ((A.item instanceof Tool && B.item.parent === A.item) || (B.item instanceof Tool && A.item.parent === B.item)) return true;
+  // robot base link vs the item it is mounted on (mobile platform / pedestal parent)
+  if ((A.linkIndex === 0 && A.item.parent === B.item) || (B.linkIndex === 0 && B.item.parent === A.item)) return true;
+  if (opts.selfOnly && (rootOf(A.item) !== rootOf(B.item) || !(rootOf(A.item) instanceof Robot))) return true;
+  if (opts.robotsOnly && !(rootOf(A.item) instanceof Robot) && !(rootOf(B.item) instanceof Robot)) return true;
+  // A box around a tool, finger or part mounted on the robot overlaps the arm. The shell usually does not.
+  if ((A.approx || B.approx) && A.item !== B.item && rootOf(A.item) === rootOf(B.item) && rootOf(A.item) instanceof Robot) return true;
+  if (ignore.has(`${A.item.id}|${B.item.id}`) || ignore.has(`${B.item.id}|${A.item.id}`)) return true;
+  // A box around an imported tool is fatter than the shell and crosses the forearm while the triangles do not.
+  const ownedTool = (A.item instanceof Tool && A.item.parent === B.item) || (B.item instanceof Tool && B.item.parent === A.item);
+  if (ownedTool && (A.approx || B.approx)) return true;
+  return false;
+}
+
+/** Penetration estimate (> 0 = collision) with exact triangle tests for meshes when meshAccurate is set. */
+function pairDepth(A: Collider, B: Collider, opts: CollisionOptions, margin = opts.margin ?? 0): number {
+  let d = shapeDistance(A.shape, B.shape) + margin;
+  // self-collision with approximate capsules: shrink both radii by 30% to avoid false positives at the wrist/shoulder
+  if (A.item === B.item && A.shape.kind === 'capsule' && B.shape.kind === 'capsule') d -= 0.3 * (A.shape.r + B.shape.r);
+  if (d <= 0) return d;
+  if (opts.meshAccurate && (A.shape.kind === 'mesh' || B.shape.kind === 'mesh')) return exactHit(A.shape, B.shape, margin) ? Math.max(1, Math.min(d, 1)) : -1;
+  return d;
 }
 
 /** Robot-centric check: colliders of one robot (with its tools) against the rest of the station. */
@@ -453,7 +457,7 @@ export function checkCollisionsMapped(station: Station, opts: CollisionOptions =
     const bs = colliders.filter((c) => c.item.id === e[2] && (e[3] < 0 || c.linkIndex === e[3]));
     for (const A of as) for (const B of bs) {
       if (pairs.some((p) => (p.a === A && p.b === B) || (p.a === B && p.b === A))) continue;
-      const d = shapeDistance(A.shape, B.shape) + (opts.margin ?? 0);
+      const d = pairDepth(A, B, opts);
       if (d > 0) pairs.push({ a: A, b: B, depth: d });
     }
   }
@@ -468,10 +472,8 @@ export function itemsCollide(a: Item, b: Item, opts: CollisionOptions = {}): Col
   for (const A of ca) for (const B of cb) {
     if (A.item instanceof Tool && A.item.attached.includes(B.item.id)) continue;
     if (B.item instanceof Tool && B.item.attached.includes(A.item.id)) continue;
-    let d = shapeDistance(A.shape, B.shape) + (opts.margin ?? 0);
-    if (d <= 0) continue;
-    if (A.shape.kind === 'mesh' && B.shape.kind === 'mesh' && opts.meshAccurate && !meshMesh(A.shape, B.shape)) continue;
-    out.push({ a: A, b: B, depth: d });
+    const d = pairDepth(A, B, opts);
+    if (d > 0) out.push({ a: A, b: B, depth: d });
   }
   return out;
 }
@@ -649,4 +651,252 @@ function meshBVH(s: Extract<Shape, { kind: 'mesh' }>): MeshBVH {
 /** Triangle-accurate mesh/mesh test using BVHs (replaces the brute-force version for large meshes). */
 export function meshMeshBVH(m1: Extract<Shape, { kind: 'mesh' }>, m2: Extract<Shape, { kind: 'mesh' }>): boolean {
   return meshBVH(m1).intersects(meshBVH(m2));
+}
+
+
+// ---- Local-space mesh BVH (built once per mesh, queried with relative transforms) --------------------------------
+
+const scaledCache = new WeakMap<Float32Array, Map<string, Float32Array>>();
+function scaledPositions(pos: Float32Array, s: number[]): Float32Array {
+  if (s[0] === 1 && s[1] === 1 && s[2] === 1) return pos;
+  const key = s.join(',');
+  let m = scaledCache.get(pos);
+  if (!m) scaledCache.set(pos, (m = new Map()));
+  let out = m.get(key);
+  if (!out) {
+    out = new Float32Array(pos.length);
+    for (let i = 0; i < pos.length; i += 3) { out[i] = pos[i] * s[0]; out[i + 1] = pos[i + 1] * s[1]; out[i + 2] = pos[i + 2] * s[2]; }
+    m.set(key, out);
+  }
+  return out;
+}
+
+/** BVH over the triangles of a mesh in its own coordinates. */
+export class LocalBVH {
+  readonly order: Uint32Array;
+  readonly min: number[] = [];
+  readonly max: number[] = [];
+  readonly left: number[] = [];
+  readonly right: number[] = [];
+  readonly start: number[] = [];
+  readonly count: number[] = [];
+  constructor(readonly pos: Float32Array) {
+    const n = Math.floor(pos.length / 9);
+    this.order = new Uint32Array(n);
+    for (let i = 0; i < n; i++) this.order[i] = i;
+    const cen = new Float32Array(n * 3);
+    for (let i = 0; i < n; i++) for (let a = 0; a < 3; a++) cen[i * 3 + a] = (pos[i * 9 + a] + pos[i * 9 + 3 + a] + pos[i * 9 + 6 + a]) / 3;
+    if (n) this.build(0, n, cen, 0);
+  }
+  private build(lo: number, hi: number, cen: Float32Array, depth: number): number {
+    const id = this.left.length;
+    const mn = [Infinity, Infinity, Infinity], mx = [-Infinity, -Infinity, -Infinity];
+    for (let k = lo; k < hi; k++) { const t = this.order[k] * 9; for (let v = 0; v < 9; v += 3) for (let a = 0; a < 3; a++) { const x = this.pos[t + v + a]; if (x < mn[a]) mn[a] = x; if (x > mx[a]) mx[a] = x; } }
+    this.min.push(mn[0], mn[1], mn[2]); this.max.push(mx[0], mx[1], mx[2]);
+    this.left.push(-1); this.right.push(-1); this.start.push(lo); this.count.push(hi - lo);
+    if (hi - lo <= 8 || depth > 40) return id;
+    const ext = [mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2]];
+    const axis = ext[0] >= ext[1] && ext[0] >= ext[2] ? 0 : ext[1] >= ext[2] ? 1 : 2;
+    const sub = Array.from(this.order.subarray(lo, hi)).sort((p, q) => cen[p * 3 + axis] - cen[q * 3 + axis]);
+    this.order.set(sub, lo);
+    const mid = (lo + hi) >> 1;
+    const l = this.build(lo, mid, cen, depth + 1);
+    const r = this.build(mid, hi, cen, depth + 1);
+    this.left[id] = l; this.right[id] = r;
+    return id;
+  }
+  tri(i: number, out: V[]): V[] {
+    const p = this.pos, k = i * 9;
+    out[0] = [p[k], p[k + 1], p[k + 2]]; out[1] = [p[k + 3], p[k + 4], p[k + 5]]; out[2] = [p[k + 6], p[k + 7], p[k + 8]];
+    return out;
+  }
+}
+const localBvhCache = new WeakMap<Float32Array, LocalBVH>();
+export function localBVH(pos: Float32Array): LocalBVH {
+  let b = localBvhCache.get(pos);
+  if (!b) localBvhCache.set(pos, (b = new LocalBVH(pos)));
+  return b;
+}
+
+const xf = (m: Mat4, p: V): V => [m[0] * p[0] + m[4] * p[1] + m[8] * p[2] + m[12], m[1] * p[0] + m[5] * p[1] + m[9] * p[2] + m[13], m[2] * p[0] + m[6] * p[1] + m[10] * p[2] + m[14]];
+/** AABB (center, half extents) of node i of a BVH after transform T. */
+function xfBox(T: Mat4, mn: number[], mx: number[], i: number): [V, V] {
+  const c: V = [(mn[i * 3] + mx[i * 3]) / 2, (mn[i * 3 + 1] + mx[i * 3 + 1]) / 2, (mn[i * 3 + 2] + mx[i * 3 + 2]) / 2];
+  const h = [(mx[i * 3] - mn[i * 3]) / 2, (mx[i * 3 + 1] - mn[i * 3 + 1]) / 2, (mx[i * 3 + 2] - mn[i * 3 + 2]) / 2];
+  const cc = xf(T, c);
+  const hh: V = [0, 0, 0];
+  for (let r = 0; r < 3; r++) hh[r] = Math.abs(T[r]) * h[0] + Math.abs(T[4 + r]) * h[1] + Math.abs(T[8 + r]) * h[2];
+  return [cc, hh];
+}
+const boxOverlap = (bvh: LocalBVH, i: number, c: V, h: V, m = 0) =>
+  bvh.min[i * 3] <= c[0] + h[0] + m && bvh.max[i * 3] >= c[0] - h[0] - m && bvh.min[i * 3 + 1] <= c[1] + h[1] + m && bvh.max[i * 3 + 1] >= c[1] - h[1] - m && bvh.min[i * 3 + 2] <= c[2] + h[2] + m && bvh.max[i * 3 + 2] >= c[2] - h[2] - m;
+
+/** Triangle vs axis-aligned box centred at the origin with half extents h (separating axis test). */
+function triBox(t: V[], h: V): boolean {
+  for (let a = 0; a < 3; a++) { const mn = Math.min(t[0][a], t[1][a], t[2][a]), mx = Math.max(t[0][a], t[1][a], t[2][a]); if (mn > h[a] || mx < -h[a]) return false; }
+  const e = [sub(t[1], t[0]), sub(t[2], t[1]), sub(t[0], t[2])];
+  const n = cross(e[0], e[1]);
+  const r0 = h[0] * Math.abs(n[0]) + h[1] * Math.abs(n[1]) + h[2] * Math.abs(n[2]);
+  if (Math.abs(dot(n, t[0])) > r0) return false;
+  const axesU: V[] = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
+  for (const u of axesU) for (const ed of e) {
+    const ax = cross(u, ed);
+    if (Math.abs(ax[0]) + Math.abs(ax[1]) + Math.abs(ax[2]) < 1e-12) continue;
+    const p0 = dot(t[0], ax), p1 = dot(t[1], ax), p2 = dot(t[2], ax);
+    const r = h[0] * Math.abs(ax[0]) + h[1] * Math.abs(ax[1]) + h[2] * Math.abs(ax[2]);
+    if (Math.min(p0, p1, p2) > r || Math.max(p0, p1, p2) < -r) return false;
+  }
+  return true;
+}
+
+/** Closest point on triangle abc to p (Ericson). */
+function closestOnTri(p: V, a: V, b: V, c: V): V {
+  const ab = sub(b, a), ac = sub(c, a), ap = sub(p, a);
+  const d1 = dot(ab, ap), d2 = dot(ac, ap);
+  if (d1 <= 0 && d2 <= 0) return a;
+  const bp = sub(p, b), d3 = dot(ab, bp), d4 = dot(ac, bp);
+  if (d3 >= 0 && d4 <= d3) return b;
+  const vc = d1 * d4 - d3 * d2;
+  if (vc <= 0 && d1 >= 0 && d3 <= 0) return add(a, scale(ab, d1 / (d1 - d3)));
+  const cp = sub(p, c), d5 = dot(ab, cp), d6 = dot(ac, cp);
+  if (d6 >= 0 && d5 <= d6) return c;
+  const vb = d5 * d2 - d1 * d6;
+  if (vb <= 0 && d2 >= 0 && d6 <= 0) return add(a, scale(ac, d2 / (d2 - d6)));
+  const va = d3 * d6 - d5 * d4;
+  if (va <= 0 && d4 - d3 >= 0 && d5 - d6 >= 0) return add(b, scale(sub(c, b), (d4 - d3) / (d4 - d3 + (d5 - d6))));
+  const den = 1 / (va + vb + vc);
+  return add(a, add(scale(ab, vb * den), scale(ac, vc * den)));
+}
+
+type MeshShape = Extract<Shape, { kind: 'mesh' }>;
+
+/** Exact (triangle-level) intersection test of a mesh against another shape. */
+export function exactHit(s1: Shape, s2: Shape, margin = 0): boolean {
+  if (s1.kind !== 'mesh') { if (s2.kind !== 'mesh') return shapeDistance(s1, s2) + margin > 0; return exactHit(s2, s1, margin); }
+  const m = s1 as MeshShape, bvh = localBVH(m.positions);
+  if (!bvh.count.length) return false;
+  const inv = invert(m.pose);
+  const tA: V[] = [[0, 0, 0], [0, 0, 0], [0, 0, 0]], tB: V[] = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+  if (s2.kind === 'mesh') {
+    const b2 = localBVH(s2.positions);
+    if (!b2.count.length) return false;
+    const T = multiply(inv, s2.pose); // mesh 2 -> mesh 1 coordinates
+    const stack: number[] = [0, 0];
+    let budget = 0;
+    while (stack.length) {
+      const j = stack.pop()!, i = stack.pop()!;
+      const [c, h] = xfBox(T, b2.min, b2.max, j);
+      if (!boxOverlap(bvh, i, c, h, margin)) continue;
+      const leafA = bvh.left[i] < 0, leafB = b2.left[j] < 0;
+      if (leafA && leafB) {
+        for (let x = bvh.start[i]; x < bvh.start[i] + bvh.count[i]; x++) {
+          bvh.tri(bvh.order[x], tA);
+          for (let y = b2.start[j]; y < b2.start[j] + b2.count[j]; y++) {
+            b2.tri(b2.order[y], tB);
+            if (triTri(tA, [xf(T, tB[0]), xf(T, tB[1]), xf(T, tB[2])])) return true;
+            if (++budget > 2_000_000) return true;
+          }
+        }
+      } else if (leafA) stack.push(i, b2.left[j], i, b2.right[j]);
+      else if (leafB) stack.push(bvh.left[i], j, bvh.right[i], j);
+      else stack.push(bvh.left[i], b2.left[j], bvh.left[i], b2.right[j], bvh.right[i], b2.left[j], bvh.right[i], b2.right[j]);
+    }
+    return false;
+  }
+  if (s2.kind === 'obb') {
+    // box into mesh coordinates
+    const c = xf(inv, s2.center);
+    const ax = s2.axes.map((a) => transformDir(inv, a)) as V[];
+    const half: V = [s2.half[0] + margin, s2.half[1] + margin, s2.half[2] + margin];
+    const hh: V = [0, 0, 0];
+    for (let r = 0; r < 3; r++) hh[r] = Math.abs(ax[0][r]) * half[0] + Math.abs(ax[1][r]) * half[1] + Math.abs(ax[2][r]) * half[2];
+    const toBox = (p: V): V => { const d = sub(p, c); return [dot(d, ax[0]), dot(d, ax[1]), dot(d, ax[2])]; };
+    const stack = [0];
+    while (stack.length) {
+      const i = stack.pop()!;
+      if (!boxOverlap(bvh, i, c, hh)) continue;
+      if (bvh.left[i] >= 0) { stack.push(bvh.left[i], bvh.right[i]); continue; }
+      for (let x = bvh.start[i]; x < bvh.start[i] + bvh.count[i]; x++) {
+        bvh.tri(bvh.order[x], tA);
+        if (triBox([toBox(tA[0]), toBox(tA[1]), toBox(tA[2])], half)) return true;
+      }
+    }
+    return false;
+  }
+  // sphere / capsule: points along the axis within r of a triangle
+  const r = s2.r + margin;
+  const a = xf(inv, s2.kind === 'sphere' ? s2.c : s2.a), b = xf(inv, s2.kind === 'sphere' ? s2.c : s2.b);
+  const len = norm(sub(b, a));
+  const nS = s2.kind === 'sphere' ? 0 : Math.max(1, Math.ceil(len / Math.max(1e-6, r * 0.5)));
+  const pts: V[] = [];
+  for (let k = 0; k <= nS; k++) pts.push(nS ? add(a, scale(sub(b, a), k / nS)) : a);
+  const c: V = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2, (a[2] + b[2]) / 2];
+  const h: V = [Math.abs(b[0] - a[0]) / 2 + r, Math.abs(b[1] - a[1]) / 2 + r, Math.abs(b[2] - a[2]) / 2 + r];
+  const stack = [0];
+  while (stack.length) {
+    const i = stack.pop()!;
+    if (!boxOverlap(bvh, i, c, h)) continue;
+    if (bvh.left[i] >= 0) { stack.push(bvh.left[i], bvh.right[i]); continue; }
+    for (let x = bvh.start[i]; x < bvh.start[i] + bvh.count[i]; x++) {
+      bvh.tri(bvh.order[x], tA);
+      for (const p of pts) if (norm(sub(closestOnTri(p, tA[0], tA[1], tA[2]), p)) <= r) return true;
+    }
+  }
+  return false;
+}
+
+interface AABB { min: V; max: V }
+function shapeAABB(s: Shape): AABB {
+  const b = s.kind === 'mesh' ? s.obb : s;
+  if (b.kind === 'sphere') return { min: [b.c[0] - b.r, b.c[1] - b.r, b.c[2] - b.r], max: [b.c[0] + b.r, b.c[1] + b.r, b.c[2] + b.r] };
+  if (b.kind === 'capsule') return { min: [Math.min(b.a[0], b.b[0]) - b.r, Math.min(b.a[1], b.b[1]) - b.r, Math.min(b.a[2], b.b[2]) - b.r], max: [Math.max(b.a[0], b.b[0]) + b.r, Math.max(b.a[1], b.b[1]) + b.r, Math.max(b.a[2], b.b[2]) + b.r] };
+  const h: V = [0, 0, 0];
+  for (let r = 0; r < 3; r++) h[r] = Math.abs(b.axes[0][r]) * b.half[0] + Math.abs(b.axes[1][r]) * b.half[1] + Math.abs(b.axes[2][r]) * b.half[2];
+  return { min: [b.center[0] - h[0], b.center[1] - h[1], b.center[2] - h[2]], max: [b.center[0] + h[0], b.center[1] + h[1], b.center[2] + h[2]] };
+}
+const aabbOverlap = (a: AABB, b: AABB, m: number) => a.min[0] <= b.max[0] + m && a.max[0] >= b.min[0] - m && a.min[1] <= b.max[1] + m && a.max[1] >= b.min[1] - m && a.min[2] <= b.max[2] + m && a.max[2] >= b.min[2] - m;
+const IGNORED_TYPES = new Set([ItemType.FIELD, ItemType.CROP_ROW, ItemType.MAP, ItemType.ZONE]);
+
+/**
+ * Cached collision check of one robot (its links, tools and attached parts) against itself and the station, used
+ * along program timelines. Static colliders are rebuilt only when `version` changes (attach/detach/show/hide).
+ * Link and object meshes are tested triangle-exactly (BVH) when an asset store is given (meshAccurate defaults on);
+ * the station collision map (disabled / enabled pairs) is honoured.
+ */
+export function robotCollisionChecker(station: Station, robot: Robot, opts: CollisionOptions = {}): { check(version?: number): CollisionPair[] } {
+  const o: CollisionOptions = { ...opts, meshAccurate: opts.meshAccurate ?? !!opts.assets };
+  const margin = o.margin ?? 0;
+  const ignore = new Set((o.ignore ?? []).map(([a, b]) => `${a}|${b}`));
+  let version = NaN;
+  let mine = new Set<Item>();
+  let statics: Array<{ c: Collider; box: AABB }> = [];
+  return {
+    check(v = 0): CollisionPair[] {
+      const map = station.params.collisionMap ? getCollisionMap(station) : null;
+      if (map && !map.active) return [];
+      if (v !== version) {
+        version = v;
+        mine = new Set(robot.walk());
+        statics = [];
+        if (!o.selfOnly) for (const it of station.walk()) {
+          if (it === station || !it.visible || mine.has(it) || IGNORED_TYPES.has(it.type)) continue;
+          for (const c of collidersOf(it, o)) statics.push({ c, box: shapeAABB(c.shape) });
+        }
+      }
+      const own: Array<{ c: Collider; box: AABB }> = [];
+      for (const it of mine) if (it.visible && !IGNORED_TYPES.has(it.type)) for (const c of collidersOf(it, o)) own.push({ c, box: shapeAABB(c.shape) });
+      const pairs: CollisionPair[] = [];
+      const test = (A: { c: Collider; box: AABB }, B: { c: Collider; box: AABB }) => {
+        const state = map ? pairState(map, A.c, B.c) : 'default';
+        if (state === 'disabled') return;
+        if (state !== 'enabled' && skipPair(A.c, B.c, o, ignore)) return;
+        if (!aabbOverlap(A.box, B.box, margin)) return;
+        const d = pairDepth(A.c, B.c, o, margin);
+        if (d > 0) pairs.push({ a: A.c, b: B.c, depth: d });
+      };
+      for (let i = 0; i < own.length; i++) for (let j = i + 1; j < own.length; j++) test(own[i], own[j]);
+      for (const A of own) for (const B of statics) test(A, B);
+      return pairs;
+    },
+  };
 }

@@ -149,12 +149,13 @@ function orchard(): Station {
   mission.rowIds = field.rows().slice(0, 4).map((r) => r.id);
   mission.settings = { workSpeed: 400, bothSides: true, sideOffset: field.crop.rowSpacing / 2, secondsPerFruit: 4 };
   try { planMission(st, mission, fm); } catch { /* fleet may be empty */ }
-  const scoutMission = st.addChild(new MissionItem('Spray rows 5-8'));
-  scoutMission.missionType = 'spray';
-  scoutMission.fieldId = field.id;
-  scoutMission.fleetId = fleet.id;
-  scoutMission.rowIds = field.rows().slice(4, 8).map((r) => r.id);
-  scoutMission.settings = { workSpeed: 1500, bothSides: false, sideOffset: field.crop.rowSpacing / 2 };
+  const sprayMission = st.addChild(new MissionItem('Spray rows 5-8'));
+  sprayMission.missionType = 'spray';
+  sprayMission.fieldId = field.id;
+  sprayMission.fleetId = fleet.id;
+  sprayMission.rowIds = field.rows().slice(4, 8).map((r) => r.id);
+  sprayMission.settings = { workSpeed: 1500, bothSides: false, sideOffset: field.crop.rowSpacing / 2, tankL: 400 };
+  try { planMission(st, sprayMission, fm); } catch { /* fleet may be empty */ }
   return st;
 }
 

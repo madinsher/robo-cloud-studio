@@ -16,6 +16,8 @@ import { buildGeometry, buildLinkVisuals, makeTriad, makeTargetGlyph, polylineOb
 import { Mat4, multiply, invert, getPos, fromArray, transl } from '../core/math/pose';
 import { actuatedIndices } from '../core/kinematics/chain';
 import { Trajectory } from '../core/motion/trajectory';
+import { threeFovDeg, cameraIntrinsics } from '../vision/camera_model';
+import type { CameraRender } from '../vision/sensing';
 
 export interface RendererOptions {
   background?: number;
@@ -32,6 +34,10 @@ interface Entry {
   links?: THREE.Group[];
   flangeGroup?: THREE.Group;
   selectionBox?: THREE.BoxHelper;
+  /** Mesh references (ids and lower-case basenames) used by this entry: rebuilt when such an asset arrives. */
+  meshKeys?: string[];
+  /** showFrames/showTargets flags last applied to the subtree (avoids a traverse per frame). */
+  flags?: string;
 }
 
 export type SelectCallback = (item: Item | null, additive: boolean) => void;
@@ -133,7 +139,8 @@ export class SceneRenderer {
     this.renderer.domElement.addEventListener('pointerup', (e) => this.onPointerUp(e));
     this.renderer.domElement.addEventListener('dblclick', (e) => this.focusAt(e));
     window.addEventListener('resize', () => this.resize());
-    this.assets.onChange(() => this.rebuildAll());
+    // an asset that arrives (or changes) rebuilds exactly the entries referencing it (late URDF meshes replace placeholders)
+    this.assets.onChange((id) => this.onAssetChanged(id));
     this.bindStation(station);
     this.resize();
     this.renderer.setAnimationLoop(() => this.frame());
@@ -143,8 +150,9 @@ export class SceneRenderer {
     for (const off of this.offTree) off();
     this.offTree = [];
     this.station = station;
-    for (const e of this.entries.values()) this.scene.remove(e.root);
+    for (const e of this.entries.values()) { this.scene.remove(e.root); if (e.selectionBox) this.scene.remove(e.selectionBox); }
     this.entries.clear();
+    this.meshUsers.clear();
     this.setGizmo(null);
     this.offTree.push(station.events.on('changed', ({ item, what }) => {
       this.dirty = true;
@@ -288,19 +296,39 @@ export class SceneRenderer {
     if (this.trajectoryLine) { this.scene.remove(this.trajectoryLine); this.trajectoryLine = null; }
     if (!robot || !trajs.length) return;
     const base = robot.poseAbs();
-    const pts: THREE.Vector3[] = [];
-    const colors: number[] = [];
+    // at most ~60k vertices whatever the program length (machining programs have millions of samples)
+    let n = 0; for (const tr of trajs) n += tr.samples.length;
+    const stride = Math.max(1, Math.ceil(n / 60000));
+    const pos = new Float32Array(Math.ceil(n / stride) * 3 + 3);
+    const col = new Float32Array(pos.length);
+    let k = 0, v = 0;
     for (const tr of trajs) {
       const ok = tr.ok;
       for (const s of tr.samples) {
+        if (k++ % stride) continue;
         const p = getPos(multiply(base, s.pose));
-        pts.push(new THREE.Vector3(p[0], p[1], p[2]));
-        colors.push(ok ? 0.2 : 1, ok ? 0.9 : 0.2, ok ? 0.4 : 0.2);
+        pos[v] = p[0]; pos[v + 1] = p[1]; pos[v + 2] = p[2];
+        col[v] = ok ? 0.2 : 1; col[v + 1] = ok ? 0.9 : 0.2; col[v + 2] = ok ? 0.4 : 0.2;
+        v += 3;
       }
     }
-    if (!pts.length) return;
-    const geo = new THREE.BufferGeometry().setFromPoints(pts);
-    geo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+    if (!v) return;
+    this.setPathLine(pos.subarray(0, v), col.subarray(0, v));
+  }
+
+  /** Preview line from absolute TCP positions (x,y,z triples), e.g. computed by the compile worker. */
+  showPathPreview(points: Float32Array | null): void {
+    if (this.trajectoryLine) { this.scene.remove(this.trajectoryLine); this.trajectoryLine = null; }
+    if (!points || points.length < 6) return;
+    const col = new Float32Array(points.length);
+    for (let i = 0; i < col.length; i += 3) { col[i] = 0.2; col[i + 1] = 0.9; col[i + 2] = 0.4; }
+    this.setPathLine(points, col);
+  }
+
+  private setPathLine(pos: Float32Array, col: Float32Array) {
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
     this.trajectoryLine = new THREE.Line(geo, new THREE.LineBasicMaterial({ vertexColors: true }));
     this.trajectoryLine.renderOrder = 5;
     this.scene.add(this.trajectoryLine);
@@ -312,7 +340,7 @@ export class SceneRenderer {
   rebuildAll(): void {
     const live = new Set<string>();
     for (const item of this.station.walk()) {
-      if (item === this.station) continue;
+      if (item === this.station || !hasScene(item)) continue; // programs / instructions have no 3D node (5k-instruction programs)
       live.add(item.id);
       this.ensureEntry(item);
     }
@@ -324,8 +352,31 @@ export class SceneRenderer {
   private removeEntry(item: Item) {
     for (const it of item.walk()) {
       const e = this.entries.get(it.id);
-      if (e) { this.scene.remove(e.root); this.entries.delete(it.id); }
+      if (e) { this.scene.remove(e.root); this.entries.delete(it.id); this.unindexMeshes(e); }
     }
+  }
+
+  /** mesh key (id or lower-case basename) -> ids of entries using it. */
+  private meshUsers = new Map<string, Set<string>>();
+  private indexMeshes(e: Entry) {
+    const refs: string[] = [];
+    const add = (list: unknown) => { if (Array.isArray(list)) for (const r of list) if (r && typeof r.mesh === 'string') refs.push(r.mesh); };
+    add((e.item as any).geometry); add((e.item as any).colliders);
+    if (e.item instanceof Robot) for (const l of e.item.chain.links) add(l.visuals);
+    const keys = new Set<string>();
+    for (const r of refs) { keys.add(r); keys.add(r.split(/[\\/]/).pop()!.toLowerCase()); }
+    e.meshKeys = [...keys];
+    for (const k of keys) { let s = this.meshUsers.get(k); if (!s) this.meshUsers.set(k, (s = new Set())); s.add(e.item.id); }
+  }
+  private unindexMeshes(e: Entry) {
+    for (const k of e.meshKeys ?? []) this.meshUsers.get(k)?.delete(e.item.id);
+  }
+  private onAssetChanged(id: string) {
+    const a = this.assets.get(id);
+    for (const k of [id, id.split(/[\\/]/).pop()!.toLowerCase(), a?.name?.toLowerCase() ?? '']) {
+      for (const itemId of this.meshUsers.get(k) ?? []) if (this.entries.has(itemId)) this.structural.add(itemId);
+    }
+    this.dirty = true;
   }
 
   private signature(item: Item): string {
@@ -339,7 +390,7 @@ export class SceneRenderer {
     if (item instanceof PathItem) return `path:${item.points.length}:${item.closed}`;
     if (item instanceof Component) return `comp:${item.behaviour.type}:${JSON.stringify(item.geometry)}:${JSON.stringify((item.behaviour as any).path ?? null)}`;
     if (item instanceof Target) return `target:${item.isJointTarget}`;
-    if (item instanceof CameraItem) return `cam:${item.fov}`;
+    if (item instanceof CameraItem) return `cam:${item.fov}:${item.fovAxis}:${item.width}x${item.height}:${item.near}:${item.far}`;
     return `item:${item.type}`;
   }
 
@@ -347,12 +398,13 @@ export class SceneRenderer {
     let e = this.entries.get(item.id);
     const sig = this.signature(item);
     if (e && e.sig === sig && !this.structural.has(item.id)) return e;
-    if (e) this.scene.remove(e.root);
+    if (e) { this.scene.remove(e.root); this.unindexMeshes(e); if (e.selectionBox) { this.scene.remove(e.selectionBox); } }
     const root = new THREE.Group();
     root.matrixAutoUpdate = false;
     root.userData.itemId = item.id;
     e = { item, root, sig };
     this.buildItem(item, e);
+    this.indexMeshes(e);
     this.scene.add(root);
     this.entries.set(item.id, e);
     return e;
@@ -417,8 +469,8 @@ export class SceneRenderer {
         root.add(ph);
       }
     } else if (item instanceof CameraItem) {
-      const cam = new THREE.PerspectiveCamera(item.fov, item.width / item.height, item.near, Math.min(item.far, 3000));
-      cam.rotateY(Math.PI); // look down +Z of the item
+      const cam = new THREE.PerspectiveCamera(threeFovDeg(item), item.width / item.height, item.near, Math.min(item.far, 3000));
+      cam.rotateX(Math.PI); // look down +Z of the item with image Y down (same frame as renderFromItem)
       const helper = new THREE.CameraHelper(cam);
       root.add(cam);
       root.add(helper);
@@ -657,8 +709,8 @@ export class SceneRenderer {
     this.controls.update();
     if (this.structural.size) {
       for (const id of [...this.structural]) {
-        const it = this.station.findById(id);
-        if (it) for (const sub of it.walk()) this.ensureEntry(sub);
+        const it = this.entries.get(id)?.item ?? this.station.findById(id);
+        if (it && it.station === this.station) for (const sub of it.walk()) if (hasScene(sub)) this.ensureEntry(sub);
       }
       this.structural.clear();
     }
@@ -706,11 +758,15 @@ export class SceneRenderer {
           } else line.visible = false;
         }
       }
-      // frames/targets visibility toggles
-      e.root.traverse((o) => {
-        if (o.userData.isFrame) o.visible = this.showFrames;
-        if (o.userData.isTarget) o.visible = this.showTargets;
-      });
+      // frames/targets visibility toggles (only when the flags changed or the entry was rebuilt)
+      const flags = `${this.showFrames}${this.showTargets}`;
+      if (e.flags !== flags) {
+        e.flags = flags;
+        e.root.traverse((o) => {
+          if (o.userData.isFrame) o.visible = this.showFrames;
+          if (o.userData.isTarget) o.visible = this.showTargets;
+        });
+      }
       // selection / collision highlight
       const sel = selectedIds.has(item.id) || this.collisionIds.has(item.id);
       if (sel && !e.selectionBox) {
@@ -730,9 +786,105 @@ export class SceneRenderer {
     }
   }
 
+  /**
+   * Pixel-true buffers of a camera item (the WebGL side of vision/sensing.ts): metric depth in mm along the optical +Z
+   * (24-bit fixed point of depth/far), an instance-ID buffer with the same keys as the software rasterizer
+   * (`object:<id>`, `robot:<id>`, `tool:<id>`, `vehicle:<id>`, `component:<id>`, `field:<id>:trunk|canopy|fruit`,
+   * `ground`) and, with `rgb`, the shaded colour image — one camera model (cameraIntrinsics), no antialiasing, so masks
+   * and overlays are exact. Returns null for another station (the caller falls back to software).
+   */
+  renderCameraBuffers(station: Station, cam: CameraItem, req: { width?: number; height?: number; rgb?: boolean; ground?: boolean } = {}): CameraRender | null {
+    if (station !== this.station) return null;
+    for (const it of station.walk()) if (it !== station && !this.entries.has(it.id)) this.ensureEntry(it);
+    this.syncTransforms();
+    const w = Math.round(req.width ?? cam.width), h = Math.round(req.height ?? cam.height);
+    const K = cameraIntrinsics(cam, w, h);
+    const tc = new THREE.PerspectiveCamera(threeFovDeg(cam, w, h), w / h, cam.near, cam.far);
+    const cm = mat4ToThree(cam.poseAbs()).multiply(new THREE.Matrix4().makeRotationX(Math.PI));
+    tc.matrixAutoUpdate = false; tc.matrix.copy(cm); tc.matrixWorld.copy(cm); tc.matrixWorldInverse.copy(cm).invert(); tc.updateProjectionMatrix();
+    // drawable meshes → instance keys (everything else — helpers, frames, targets, gizmo, grid — is hidden)
+    const keyOf = (o: THREE.Object3D): string | null => {
+      let p: THREE.Object3D | null = o;
+      while (p && p.userData.itemId === undefined) p = p.parent;
+      const it = p ? station.findById(p.userData.itemId) : null;
+      if (!it) return null;
+      if (it instanceof Robot) return `robot:${it.id}`;
+      if (it instanceof Tool) return `tool:${it.id}`;
+      if (it instanceof SceneObject) return `object:${it.id}`;
+      if (it instanceof MobileRobot) return `vehicle:${it.id}`;
+      if (it instanceof Component) return `component:${it.id}`;
+      if (it instanceof FieldItem && o instanceof THREE.InstancedMesh) { const g = o.geometry as THREE.BufferGeometry & { parameters?: { radius?: number } }; return `field:${it.id}:${g.type === 'CylinderGeometry' ? 'trunk' : g.parameters?.radius === 1 ? 'fruit' : 'canopy'}`; }
+      return null;
+    };
+    this.scene.updateMatrixWorld(true);
+    const keys: string[] = [], keyIdx = new Map<string, number>(), drawn: Array<{ mesh: THREE.Mesh; k: number }> = [];
+    const hidden: THREE.Object3D[] = [];
+    this.scene.traverseVisible((o) => {
+      if (o === this.scene || o instanceof THREE.Light) return;
+      if (!(o instanceof THREE.Mesh)) { if (!o.children.length || o instanceof THREE.Line || o instanceof THREE.Points || o instanceof THREE.Sprite) hidden.push(o); return; }
+      const mat = (Array.isArray(o.material) ? o.material[0] : o.material) as THREE.Material & { wireframe?: boolean };
+      const key = mat && !mat.wireframe && !(mat.transparent && mat.opacity < 0.3) && mat.depthWrite !== false ? keyOf(o) : null;
+      if (!key) { hidden.push(o); return; }
+      let k = keyIdx.get(key); if (k === undefined) { k = keys.length; keys.push(key); keyIdx.set(key, k); }
+      drawn.push({ mesh: o, k });
+    });
+    let ground: THREE.Mesh | null = null;
+    if (req.ground) { ground = new THREE.Mesh(new THREE.PlaneGeometry(2e6, 2e6), new THREE.MeshBasicMaterial({ color: 0x50555c, side: THREE.DoubleSide })); ground.matrixAutoUpdate = false; ground.updateMatrixWorld(true); this.scene.add(ground); keys.push('ground'); drawn.push({ mesh: ground, k: keys.length - 1 }); }
+    for (const o of hidden) o.visible = false;
+    const helperVisible = this.transform.getHelper().visible; this.transform.getHelper().visible = false;
+    const bg = this.scene.background, fog = this.scene.fog, clear = new THREE.Color(); this.renderer.getClearColor(clear); const clearA = this.renderer.getClearAlpha();
+    const rt = new THREE.WebGLRenderTarget(w, h, { type: THREE.UnsignedByteType, minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter, depthBuffer: true, samples: 0 });
+    const buf = new Uint8Array(w * h * 4);
+    const vert = 'varying float vDepth;\nvoid main() {\n  vec4 p = vec4(position, 1.0);\n#ifdef USE_INSTANCING\n  p = instanceMatrix * p;\n#endif\n  vec4 mv = modelViewMatrix * p;\n  vDepth = -mv.z;\n  gl_Position = projectionMatrix * mv;\n}';
+    const passMaterial = (frag: string, uniforms: Record<string, THREE.IUniform>) => new THREE.ShaderMaterial({ vertexShader: vert, fragmentShader: frag, uniforms, side: THREE.DoubleSide });
+    const saved = drawn.map((d) => d.mesh.material);
+    const flipRead = (): Uint8Array => { this.renderer.readRenderTargetPixels(rt, 0, 0, w, h, buf); const out = new Uint8Array(w * h * 4); for (let y = 0; y < h; y++) out.set(buf.subarray((h - 1 - y) * w * 4, (h - y) * w * 4), y * w * 4); return out; };
+    const mats: THREE.Material[] = [];
+    let ids: Int32Array, depth: Float32Array, rgba: Uint8ClampedArray | undefined;
+    try {
+      this.scene.background = null; this.scene.fog = null;
+      this.renderer.setClearColor(0x000000, 0);
+      this.renderer.setRenderTarget(rt);
+      // 1. instance IDs (index + 1 in 24 bits; 0 = background)
+      const idMats = keys.map((_, k) => { const id = k + 1; const m = passMaterial('uniform vec3 idColor;\nvoid main() { gl_FragColor = vec4(idColor, 1.0); }', { idColor: { value: new THREE.Vector3((id & 255) / 255, ((id >> 8) & 255) / 255, ((id >> 16) & 255) / 255) } }); mats.push(m); return m; });
+      drawn.forEach((d) => { d.mesh.material = idMats[d.k]; });
+      this.renderer.render(this.scene, tc);
+      const idb = flipRead();
+      ids = new Int32Array(w * h);
+      for (let i = 0; i < w * h; i++) ids[i] = (idb[i * 4] | (idb[i * 4 + 1] << 8) | (idb[i * 4 + 2] << 16)) - 1;
+      // 2. metric depth: q = round(z / far · (2²⁴ − 1)) in RGB
+      const dm = passMaterial('uniform float farEnc;\nvarying float vDepth;\nvoid main() {\n  float q = floor(clamp(vDepth / farEnc, 0.0, 1.0) * 16777215.0 + 0.5);\n  q = max(q, 1.0);\n  float b = floor(q / 65536.0); float r2 = q - b * 65536.0; float g = floor(r2 / 256.0); float r = r2 - g * 256.0;\n  gl_FragColor = vec4(r / 255.0, g / 255.0, b / 255.0, 1.0);\n}', { farEnc: { value: cam.far } });
+      mats.push(dm);
+      drawn.forEach((d) => { d.mesh.material = dm; });
+      this.renderer.render(this.scene, tc);
+      const db = flipRead();
+      depth = new Float32Array(w * h);
+      for (let i = 0; i < w * h; i++) { const q = db[i * 4] + db[i * 4 + 1] * 256 + db[i * 4 + 2] * 65536; depth[i] = q > 0 && ids[i] >= 0 ? (q / 16777215) * cam.far : 0; }
+      // 3. colour (normal materials, lights and background; helpers stay hidden)
+      drawn.forEach((d, i) => { d.mesh.material = saved[i]; });
+      if (req.rgb) {
+        this.scene.background = bg; this.scene.fog = fog; this.renderer.setClearColor(clear, clearA);
+        if (ground) ground.visible = false;
+        this.renderer.render(this.scene, tc);
+        rgba = new Uint8ClampedArray(flipRead().buffer);
+      }
+    } finally {
+      drawn.forEach((d, i) => { d.mesh.material = saved[i]; });
+      for (const m of mats) m.dispose();
+      for (const o of hidden) o.visible = true;
+      if (ground) { this.scene.remove(ground); ground.geometry.dispose(); (ground.material as THREE.Material).dispose(); }
+      this.transform.getHelper().visible = helperVisible;
+      this.scene.background = bg; this.scene.fog = fog; this.renderer.setClearColor(clear, clearA);
+      this.renderer.setRenderTarget(null);
+      rt.dispose();
+    }
+    return { width: w, height: h, K, camWorld: cam.poseAbs(), near: cam.near, far: cam.far, depth, ids, keys, rgba, source: 'webgl' };
+  }
+
   /** Render the scene from an item's frame (camera looks along +Z, X right, Y down) into a canvas element. */
   renderFromItem(item: Item, target: HTMLCanvasElement, fov = 60, near = 10, far = 50000, depth = false): void {
-    const cam = new THREE.PerspectiveCamera(fov, target.width / target.height, near, far);
+    // a camera item always renders with the studio camera model (vision/camera_model.ts): its fov axis and resolution decide K
+    const cam = new THREE.PerspectiveCamera(item instanceof CameraItem ? threeFovDeg(item, target.width, target.height) : fov, target.width / target.height, near, far);
     const m = mat4ToThree(item.poseAbs());
     // three cameras look along -Z: rotate 180° about X so the item's +Z becomes the viewing direction with Y down
     const flip = new THREE.Matrix4().makeRotationX(Math.PI);
@@ -802,6 +954,11 @@ function hashCells(c: Uint8Array): number {
   let h = 0;
   for (let i = 0; i < c.length; i += 7) h = (h * 31 + c[i]) | 0;
   return h;
+}
+
+/** Items that get a scene node (programs and their instructions are not drawn). */
+function hasScene(item: Item): boolean {
+  return item.type !== ItemType.INSTRUCTION && item.type !== ItemType.PROGRAM;
 }
 
 export { Program };

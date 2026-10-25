@@ -42,7 +42,7 @@ export type { Opts } from './dsl_core';
 /** Detect the document kind from its first keyword. */
 export function detectKind(src: string): ControlKind | null {
   const first = lines(src)[0]?.text.trim().split(/\s+/)[0]?.toLowerCase();
-  const map: Record<string, ControlKind> = { automaton: 'des', spec: 'des', des: 'des', plant: 'des', petri: 'petri', s3pr: 's3pr', smv: 'smv', module: 'smv', bt: 'bt', behavior: 'bt', statechart: 'statechart', gr1: 'gr1', hybrid: 'hybrid', modes: 'hybrid', pddl: 'pddl', '(define': 'pddl', stn: 'stn', stnu: 'stn', mdp: 'mdp', pomdp: 'pomdp', jobshop: 'jobshop', realtime: 'realtime', fta: 'fta', reliability: 'reliability', mrta: 'mrta', mapf: 'mapf', stl: 'stl', fmea: 'fmea', acceptance: 'acceptance', perf: 'perf' };
+  const map: Record<string, ControlKind> = { fsm: 'fsm', automaton: 'des', spec: 'des', des: 'des', plant: 'des', petri: 'petri', s3pr: 's3pr', smv: 'smv', module: 'smv', bt: 'bt', behavior: 'bt', statechart: 'statechart', gr1: 'gr1', hybrid: 'hybrid', modes: 'hybrid', pddl: 'pddl', '(define': 'pddl', stn: 'stn', stnu: 'stn', mdp: 'mdp', pomdp: 'pomdp', jobshop: 'jobshop', realtime: 'realtime', fta: 'fta', reliability: 'reliability', mrta: 'mrta', mapf: 'mapf', stl: 'stl', fmea: 'fmea', acceptance: 'acceptance', perf: 'perf' };
   if (!first) return null;
   if (first.startsWith('(define')) return 'pddl';
   return map[first] ?? detectMrsKind(src);
@@ -52,19 +52,27 @@ export function detectKind(src: string): ControlKind | null {
 // DES
 // ---------------------------------------------------------------------------------------------
 
-export interface DesDoc { name: string; plant: AutomatonSpec[]; specs: AutomatonSpec[]; uncontrollable: string[]; unobservable: string[]; faults: string[]; checks: Array<{ kind: 'ltl' | 'ctl'; formula: string; name?: string }>; supervisorName?: string; /** Diagram positions per automaton (graphical editor). */ layout?: Record<string, Record<string, [number, number]>>; /** Robot actions bound to states (`Automaton.state`). */ actions: ActionBinding[] }
+export interface DesDoc { name: string; plant: AutomatonSpec[]; specs: AutomatonSpec[]; uncontrollable: string[]; unobservable: string[]; faults: string[]; checks: Array<{ kind: 'ltl' | 'ctl'; formula: string; name?: string }>; supervisorName?: string; /** Diagram positions per automaton (graphical editor). */ layout?: Record<string, Record<string, [number, number]>>; /** Robot actions bound to states (`Automaton.state`). */ actions: ActionBinding[]; /** `guard <event> "<expr>"`: the controllable event is issued only while the expression over the blackboard / station signals holds. */ guards?: Record<string, string>; /** `sensor <event> "<expr>"`: the world raises the (uncontrollable) event on each rising edge of the expression. */ sensors?: SensorSpec[]; /** `blackboard k=v …`: initial blackboard values of the executor. */ blackboard?: Record<string, string | number | boolean> }
+/** A sensor-driven event: raised on every rising edge of a blackboard / signal expression (`sensor part_in "part_present"`). */
+export interface SensorSpec { event: string; expr: string }
 
 const TRANS_RE = /^(\S+)\s*-+\s*(.+?)\s*-+>\s*(\S+)$/;
 
-/** A robot / cell action bound to an automaton state (`Automaton.state`) or a Petri transition (see ctl/exec.ts). */
-export interface ActionBinding { target: string; kind: 'program' | 'target' | 'goto' | 'signal' | 'wait' | 'event' | 'set'; value: string; robot?: string; done?: string; component?: string; args: Record<string, string | number | boolean> }
-export const ACTION_KINDS: ActionBinding['kind'][] = ['program', 'target', 'goto', 'signal', 'wait', 'event', 'set'];
-function parseAction(words: string[], opts: Opts, n: number): ActionBinding {
-  const target = words[1]; if (!target) throw new DslError('action <state|transition> program=|target=|goto=|signal=|wait=|event=|set= …', n);
+/**
+ * A robot / cell action bound to an automaton state (`Automaton.state`), a Petri transition or an FSM state (see ctl/exec.ts).
+ * `done=` event fired on success, `fail=` event fired on failure (automata), `timeout=` seconds after which the action is
+ * halted and fails. `await` waits for a blackboard / signal expression; `skill` calls a named mobile skill (dock, reach…).
+ */
+export interface ActionBinding { target: string; kind: 'program' | 'target' | 'goto' | 'signal' | 'wait' | 'event' | 'set' | 'await' | 'skill'; value: string; robot?: string; done?: string; fail?: string; timeout?: number; component?: string; args: Record<string, string | number | boolean> }
+export const ACTION_KINDS: ActionBinding['kind'][] = ['program', 'target', 'goto', 'signal', 'wait', 'event', 'set', 'await', 'skill'];
+export function parseAction(words: string[], opts: Opts, n: number, targetIndex = 1): ActionBinding {
+  const target = words[targetIndex] ?? ''; if (targetIndex && !target) throw new DslError('action <state|transition> program=|target=|goto=|signal=|wait=|event=|set=|await=|skill= …', n);
   const kind = ACTION_KINDS.find((k) => opts[k] !== undefined); if (!kind) throw new DslError(`action ${target}: one of ${ACTION_KINDS.map((k) => `${k}=`).join(' ')} is required`, n);
-  const args: ActionBinding['args'] = {}; for (const [k, v] of Object.entries(opts)) if (!['robot', 'done', 'component', kind].includes(k)) args[k] = v;
-  return { target, kind, value: String(opts[kind]), robot: opts.robot !== undefined ? String(opts.robot) : undefined, done: opts.done !== undefined ? String(opts.done) : undefined, component: opts.component !== undefined ? String(opts.component) : undefined, args };
+  const args: ActionBinding['args'] = {}; for (const [k, v] of Object.entries(opts)) if (!['robot', 'done', 'fail', 'timeout', 'component', kind].includes(k)) args[k] = v;
+  return { target, kind, value: String(opts[kind]), robot: opts.robot !== undefined ? String(opts.robot) : undefined, done: opts.done !== undefined ? String(opts.done) : undefined, fail: opts.fail !== undefined ? String(opts.fail) : undefined, timeout: opts.timeout !== undefined ? Number(opts.timeout) : undefined, component: opts.component !== undefined ? String(opts.component) : undefined, args };
 }
+/** Expression of a `guard` / `sensor` line: the quoted text or the rest of the line. */
+const exprOf = (t: string, kw: string, ev: string, quoted: string[]) => quoted[0] ?? t.slice(t.indexOf(ev, kw.length) + ev.length).trim();
 
 /** `key=x,y` options → positions. */
 function layoutOf(opts: Opts): Record<string, [number, number]> {
@@ -86,6 +94,9 @@ export function parseDes(src: string): DesDoc {
     if (kw === 'check') { const kind = words[1]?.toLowerCase() as 'ltl' | 'ctl'; const name = quoted[0]; const rest = t.replace(/^check\s+\w+\s*/i, '').replace(name ? `"${name}"` : '', '').trim(); if (kind !== 'ltl' && kind !== 'ctl') throw new DslError('check ltl|ctl <formula>', l.n); doc.checks.push({ kind, formula: rest, name }); continue; }
     if (kw === 'layout') { const auto = words[1]; if (!auto) throw new DslError('layout <automaton> state=x,y …', l.n); (doc.layout ??= {})[auto] = { ...(doc.layout?.[auto] ?? {}), ...layoutOf(opts) }; continue; }
     if (kw === 'action') { doc.actions.push(parseAction(words, opts, l.n)); continue; }
+    if (kw === 'guard') { const ev = words[1]; if (!ev) throw new DslError('guard <event> "<expression>"', l.n); (doc.guards ??= {})[ev] = exprOf(t, kw, ev, quoted); continue; }
+    if (kw === 'blackboard' || kw === 'bb') { Object.assign((doc.blackboard ??= {}), opts); continue; }
+    if (kw === 'sensor') { const ev = words[1]; if (!ev) throw new DslError('sensor <event> "<expression>"', l.n); (doc.sensors ??= []).push({ event: ev, expr: exprOf(t, kw, ev, quoted) }); continue; }
     if (!cur) throw new DslError(`expected 'automaton <name>' before '${t}'`, l.n);
     if (kw === 'events') { cur.events.push(...words.slice(1)); continue; }
     if (kw === 'initial') { cur.initial = words[1]; continue; }
@@ -105,13 +116,24 @@ export { automatonToDsl } from './graphdoc';
 // Petri nets and S³PR
 // ---------------------------------------------------------------------------------------------
 
-export function parsePetri(src: string): { spec: PetriNetSpec; checks: Array<{ kind: 'ltl' | 'ctl'; formula: string; name?: string }>; horizon: number; layout: Record<string, [number, number]>; actions: ActionBinding[] } {
-  const spec: PetriNetSpec = { name: 'Petri net', places: [], transitions: [], arcs: [] }; const checks: DesDoc['checks'] = []; let horizon = 300; let layout: Record<string, [number, number]> = {}; const actions: ActionBinding[] = [];
+/**
+ * Petri document. Transitions: `delay=` (deterministic, s), `rate=` (exponential, 1/s), `immediate` (zero time, pre-empts
+ * timed ones), `priority=`, `servers=` (concurrent firings, default 1 = single-server), `guard="<expr>"` (blackboard /
+ * station signals), `on=<event>` (input transition: fires only when the event occurs). `final p q=2` declares a final
+ * marking (the run ends as *done* there, any other dead marking is a *deadlock*); `sensor <event> "<expr>"` raises an
+ * event on each rising edge of an expression.
+ */
+export interface PetriParse { spec: PetriNetSpec; checks: Array<{ kind: 'ltl' | 'ctl'; formula: string; name?: string }>; horizon: number; layout: Record<string, [number, number]>; actions: ActionBinding[]; finals?: Array<Record<string, number>>; sensors?: SensorSpec[]; blackboard?: Record<string, string | number | boolean> }
+export function parsePetri(src: string): PetriParse {
+  const spec: PetriNetSpec = { name: 'Petri net', places: [], transitions: [], arcs: [] }; const checks: DesDoc['checks'] = []; let horizon = 300; let layout: Record<string, [number, number]> = {}; const actions: ActionBinding[] = []; const finals: Array<Record<string, number>> = []; const sensors: SensorSpec[] = []; let bbInit: Record<string, string | number | boolean> | undefined;
   for (const l of lines(src)) {
     const t = l.text.trim(); const { words, opts, quoted } = tokenize(t); const kw = words[0]?.toLowerCase();
     if (kw === 'petri') { spec.name = words.slice(1).filter((w) => !w.includes('=')).join(' ') || spec.name; if (typeof opts.horizon === 'number') horizon = opts.horizon; continue; }
     if (kw === 'place') { spec.places.push({ id: words[1], tokens: Number(opts.tokens ?? opts.m0 ?? 0), kind: (opts.kind as PlaceKind) ?? undefined, capacity: opts.capacity as number | undefined, label: quoted[0] }); continue; }
-    if (kw === 'transition' || kw === 'trans') { spec.transitions.push({ id: words[1], delay: opts.delay as number | undefined, rate: opts.rate as number | undefined, immediate: words.includes('immediate') || opts.immediate === true, weight: opts.weight as number | undefined, priority: opts.priority as number | undefined, label: quoted[0] }); continue; }
+    if (kw === 'transition' || kw === 'trans') { spec.transitions.push({ id: words[1], delay: opts.delay as number | undefined, rate: opts.rate as number | undefined, immediate: words.includes('immediate') || opts.immediate === true, weight: opts.weight as number | undefined, priority: opts.priority as number | undefined, servers: opts.servers !== undefined ? Number(opts.servers) : undefined, guard: opts.guard !== undefined ? String(opts.guard) : undefined, on: opts.on !== undefined ? String(opts.on) : undefined, label: quoted.find((x) => x !== opts.guard) }); continue; }
+    if (kw === 'blackboard' || kw === 'bb') { Object.assign((bbInit ??= {}), opts); continue; }
+    if (kw === 'final') { const m: Record<string, number> = {}; for (const w of words.slice(1)) m[w] = 1; for (const [k, v] of Object.entries(opts)) m[k] = Number(v); finals.push(m); continue; }
+    if (kw === 'sensor') { const ev = words[1]; if (!ev) throw new DslError('sensor <event> "<expression>"', l.n); sensors.push({ event: ev, expr: exprOf(t, kw, ev, quoted) }); continue; }
     if (kw === 'arc') {
       const body = t.replace(/^arc\s+/i, '').replace(/\s+weight=\S+/, '');
       const inhibitor = /-o\s/.test(body) || / -o$/.test(body);
@@ -125,7 +147,7 @@ export function parsePetri(src: string): { spec: PetriNetSpec; checks: Array<{ k
     if (kw === 'action') { actions.push(parseAction(words, opts, l.n)); continue; }
     throw new DslError(`cannot parse '${t}'`, l.n);
   }
-  return { spec, checks, horizon, layout, actions };
+  return { spec, checks, horizon, layout, actions, ...(finals.length ? { finals } : {}), ...(sensors.length ? { sensors } : {}), ...(bbInit ? { blackboard: bbInit } : {}) };
 }
 
 export function parseS3PR(src: string): S3PRSpec {
@@ -203,7 +225,10 @@ export function parseBt(src: string): BtDoc {
     if (!type) throw new DslError(`unknown node type '${kw}'`, l.n);
     const node: BTNodeSpec = { type };
     const rest = words.slice(1).filter((w) => !/^[A-Za-z_][\w.]*=/.test(w) || quoted.includes(w));
-    if (type === 'action' || type === 'condition') { node.fn = rest[0]; if (type === 'condition' && !node.fn) throw new DslError('condition needs an expression or binding', l.n); if (typeof opts.name === 'string') node.name = opts.name; else if (quoted[0] && quoted[0] !== rest[0]) node.name = quoted[0]; const args: Record<string, unknown> = {}; for (const [k, v] of Object.entries(opts)) if (!['name', 'timeout', 'pre', 'post'].includes(k)) args[k] = v; node.args = args; if (opts.timeout !== undefined) node.timeout = Number(opts.timeout); if (typeof opts.pre === 'string') node.pre = opts.pre; if (typeof opts.post === 'string') node.post = opts.post; }
+    if (type === 'action' || type === 'condition') { node.fn = rest[0]; if (type === 'condition' && !node.fn) throw new DslError('condition needs an expression or binding', l.n);
+      // `program name=X` / `signal name=X` (older editor output): the name is the argument, not the node label
+      if (type === 'action' && (node.fn === 'program' || node.fn === 'signal') && opts[node.fn] === undefined && opts.name !== undefined) { opts[node.fn] = opts.name; delete opts.name; }
+      if (typeof opts.name === 'string') node.name = opts.name; else if (quoted[0] && quoted[0] !== rest[0]) node.name = quoted[0]; const args: Record<string, unknown> = {}; for (const [k, v] of Object.entries(opts)) if (!['name', 'timeout', 'pre', 'post'].includes(k)) args[k] = v; node.args = args; if (opts.timeout !== undefined) node.timeout = Number(opts.timeout); if (typeof opts.pre === 'string') node.pre = opts.pre; if (typeof opts.post === 'string') node.post = opts.post; }
     else {
       const num = rest.find((w) => /^\d+(\.\d+)?$/.test(w)); const nm = quoted[0] ?? rest.find((w) => !/^\d+(\.\d+)?$/.test(w) && w !== 'memory');
       node.name = (opts.name as string) ?? nm ?? type;
@@ -471,6 +496,35 @@ spec Buffer   # one slot: M2 may start only after M1 finished
   F -start2-> E
 uncontrollable finish1 finish2
 check ltl G(M1='W' -> F M1='I')`,
+  fsm: `fsm Pick all boxes
+blackboard remaining=3 picked=0
+outcomes done aborted
+state Home initial
+  do program=Home timeout=30
+  ok -> Cycle
+  fail -> aborted
+machine Cycle
+  outcomes empty failed
+  state Plan decision
+    when "remaining > 0" -> next
+    otherwise -> empty
+    next -> Pick
+  state Pick
+    do program=Pick timeout=60
+    exit set=remaining value="=remaining - 1"
+    ok -> Place
+    fail -> failed
+  state Place
+    do program=Place timeout=60
+    exit set=picked value="=picked + 1"
+    ok -> Plan
+    fail -> failed
+  empty -> Park
+  failed -> aborted
+state Park
+  do program=Home timeout=30
+  ok -> done
+  fail -> aborted`,
   petri: `petri Two processes sharing a robot and a zone
 place p1 tokens=1 kind=idle
 place a1 kind=activity

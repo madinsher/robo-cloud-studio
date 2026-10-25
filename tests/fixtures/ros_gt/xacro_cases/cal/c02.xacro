@@ -1,0 +1,4 @@
+<?xml version="1.0"?>
+<robot name="r" xmlns:xacro="http://www.ros.org/wiki/xacro">
+<v a="${sorted([3,1])}" b="${list(range(3))}" c="${'%.2f' % 1.234}" e="${'x'.upper()}" f="${len('abc')}" g="${max(1, 2.5)}" h="${float(2)}" i="${str(1.0)}" j="${dict(a=1)['a']}" k="${[0.5,0.6][1]}" l="${'a' in 'abc'}" m="${1 if 0 else 2}" n="${not 0}" o="${1 &lt; 2 &lt; 3}" p="${'%s_%d' % ('x', 3)}" q="${[x*2 for x in [1,2]]}" r="${'a b'.split()}" s="${0 or 'z'}" t="${1e3}" u="${'%g' % 0.5}" w="${2**0.5}" x="${10**20}" y="${floor(2.5)}" z="${ceil(2.1)}"/>
+</robot>

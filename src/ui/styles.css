@@ -17,7 +17,7 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .panel-body { padding: 8px 10px; overflow: auto; }
 .tree-filter { width: 110px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 4px; padding: 2px 6px; }
 .tree-list { overflow: auto; flex: 1; padding: 4px 0; }
-.tree-row { display: flex; align-items: center; gap: 4px; padding: 2px 6px; cursor: pointer; white-space: nowrap; user-select: none; }
+.tree-row { display: flex; align-items: center; gap: 4px; padding: 2px 6px; height: 22px; box-sizing: border-box; cursor: pointer; white-space: nowrap; user-select: none; }
 .tree-row:hover { background: var(--panel-2); }
 .tree-row.selected { background: var(--sel); }
 .tree-row.active .tree-name { color: var(--accent); }
@@ -104,7 +104,8 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .pe-add { display: flex; flex-wrap: wrap; gap: 3px; align-items: center; color: var(--muted); font-size: 12px; }
 .prog-select { background: var(--panel-2); border: 1px solid var(--border); border-radius: 4px; padding: 2px 6px; max-width: 200px; }
 .ins-list { flex: 1; overflow: auto; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; }
-.ins-row { display: flex; align-items: center; gap: 8px; padding: 2px 8px; cursor: pointer; border-left: 3px solid transparent; }
+.ins-row { display: flex; align-items: center; gap: 8px; padding: 2px 8px; height: 22px; box-sizing: border-box; white-space: nowrap; cursor: pointer; border-left: 3px solid transparent; }
+.ins-row.error-at { background: rgba(255,77,77,0.18); }
 .ins-row:hover { background: var(--panel-2); }
 .ins-row.selected { background: var(--sel); }
 .ins-row.running { border-left-color: var(--accent-2); background: rgba(81,207,102,0.12); }
@@ -255,3 +256,7 @@ progress { accent-color: var(--accent-2); }
 .ctl-plot { background: var(--panel-2); border-radius: 4px; display: block; } .ctl-plot .plot-title { fill: var(--text); font-size: 11px; font-weight: 600; } .ctl-plot .plot-tick { fill: var(--muted); font-size: 9px; } .ctl-plot .plot-label { fill: var(--muted); font-size: 10px; } .ctl-plot .plot-grid { stroke: var(--border); stroke-width: 0.6; } .ctl-plot .plot-frame { fill: none; stroke: var(--muted); stroke-width: 0.8; opacity: 0.6; } .ctl-plot .plot-obstacle { fill: var(--muted); opacity: 0.45; }
 .ctl-plot .plot-marker.goal { stroke: #ff6b6b; stroke-width: 1.6; } .ctl-plot .plot-marker.source { fill: #fab005; } .ctl-plot .plot-marker.station { fill: #4dabf7; } .ctl-plot .plot-marker.task { fill: #51cf66; } .ctl-plot .plot-marker.robot { fill: none; stroke: var(--text); stroke-width: 1.2; } .ctl-plot .plot-marker.start { fill: none; stroke: #51cf66; stroke-width: 1.4; } .ctl-plot .plot-marker.obstacle { fill: var(--muted); }
 .ctx-item.disabled { opacity: 0.55; font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; }
+
+.progress-pill { position: fixed; left: 50%; bottom: 34px; transform: translateX(-50%); background: var(--panel-2); border: 1px solid var(--border); border-radius: 14px; padding: 4px 14px; font-size: 12px; z-index: 90; pointer-events: none; }
+.vlist-pad { flex: none; }
+.sim-state { margin-left: 8px; color: var(--muted); }

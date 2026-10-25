@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<COLLADA xmlns="http://www.collada.org/2005/11/COLLADASchema" version="1.4.1">
+  <asset><unit name="meter" meter="1"/><up_axis>Z_UP</up_axis></asset>
+  <library_images><image id="img1"><init_from>tex.png</init_from></image></library_images>
+  <library_effects>
+    <effect id="eff-tex"><profile_COMMON>
+      <newparam sid="surf"><surface type="2D"><init_from>img1</init_from></surface></newparam>
+      <newparam sid="samp"><sampler2D><source>surf</source></sampler2D></newparam>
+      <technique sid="common"><lambert><diffuse><texture texture="samp" texcoord="UVMap"/></diffuse></lambert></technique>
+    </profile_COMMON></effect>
+    <effect id="eff-col"><profile_COMMON><technique sid="common"><phong><diffuse><color>0.1 0.8 0.3 1</color></diffuse><transparency><float>0.6</float></transparency></phong></technique></profile_COMMON></effect>
+  </library_effects>
+  <library_materials><material id="mat-tex" name="leaves"><instance_effect url="#eff-tex"/></material><material id="mat-col" name="bark"><instance_effect url="#eff-col"/></material></library_materials>
+  <library_geometries><geometry id="quad"><mesh>
+    <source id="p"><float_array id="pa" count="12">0 0 0 0.2 0 0 0.2 0.2 0 0 0.2 0</float_array><technique_common><accessor source="#pa" count="4" stride="3"/></technique_common></source>
+    <source id="t"><float_array id="ta" count="8">0 0 1 0 1 1 0 1</float_array><technique_common><accessor source="#ta" count="4" stride="2"/></technique_common></source>
+    <vertices id="v"><input semantic="POSITION" source="#p"/></vertices>
+    <triangles material="m1" count="1"><input semantic="VERTEX" source="#v" offset="0"/><input semantic="TEXCOORD" source="#t" offset="1" set="0"/><p>0 0 1 1 2 2</p></triangles>
+    <triangles material="m2" count="1"><input semantic="VERTEX" source="#v" offset="0"/><input semantic="TEXCOORD" source="#t" offset="1" set="0"/><p>0 0 2 2 3 3</p></triangles>
+  </mesh></geometry></library_geometries>
+  <library_visual_scenes><visual_scene id="s"><node id="n"><translate>0 0 0.1</translate>
+    <instance_geometry url="#quad"><bind_material><technique_common><instance_material symbol="m1" target="#mat-tex"/><instance_material symbol="m2" target="#mat-col"/></technique_common></bind_material></instance_geometry>
+  </node></visual_scene></library_visual_scenes>
+</COLLADA>

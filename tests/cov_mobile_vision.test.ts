@@ -87,8 +87,9 @@ describe('mobile items', () => {
     expect([r2.payloadKg, r2.rosNamespace, r2.fleetId]).toEqual([400, '/tractor', 'fleet-1']);
     expect(r2.home).toEqual({ x: 1, y: 2, theta: 3 });
     expect(r2.state.odometer).toBe(777);
-    expect(r2.state.path).toBeNull(); // transient path progress is not restored
-    expect(r2.state.pathIndex).toBe(0);
+    // a station saved mid-mission resumes the path being followed (agri_mobile B10)
+    expect(r2.state.path).toEqual([[0, 0], [1, 1]]);
+    expect(r2.state.pathIndex).toBe(1);
     expect(r2.state.x).toBeCloseTo(1000);
     expect(r2.state.theta).toBeCloseTo(90, 6);
     const m2 = copy.itemsOfType<MapItem>(ItemType.MAP)[0];

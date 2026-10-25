@@ -1,0 +1,4 @@
+<?xml version="1.0"?>
+<robot name="r" xmlns:xacro="http://www.ros.org/wiki/xacro">
+<xacro:property name="v" value="1"/><t>text ${v} and $(arg_text) &amp; more</t><t2>  spaced  ${v+1}  </t2>
+</robot>

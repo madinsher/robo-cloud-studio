@@ -24,13 +24,21 @@ import type { Vec3, Mat4 } from '../core/math/pose';
 import { multiply, transl, rotx, roty, rotz } from '../core/math/pose';
 import type { Intrinsics } from './camera_model';
 import type { PointCloud } from './pointcloud';
+import type { CameraRender } from './sensing';
 import { VISION_MODELS, VisionModelSpec, VisionTask, VisionStackConfig } from './stack';
 
 // ---------------------------------------------------------------------------------------------
 // Common types
 // ---------------------------------------------------------------------------------------------
 
-export interface Mask { data: Uint8Array; width: number; height: number }
+/** Binary mask cropped to a pixel window; (x0, y0) is its top-left pixel in the image (default floor(box.x), floor(box.y)). */
+export interface Mask { data: Uint8Array; width: number; height: number; x0?: number; y0?: number }
+/** Mask value at image pixel (x, y) for a box. */
+export function maskAt(b: { x: number; y: number; mask?: Mask }, x: number, y: number): boolean {
+  const m = b.mask; if (!m) return true;
+  const mx = x - (m.x0 ?? Math.floor(b.x)), my = y - (m.y0 ?? Math.floor(b.y));
+  return mx >= 0 && my >= 0 && mx < m.width && my < m.height && m.data[my * m.width + mx] !== 0;
+}
 export interface Box2D {
   x: number; y: number; w: number; h: number;
   score: number;
@@ -51,19 +59,25 @@ export interface Box2D {
   truthId?: string;
   /** Secondary classification (e.g. ripeness) */
   attr?: Record<string, number | string>;
+  /** Grasp surface from depth (or truth+noise): point (world, mm), outward normal, in-plane X axis (folded by symmetry), face size. */
+  surface?: { point: Vec3; normal: Vec3; xAxis: Vec3; size?: [number, number]; symmetryDeg: number; points: number; source: 'depth' | 'truth' };
 }
 
 export interface TruthObject {
   id: string;
   cls: string;
   box: { x: number; y: number; w: number; h: number };
-  /** World position (mm) and camera depth (mm). */
+  /** World position (mm) of the object centre (centroid of its oriented box) and its camera depth (mm along Z). */
   p: Vec3; z: number;
   /** Real size (mm). */
   size: number;
   visible: boolean;
   attrs?: Record<string, number | string>;
   keypoints?: Array<[number, number]>;
+  /** Objects: world pose of the oriented box (16 values, column-major; origin = box centre) and its full size (mm). */
+  pose?: number[]; dims?: Vec3;
+  /** Exact silhouette from the instance-ID render, visible pixels and visible / unoccluded area. */
+  mask?: Mask; pixels?: number; visibleFraction?: number;
 }
 
 export interface VisionFrame {
@@ -82,6 +96,8 @@ export interface VisionFrame {
   truth?: TruthObject[];
   /** Robot proprioception for VLA: joints (deg) + TCP pose. */
   proprio?: { joints?: number[]; tcp?: number[]; gripper?: number };
+  /** Pixel-true render (depth + instance IDs) the frame was built from — not serialised. */
+  render?: CameraRender;
 }
 
 export interface RunOptions {
@@ -92,6 +108,8 @@ export interface RunOptions {
   /** VLM prompt / VLA instruction. */
   prompt?: string;
   seed?: number;
+  /** Simulated runtime: false = exact ground truth (no misses, no jitter, no false positives). Default true. */
+  simulate?: boolean;
 }
 
 export interface VisionResult {
@@ -158,6 +176,9 @@ export class SimulatedModel implements VisionModel {
     const t0 = now();
     const rnd = makeRng((opts.seed ?? this.seed) * 7919 + this.frameNo++ * 104729 + 1);
     const truth = frame.truth ?? [];
+    const noisy = opts.simulate !== false;
+    // without ground truth a simulated model has nothing to report (never fabricate detections)
+    if (!frame.truth && opts.task !== 'vla_policy' && opts.task !== 'vlm_query') return { task: opts.task, model: this.id, boxes: [], labels: opts.task === 'classify' ? [] : undefined, latencyMs: now() - t0 };
     const acc = this.spec.accuracy;
     const boxes: Box2D[] = [];
     const wanted = new Set(opts.classes.map((c) => c.toLowerCase()));
@@ -176,6 +197,14 @@ export class SimulatedModel implements VisionModel {
       const known = wanted.size === 0 || wanted.has(t.cls.toLowerCase()) || open;
       if (!known) continue;
       const px = Math.min(t.box.w, t.box.h);
+      if (!noisy) {
+        // exact detector: the truth box, the ID-buffer silhouette, the truth keypoints
+        const b: Box2D = { x: t.box.x, y: t.box.y, w: t.box.w, h: t.box.h, score: 0.99, cls: t.cls, truthId: t.id, attr: t.attrs ? { ...t.attrs } : undefined };
+        if (opts.task === 'segment') b.mask = t.mask ?? ellipseMask(b, frame.width, frame.height);
+        if (opts.task === 'keypoints') b.keypoints = (t.keypoints ?? [[t.box.x + t.box.w / 2, t.box.y]]).map(([kx, ky]) => [kx, ky, 0.99]);
+        boxes.push(b);
+        continue;
+      }
       // recall model: sigmoid on box size in pixels (small objects are missed) × model accuracy
       const sizeFactor = 1 / (1 + Math.exp(-(px - 8) / 3)); // ~50 % at 8 px, ~80 % at 12 px, ~98 % at 20 px (640 input)
       const recall = Math.min(0.99, (0.55 + 0.45 * acc) * sizeFactor);
@@ -183,14 +212,14 @@ export class SimulatedModel implements VisionModel {
       const jit = (1 - acc) * 0.15 * px + 0.5;
       const b: Box2D = { x: t.box.x + gauss(rnd) * jit, y: t.box.y + gauss(rnd) * jit, w: Math.max(2, t.box.w * (1 + gauss(rnd) * (1 - acc) * 0.2)), h: Math.max(2, t.box.h * (1 + gauss(rnd) * (1 - acc) * 0.2)), score: Math.min(0.99, Math.max(opts.confidence, recall * (0.75 + 0.25 * rnd()))), cls: t.cls, truthId: t.id, attr: t.attrs ? { ...t.attrs } : undefined };
       if (b.score < opts.confidence) continue;
-      if (opts.task === 'segment') b.mask = ellipseMask(b, frame.width, frame.height);
+      if (opts.task === 'segment') b.mask = t.mask ?? ellipseMask(b, frame.width, frame.height);
       if (opts.task === 'keypoints') { const kps = t.keypoints ?? [[t.box.x + t.box.w / 2, t.box.y]]; b.keypoints = kps.map(([kx, ky]) => [kx + gauss(rnd) * jit, ky + gauss(rnd) * jit, Math.min(0.99, acc + 0.2 * rnd())]); }
       // classification attribute confusion (e.g. ripeness) scales with accuracy
       if (b.attr && typeof b.attr.ripe === 'number' && rnd() < (1 - acc) * 0.5) b.attr.ripe = 1 - (b.attr.ripe as number); // coarse attribute confusion
       boxes.push(b);
     }
-    // false positives: (1 - acc) * 2 per frame on average
-    const nFP = Math.floor((1 - acc) * 2 + rnd());
+    // false positives: (1 - acc) * 2 per frame on average (noise model only)
+    const nFP = noisy ? Math.floor((1 - acc) * 2 + rnd()) : 0;
     const clsList = opts.classes.length ? opts.classes : ['object'];
     for (let i = 0; i < nFP; i++) {
       const w = 8 + rnd() * 40, h = 8 + rnd() * 40;
@@ -241,7 +270,7 @@ export function ellipseMask(b: { x: number; y: number; w: number; h: number }, w
   const data = new Uint8Array(mw * mh);
   const cx = b.x + b.w / 2 - x0, cy = b.y + b.h / 2 - y0, rx = b.w / 2, ry = b.h / 2;
   for (let y = 0; y < mh; y++) for (let x = 0; x < mw; x++) { const dx = (x + 0.5 - cx) / rx, dy = (y + 0.5 - cy) / ry; if (dx * dx + dy * dy <= 1) data[y * mw + x] = 1; }
-  return { data, width: mw, height: mh };
+  return { data, width: mw, height: mh, x0, y0 };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -250,18 +279,26 @@ export function ellipseMask(b: { x: number; y: number; w: number; h: number }, w
 
 export interface LetterboxInfo { scale: number; padX: number; padY: number; size: number }
 
-/** RGBA → NCHW float [0,1] letterboxed to a square input. */
+/**
+ * RGBA → NCHW float [0,1] letterboxed to a square input. `width`×`height` is the image coordinate frame the boxes are
+ * reported in; when the pixel buffer holds a different resolution of the same image (a downscaled render), it is
+ * resampled from the buffer's real size, so the output never reads outside the buffer.
+ */
 export function letterbox(rgba: Uint8ClampedArray, width: number, height: number, size: number): { data: Float32Array; info: LetterboxInfo } {
   const scale = Math.min(size / width, size / height);
   const nw = Math.round(width * scale), nh = Math.round(height * scale);
   const padX = Math.floor((size - nw) / 2), padY = Math.floor((size - nh) / 2);
   const data = new Float32Array(3 * size * size).fill(114 / 255);
   const plane = size * size;
+  const npx = rgba.length >> 2;
+  let bw = width, bh = height;
+  if (npx !== width * height) { bw = Math.max(1, Math.round(Math.sqrt((npx * width) / height))); bh = Math.max(1, Math.floor(npx / bw)); }
+  const kx = bw / width, ky = bh / height;
   for (let y = 0; y < nh; y++) {
-    const sy = Math.min(height - 1, Math.floor(y / scale));
+    const sy = Math.min(bh - 1, Math.floor((y / scale) * ky));
     for (let x = 0; x < nw; x++) {
-      const sx = Math.min(width - 1, Math.floor(x / scale));
-      const si = (sy * width + sx) * 4, di = (y + padY) * size + (x + padX);
+      const sx = Math.min(bw - 1, Math.floor((x / scale) * kx));
+      const si = (sy * bw + sx) * 4, di = (y + padY) * size + (x + padX);
       data[di] = rgba[si] / 255; data[plane + di] = rgba[si + 1] / 255; data[2 * plane + di] = rgba[si + 2] / 255;
     }
   }
@@ -342,7 +379,7 @@ export function protoMask(proto: { data: Float32Array; dims: number[] }, coefs: 
       data[y * w + x] = v > 0 ? 1 : 0; // sigmoid(v) > 0.5
     }
   }
-  return { data, width: w, height: h };
+  return { data, width: w, height: h, x0, y0 };
 }
 
 export interface OnnxOptions { url: string; task: 'detect' | 'segment' | 'keypoints' | 'classify'; classes: string[]; inputSize?: number; numKeypoints?: number; executionProviders?: string[]; wasmPaths?: string }
@@ -361,7 +398,11 @@ export class OnnxYoloModel implements VisionModel {
       const ort = g.ort ?? (await import('onnxruntime-web'));
       this.ort = ort;
       if (this.opts.wasmPaths) ort.env.wasm.wasmPaths = this.opts.wasmPaths;
-      else if (typeof location !== 'undefined' && !g.ort) ort.env.wasm.wasmPaths = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ort.env.versions?.web ?? '1.30.0'}/dist/`;
+      else if (typeof location !== 'undefined' && !g.ort) {
+        // the WASM binary is bundled with the app (vite asset): no CDN download, works offline
+        const wasm = (await import('onnxruntime-web/ort-wasm-simd-threaded.jsep.wasm?url')).default as string;
+        ort.env.wasm.wasmPaths = { wasm };
+      }
       const providers = this.opts.executionProviders ?? (typeof navigator !== 'undefined' && (navigator as any).gpu ? ['webgpu', 'wasm'] : ['wasm']);
       const remote = /^(https?:|data:|blob:)/.test(this.opts.url) || typeof location !== 'undefined';
       const src = remote ? new Uint8Array(await (await fetch(this.opts.url)).arrayBuffer()) : this.opts.url; // Node: onnxruntime reads the file path
@@ -443,7 +484,7 @@ export function polygonMask(poly: number[][], b: Box2D, imgW: number, imgH: numb
     for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) { const [xi, yi] = poly[i], [xj, yj] = poly[j]; if ((yi > py) !== (yj > py) && px < ((xj - xi) * (py - yi)) / (yj - yi) + xi) inside = !inside; }
     if (inside) data[y * w + x] = 1;
   }
-  return { data, width: w, height: h };
+  return { data, width: w, height: h, x0, y0 };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -539,13 +580,30 @@ export class VlaHttpModel implements VisionModel {
 }
 
 /**
- * Apply a normalised 7-DoF action (dx dy dz droll dpitch dyaw gripper ∈ [-1,1]) to a TCP pose. Deltas are
- * expressed in the camera frame by default (eye-in-hand policies), scaled to mm/deg per step.
+ * Apply a normalised 7-DoF action (dx dy dz droll dpitch dyaw gripper ∈ [-1,1]) to a TCP pose (absolute), scaled to
+ * mm/deg per step. The delta is expressed in the tool frame (default), the world frame, or the axes of `axes` (the
+ * camera pose for eye-in-hand policies: x right, y down, z forward); rotations turn about the TCP point.
  */
-export function applyVlaAction(tcp: Mat4, action: number[], opts: { scaleMm?: number; scaleDeg?: number; frame?: 'tool' | 'world' } = {}): { pose: Mat4; gripper: number } {
+export function applyVlaAction(tcp: Mat4, action: number[], opts: { scaleMm?: number; scaleDeg?: number; frame?: 'tool' | 'world'; axes?: Mat4 } = {}): { pose: Mat4; gripper: number } {
   const sMm = opts.scaleMm ?? 20, sDeg = ((opts.scaleDeg ?? 5) * Math.PI) / 180;
   const [dx = 0, dy = 0, dz = 0, dr = 0, dp = 0, dyaw = 0, g = 0] = action;
-  const delta = multiply(multiply(multiply(transl(dx * sMm, dy * sMm, dz * sMm), rotx(dr * sDeg)), roty(dp * sDeg)), rotz(dyaw * sDeg));
+  const rot = multiply(multiply(rotx(dr * sDeg), roty(dp * sDeg)), rotz(dyaw * sDeg));
+  if (opts.axes) {
+    const A = opts.axes;
+    const R = (m: Mat4, v: number[]) => [m[0] * v[0] + m[4] * v[1] + m[8] * v[2], m[1] * v[0] + m[5] * v[1] + m[9] * v[2], m[2] * v[0] + m[6] * v[1] + m[10] * v[2]];
+    const d = R(A, [dx * sMm, dy * sMm, dz * sMm]);
+    // world rotation A·Rd·Aᵀ applied to the TCP orientation, about the TCP point
+    const pose = transl(0, 0, 0);
+    const Arot = transl(0, 0, 0); for (const i of [0, 1, 2, 4, 5, 6, 8, 9, 10]) Arot[i] = A[i];
+    const AT = transl(0, 0, 0); for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++) AT[c * 4 + r] = A[r * 4 + c];
+    const Rw = multiply(multiply(Arot, rot), AT);
+    const Rt = transl(0, 0, 0); for (const i of [0, 1, 2, 4, 5, 6, 8, 9, 10]) Rt[i] = tcp[i];
+    const Rn = multiply(Rw, Rt);
+    for (const i of [0, 1, 2, 4, 5, 6, 8, 9, 10]) pose[i] = Rn[i];
+    pose[12] = tcp[12] + d[0]; pose[13] = tcp[13] + d[1]; pose[14] = tcp[14] + d[2];
+    return { pose, gripper: g };
+  }
+  const delta = multiply(transl(dx * sMm, dy * sMm, dz * sMm), rot);
   const pose = opts.frame === 'world' ? multiply(delta, tcp) : multiply(tcp, delta);
   return { pose, gripper: g };
 }
@@ -559,13 +617,29 @@ export interface RosLike { subscribe(topic: string, type: string, cb: (msg: any)
 export class Ros2VisionModel implements VisionModel {
   id: string; name: string; tasks: VisionTask[] = ['detect', 'track', 'segment', 'pose'];
   private latest: any = null;
-  constructor(ros: RosLike, readonly topic: string, id = 'ros2', type = 'vision_msgs/msg/Detection2DArray') { this.id = id; this.name = `ROS 2 ${topic}`; ros.subscribe(topic, type, (m) => { this.latest = m; }); }
+  constructor(ros: RosLike, readonly topic: string, id = 'ros2', readonly type = 'vision_msgs/msg/Detection2DArray') { this.id = id; this.name = `ROS 2 ${topic}`; ros.subscribe(topic, type, (m) => { this.latest = m; }); }
   async run(frame: VisionFrame, opts: RunOptions): Promise<VisionResult> {
     const t0 = now();
-    const boxes = this.latest ? parseDetection2DArray(this.latest, opts.confidence) : [];
+    const boxes = this.latest ? (/yolo_msgs/.test(this.type) ? parseYoloDetectionArray(this.latest, opts.confidence) : parseDetection2DArray(this.latest, opts.confidence)) : [];
     void frame;
     return { task: opts.task, model: this.id, boxes, latencyMs: now() - t0, raw: this.latest };
   }
+}
+
+/** yolo_ros `yolo_msgs/DetectionArray`: class_name, score, id (track), bbox {center.position, size}, bbox3d (metres, target frame), mask.data polygon. */
+export function parseYoloDetectionArray(msg: any, confidence: number): Box2D[] {
+  const out: Box2D[] = [];
+  for (const d of msg.detections ?? []) {
+    const score = Number(d.score ?? 1);
+    if (score < confidence) continue;
+    const c = d.bbox?.center?.position ?? d.bbox?.center ?? { x: 0, y: 0 }, sz = d.bbox?.size ?? { x: 0, y: 0 };
+    const b: Box2D = { x: c.x - sz.x / 2, y: c.y - sz.y / 2, w: sz.x, h: sz.y, score, cls: String(d.class_name ?? d.class_id ?? 'object'), clsId: typeof d.class_id === 'number' ? d.class_id : undefined };
+    if (d.id !== undefined && d.id !== '') { const n = Number(String(d.id).replace(/\D/g, '')); if (Number.isFinite(n) && String(d.id).length) b.id = n; }
+    const p3 = d.bbox3d?.center?.position;
+    if (p3 && (p3.x || p3.y || p3.z)) b.p = [p3.x * 1000, p3.y * 1000, p3.z * 1000];
+    out.push(b);
+  }
+  return out;
 }
 
 export function parseDetection2DArray(msg: any, confidence: number): Box2D[] {
@@ -587,37 +661,51 @@ export function parseDetection2DArray(msg: any, confidence: number): Box2D[] {
 // Tracking — ByteTrack association with a constant-velocity filter
 // ---------------------------------------------------------------------------------------------
 
-export interface Track { id: number; cls: string; x: number; y: number; w: number; h: number; vx: number; vy: number; score: number; age: number; hits: number; lost: number; last: Box2D; p?: Vec3 }
+export interface Track { id: number; cls: string; x: number; y: number; w: number; h: number; vx: number; vy: number; score: number; age: number; hits: number; lost: number; last: Box2D; p?: Vec3; /** time since the last measurement (s) */ since?: number }
 
+/**
+ * ByteTrack association (high-score detections first, then low-score ones) on boxes predicted with a constant-velocity
+ * α-β filter: x̂ = x + v·dt, r = z − x̂, x = x̂ + α·r, v = v + β·r/dt — the velocity converges to the true image velocity
+ * (the residual vanishes only when v is right). Detections that do not overlap a prediction (fast objects on the first
+ * frames, before v is known) are associated by centre distance within `gate` box sizes.
+ */
 export class ByteTracker {
   tracks: Track[] = [];
   private nextId = 1;
-  constructor(readonly opts: { highThresh?: number; lowThresh?: number; iouThresh?: number; maxLost?: number; minHits?: number; alpha?: number } = {}) {}
+  constructor(readonly opts: { highThresh?: number; lowThresh?: number; iouThresh?: number; maxLost?: number; minHits?: number; alpha?: number; beta?: number; gate?: number } = {}) {}
   /** dt in seconds; returns confirmed tracks as boxes with ids. */
   update(dets: Box2D[], dt: number): Box2D[] {
-    const hi = this.opts.highThresh ?? 0.5, lo = this.opts.lowThresh ?? 0.1, thr = this.opts.iouThresh ?? 0.3, maxLost = this.opts.maxLost ?? 15, minHits = this.opts.minHits ?? 2, alpha = this.opts.alpha ?? 0.6;
-    for (const t of this.tracks) { t.x += t.vx * dt; t.y += t.vy * dt; t.age++; }
+    const hi = this.opts.highThresh ?? 0.5, lo = this.opts.lowThresh ?? 0.1, thr = this.opts.iouThresh ?? 0.3, maxLost = this.opts.maxLost ?? 15, minHits = this.opts.minHits ?? 2;
+    const alpha = this.opts.alpha ?? 0.85, beta = this.opts.beta ?? 0.4, gate = this.opts.gate ?? 1.2;
+    for (const t of this.tracks) { t.x += t.vx * dt; t.y += t.vy * dt; t.age++; t.since = (t.since ?? 0) + dt; }
     const high = dets.filter((d) => d.score >= hi), low = dets.filter((d) => d.score >= lo && d.score < hi);
     const unmatchedT = new Set(this.tracks.map((_, i) => i));
     const matchSet = (cands: Box2D[], pool: number[], iouMin: number) => {
       const pairs: Array<[number, number, number]> = [];
-      pool.forEach((ti) => cands.forEach((d, di) => { const t = this.tracks[ti]; if (t.cls !== d.cls) return; const v = iou(t, d); if (v >= iouMin) pairs.push([v, ti, di]); }));
+      pool.forEach((ti) => cands.forEach((d, di) => {
+        const t = this.tracks[ti]; if (t.cls !== d.cls) return;
+        const v = iou(t, d);
+        if (v >= iouMin) { pairs.push([1 + v, ti, di]); return; }
+        const dist = Math.hypot(d.x + d.w / 2 - (t.x + t.w / 2), d.y + d.h / 2 - (t.y + t.h / 2)), size = Math.max(t.w, t.h, d.w, d.h);
+        if (dist < gate * size) pairs.push([1 - dist / (gate * size), ti, di]);
+      }));
       pairs.sort((a, b) => b[0] - a[0]);
       const usedD = new Set<number>(), usedT = new Set<number>();
       for (const [, ti, di] of pairs) {
         if (usedD.has(di) || usedT.has(ti)) continue;
         usedD.add(di); usedT.add(ti); unmatchedT.delete(ti);
         const t = this.tracks[ti], d = cands[di];
-        const nvx = dt > 0 ? (d.x - t.x) / dt : 0, nvy = dt > 0 ? (d.y - t.y) / dt : 0;
-        t.vx = alpha * t.vx + (1 - alpha) * nvx; t.vy = alpha * t.vy + (1 - alpha) * nvy;
-        t.x = d.x; t.y = d.y; t.w = d.w; t.h = d.h; t.score = d.score; t.hits++; t.lost = 0; t.last = d; if (d.p) t.p = d.p;
+        const tm = t.since && t.since > 0 ? t.since : dt;
+        const rx = d.x - t.x, ry = d.y - t.y;
+        if (tm > 0) { t.vx += (beta * rx) / tm; t.vy += (beta * ry) / tm; }
+        t.x += alpha * rx; t.y += alpha * ry; t.w = d.w; t.h = d.h; t.score = d.score; t.hits++; t.lost = 0; t.last = d; t.since = 0; if (d.p) t.p = d.p;
       }
       return cands.filter((_, di) => !usedD.has(di));
     };
     const remainingHigh = matchSet(high, [...unmatchedT], thr);
     matchSet(low, [...unmatchedT].filter((ti) => this.tracks[ti].lost === 0 || this.tracks[ti].hits >= minHits), thr);
     for (const ti of unmatchedT) this.tracks[ti].lost++;
-    for (const d of remainingHigh) this.tracks.push({ id: this.nextId++, cls: d.cls, x: d.x, y: d.y, w: d.w, h: d.h, vx: 0, vy: 0, score: d.score, age: 1, hits: 1, lost: 0, last: d, p: d.p });
+    for (const d of remainingHigh) this.tracks.push({ id: this.nextId++, cls: d.cls, x: d.x, y: d.y, w: d.w, h: d.h, vx: 0, vy: 0, score: d.score, age: 1, hits: 1, lost: 0, last: d, p: d.p, since: 0 });
     this.tracks = this.tracks.filter((t) => t.lost <= maxLost);
     return this.tracks.filter((t) => t.hits >= minHits && t.lost === 0).map((t) => ({ ...t.last, x: t.x, y: t.y, w: t.w, h: t.h, id: t.id, vx: t.vx, vy: t.vy, p: t.p ?? t.last.p }));
   }
@@ -630,15 +718,32 @@ export class ByteTracker {
 
 export interface ModelContext { ros?: RosLike; serverBase?: string | null }
 
-/** Instantiate the executable model for a task from the camera's configuration. */
+/** A configured runtime that cannot run (missing model URL / server / topic): every run fails with the reason, so the pipeline reports it instead of silently simulating. */
+export class UnavailableModel implements VisionModel {
+  tasks: VisionTask[];
+  name: string;
+  constructor(readonly id: string, task: VisionTask, readonly reason: string) { this.tasks = [task]; this.name = `unavailable (${reason})`; }
+  async run(): Promise<VisionResult> { throw new Error(this.reason); }
+}
+
+/**
+ * Instantiate the executable model for a task from the camera's configuration. Only runtime 'simulated' uses the
+ * ground-truth SimulatedModel; a real runtime that is not configured gives an UnavailableModel (explicit error).
+ */
 export function createModel(cfg: VisionStackConfig, task: VisionTask, ctx: ModelContext = {}): VisionModel {
   const specId = cfg.models[task] ?? cfg.models.detect;
   const spec = VISION_MODELS.find((m) => m.id === specId) ?? VISION_MODELS[0];
-  if (task === 'vlm_query' && cfg.vlm?.url && cfg.runtime !== 'simulated') return new VlmOpenAIModel({ url: cfg.vlm.url, model: cfg.vlm.model, apiKey: cfg.vlm.apiKey }, spec.id);
-  if (task === 'vla_policy' && cfg.vla?.url && cfg.runtime !== 'simulated') return new VlaHttpModel({ url: cfg.vla.url, model: cfg.vla.model, format: cfg.vla.format }, spec.id);
-  if ((task === 'detect' || task === 'segment' || task === 'keypoints' || task === 'classify') && cfg.runtime === 'vlm' && cfg.vlm?.url) return new VlmOpenAIModel({ url: cfg.vlm.url, model: cfg.vlm.model, apiKey: cfg.vlm.apiKey }, spec.id);
-  if (cfg.runtime === 'onnx' && cfg.modelUrl && (task === 'detect' || task === 'segment' || task === 'keypoints' || task === 'classify')) return new OnnxYoloModel({ url: cfg.modelUrl, task, classes: cfg.classes, inputSize: cfg.inputSize ?? 640 }, spec.id);
-  if (cfg.runtime === 'server' && ctx.serverBase) return new HttpModel({ url: `${ctx.serverBase}/vision/infer`, model: cfg.serverModel ?? spec.id }, spec.id);
-  if (cfg.runtime === 'ros2' && ctx.ros && cfg.rosTopic) return new Ros2VisionModel(ctx.ros, cfg.rosTopic, spec.id);
-  return new SimulatedModel(spec, cfg.seed ?? 1);
+  if (cfg.runtime === 'simulated') return new SimulatedModel(spec, cfg.seed ?? 1);
+  const imageTask = task === 'detect' || task === 'segment' || task === 'keypoints' || task === 'classify';
+  if (task === 'vlm_query') return cfg.vlm?.url ? new VlmOpenAIModel({ url: cfg.vlm.url, model: cfg.vlm.model, apiKey: cfg.vlm.apiKey }, spec.id) : new UnavailableModel(spec.id, task, 'VLM query: no endpoint URL configured (vlm.url)');
+  if (task === 'vla_policy') return cfg.vla?.url ? new VlaHttpModel({ url: cfg.vla.url, model: cfg.vla.model, format: cfg.vla.format }, spec.id) : new UnavailableModel(spec.id, task, 'VLA policy: no action-server URL configured (vla.url)');
+  switch (cfg.runtime) {
+    case 'vlm': return cfg.vlm?.url ? new VlmOpenAIModel({ url: cfg.vlm.url, model: cfg.vlm.model, apiKey: cfg.vlm.apiKey }, spec.id) : new UnavailableModel(spec.id, task, 'runtime "vlm": no endpoint URL configured (vlm.url)');
+    case 'onnx':
+      if (!imageTask) return new UnavailableModel(spec.id, task, `runtime "onnx" runs image models only, not "${task}"`);
+      return cfg.modelUrl ? new OnnxYoloModel({ url: cfg.modelUrl, task, classes: cfg.classes, inputSize: cfg.inputSize ?? 640 }, spec.id) : new UnavailableModel(spec.id, task, 'runtime "onnx": no ONNX model configured (modelUrl)');
+    case 'server': return ctx.serverBase ? new HttpModel({ url: `${ctx.serverBase.replace(/\/$/, '')}/vision/infer`, model: cfg.serverModel ?? spec.id }, spec.id) : new UnavailableModel(spec.id, task, 'runtime "server": no studio server connected (serverBase)');
+    case 'ros2': return ctx.ros && cfg.rosTopic ? new Ros2VisionModel(ctx.ros, cfg.rosTopic, spec.id, cfg.rosTopicType) : new UnavailableModel(spec.id, task, !cfg.rosTopic ? 'runtime "ros2": no detection topic configured (rosTopic)' : 'runtime "ros2": no rosbridge connection');
+    default: return new UnavailableModel(spec.id, task, `unknown runtime "${String(cfg.runtime)}"`);
+  }
 }

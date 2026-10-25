@@ -1,0 +1,1 @@
+<robot name="t" xmlns:xacro="http://www.ros.org/wiki/xacro"><xacro:macro name="m" params="name **content"><link name="${name}"><xacro:insert_block name="content"/></link></xacro:macro><xacro:m name="a"><content><visual><geometry><box size="1 1 1"/></geometry></visual><inertial><mass value="2"/></inertial></content></xacro:m></robot>

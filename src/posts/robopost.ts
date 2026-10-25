@@ -1,0 +1,243 @@
+/**
+ * RoboDK-style post processor framework. Built-in vendor posts subclass RoboPost and implement the same callbacks as
+ * RoboDK's Python `RobotPost` (ProgStart, MoveJ, MoveL, MoveC, setFrame, setTool, setSpeed, setZoneData, setDO, waitDI,
+ * RunCode, RunMessage, ProgFinish, ProgSave). `runRoboPost` replays a compiled PostProgram exactly the way
+ * python/post_shim.py replays it through RoboDK's own posts, so both outputs can be compared line by line
+ * (tests/posts_gt.test.ts). Control-flow events (loop / if / thread / wait-signal) go through `ctl*` hooks that
+ * vendor posts override with native syntax; the default writes a comment and a warning (I6).
+ */
+import { Mat4 } from '../core/math/pose';
+import { PostEvent, PostFile, PostProgram } from './base';
+export { nameIndex } from './base';
+
+// ---- Python-compatible number formatting ---------------------------------------------------------------------------
+/** printf '%.Nf' (tiny negatives keep their sign like CPython: -0.0001 -> '-0.000'; an exact -0 prints '0.000'). */
+export function fx(v: number, d = 3): string {
+  if (!Number.isFinite(v)) return String(v);
+  return (v === 0 ? 0 : v).toFixed(d);
+}
+/** Python str(float) / repr. */
+export function pyStr(v: number): string {
+  if (Number.isInteger(v)) return typeof v === 'number' && Math.abs(v) < 1e16 ? (Object.is(v, -0) ? '-0.0' : v.toFixed(1)) : String(v);
+  const a = Math.abs(v);
+  if (a !== 0 && (a < 1e-4 || a >= 1e16)) { const e = v.toExponential(); return e.replace(/e([+-])(\d)$/, 'e$10$2'); }
+  return String(v);
+}
+/** Python '%g' (precision 6 by default). */
+export function pyG(v: number, prec = 6): string {
+  if (v === 0) return Object.is(v, -0) ? '-0' : '0';
+  const exp = Math.floor(Math.log10(Math.abs(v)));
+  let s: string;
+  if (exp < -4 || exp >= prec) {
+    s = v.toExponential(prec - 1).replace(/\.?0+e/, 'e').replace(/e([+-])(\d)$/, 'e$10$2');
+  } else {
+    s = v.toFixed(Math.max(0, prec - 1 - exp));
+    if (s.includes('.')) s = s.replace(/\.?0+$/, '');
+  }
+  return s;
+}
+/** Python '%i' / '%d' of a float (truncates toward zero). */
+export const pyI = (v: number) => String(Math.trunc(v));
+/** Python round() (banker's rounding on .5). */
+export function pyRound(v: number, d = 0): number {
+  const m = 10 ** d, x = v * m, r = Math.round(x);
+  return (Math.abs(x % 1) === 0.5 ? (r % 2 === 0 ? r : r - 1) : r) / m;
+}
+
+export type IoName = string | number;
+export interface PostOptions { [k: string]: any }
+export interface RoboPostCtx {
+  robotName: string;
+  dof: number;
+  axesType: string[];
+  options: PostOptions;
+  /** generation date (header comments, Fanuc/Motoman dates) */
+  date: Date;
+  /** Names of the programs generated in this run (main first). */
+  programs: string[];
+  warn(msg: string): void;
+}
+
+/** Base class mirroring RoboDK's RobotPost. Subclasses override what they need. */
+export abstract class RoboPost {
+  PROG: string[] = [];
+  LOG: string[] = [];
+  PROG_EXT = 'txt';
+  PROG_NAME = 'Program';
+  ROBOT_NAME: string;
+  nAxes: number;
+  AXES_TYPE: string[];
+  /** Extra files produced by ProgSave besides the main program. */
+  protected extraFiles: PostFile[] = [];
+
+  constructor(protected ctx: RoboPostCtx) {
+    this.ROBOT_NAME = ctx.robotName;
+    this.nAxes = ctx.dof;
+    this.AXES_TYPE = ctx.axesType;
+  }
+  get options(): PostOptions { return this.ctx.options; }
+
+  addline(s: string): void { this.PROG.push(s); }
+  addlog(s: string): void { this.LOG.push(s); this.ctx.warn(s); }
+
+  ProgStart(name: string): void { this.PROG_NAME = name; }
+  ProgFinish(_name: string): void { /* override */ }
+  /** Return the generated files (RoboDK writes them into a folder). */
+  ProgSave(name: string): PostFile[] { return [{ name: `${name}.${this.PROG_EXT}`, content: this.PROG.join('\n') + '\n' }, ...this.extraFiles]; }
+
+  abstract MoveJ(pose: Mat4 | null, joints: number[], conf: number[]): void;
+  abstract MoveL(pose: Mat4 | null, joints: number[], conf: number[]): void;
+  MoveC(pose1: Mat4 | null, joints1: number[], pose2: Mat4 | null, joints2: number[], conf1: number[], conf2: number[]): void {
+    this.addlog('Circular moves not supported: converted to 2 linear moves');
+    this.MoveL(pose1, joints1, conf1);
+    this.MoveL(pose2, joints2, conf2);
+  }
+  setFrame(_pose: Mat4, _frameId: number, _name: string): void { /* override */ }
+  setTool(_pose: Mat4, _toolId: number, _name: string): void { /* override */ }
+  Pause(_ms: number): void { /* override */ }
+  setSpeed(_mms: number): void { /* override */ }
+  setAcceleration(_mmss: number): void { /* override */ }
+  setSpeedJoints(_degs: number): void { /* override */ }
+  setAccelerationJoints(_degss: number): void { /* override */ }
+  setZoneData(_mm: number): void { /* override */ }
+  setDO(_io: IoName, _value: number | boolean | string): void { /* override */ }
+  setAO(io: IoName, value: number | string): void { this.setDO(io, value); }
+  waitDI(_io: IoName, _value: number | boolean | string, _timeoutMs = -1): void { /* override */ }
+  RunCode(_code: string, _isCall = false): void { /* override */ }
+  RunMessage(_msg: string, _isComment = false): void { /* override */ }
+
+  // ---- studio control-flow extensions (I6). Default: comment + warning. ----
+  /** FOR loop calling a sub-program `count` times (count <= 0: endless loop). */
+  ctlLoop(count: number, body: string): void {
+    this.addlog(`Loops are not supported by this post: ${body} is called once`);
+    this.RunMessage(`loop ${count > 0 ? count + 'x' : 'forever'}: ${body}`, true);
+    this.RunCode(body, true);
+  }
+  /** IF on a signal/expression calling sub-programs. */
+  ctlIf(cond: CtlCondition, thenProg: string | null, elseProg: string | null): void {
+    this.addlog(`IF is not supported by this post (${cond.text}): branches written as comments`);
+    this.RunMessage(`if ${cond.text}: ${thenProg ?? '-'} else ${elseProg ?? '-'}`, true);
+  }
+  /** Start a program in parallel (RoboDK "Start thread"). */
+  ctlThread(name: string): void {
+    this.addlog(`Threads are not supported by this post: ${name} is called sequentially`);
+    this.RunCode(name, true);
+  }
+}
+
+/** Condition of an IF: an IO/signal comparison when parsable, otherwise raw expression text. */
+export interface CtlCondition { text: string; io?: IoName; value?: number | boolean | string; op?: '==' | '!=' }
+
+/** Parse "DI_5 == 1", "partReady", "!busy", "IN[3]==ON" into a CtlCondition. */
+export function parseCondition(text: string): CtlCondition {
+  const t = text.trim();
+  let m = t.match(/^(!|not\s+)?\s*([A-Za-z_][\w.\[\]]*|\d+)\s*$/i);
+  if (m) return { text: t, io: ioName(m[2]), value: m[1] ? 0 : 1, op: '==' };
+  m = t.match(/^([A-Za-z_][\w.\[\]]*|\d+)\s*(==|=|!=|<>)\s*(true|false|on|off|high|low|-?\d+(?:\.\d+)?)$/i);
+  if (m) {
+    const v = m[3].toLowerCase();
+    const value = v === 'true' || v === 'on' || v === 'high' ? 1 : v === 'false' || v === 'off' || v === 'low' ? 0 : Number(v);
+    return { text: t, io: ioName(m[1]), value, op: m[2] === '!=' || m[2] === '<>' ? '!=' : '==' };
+  }
+  return { text: t };
+}
+
+/** RoboDK passes numeric IO names as numbers, names as strings. */
+export function ioName(io: string | number): IoName {
+  if (typeof io === 'number') return io;
+  const s = String(io).trim();
+  return /^-?\d+$/.test(s) ? Number(s) : s;
+}
+const ioValue = (v: number | boolean | string): number | string => (typeof v === 'boolean' ? (v ? 1 : 0) : v);
+
+
+/** Date in RoboDK's header comment format (dd/mm/yyyy hh:mm:ss). */
+export function rdkDate(d: Date): string {
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `${p(d.getDate())}/${p(d.getMonth() + 1)}/${d.getFullYear()} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+function flattenPrograms(p: PostProgram): PostProgram[] {
+  const out: PostProgram[] = [p];
+  const seen = new Set([p.name]);
+  const walk = (q: PostProgram) => { for (const s of q.subprograms) { if (seen.has(s.name)) continue; seen.add(s.name); out.push(s); walk(s); } };
+  walk(p);
+  return out;
+}
+
+/** Feed one program's events into a post instance (same mapping as python/post_shim.py `_replay`). */
+export function replayEvents(post: RoboPost, events: PostEvent[]): void {
+  for (const ev of events) {
+    switch (ev.kind) {
+      case 'moveJ': post.MoveJ(ev.pose, ev.joints, ev.conf ?? [0, 0, 0]); break;
+      case 'moveL': post.MoveL(ev.pose, ev.joints ?? [], ev.conf ?? [0, 0, 0]); break;
+      case 'moveC': post.MoveC(ev.via, ev.viaJoints ?? ev.joints ?? [], ev.pose, ev.joints ?? [], ev.viaConf ?? ev.conf ?? [0, 0, 0], ev.conf ?? [0, 0, 0]); break;
+      case 'setFrame': post.setFrame(ev.pose, ev.frameId ?? -1, ev.name); break;
+      case 'setTool': post.setTool(ev.pose, ev.toolNum ?? -1, ev.name); break;
+      case 'setSpeed':
+        if (ev.speedLinear !== undefined) post.setSpeed(ev.speedLinear);
+        if (ev.speedJoints !== undefined) post.setSpeedJoints(ev.speedJoints);
+        if (ev.accelLinear !== undefined) post.setAcceleration(ev.accelLinear);
+        if (ev.accelJoints !== undefined) post.setAccelerationJoints(ev.accelJoints);
+        break;
+      case 'setRounding': post.setZoneData(ev.radius); break;
+      case 'pause': post.Pause(ev.timeMs); break;
+      case 'setDO': post.setDO(ioName(ev.io), ioValue(ev.value)); break;
+      case 'setAO': post.setAO(ioName(ev.io), ev.value); break;
+      case 'waitDI': post.waitDI(ioName(ev.io), ioValue(ev.value), ev.timeoutMs ?? -1); break;
+      case 'runCode': post.RunCode(ev.code, ev.isCall); break;
+      case 'comment': post.RunMessage(ev.text, true); break;
+      case 'message': post.RunMessage(ev.text, false); break;
+      case 'callProgram': post.RunCode(ev.name, true); break;
+      case 'gripper': post.RunMessage(ev.text ?? `gripper ${ev.close ? 'close' : 'open'}`, true); break;
+      case 'navigate': post.RunMessage(`NAVIGATE X ${fx(ev.x)} Y ${fx(ev.y)}`, true); break;
+      case 'task': post.RunMessage(`TASK ${ev.task}`, true); break;
+      case 'loop': post.ctlLoop(ev.count, ev.body); break;
+      case 'if': post.ctlIf(parseCondition(ev.condition), ev.then, ev.else); break;
+      case 'thread': post.ctlThread(ev.name); break;
+    }
+  }
+}
+
+export interface RunOptions extends PostOptions {
+  /** Header comments right after ProgStart (RoboDK: "Program generated by RoboDK ..."); false disables them. */
+  headerComments?: string[] | false;
+  date?: Date;
+}
+
+/**
+ * Run a RoboPost class over a compiled program and its sub-programs. Like RoboDK's default (INCLUDE_SUB_PROGRAMS
+ * False), every program gets its own post instance and files unless the post sets `includeSubPrograms`, in which case
+ * one instance receives all programs (main first) and ProgSave is called once.
+ */
+export function runRoboPost(make: (ctx: RoboPostCtx) => RoboPost, p: PostProgram, options: RunOptions = {}, includeSubPrograms = false): PostFile[] {
+  const progs = flattenPrograms(p);
+  const date = options.date ?? new Date();
+  const warnings: string[] = [];
+  const ctx: RoboPostCtx = {
+    robotName: p.robotName || 'Robot', dof: p.dof, axesType: p.axesType ?? Array(p.dof).fill('R'), options, date,
+    programs: progs.map((q) => q.name), warn: (m) => warnings.push(m),
+  };
+  const header = options.headerComments === false ? [] : options.headerComments ?? [`Program generated by VerticalBot Studio for ${ctx.robotName} on ${rdkDate(date)}`, 'Using nominal kinematics.'];
+  const play = (post: RoboPost, q: PostProgram) => {
+    post.ProgStart(q.name);
+    for (const c of header) post.RunMessage(c, true);
+    replayEvents(post, q.events);
+    post.ProgFinish(q.name);
+  };
+  const files: PostFile[] = [];
+  if (includeSubPrograms) {
+    const post = make(ctx);
+    for (const q of progs) play(post, q);
+    files.push(...post.ProgSave(p.name));
+  } else {
+    for (const q of progs) {
+      const post = make(ctx);
+      play(post, q);
+      files.push(...post.ProgSave(q.name));
+    }
+  }
+  // de-duplicate file names (sub-program generated twice through different call paths)
+  const seen = new Set<string>();
+  return files.filter((f) => (seen.has(f.name) ? false : (seen.add(f.name), true)));
+}

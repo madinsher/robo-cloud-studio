@@ -5,7 +5,9 @@
 import { ControlKind, CtlKind } from './model';
 import { MRS_ANALYSERS } from '../mrs/analysis';
 import * as dsl from './dsl';
-import { DES, parallel, analyseBlocking, supcon, checkControllability, checkNonconflict, observer, checkObservability, checkDiagnosability, supervisorTable, AutomatonSpec } from './des';
+import { DES, parallel, analyseBlocking, supcon, checkControllability, checkNonconflict, observer, checkDiagnosability, supervisorTable, observedSupervisor, AutomatonSpec } from './des';
+import { parseFsm, checkFsm, fsmMachines, stateOutcomes, FsmMachine } from './fsm';
+import { BT_ACTION_BINDINGS } from './graphdoc';
 import { PetriNet, analysePetriNet, preventDeadlocks, simulateTimed, analyseGspn, buildS3PR } from './petri';
 import { bottleneckBound, saturationCurve, cycleTimeFromOperations, littlesLaw } from './perf';
 import { checkLTL, checkCTL, kripkeFromDES, kripkeFromPetri, Kripke, LTL3Monitor } from './temporal';
@@ -72,6 +74,11 @@ function runChecks(k: Kripke, checks: Array<{ kind: 'ltl' | 'ctl'; formula: stri
   return ok;
 }
 
+function fsmGraph(m: FsmMachine): GraphView {
+  const init = (m.states.find((s) => s.initial) ?? m.states[0])?.name;
+  return { kind: 'automaton', nodes: [...m.states.map((s) => ({ id: s.name, label: s.kind === 'machine' ? `[${s.name}]` : s.name, initial: s.name === init })), ...m.outcomes.map((o) => ({ id: `⊙${o}`, label: o, marked: true }))], edges: m.states.flatMap((s) => Object.entries(s.transitions).map(([o, to]) => ({ from: s.name, to: m.states.some((x) => x.name === to) ? to : `⊙${to}`, label: o }))) };
+}
+
 function automatonGraph(g: DES, limit = 80): GraphView | undefined {
   if (g.X.size > limit) return undefined;
   return { kind: 'automaton', nodes: [...g.X].map((x) => ({ id: x, label: x, initial: x === g.x0, marked: g.xm.has(x) })), edges: g.transitions().map((t) => ({ from: t.from, to: t.to, label: t.event })) };
@@ -112,12 +119,14 @@ const CTL_ANALYSERS: Record<CtlKind, Analyser> = {
         S.push(sec('Modular supervisors', nc.nonconflicting ? 'ok' : 'warn', [`${specs.map((sp, i) => `${sp.name}: ${mods[i].states.size} states`).join(', ')}`, nc.nonconflicting ? `joint behaviour of the ${specs.length} modular supervisors: ${nc.jointStates} states, non-conflicting` : `CONFLICT: ${nc.blocking} blocking states in the joint behaviour (trace ${nc.trace?.join(' ')}) — use the monolithic supervisor or a coordinator`]));
       }
       if (doc.unobservable.length && r.realizable) {
-        const obs = observer(r.supervisor, doc.unobservable);
-        const ctrl = [...g.sigma].filter((e) => !uc.includes(e));
-        const ob = checkObservability(g, r.states, r.supervisor, doc.unobservable, ctrl);
-        M['observer states'] = obs.states.size;
-        const amb = [...obs.states.values()].filter((cell) => cell.length > 1).length;
-        S.push(sec(`Partial observation (unobservable: ${doc.unobservable.join(', ')})`, ob.observable ? 'ok' : 'warn', [`observer: ${obs.states.size} states, ${amb} with more than one possible plant state`, ob.observable ? 'the supervisor decisions are observable: inside every observer cell each controllable event is uniformly enabled or disabled' : `NOT observable: ${ob.issues.length} decisions depend on unobservable history (e.g. ${ob.issues[0].event} in cell ${ob.issues[0].cell.slice(0, 60)}) — add sensing or make the decision conservative`]));
+        // the deployed supervisor (executor, Python export) is the observer-based one: report exactly what runs
+        const os = observedSupervisor(g, r.supervisor, uc, doc.unobservable, comps.length);
+        M['observer states'] = os.table.states.length; M['implementable under partial observation'] = os.nonblocking;
+        const lines2 = [`observer-based supervisor: ${os.table.states.length} cells (${os.ambiguous} with more than one possible state); closed loop ${os.closedLoopStates} states`,
+          os.observable ? 'the decisions are observable: inside every cell each controllable event is uniformly enabled or disabled' : `decisions depend on unobservable history in ${os.issues.length} cases (e.g. ${os.issues[0].event} in ${os.issues[0].cell.slice(0, 60)}): the deployed table enables an event only when every possible state allows it`,
+          os.nonblocking ? 'the closed loop with the deployed (observer-based) supervisor is non-blocking: implementable as is' : `NOT implementable: with the observer-based supervisor the closed loop blocks after ${os.blockingTrace?.join(' ') || 'the start'} — add sensing (make the event observable) or change the specification`];
+        if (!os.nonblocking) ok = false;
+        S.push(sec(`Partial observation (unobservable: ${doc.unobservable.join(', ')})`, os.nonblocking ? (os.observable ? 'ok' : 'warn') : 'error', lines2));
       }
       if (doc.faults.length) { const d = checkDiagnosability(g, doc.faults, doc.unobservable); M['diagnosable'] = d.diagnosable; S.push(sec(`Diagnosability of ${doc.faults.join(', ')}`, d.diagnosable ? 'ok' : 'warn', [d.diagnosable ? 'every fault is detected after finitely many observable events (no indeterminate cycle in the twin plant)' : `NOT diagnosable: the fault can stay hidden forever (ambiguous cycle reached by ${d.witness?.join(' ')})`])); }
       if (doc.checks.length) { const k = kripkeFromDES(r.realizable ? r.supervisor : g); ok = runChecks(k, doc.checks, S) && ok; }
@@ -156,7 +165,7 @@ const CTL_ANALYSERS: Record<CtlKind, Analyser> = {
 
   bt: (src, S, M) => {
     const doc = dsl.parseBt(src); let ok = true;
-    const issues = checkBehaviorTree(doc.root); const errors = issues.filter((i) => i.level === 'error');
+    const issues = checkBehaviorTree(doc.root, { actions: [...BT_ACTION_BINDINGS, 'drop'] }); const errors = issues.filter((i) => i.level === 'error');
     if (errors.length) ok = false;
     const count = (n: BTNodeSpec): number => 1 + (n.children ?? []).reduce((s, c) => s + count(c), 0);
     M['nodes'] = count(doc.root); M['structural errors'] = errors.length;
@@ -167,6 +176,17 @@ const CTL_ANALYSERS: Record<CtlKind, Analyser> = {
     if (doc.checks.length) { const k = btKripke(doc.root, doc.outcomes, 4000); M['abstract states'] = k.states.length; S.push(sec('Abstraction for model checking', 'info', [`${k.states.length} abstract states over non-deterministic leaf outcomes${Object.keys(doc.outcomes).length ? `; restricted: ${Object.entries(doc.outcomes).map(([l, o]) => `${l} ∈ {${o.join(',')}}`).join(', ')}` : ''}`])); ok = runChecks(k, doc.checks, S) && ok; }
     for (const m of doc.monitors) { try { const mon = new LTL3Monitor(m); S.push(sec(`Runtime monitor ${mon.formula}`, 'info', [`${mon.atoms.length} atoms; ${mon.table().states.length} monitor states — attached at runtime`])); } catch (e) { ok = false; S.push(sec(`Monitor ${m}`, 'error', [(e as Error).message])); } }
     return { title: doc.name, ok };
+  },
+
+  fsm: (src, S, M) => {
+    const doc = parseFsm(src); const issues = checkFsm(doc); const errors = issues.filter((i) => i.level === 'error');
+    const ms = fsmMachines(doc); const states = ms.reduce((n, m) => n + m.machine.states.length, 0);
+    M['machines'] = ms.length; M['states'] = states; M['structural errors'] = errors.length;
+    S.push(sec('Machines', 'info', [], { table: { head: ['Machine', 'States', 'Outcomes', 'Initial'], rows: ms.map((m) => [m.path, m.machine.states.length, m.machine.outcomes.join(' ') || '—', (m.machine.states.find((x) => x.initial) ?? m.machine.states[0])?.name ?? '—']) } }));
+    S.push(sec('Structure (outcome maps, targets, reachability)', errors.length ? 'error' : issues.length ? 'warn' : 'ok', issues.length ? issues.map((i) => `${i.level}: ${i.where} — ${i.message}`) : ['every outcome is mapped, every target exists, every state is reachable'], { graph: fsmGraph(doc.root) }));
+    S.push(sec('States', 'info', [], { table: { head: ['State', 'Kind', 'Action', 'Outcomes → targets'], rows: ms.flatMap((m) => m.machine.states.map((st) => [`${m.path}/${st.name}`, st.kind, st.action ? `${st.action.kind} ${st.action.value}${st.action.robot ? ' on ' + st.action.robot : ''}` : st.when.map((w) => `${w.expr} → ${w.outcome}`).join('; ') || '—', stateOutcomes(st).map((o) => `${o} → ${st.transitions[o] ?? '∅'}`).join(', ')])) } }));
+    if (Object.keys(doc.blackboard).length) S.push(sec('Blackboard', 'info', Object.entries(doc.blackboard).map(([k, v]) => `${k} = ${v}`)));
+    return { title: doc.name, ok: errors.length === 0 };
   },
 
   statechart: (src, S, M) => {

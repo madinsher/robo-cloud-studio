@@ -1,0 +1,2 @@
+error: Xacro conditional "1.0" evaluated to "1.0", which is not a boolean expression.
+when processing file: c08.xacro

@@ -1,0 +1,3 @@
+error: Unused block "second"
+when instantiating macro: m (c37.xacro)
+in file: c37.xacro

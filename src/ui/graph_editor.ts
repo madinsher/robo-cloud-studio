@@ -223,9 +223,9 @@ export function buildGraphEditor(opts: { onChange: (source: string) => void; cat
     const list = actions(); const cur = actionOf(list, target);
     const cat = opts.catalog?.() ?? { robots: [], programs: [], targets: [], zones: [], signals: [] };
     const wrap = h('div', { class: 'ge-action' }, h('div', { class: 'prop-title' }, t(desMode ? 'Entry action (robot)' : 'Operation (robot)')));
-    const defaults: Record<ActionBinding['kind'], string> = { program: cat.programs[0]?.name ?? '', target: cat.targets[0] ?? '', goto: cat.zones[0] ?? '', signal: cat.signals[0] ?? 'start', wait: '1', event: 'done', set: 'flag' };
+    const defaults: Record<ActionBinding['kind'], string> = { program: cat.programs[0]?.name ?? '', target: cat.targets[0] ?? '', goto: cat.zones[0] ?? '', signal: cat.signals[0] ?? 'start', wait: '1', event: 'done', set: 'flag', await: 'part_present', skill: 'dock' };
     const kindSel = h('select', { onChange: (e: Event) => { const k = (e.target as HTMLSelectElement).value as ActionBinding['kind'] | ''; guarded(() => { if (!k) setAction(list, target, null); else setAction(list, target, { kind: k, value: defaults[k], robot: k === 'goto' ? cat.robots.find((r) => r.mobile)?.name : k === 'program' || k === 'target' ? (cur?.robot ?? cat.robots.find((r) => !r.mobile)?.name) : undefined, done: cur?.done, args: {} }); }); } },
-      h('option', { value: '' }, t('none')), ...ACTION_KINDS.map((k) => h('option', { value: k, selected: cur?.kind === k }, t({ program: 'run program', target: 'move to target', goto: 'go to zone', signal: 'set signal', wait: 'wait', event: 'emit event', set: 'set blackboard' }[k]))));
+      h('option', { value: '' }, t('none')), ...ACTION_KINDS.map((k) => h('option', { value: k, selected: cur?.kind === k }, t({ program: 'run program', target: 'move to target', goto: 'go to zone', signal: 'set signal', wait: 'wait', event: 'emit event', set: 'set blackboard', await: 'wait for condition', skill: 'mobile skill' }[k] ?? k))));
     wrap.append(field('Action', kindSel));
     if (!cur) { wrap.append(h('div', { class: 'hint' }, t(desMode ? 'Runs when the state is entered; done= fires the event that leaves it.' : 'Runs when the transition fires; the output tokens appear when it finishes.'))); return wrap; }
     const upd = (fn: (a: ActionBinding) => void) => guarded(() => fn(cur));
@@ -240,8 +240,11 @@ export function buildGraphEditor(opts: { onChange: (source: string) => void; cat
     if (cur.kind === 'signal') wrap.append(field('Signal', cat.signals.length ? selectOf(cat.signals, cur.value, (v) => upd((a) => { a.value = v; })) : text(cur.value, (v) => upd((a) => { a.value = v.trim(); }), 'signal name')), field('Value', text(String(cur.args.value ?? 'true'), (v) => upd((a) => { a.args.value = v === 'true' ? true : v === 'false' ? false : Number.isFinite(Number(v)) && v.trim() !== '' ? Number(v) : v; }))));
     if (cur.kind === 'wait') wrap.append(field('Seconds', num(Number(cur.value), (v) => upd((a) => { a.value = String(v ?? 1); }))));
     if (cur.kind === 'event') wrap.append(field('Event', text(cur.value, (v) => upd((a) => { a.value = v.trim(); }))));
-    if (cur.kind === 'set') wrap.append(field('Key', text(cur.value, (v) => upd((a) => { a.value = v.trim(); }))), field('Value', text(String(cur.args.value ?? 'true'), (v) => upd((a) => { a.args.value = v; }))));
-    if (desMode) { const a0 = cur; const evs = [...new Set(cur ? (cur.kind && (des ? [...(blocks().flatMap((b) => b.a.events))] : [])) : [])]; wrap.append(field('Done event (fired when finished)', evs.length ? selectOf(['', ...evs], a0.done ?? '', (v) => upd((a) => { a.done = v || undefined; })) : text(a0.done ?? '', (v) => upd((a) => { a.done = v.trim() || undefined; }), 'event'))); }
+    if (cur.kind === 'set') wrap.append(field('Key', text(cur.value, (v) => upd((a) => { a.value = v.trim(); }))), field('Value (=expr evaluates)', text(String(cur.args.value ?? 'true'), (v) => upd((a) => { a.args.value = v; }))));
+    if (cur.kind === 'await') wrap.append(field('Condition (blackboard / signals)', text(cur.value, (v) => upd((a) => { a.value = v.trim() || 'true'; }), 'part_present && !busy')));
+    if (cur.kind === 'skill') wrap.append(field('Skill', selectOf(['dock', 'undock', 'reach', 'stow', 'grasp', 'place', 'halt'], cur.value, (v) => upd((a) => { a.value = v; }))));
+    wrap.append(field('Timeout (s, fails the action)', num(cur.timeout, (v) => upd((a) => { a.timeout = v; }))));
+    if (desMode) { const a0 = cur; const evs = [...new Set(cur ? (cur.kind && (des ? [...(blocks().flatMap((b) => b.a.events))] : [])) : [])]; wrap.append(field('Done event (fired when finished)', evs.length ? selectOf(['', ...evs], a0.done ?? '', (v) => upd((a) => { a.done = v || undefined; })) : text(a0.done ?? '', (v) => upd((a) => { a.done = v.trim() || undefined; }), 'event')), field('Fail event (fired when the action fails)', evs.length ? selectOf(['', ...evs], a0.fail ?? '', (v) => upd((a) => { a.fail = v || undefined; })) : text(a0.fail ?? '', (v) => upd((a) => { a.fail = v.trim() || undefined; }), 'event'))); }
     return wrap;
   }
 

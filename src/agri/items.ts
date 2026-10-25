@@ -14,6 +14,8 @@ export interface CropParams {
   canopyWidth: number;
   canopyBase: number; // mm above ground where the canopy starts
   trunkHeight: number;
+  /** Trunk / stem diameter (mm) — collision radius for robots and arms (default by crop). */
+  trunkDiameter?: number;
   /** Fruit per plant (mean) and fruit size (mm). */
   fruitPerPlant: number;
   fruitDiameter: number;
@@ -136,15 +138,22 @@ export class MissionItem extends Item {
   /** Generated task ids (fleet tasks). */
   taskIds: string[] = [];
   progress = 0;
+  /** Scouting observations (plant health) and process results, persisted with the station. */
+  observations: Array<{ t: number; rowId: string; plant: number; health: number; diseased: boolean; robot: string }> = [];
+  /** Follow-up task keys already created (row:type). */
+  followUps: string[] = [];
+  /** Planner warnings (headland too short for the turning radius, unreachable fruit…). */
+  warnings: string[] = [];
   constructor(name = 'Mission', id?: string) {
     super(ItemType.MISSION, name, id);
   }
   protected override serializeExtra() {
-    return { missionType: this.missionType, fieldId: this.fieldId, fleetId: this.fleetId, rowIds: this.rowIds, status: this.status, settings: this.settings, taskIds: this.taskIds, progress: this.progress };
+    return { missionType: this.missionType, fieldId: this.fieldId, fleetId: this.fleetId, rowIds: this.rowIds, status: this.status, settings: this.settings, taskIds: this.taskIds, progress: this.progress, observations: this.observations, followUps: this.followUps, warnings: this.warnings };
   }
   override deserializeExtra(d: SerializedItem, _ctx: DeserializeContext) {
     this.missionType = (d.missionType as MissionType) ?? 'harvest'; this.fieldId = (d.fieldId as any) ?? null; this.fleetId = (d.fleetId as any) ?? null; this.rowIds = (d.rowIds as string[]) ?? [];
     this.status = (d.status as MissionStatus) ?? 'draft'; this.settings = (d.settings as any) ?? {}; this.taskIds = (d.taskIds as string[]) ?? []; this.progress = (d.progress as number) ?? 0;
+    this.observations = (d.observations as any) ?? []; this.followUps = (d.followUps as string[]) ?? []; this.warnings = (d.warnings as string[]) ?? [];
   }
 }
 

@@ -6,6 +6,32 @@ export interface MeshData {
   min: [number, number, number];
   max: [number, number, number];
   triangles: number;
+  /** Texture coordinates (2 per vertex) when the source has them. */
+  uvs?: Float32Array;
+  /** Material ranges (vertex start/count, three.js addGroup semantics) into `materials`. */
+  groups?: MeshGroup[];
+  /** Per-group materials from the file (OBJ+MTL, COLLADA effects); used when the referencing geometry has no colour. */
+  materials?: MeshMaterial[];
+}
+
+export interface MeshGroup { start: number; count: number; material: number }
+
+export interface MeshMaterial {
+  name?: string;
+  /** Linear RGB 0..1. */
+  color?: [number, number, number];
+  opacity?: number;
+  emissive?: [number, number, number];
+  roughness?: number;
+  metalness?: number;
+  /** Base colour texture, embedded so station files keep it. */
+  map?: { data: Uint8Array; mime: string; name?: string };
+}
+
+/** MIME type of an image file name. */
+export function imageMime(name: string): string {
+  const e = name.toLowerCase().split('.').pop() ?? '';
+  return e === 'jpg' || e === 'jpeg' ? 'image/jpeg' : e === 'bmp' ? 'image/bmp' : e === 'gif' ? 'image/gif' : e === 'webp' ? 'image/webp' : e === 'tga' ? 'image/x-tga' : 'image/png';
 }
 
 export function parseSTL(buf: ArrayBuffer, scale = 1): MeshData {

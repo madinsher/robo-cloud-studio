@@ -1,0 +1,8 @@
+{
+ "ok": true,
+ "error": null,
+ "log": "setSpeedJoints not defined\nsetAcceleration not defined\nsetAccelerationJoints not defined\nsetSpeedJoints not defined\n",
+ "files": [
+  "Cobotta-01-A.005"
+ ]
+}

@@ -31,6 +31,7 @@ export function instantiateSubtree(data: SerializedItem, parent: Item, station: 
     return item;
   };
   const root = build(copy, parent);
+  if (root.station === station) station.indexAdd(root);
   for (const fn of ctx.deferred) fn();
   station.notifyTree('childAdded', { parent, child: root });
   return root;

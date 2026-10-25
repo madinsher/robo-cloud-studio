@@ -20,14 +20,18 @@ import { renderPlot } from './plots';
 import { TEMPLATES, parseBt, parseDes, parsePetri, parseHybrid, detectKind } from '../ctl/dsl';
 import { analyse, Report, GraphView } from '../ctl/analysis';
 import { COURSE_EXAMPLES } from '../ctl/examples_dsl';
-import { ControlRuntime, stationBindings, hostBindings, WorldBindings } from '../ctl/runtime';
+import { ControlRuntime, stationBindings, hostBindings, WorldBindings, StationHost } from '../ctl/runtime';
 import { AutomatonExecutor, PetriExecutor, ExecutorWorld } from '../ctl/exec';
+import { FsmExecutor, parseFsm } from '../ctl/fsm';
+import { programBackendFor, mapSignals, ProgramBackend } from '../ctl/host';
+import { makeStationWorld, StationWorld } from '../ctl/world';
+import { synthesizeSupervisor } from '../ctl/supervisor';
+import { controlExports } from '../ctl/codegen';
 import { Robot } from '../core/items/robot';
 import { Program } from '../core/items/program';
 import { Target } from '../core/items/item';
 import { ZoneItem } from '../mobile/items';
-import { planMoveJ, planMoveL } from '../core/motion/trajectory';
-import { DES, parallel, supcon, supervisorTable, supervisorPython, SupervisorTable } from '../ctl/des';
+import { supervisorPython, SupervisorTable } from '../ctl/des';
 import { t } from './i18n';
 import { layoutGraph, TREE_BOX } from './graph_layout';
 import { buildGraphEditor, EditorKind, ActionCatalog } from './graph_editor';
@@ -39,13 +43,12 @@ const kindLabel = (k: ControlKind) => CONTROL_KINDS.find((x) => x.kind === k)?.l
 const kindTag = (k: { chapter: string; practicum?: string; group: string }) => (k.group === 'multi-robot' ? `${k.practicum && k.practicum !== '—' ? k.practicum + ', ' : ''}${k.chapter}` : `ch. ${k.chapter}`);
 const kv = (k: string, v: string) => h('div', { class: 'kv-row' }, h('span', { class: 'k' }, t(k)), h('span', { class: 'v' }, v));
 
-/** Synthesise the supervisor table of a DES document (null when the specification is unrealisable). */
+/**
+ * The deployed supervisor table of a DES document: synthesis, then the observer-based table when events are
+ * unobservable (the same table runs in the executors and in the Python export). null when unrealisable.
+ */
 export function supervisorFromDes(source: string): SupervisorTable | null {
-  const doc = parseDes(source);
-  if (!doc.plant.length) return null;
-  const g = parallel(...doc.plant.map((a) => DES.fromSpec(a)));
-  const r = supcon(g, doc.specs.map((a) => DES.fromSpec(a)), doc.uncontrollable);
-  return r.realizable ? supervisorTable(r.supervisor, doc.uncontrollable, doc.unobservable, doc.plant.length) : null;
+  try { return synthesizeSupervisor(source)?.table ?? null; } catch { return null; }
 }
 
 /** Run the analysis of a model and store the verdict on the item. */
@@ -242,20 +245,30 @@ export function renderReport(r: Report): HTMLElement {
 // Mission runtime on the station
 // ---------------------------------------------------------------------------------------------
 
-export interface MissionRun { rt: ControlRuntime; robot: MobileRobot; model: ControlModelItem; hook: (dt: number) => void; startedAt: number; done: boolean }
+export interface MissionRun { rt: ControlRuntime; robot: MobileRobot | null; model: ControlModelItem; hook: (dt: number) => void; startedAt: number; done: boolean; world: ExecutorWorld & { stop(): void } }
 
-export function startMission(app: App, model: ControlModelItem, robot: MobileRobot, opts: { targets?: number; maxSeconds?: number } = {}): MissionRun {
+/**
+ * Run a behavior tree on the station: host actions (programs, moves, signals, waits) always, the mobile skills of
+ * `robot` when given (arm-only stations need none). Supervisor = the deployed table of the referenced DES model.
+ */
+export function startMission(app: App, model: ControlModelItem, robot: MobileRobot | null, opts: { targets?: number; maxSeconds?: number } = {}): MissionRun {
   const bt = parseBt(model.source);
   const models = controlModels(app.station);
   const findModel = (kind: ControlKind, name?: string) => (name ? models.find((m) => m.kind === kind && m.name === name) : undefined) ?? models.find((m) => m.kind === kind);
-  let supervisor: SupervisorTable | undefined; const desM = findModel('des', bt.supervisor);
-  if (desM) { const s = supervisorFromDes(desM.source); if (s) { supervisor = s; app.log(`[control] supervisor from "${desM.name}": ${s.states.length} states`); } else toast(`Supervisor "${desM.name}" is unrealisable — running without it`, 'warn'); }
+  let supervisor: SupervisorTable | undefined; const desM = bt.supervisor || robot ? findModel('des', bt.supervisor) : undefined;
+  if (desM) { const s = supervisorFromDes(desM.source); if (s) { supervisor = s; app.log(`[control] supervisor from "${desM.name}": ${s.states.length} states${s.observer ? ' (observer-based)' : ''}`); } else toast(`Supervisor "${desM.name}" is unrealisable — running without it`, 'warn'); }
   const hm = findModel('hybrid', bt.modes); const modes = hm ? parseHybrid(hm.source) : undefined;
   const human = () => { const it = [...app.station.walk()].find((i: Item) => i !== robot && /human|operator|person|worker/i.test(i.name)); if (!it) return null; const p = it.pose(); return [p[12], p[13]] as [number, number]; };
-  const w = stationBindings({ robot, station: app.station, humanPosition: human });
-  const host = stationWorld(app).host; // program / move / signal actions of the station for the tree
-  const inFleet = app.station.itemsOfType<FleetItem>(ItemType.FLEET).some((f) => f.robotIds.includes(robot.id));
-  const rt = new ControlRuntime({ bt, supervisor, modes, bindings: { ...w, actions: { ...host.actions, ...w.actions }, halt: { ...host.halt, ...w.halt }, events: () => [...(w.events?.() ?? []), ...(host.events?.() ?? [])], step: inFleet ? undefined : (dt) => w.stepRobot(dt) }, log: (m) => app.log(`[${model.name}] ${m}`, /denied|VIOLATED|mismatch/.test(m) ? 'warn' : 'info') });
+  const world = stationWorld(app); const host = world.host;
+  const w = robot ? (world.forRobot(robot.name), world.mobiles.get(robot.id) ?? null) : null; // goto / dock / … and the arm programs of a mobile manipulator
+  const inFleet = !!robot && app.station.itemsOfType<FleetItem>(ItemType.FLEET).some((f) => f.robotIds.includes(robot.id));
+  const bindings: WorldBindings = {
+    sense: () => ({ ...host.sense(), ...(w?.sense() ?? {}) }),
+    actions: { ...host.actions, ...(w?.actions ?? {}) }, halt: { ...host.halt, ...(w?.halt ?? {}) },
+    events: () => [...(w?.events?.() ?? []), ...(host.events?.() ?? [])],
+    step: (dt) => { host.step?.(dt); if (w && !inFleet) w.stepRobot(dt); },
+  };
+  const rt = new ControlRuntime({ bt, supervisor, modes, bindings, log: (m) => app.log(`[${model.name}] ${m}`, /denied|VIOLATED|mismatch|failure|no binding/.test(m) ? 'warn' : 'info') });
   rt.bb.targets = opts.targets ?? 1;
   const maxSeconds = opts.maxSeconds ?? 600;
   // A tree whose root returns success per cycle (the course mission) keeps being ticked until it reports; a tree
@@ -263,29 +276,32 @@ export function startMission(app: App, model: ControlModelItem, robot: MobileRob
   // from a supervisor denial.
   const hasReport = JSON.stringify(bt.root).includes('"report"');
   let failTicks = 0;
-  const run: MissionRun = { rt, robot, model, startedAt: app.worldTime, done: false, hook: (dt) => {
+  const finish = (why: string, level: 'ok' | 'warn' | 'error') => {
+    run.done = true; stopMission(app, run);
+    const s = rt.summary();
+    const msg = `${model.name}${robot ? ` on ${robot.name}` : ''}: ${why} after ${s.time.toFixed(1)} s — denied ${s.denied}, violations ${s.violations}, model mismatches ${s.supervisorErrors}${rt.tree.unknown.size ? `, unknown actions ${[...rt.tree.unknown].join(', ')}` : ''}`;
+    app.log(`[control] ${msg}`, level === 'ok' ? 'info' : 'warn'); toast(msg, level, 6000);
+  };
+  const run: MissionRun = { rt, robot, model, world, startedAt: app.worldTime, done: false, hook: (dt) => {
     if (run.done) return;
-    rt.tick(dt);
-    if (modes) { if (typeof rt.bb.vmax === 'number') robot.params.vmaxOverride = rt.bb.vmax; else delete robot.params.vmaxOverride; }
-    failTicks = rt.status === 'failure' ? failTicks + 1 : 0;
-    const finished = rt.bb.reported === true || (rt.status === 'success' && !hasReport) || (rt.status === 'failure' && (failTicks * dt >= 0.5 || rt.bb.lastDenied !== undefined)) || rt.time >= maxSeconds;
-    if (finished) {
-      run.done = true; stopMission(app, run);
-      const s = rt.summary();
-      const msg = `${model.name} on ${robot.name}: ${rt.bb.reported ? 'mission reported' : rt.status} after ${s.time.toFixed(1)} s — denied ${s.denied}, violations ${s.violations}, model mismatches ${s.supervisorErrors}`;
-      app.log(`[control] ${msg}`, s.violations || s.supervisorErrors ? 'warn' : 'info'); toast(msg, s.violations ? 'warn' : 'ok', 6000);
-    }
+    try {
+      rt.tick(dt);
+      if (robot && modes) { if (typeof rt.bb.vmax === 'number') robot.params.vmaxOverride = rt.bb.vmax; else delete robot.params.vmaxOverride; }
+      failTicks = rt.status === 'failure' ? failTicks + 1 : 0;
+      const finished = rt.bb.reported === true || (rt.status === 'success' && !hasReport) || (rt.status === 'failure' && (failTicks * dt >= 0.5 || rt.bb.lastDenied !== undefined)) || rt.time >= maxSeconds;
+      if (finished) { const s = rt.summary(); finish(rt.bb.reported ? 'mission reported' : rt.time >= maxSeconds ? 'time limit' : rt.status, rt.status === 'failure' || s.violations || s.supervisorErrors || rt.time >= maxSeconds ? 'warn' : 'ok'); }
+    } catch (e) { finish(`stopped by an error: ${(e as Error).message}`, 'error'); }
   } };
   app.worldHooks.push(run.hook);
   app.startWorld();
-  app.log(`[control] mission "${model.name}" started on ${robot.name}${supervisor ? ' under supervisor' : ''}${modes ? ' with mode automaton' : ''}`);
+  app.log(`[control] mission "${model.name}" started${robot ? ` on ${robot.name}` : ' on the station'}${supervisor ? ' under supervisor' : ''}${modes ? ' with mode automaton' : ''}`);
   return run;
 }
 
 export function stopMission(app: App, run: MissionRun): void {
   const i = app.worldHooks.indexOf(run.hook); if (i >= 0) app.worldHooks.splice(i, 1);
-  run.done = true; delete run.robot.params.vmaxOverride;
-  if (run.robot.state.path) { run.robot.state.path = null; run.robot.state.v = 0; run.robot.state.status = 'idle'; }
+  run.done = true; run.world.stop();
+  if (run.robot) { delete run.robot.params.vmaxOverride; if (run.robot.state.path) { run.robot.state.path = null; run.robot.state.v = 0; run.robot.state.status = 'idle'; } }
 }
 
 export function traceCsv(rt: ControlRuntime): string {
@@ -313,29 +329,22 @@ export function actionCatalog(app: App): ActionCatalog & { desModels: string[]; 
   };
 }
 
-/** The station as an executor world: host actions over the app, per-mobile-robot bindings, world stepping. */
-export function stationWorld(app: App): ExecutorWorld & { stop(): void } {
-  const host = hostBindings({
-    station: app.station,
-    runProgram: (p) => app.runProgram(p), programPlaying: () => app.sim.playing, stopProgram: () => app.stopProgram(),
-    moveDuration: (robot, target, linear) => { const q1 = robot.jointsForTarget(target); if (!q1) return null; const tr = linear ? planMoveL(robot, robot.joints(), robot.solveFK(q1), robot.motion.speedLinear, robot.motion.accelLinear) : planMoveJ(robot, robot.joints(), q1, robot.motion.speedJoints, robot.motion.accelJoints); return tr.duration; },
-    setSignal: (n, v) => app.processSim.setSignal(n, v),
-  });
-  const mobiles = new Map<string, WorldBindings & { stepRobot(dt: number): void }>();
-  const inFleet = (r: MobileRobot) => app.station.itemsOfType<FleetItem>(ItemType.FLEET).some((f) => f.robotIds.includes(r.id));
-  const forRobot = (name?: string) => {
-    const r = app.station.itemsOfType<MobileRobot>(ItemType.MOBILE_ROBOT).find((m) => m.name === name || (!name && mobiles.size === 0)); if (!r) return null;
-    let b = mobiles.get(r.id); if (!b) { b = stationBindings({ robot: r, station: app.station }); mobiles.set(r.id, b); } return b;
-  };
-  return {
-    host, forRobot,
-    step: (dt) => { for (const [id, b] of mobiles) { const r = app.station.findById(id) as MobileRobot | null; if (r && !inFleet(r)) b.stepRobot(dt); } },
-    events: () => [...(host.events?.() ?? []), ...[...mobiles.values()].flatMap((b) => b.events?.() ?? [])],
-    stop: () => { host.halt?.program?.({ time: 0, dt: 0, bb: {} }, {}); for (const [id] of mobiles) { const r = app.station.findById(id) as MobileRobot | null; if (r) { r.state.path = null; r.state.v = 0; r.state.status = 'idle'; } } },
-  };
+/** The host of the control runtimes over the app: program backend (station runtime when present, else one simulator per robot), the process signal table, logging. */
+export function stationHost(app: App): StationHost {
+  const ps = app.processSim;
+  const signals = mapSignals(ps.signals as Map<string, unknown>, (n, v) => ps.setSignal(n, typeof v === 'number' || typeof v === 'boolean' ? v : v === 'true' ? true : v === 'false' ? false : Number.isFinite(Number(v)) ? Number(v) : !!v));
+  const programs: ProgramBackend = programBackendFor(app.station, app, { signals, speed: () => 1, log: (m, level) => app.log(m, level === 'error' ? 'error' : level === 'warn' ? 'warn' : 'info') });
+  return { station: app.station, programs, log: (m, level) => app.log(`[control] ${m}`, level === 'error' ? 'error' : level === 'warn' ? 'warn' : 'info') };
 }
 
-export interface ActiveRun { model: ControlModelItem; hook: (dt: number) => void; done: boolean; rt?: ControlRuntime; exec?: AutomatonExecutor | PetriExecutor; fleet?: FleetRuntime; stop(): void; status(): string; logLines(): string[] }
+/** The station as an executor world: host actions over the app, per-mobile-robot bindings (arm programs as skills), world stepping. */
+export function stationWorld(app: App): StationWorld {
+  const inFleet = (r: MobileRobot) => app.station.itemsOfType<FleetItem>(ItemType.FLEET).some((f) => f.robotIds.includes(r.id));
+  const human = () => { const it = [...app.station.walk()].find((i: Item) => /human|operator|person|worker/i.test(i.name)); if (!it) return null; const p = it.pose(); return [p[12], p[13]] as [number, number]; };
+  return makeStationWorld(stationHost(app), { inFleet, humanPosition: human });
+}
+
+export interface ActiveRun { model: ControlModelItem; hook: (dt: number) => void; done: boolean; rt?: ControlRuntime; exec?: AutomatonExecutor | PetriExecutor | FsmExecutor; fleet?: FleetRuntime; stop(): void; status(): string; logLines(): string[] }
 
 /** Run a group-control model (consensus / formation, swarm, coverage, safety, grid MAPF, warehouse fleet) on the mobile robots of the station. */
 export function startFleetRun(app: App, model: ControlModelItem, opts: { maxSeconds?: number } = {}): ActiveRun {
@@ -358,38 +367,45 @@ export function startFleetRun(app: App, model: ControlModelItem, opts: { maxSeco
   return run;
 }
 
-/** Run an automaton or Petri-net model on the station until it is quiescent (or stopped). */
+/** Run an automaton, Petri-net or FSM model on the station until it ends (verdict done / deadlock / failed), or stopped. */
 export function startModelRun(app: App, model: ControlModelItem, opts: { maxSeconds?: number } = {}): ActiveRun {
+  if (model.kind !== 'des' && model.kind !== 'petri' && model.kind !== 'fsm') throw new Error('only automata (des), Petri nets (petri) and FSMs (fsm) can be executed here');
   const world = stationWorld(app);
-  const log = (m: string) => app.log(`[${model.name}] ${m}`, /mismatch|failed|denied|deadlock/.test(m) ? 'warn' : 'info');
-  let exec: AutomatonExecutor | PetriExecutor;
+  const log = (m: string) => app.log(`[${model.name}] ${m}`, /mismatch|failed|denied|deadlock|DEADLOCK|timeout|not mapped/.test(m) ? 'warn' : 'info');
+  let exec: AutomatonExecutor | PetriExecutor | FsmExecutor;
   if (model.kind === 'des') {
     const doc = parseDes(model.source);
     let supervisor; if (doc.specs.length) { supervisor = supervisorFromDes(model.source) ?? undefined; if (!supervisor) toast('Specifications are unrealisable — running the plant without a supervisor', 'warn'); }
     exec = new AutomatonExecutor({ doc, world, supervisor, log });
   } else if (model.kind === 'petri') {
     const p = parsePetri(model.source);
-    exec = new PetriExecutor({ doc: { spec: p.spec, checks: p.checks, horizon: p.horizon, layout: p.layout, actions: p.actions }, world, log });
-  } else throw new Error('only automata (des) and Petri nets (petri) can be executed here');
+    exec = new PetriExecutor({ doc: p, world, log });
+  } else exec = new FsmExecutor({ doc: parseFsm(model.source), world, log });
   const maxSeconds = opts.maxSeconds ?? 3600;
+  const end = (why?: string) => {
+    run.done = true; const i = app.worldHooks.indexOf(run.hook); if (i >= 0) app.worldHooks.splice(i, 1); world.stop();
+    const s = exec.summary(); const outcome = exec instanceof FsmExecutor && exec.outcome ? ` · outcome ${exec.outcome}` : '';
+    const bad = s.verdict !== 'done' || s.mismatches > 0 || s.failed > 0 || (exec instanceof FsmExecutor && /fail|abort|error/i.test(exec.outcome ?? ''));
+    const msg = `${model.name}: ${why ?? s.verdict} after ${s.time.toFixed(1)} s${outcome} — ${s.fired} ${model.kind === 'fsm' ? 'transitions' : 'firings'}, ${s.mismatches} mismatches, ${s.failed} failed actions · ${s.where}`;
+    app.log(`[control] ${msg}`, bad ? 'warn' : 'info'); toast(msg, why?.startsWith('error') ? 'error' : bad ? 'warn' : 'ok', 6000);
+  };
   const run: ActiveRun = {
     model, exec, done: false,
     hook: (dt) => {
       if (run.done) return;
-      const st = exec.tick(dt);
-      if (st !== 'running' || exec.time >= maxSeconds) {
-        run.done = true; const i = app.worldHooks.indexOf(run.hook); if (i >= 0) app.worldHooks.splice(i, 1); world.stop();
-        const s = exec.summary(); const msg = `${model.name}: ${s.status} after ${s.time.toFixed(1)} s — ${s.fired} firings, ${s.mismatches} mismatches, ${s.failed} failed actions · ${s.where}`;
-        app.log(`[control] ${msg}`, s.mismatches || s.failed ? 'warn' : 'info'); toast(msg, s.mismatches || s.failed ? 'warn' : 'ok', 6000);
-      }
+      try {
+        const st = exec.tick(dt);
+        if (st !== 'running') end();
+        else if (exec.time >= maxSeconds) { exec.stop('timeout'); end(`time limit (${maxSeconds} s)`); }
+      } catch (e) { exec.stop('failed'); end(`error: ${(e as Error).message}`); }
     },
     stop: () => { const i = app.worldHooks.indexOf(run.hook); if (i >= 0) app.worldHooks.splice(i, 1); run.done = true; exec.stop(); world.stop(); },
-    status: () => { const s = exec.summary(); return `${run.done ? '⏹' : '▶'} ${model.name}: ${s.status} · t=${fmt(s.time, 1)} s · ${s.fired} ${t('firings')} · ${t('mismatches')} ${s.mismatches}${s.denied ? ` · ${t('denied')} ${s.denied}` : ''} · ${s.where}${s.running.length ? ` · ${t('running')}: ${s.running.join('; ')}` : ''}`; },
+    status: () => { const s = exec.summary(); return `${run.done ? '⏹' : '▶'} ${model.name}: ${s.status === 'running' ? 'running' : s.verdict} · t=${fmt(s.time, 1)} s · ${s.fired} ${t('firings')} · ${t('mismatches')} ${s.mismatches}${s.denied ? ` · ${t('denied')} ${s.denied}` : ''} · ${s.where}${s.running.length ? ` · ${t('running')}: ${s.running.join('; ')}` : ''}`; },
     logLines: () => exec.log,
   };
   app.worldHooks.push(run.hook);
   app.startWorld();
-  app.log(`[control] ${model.kind === 'des' ? 'automaton' : 'Petri net'} "${model.name}" started on the station (${model.kind === 'des' ? (exec as AutomatonExecutor).comps.length + ' components' : (exec as PetriExecutor).net.places.length + ' places'})`);
+  app.log(`[control] ${model.kind === 'des' ? 'automaton' : model.kind === 'petri' ? 'Petri net' : 'FSM'} "${model.name}" started on the station (${exec instanceof AutomatonExecutor ? exec.comps.length + ' components' : exec instanceof PetriExecutor ? exec.net.places.length + ' places' : exec.where()}; programs: ${world.programs.kind})`);
   return run;
 }
 
@@ -539,17 +555,16 @@ export function buildControlPanel(app: App): { el: HTMLElement; render: () => vo
       try { run = startFleetRun(app, selected); shownDone = false; } catch (e) { toast(`Cannot start: ${(e as Error).message}`, 'error', 7000); return; }
       refreshStatus(); return;
     }
-    if (selected.kind === 'des' || selected.kind === 'petri') {
+    if (selected.kind === 'des' || selected.kind === 'petri' || selected.kind === 'fsm') {
       try { run = startModelRun(app, selected); shownDone = false; } catch (e) { toast(`Cannot start: ${(e as Error).message}`, 'error', 6000); return; }
       refreshStatus(); return;
     }
-    if (selected.kind !== 'bt') return toast('Run needs a behavior tree (bt), an automaton (des) or a Petri net (petri) model', 'warn');
-    const robot = app.station.findById(robotSel.value) as MobileRobot | null;
-    if (!robot) return toast('Add a mobile robot first (Mobile & Fleet › Add mobile robot…)', 'warn');
+    if (selected.kind !== 'bt') return toast('Run needs a behavior tree (bt), an automaton (des), a Petri net (petri) or an FSM (fsm) model', 'warn');
+    const robot = app.station.findById(robotSel.value) as MobileRobot | null; // optional: arm-only stations run program / move / signal actions
     try { const m = startMission(app, selected, robot, { targets: Number(targetsIn.value) || 0 }); run = { model: m.model, hook: m.hook, get done() { return m.done; }, set done(v: boolean) { m.done = v; }, rt: m.rt, stop: () => stopMission(app, m), status: () => missionStatus(m), logLines: () => m.rt.log }; shownDone = false; } catch (e) { toast(`Cannot start: ${(e as Error).message}`, 'error', 6000); return; }
     refreshStatus();
   };
-  const missionStatus = (m: MissionRun) => { const s = m.rt.summary(); return `${m.done ? '⏹' : '▶'} ${m.model.name} on ${m.robot.name}: ${s.status} · t=${fmt(s.time, 1)} s · ${s.ticks} ticks · ${t('plant')} ${s.plantState ?? '—'}${s.mode ? ` · ${t('mode')} ${s.mode}` : ''} · ${t('denied')} ${s.denied} · ${t('violations')} ${s.violations} · ${s.verdicts.map((v) => `${v.verdict} ${v.formula}`).join(' | ')}`; };
+  const missionStatus = (m: MissionRun) => { const s = m.rt.summary(); return `${m.done ? '⏹' : '▶'} ${m.model.name}${m.robot ? ` on ${m.robot.name}` : ''}: ${s.status} · t=${fmt(s.time, 1)} s · ${s.ticks} ticks · ${t('plant')} ${s.plantState ?? '—'}${s.mode ? ` · ${t('mode')} ${s.mode}` : ''} · ${t('denied')} ${s.denied} · ${t('violations')} ${s.violations} · ${s.verdicts.map((v) => `${v.verdict} ${v.formula}`).join(' | ')}`; };
   const refreshStatus = () => {
     runLabel();
     if (!run) { status.textContent = t(selected && isMrsKind(selected.kind) ? (RUNNABLE_KINDS.includes(selected.kind) ? 'Run on fleet drives the mobile robots of the station with the group law of the model (mission under a chosen architecture, consensus / formation, swarm, coverage, safety filter, grid MAPF plan, warehouse fleet); a warehouse model builds its scene with Build scene.' : 'This group-control model is analysed only (report with charts); runnable kinds: mission, consensus, swarm, coverage, safety, gridmapf, warehouse.') : selected && (selected.kind === 'des' || selected.kind === 'petri') ? 'Run on station executes the automaton / net: entry actions and transition operations bound in the diagram inspector drive the robots, programs, targets and signals of the station.' : 'Zones named as in the tree (home, table, bin, dock) are used as goto targets; an item named "Human" is the human position.'); return; }

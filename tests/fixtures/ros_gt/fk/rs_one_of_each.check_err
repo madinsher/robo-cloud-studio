@@ -1,0 +1,3 @@
+Error:   material 'aluminum' is not unique.
+         at line 150 in ./urdf_parser/src/model.cpp
+ERROR: Model Parsing the xml failed

@@ -12,7 +12,7 @@ export function parseXML(src: string): XNode {
   const n = src.length;
   const root: XNode = { type: 'element', name: '#document', attrs: {}, children: [] };
   const stack: XNode[] = [root];
-  const decode = (s: string) => s.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&#(\d+);/g, (_m, d) => String.fromCharCode(+d)).replace(/&amp;/g, '&');
+  const decode = (s: string) => s.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&#x([0-9a-fA-F]+);/g, (_m, h) => String.fromCodePoint(parseInt(h, 16))).replace(/&#(\d+);/g, (_m, d) => String.fromCodePoint(+d)).replace(/&amp;/g, '&');
   while (i < n) {
     if (src[i] === '<') {
       if (src.startsWith('<!--', i)) {
@@ -69,7 +69,8 @@ export function parseXML(src: string): XNode {
             j = e;
           }
         }
-        if (an) attrs[an] = decode(av);
+        // XML attribute-value normalization: literal tab/CR/LF become spaces (character references survive)
+        if (an) attrs[an] = decode(av.replace(/\r\n|[\t\n\r]/g, ' '));
       }
       const el: XNode = { type: 'element', name, attrs, children: [] };
       stack[stack.length - 1].children.push(el);

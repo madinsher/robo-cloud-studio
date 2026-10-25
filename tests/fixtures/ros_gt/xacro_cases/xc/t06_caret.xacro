@@ -1,0 +1,1 @@
+<robot name="t" xmlns:xacro="http://www.ros.org/wiki/xacro"><xacro:property name="w" value="0.7"/><xacro:macro name="m" params="name w:=^|0.1"><link name="${name}"><visual><geometry><box size="${w} 1 1"/></geometry></visual></link></xacro:macro><xacro:m name="a"/></robot>

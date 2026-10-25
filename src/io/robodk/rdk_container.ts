@@ -24,8 +24,15 @@ export interface RdkScanReport {
   poses: number;
   meshes: Array<{ offset: number; triangles: number }>;
   notes: string[];
-  /** `full` when the RoboDK container was parsed; `scan` is the legacy string/pose skim. */
-  fidelity?: 'full' | 'scan';
+  /**
+   * `full`: the RoboDK container was decoded and nothing was dropped; `partial`: decoded, but `dropped` lists data
+   * that was not imported or only approximated; `scan`: not a RoboDK container, legacy string/pose skim.
+   */
+  fidelity?: 'full' | 'partial' | 'scan';
+  /** Data present in the file that the import could not reproduce. */
+  dropped?: string[];
+  /** Imported items by kind. */
+  counts?: Record<string, number>;
 }
 
 async function inflate(buf: Uint8Array, format: 'deflate' | 'gzip' | 'deflate-raw'): Promise<Uint8Array<ArrayBuffer> | null> {
@@ -138,16 +145,19 @@ export async function scanRdk(data: ArrayBuffer): Promise<{ payload: Uint8Array;
 
 /** Load a RoboDK file. Real .rdk/.robot/.tool containers are parsed; anything else is skimmed for poses. */
 export async function importRdkBestEffort(data: ArrayBuffer, name = 'RoboDK import', assets?: AssetStore): Promise<{ station: Station; report: RdkScanReport }> {
+  let failure: string | null = null;
   try {
     const full = await importRobodkBinary(data, name, assets);
     if (full) {
       full.station.params.rdkReport = JSON.parse(JSON.stringify(full.report));
       return full;
     }
-  } catch {
-    /* not a RoboDK container, or a variant this reader does not know yet */
+  } catch (e) {
+    /* not a RoboDK container, or a variant this reader does not know yet: fall back to the skim and say why */
+    failure = (e as Error)?.message ?? String(e);
   }
   const { report } = await scanRdk(data);
+  if (failure) report.notes.push(`RoboDK decoder failed: ${failure}`);
   report.fidelity = 'scan';
   const st = new Station(name);
   const poses: number[][][] = (report as any)._poses ?? [];

@@ -1,43 +1,44 @@
 /**
  * VerticalBot Studio server.
  *
- *  - WebSocket JSON-RPC endpoint (default port 20500, same as RoboDK's API port) speaking the
- *    RoboDK-compatible Robolink API. Python clients use python/robodk/robolink.py (drop-in).
- *  - Relay mode: when a browser tab is connected as "host", every request is forwarded to it and
- *    executed against the live 3D station (what the user sees). Otherwise the server runs a
- *    headless station itself (CI, batch post-processing, fleet simulations on a server).
- *  - HTTP: GET /station.json (headless station), POST /station.json (replace), GET /health.
+ *  - WebSocket JSON-RPC endpoint (default port 20500, STUDIO_PORT) speaking the RoboDK-compatible Robolink API.
+ *    Python clients use python/robodk/robolink.py (drop-in, also `from robolink import *`).
+ *  - Plain TCP JSON-lines endpoint on port+1 (MATLAB / C++ / PLC clients), relayed like the WebSocket.
+ *  - RoboDK binary API protocol (official `robodk` package unmodified) on STUDIO_RDK_PORT when set (src/api/rdk_protocol.ts).
+ *  - Relay mode: when a browser tab is connected as "host", every request is forwarded to it and executed against the
+ *    live 3D station (what the user sees). Otherwise the server runs a headless station itself, with a realtime clock
+ *    (STUDIO_SIM_SPEED) so robot moves, programs and polling scripts behave like in RoboDK.
+ *  - Station Python programs (RoboDK PROGRAM_PYTHON items, program calls like SprayOn(1)) run on CPython with the
+ *    drop-in on PYTHONPATH (src/api/runner_cpython.ts); the browser asks for them through POST /python/run.
+ *  - HTTP: GET /health, GET/POST /station.json, POST /convert/rdk, POST /python/run, /vda5050/*, /vision/*.
  *
  * Run: npm run server   (node --experimental-strip-types server/index.ts)
  */
-import { WebSocketServer, WebSocket } from 'ws';
 import http from 'node:http';
 import { readFileSync, writeFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs';
-import { execFile } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { Station } from '../src/core/items/item.ts';
-import { Robolink } from '../src/api/robolink.ts';
-import { executeRpcAsync, RpcRequest } from '../src/api/rpc.ts';
+import { Station, ItemType, Item } from '../src/core/items/item.ts';
+import { RpcRequest, RpcResponse } from '../src/api/rpc.ts';
+import { createNodeHost } from '../src/api/node_host.ts';
+import { findPython } from '../src/api/runner_cpython.ts';
 import { loadStation, saveStation } from '../src/io/station-file.ts';
 import '../src/posts/index.ts';
 import { createDriver, drivers, RobotDriver } from './drivers/index.ts';
-import { parseTcpJsonLines } from './tcp.ts';
 import { Vda5050Service, mqttConnector } from './vda5050.ts';
 import { handleVisionHttp } from './vision.ts';
 
 const PORT = Number(process.env.STUDIO_PORT ?? 20500);
 const STATION_FILE = process.env.STUDIO_STATION ?? '';
 
-let station = new Station('Headless station');
+let initial = new Station('Headless station');
 if (STATION_FILE && existsSync(STATION_FILE)) {
-  station = loadStation(JSON.parse(readFileSync(STATION_FILE, 'utf8')));
+  initial = loadStation(JSON.parse(readFileSync(STATION_FILE, 'utf8')));
+  initial.filePath = STATION_FILE;
   console.log(`[studio-server] loaded ${STATION_FILE}`);
 }
-let RDK = new Robolink(station);
-RDK.onMessage = (m) => console.log(`[studio-server] message: ${m}`);
 
-let host: WebSocket | null = null;
 /** Live robot drivers keyed by robot name (RUNMODE_RUN_ROBOT). */
 const liveDrivers = new Map<string, RobotDriver>();
 async function driverCommand(msg: any): Promise<any> {
@@ -58,24 +59,77 @@ async function driverCommand(msg: any): Promise<any> {
     default: throw new Error(`Unknown driver action ${action}`);
   }
 }
-const pending = new Map<string, { ws: WebSocket; id: number | string }>();
-let seq = 0;
+const special = (req: RpcRequest): Promise<RpcResponse> | undefined => {
+  if (req.method !== '__driver__') return undefined;
+  return driverCommand(req).then((result) => ({ id: req.id, result }), (e) => ({ id: req.id, error: String(e?.message ?? e) }));
+};
+
+const READ_ONLY = /^(Item|ItemList|Valid|Name|Type|Pose|PoseAbs|Joints|Busy|WaitMove|WaitFinished|getParam|Version)$/;
+const httpServer = http.createServer();
+await new Promise<void>((resolve) => httpServer.listen(PORT, () => resolve()));
+await new Promise<void>((resolve) => httpServer.listen(PORT, () => resolve()));
+const host = await createNodeHost({
+  station: initial, server: httpServer, tcpPort: Number(process.env.STUDIO_TCP_PORT ?? PORT + 1), special,
+  afterHeadless: (req) => { if (STATION_FILE && !READ_ONLY.test(req.method)) { try { writeFileSync(STATION_FILE, JSON.stringify(saveStation(host.station(), host.rdk.assets))); } catch { /* ignore */ } } },
+});
+const station = () => host.station();
 
 /** VDA 5050 (AGV fleets over MQTT): master + digital-twin bridge, see server/vda5050.ts */
-const vda = new Vda5050Service(() => station, (url, opts) => { throw new Error(`MQTT connector not ready for ${url} (${Object.keys(opts).length} opts)`); });
+const vda = new Vda5050Service(() => station(), (url, opts) => { throw new Error(`MQTT connector not ready for ${url} (${Object.keys(opts).length} opts)`); });
 mqttConnector().then((fn) => { vda.connectFn = fn; if (process.env.STUDIO_MQTT_URL) vda.connect({ url: process.env.STUDIO_MQTT_URL, prefix: process.env.STUDIO_VDA_PREFIX, role: (process.env.STUDIO_VDA_ROLE as any) ?? 'master', manufacturer: process.env.STUDIO_VDA_MANUFACTURER }); }).catch((e) => console.warn(`[studio-server] mqtt unavailable: ${e.message}`));
 const readJson = (req: http.IncomingMessage) => new Promise<any>((resolve, reject) => { let body = ''; req.on('data', (c) => (body += c)); req.on('end', () => { try { resolve(body ? JSON.parse(body) : {}); } catch (e) { reject(e); } }); req.on('error', reject); });
 
-const httpServer = http.createServer(async (req, res) => {
+/** Interpreter for the RoboDK converter: STUDIO_ROBODK_PYTHON, RoboDK's own Python, else the default Python 3. */
+function converterPython(): string {
+  if (process.env.STUDIO_ROBODK_PYTHON) return process.env.STUDIO_ROBODK_PYTHON;
+  for (const p of ['C:/RoboDK/Python37/python.exe', 'C:/RoboDK/Python/python.exe']) if (existsSync(p)) return p;
+  try { return findPython().cmd; } catch { return process.platform === 'win32' ? 'python' : 'python3'; }
+}
+/** The converter needs the *official* robodk package: run isolated (-I) so python/robodk (the drop-in) cannot shadow it. */
+let converterStatus: { ok: boolean; detail: string } | null = null;
+function checkConverter(): { ok: boolean; detail: string } {
+  if (converterStatus) return converterStatus;
+  try {
+    const out = execFileSync(converterPython(), ['-I', '-c', 'import robodk.robolink as r, os; print(os.path.abspath(r.__file__))'], { encoding: 'utf8', timeout: 20000, windowsHide: true }).trim();
+    const dropIn = path.resolve(process.cwd(), 'python').toLowerCase();
+    converterStatus = { ok: !!out && !out.toLowerCase().startsWith(dropIn), detail: out };
+  } catch (e: any) { converterStatus = { ok: false, detail: String(e?.message ?? e).slice(0, 300) }; }
+  return converterStatus;
+}
+
+httpServer.on('request', async (req, res) => {
   if ((req.url ?? '').startsWith('/vda5050/') && (await vda.handleHttp(req, res, () => readJson(req)))) return;
   if ((req.url ?? '').startsWith('/vision/') && (await handleVisionHttp(req, res, () => readJson(req)))) return;
   if (req.method === 'OPTIONS') { res.writeHead(204, { 'access-control-allow-origin': '*', 'access-control-allow-headers': '*', 'access-control-allow-methods': 'GET,POST,OPTIONS' }); res.end(); return; }
   res.setHeader('access-control-allow-origin', '*');
-  if (req.url === '/health') { res.writeHead(200, { 'content-type': 'application/json', 'access-control-allow-origin': '*' }); res.end(JSON.stringify({ ok: true, host: !!host, station: station.name, rdkConverter: !!process.env.STUDIO_ROBODK_PYTHON || existsSync(path.join(process.cwd(), 'python', 'rdk2vbs.py')), vda5050: vda.connected, vision: existsSync(path.join(process.cwd(), 'python', 'vision_infer.py')) })); return; }
-  if (req.url === '/station.json' && req.method === 'GET') { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(saveStation(station))); return; }
+  const json = (code: number, body: any) => { res.writeHead(code, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); };
+  if (req.url === '/health') {
+    let python: string | null = null; try { python = findPython().cmd; } catch { python = null; }
+    json(200, { ok: true, host: host.api.hasHost(), station: station().name, python, pythonScripts: host.runner.running(), rdkConverter: checkConverter(), vda5050: vda.connected, vision: existsSync(path.join(process.cwd(), 'python', 'vision_infer.py')) });
+    return;
+  }
+  if (req.url === '/station.json' && req.method === 'GET') { json(200, saveStation(station(), host.rdk.assets)); return; }
+  if (req.url === '/station.json' && req.method === 'POST') {
+    let body = '';
+    req.on('data', (c) => (body += c));
+    req.on('end', () => { try { host.setStation(loadStation(JSON.parse(body), host.rdk.assets)); res.writeHead(200); res.end('ok'); } catch (e: any) { res.writeHead(400); res.end(String(e.message)); } });
+    return;
+  }
+  if (req.url === '/python/run' && req.method === 'POST') {
+    // run a station Python program on CPython; its API calls go to this server (relayed to the browser host if any)
+    try {
+      const { name, code, args } = await readJson(req);
+      const item = station().find(String(name ?? ''), ItemType.PROGRAM_PYTHON);
+      const program: Item = item ?? Object.assign(new Item(ItemType.PROGRAM_PYTHON, String(name ?? 'script')), {});
+      if (code) program.params.pythonCode = String(code);
+      const before = host.runner.history.length;
+      await host.runner({ station: station(), runtime: host.rdk.exec.rt(), name: String(name ?? 'script'), args: (args ?? []).map(String), robot: null, program });
+      json(200, { ok: true, output: host.runner.history.slice(before).map((h) => h.output).join('\n') });
+    } catch (e: any) { json(500, { error: String(e?.message ?? e) }); }
+    return;
+  }
   if (req.url === '/convert/rdk' && req.method === 'POST') {
-    // Convert an uploaded .rdk/.robot/.tool with a locally installed RoboDK (python + robodk package) -> .vbstation JSON
-    const python = process.env.STUDIO_ROBODK_PYTHON ?? process.env.PYTHON ?? 'python3';
+    // Convert an uploaded .rdk/.robot/.tool with a locally installed RoboDK (official robodk package) -> .vbstation JSON
     const chunks: Buffer[] = [];
     req.on('data', (c) => chunks.push(c));
     req.on('end', () => {
@@ -83,65 +137,22 @@ const httpServer = http.createServer(async (req, res) => {
       const dir = mkdtempSync(path.join(tmpdir(), 'vbs-rdk-'));
       const src = path.join(dir, name), out = path.join(dir, 'out.vbstation');
       writeFileSync(src, Buffer.concat(chunks));
-      execFile(python, [path.join(process.cwd(), 'python', 'rdk2vbs.py'), src, out], { timeout: 180000 }, (err, stdout, stderr) => {
-        if (err || !existsSync(out)) { res.writeHead(501, { 'content-type': 'application/json' }); res.end(JSON.stringify({ error: 'RoboDK conversion unavailable', detail: String(stderr || stdout || err?.message).slice(0, 2000) })); }
+      execFile(converterPython(), ['-I', path.join(process.cwd(), 'python', 'rdk2vbs.py'), src, out], { timeout: 180000 }, (err, stdout, stderr) => {
+        if (err || !existsSync(out)) json(501, { error: 'RoboDK conversion unavailable', detail: String(stderr || stdout || err?.message).slice(0, 2000) });
         else { res.writeHead(200, { 'content-type': 'application/json' }); res.end(readFileSync(out)); }
         rmSync(dir, { recursive: true, force: true });
       });
     });
     return;
   }
-  if (req.url === '/station.json' && req.method === 'POST') {
-    let body = '';
-    req.on('data', (c) => (body += c));
-    req.on('end', () => {
-      try { station = loadStation(JSON.parse(body)); RDK = new Robolink(station); res.writeHead(200); res.end('ok'); } catch (e: any) { res.writeHead(400); res.end(String(e.message)); }
-    });
-    return;
-  }
   res.writeHead(404); res.end();
 });
 
-const wss = new WebSocketServer({ server: httpServer });
-wss.on('connection', (ws) => {
-  let role: 'client' | 'host' = 'client';
-  ws.on('message', (data) => {
-    let msg: any;
-    try { msg = JSON.parse(String(data)); } catch { return; }
-    if (msg.role === 'host') { role = 'host'; host = ws; console.log('[studio-server] browser host connected'); return; }
-    if (role === 'host') {
-      // response from the browser for a relayed request
-      const key = String(msg.id);
-      const p = pending.get(key);
-      if (p) { pending.delete(key); p.ws.send(JSON.stringify({ ...msg, id: p.id })); }
-      return;
-    }
-    const req = msg as RpcRequest;
-    if (req.method === '__driver__') {
-      driverCommand(req).then((result) => ws.send(JSON.stringify({ id: req.id, result }))).catch((e) => ws.send(JSON.stringify({ id: req.id, error: String(e?.message ?? e) })));
-      return;
-    }
-    if (host && host.readyState === WebSocket.OPEN) {
-      const key = `r${++seq}`;
-      pending.set(key, { ws, id: req.id });
-      host.send(JSON.stringify({ ...req, id: key }));
-      setTimeout(() => { if (pending.has(key)) { pending.delete(key); ws.send(JSON.stringify({ id: req.id, error: 'host timeout' })); } }, 30000);
-    } else {
-      executeRpcAsync(RDK, req).then((res) => {
-        ws.send(JSON.stringify(res));
-        if (STATION_FILE && req.method !== 'Item' && req.method !== 'ItemList') {
-          try { writeFileSync(STATION_FILE, JSON.stringify(saveStation(station))); } catch { /* ignore */ }
-        }
-      });
-    }
-  });
-  ws.on('close', () => { if (ws === host) { host = null; console.log('[studio-server] browser host disconnected'); } });
-});
+// Official RoboDK binary protocol (opt-in: the official robodk package / RoboDK C#, C++, MATLAB clients)
+if (process.env.STUDIO_RDK_PORT) {
+  import('../src/api/rdk_protocol.ts').then(({ startRdkProtocolServer }) => startRdkProtocolServer({ port: Number(process.env.STUDIO_RDK_PORT), handle: (req) => host.api.handle(req) }))
+    .then((s) => console.log(`[studio-server] RoboDK binary API protocol on port ${s.port}`))
+    .catch((e) => console.warn(`[studio-server] RoboDK protocol unavailable: ${e.message}`));
+}
 
-// Plain TCP JSON-lines endpoint (port+1) for MATLAB / C++ / PLC clients without WebSocket support
-parseTcpJsonLines(PORT + 1, async (req) => {
-  if (req.method === '__driver__') { try { return { id: req.id, result: await driverCommand(req) }; } catch (e: any) { return { id: req.id, error: String(e?.message ?? e) }; } }
-  return executeRpcAsync(RDK, req);
-});
-
-httpServer.listen(PORT, () => console.log(`[studio-server] listening on ws://localhost:${PORT} (RoboDK-compatible API) — open the studio with ?server=ws://localhost:${PORT} to relay to the browser`));
+console.log((`[studio-server] listening on ws://localhost:${PORT} (RoboDK-compatible API), TCP JSON-lines on ${host.tcpPort} — open the studio with ?server=ws://localhost:${PORT} to relay to the browser`));

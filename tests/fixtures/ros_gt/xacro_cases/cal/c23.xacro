@@ -1,0 +1,4 @@
+<?xml version="1.0"?>
+<robot name="r" xmlns:xacro="http://www.ros.org/wiki/xacro">
+<v a="${xacro.load_yaml('sub/c.yaml')['arm']['name']}" b="${load_yaml('sub/c.yaml').arm.len}" c="${xacro.load_yaml('sub/c.yaml')['deg']}" d="${xacro.load_yaml('sub/c.yaml')['lst']}" e="${xacro.load_yaml('sub/c.yaml')['arm']}"/>
+</robot>

@@ -1,0 +1,4 @@
+<?xml version="1.0"?>
+<robot name="r" xmlns:xacro="http://www.ros.org/wiki/xacro">
+<xacro:include filename="sub/inc_ns.xacro" ns="pn"/><v l="${pn.len}" o="${pn.outer_from_inc}"/><xacro:pn.mm q="1"/>
+</robot>

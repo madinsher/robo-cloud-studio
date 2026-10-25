@@ -1,0 +1,9 @@
+{
+ "ok": true,
+ "error": null,
+ "log": "Set acceleration not defined\nSet acceleration not defined\n",
+ "files": [
+  "FeatureTest.jbi",
+  "SubPick.jbi"
+ ]
+}

@@ -1,0 +1,14 @@
+#VRML_SIM R2025a utf8
+# Synthetic importable PROTO (spawned at run time in Webots; declared IMPORTABLE in the world).
+PROTO Crate [
+  field SFVec3f translation 0 0 0
+  field SFString name "crate"
+  field SFColor color 0.5 0.35 0.2
+]
+{
+  Solid {
+    translation IS translation
+    name IS name
+    children [ Shape { appearance PBRAppearance { baseColor IS color } geometry Box { size 0.3 0.2 0.2 } } ]
+  }
+}

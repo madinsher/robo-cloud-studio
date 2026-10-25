@@ -139,6 +139,7 @@ arc a1, rZ -> t2a -> p1, rM, rZ
 arc p2, rZ -> t1b -> b1
 arc b1, rM -> t2b -> p2, rM, rZ`);
     const y = new PetriExecutor({ doc: { spec: dl.spec, checks: [], horizon: 300, layout: {}, actions: [] }, world: world() });
-    y.run(20); expect(y.status).toBe('idle'); expect(y.where()).toBe('a1 b1'); expect(y.log.at(-1)).toMatch(/deadlock/);
+    y.run(20); expect(y.status).toBe('idle'); expect(y.where()).toBe('a1 b1'); expect(y.verdict).toBe('deadlock'); expect(y.log.at(-1)).toMatch(/DEADLOCK/);
+    expect(x.verdict).toBe('done'); // tokens only in the resource place and the sinks
   });
 });

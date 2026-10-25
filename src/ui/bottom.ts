@@ -78,6 +78,9 @@ export class BottomPanel {
   private buildSim(): HTMLElement {
     this.timelineRange = h('input', { type: 'range', min: 0, max: 1, step: 0.01, value: 0, class: 'timeline' }) as HTMLInputElement;
     this.timelineRange.addEventListener('input', () => { const t = parseFloat(this.timelineRange.value); this.app.pauseProgram(); this.app.seekProgram(t); });
+    const state = h('span', { class: 'sim-state' });
+    const restart = h('input', { type: 'checkbox', checked: this.app.restartFromHome, title: 'Play after a finished run restores the home state first (repeatable runs)', onChange: (e: Event) => { this.app.restartFromHome = (e.target as HTMLInputElement).checked; } }) as HTMLInputElement;
+    this.app.events.on('simulation', ({ playing, paused }) => { const n = this.app.activeRuns().length; state.textContent = playing ? `playing · ${n} program${n === 1 ? '' : 's'}` : paused ? 'paused' : this.app.atHome ? 'at home' : 'stopped'; });
     this.timeLabel = h('span', { class: 'time-label' }, '0.00 / 0.00 s');
     const speed = h('select', { onChange: (e: Event) => { this.app.simSpeed = parseFloat((e.target as HTMLSelectElement).value); } }, ...[0.25, 0.5, 1, 2, 5, 10, 50, 100].map((s) => h('option', { value: s, selected: s === 1 }, `${s}×`)));
     const worldState = h('span', { class: 'hint' });
@@ -85,11 +88,15 @@ export class BottomPanel {
     return h('div', { class: 'pad sim-panel' },
       h('div', { class: 'btn-row' },
         h('b', null, 'Program: '),
-        h('button', { class: 'btn primary', onClick: () => this.app.runProgram() }, '▶ Run'),
-        h('button', { class: 'btn', onClick: () => this.app.pauseProgram() }, '⏸ Pause'),
-        h('button', { class: 'btn', onClick: () => this.app.stopProgram() }, '⏹ Stop'),
-        h('button', { class: 'btn', onClick: () => this.app.seekProgram(this.app.sim.duration) }, '⏭ End'),
-        h('label', null, ' Speed ', speed), this.timeLabel),
+        h('button', { class: 'btn primary', dataset: { sim: 'run' }, onClick: () => this.app.runProgram() }, '▶ Run'),
+        h('button', { class: 'btn', dataset: { sim: 'pause' }, onClick: () => this.app.pauseProgram() }, '⏸ Pause'),
+        h('button', { class: 'btn', dataset: { sim: 'resume' }, onClick: () => this.app.resumeProgram() }, '⏯ Resume'),
+        h('button', { class: 'btn', dataset: { sim: 'stop' }, onClick: () => this.app.stopProgram() }, '⏹ Stop'),
+        h('button', { class: 'btn', dataset: { sim: 'reset' }, title: 'Restore the home state: object poses, attachments, robot joints, IO (Replace objects)', onClick: () => this.app.resetSimulation() }, '⏮ Reset'),
+        h('button', { class: 'btn', dataset: { sim: 'end' }, onClick: () => { if (!this.app.runs.length && this.app.activeProgram) this.app.runProgram(); this.app.runToEnd(); } }, '⏭ End'),
+        h('button', { class: 'btn', dataset: { sim: 'home' }, title: 'Make the current state the home state restored by Reset', onClick: () => this.app.setHome() }, '⌂ Set home'),
+        h('label', { title: 'Play after a finished run restores the home state first' }, restart, ' restart from home'),
+        h('label', null, ' Speed ', speed), this.timeLabel, state),
       this.timelineRange,
       h('div', { class: 'btn-row' },
         h('b', null, 'World (fleet & process): '),

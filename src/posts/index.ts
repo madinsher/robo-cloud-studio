@@ -1,6 +1,7 @@
 import './kuka';
 import './abb';
 import './fanuc';
+import './motoman';
 import './ur';
 import './misc';
 import './robodk_python';

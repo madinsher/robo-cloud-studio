@@ -1,0 +1,1 @@
+<robot name="t" xmlns:xacro="http://www.ros.org/wiki/xacro"><xacro:arg name="use" default="true"/><xacro:property name="use" value="$(arg use)"/><xacro:if value="${use == 'true'}"><link name="string_compare_true"/></xacro:if><xacro:if value="${use}"><link name="bool_true"/></xacro:if><link name="base"/></robot>

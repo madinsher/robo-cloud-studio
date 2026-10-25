@@ -45,7 +45,7 @@ describe('xacro preprocessor', () => {
       <xacro:arg name="use_gripper" default="true"/>
       <xacro:include filename="$(find my_pkg)/common.xacro"/>
       <xacro:include filename="common.xacro"/>
-      <xacro:include filename="missing.xacro"/>
+      <xacro:include filename="missing.xacro" optional="true"/>
       <xacro:property name="len" value="\${2 * 0.5 + from_include}"/>
       <xacro:property name="quoted" value="'hello'"/>
       <xacro:property name="origin_block"><origin xyz="1 2 3"/></xacro:property>
@@ -56,28 +56,28 @@ describe('xacro preprocessor', () => {
         </link>
       </xacro:macro>
       <xacro:seg name="a"><box size="1 1 \${len}"/></xacro:seg>
-      <seg name="b" mass="2"><sphere/></seg>
+      <xacro:seg name="b" mass="2"><sphere/></xacro:seg>
       <xacro:if value="$(arg use_gripper)"><gripper/></xacro:if>
       <xacro:if value="\${len > 100 and True}"><never/></xacro:if>
       <xacro:unless value="0"><always/></xacro:unless>
       <xacro:unless value="\${not False}"><never2/></xacro:unless>
-      <text>\${len} \${unknown_symbol}</text>
+      <text>\${len} $\${escaped}</text>
     </robot>`, { resolveInclude: (f) => inc.get(f.replace(/^package:\/\/my_pkg\//, '')) ?? null, args: { use_gripper: 'false' } });
-    expect(out).toContain('<link name="arm_a" mass="1.5" pi="3.141592653589793" deg="90" rad="3.141592653589793" q="hello">');
-    expect(out).toContain('<box size="1 1 4"/>');
+    expect(out).toContain('<link name="arm_a" mass="1.5" pi="3.141592653589793" deg="90.0" rad="3.141592653589793" q="hello">');
+    expect(out).toContain('<box size="1 1 4.0"/>'); // ROS xacro: 2 * 0.5 + 3 is the float 4.0
     expect(out).toContain('<origin xyz="1 2 3"/>');
     expect(out).toContain('<link name="arm_b" mass="2"');
     expect(out).toContain('<sphere/>');
     expect(out).not.toContain('<gripper/>'); // command-line arg overrides the default
     expect(out).not.toContain('<never');
     expect(out).toContain('<always/>');
-    expect(out).toContain('4 unknown_symbol'); // unknown identifiers are left as text
+    expect(out).toContain('4.0 ${escaped}'); // $${ escape; unknown identifiers are errors like in ROS (tests/ros_xacro_features)
     expect(out).not.toContain('xmlns:xacro');
   });
   it('supports python-style operators and ** in expressions', () => {
-    const out = processXacro('<r><xacro:property name="a" value="2"/><v x="${a ** 3}" y="${a == 2 or False}" z="${max(a, 5)}" w="${abs(-1)}"/></r>');
+    const out = processXacro('<r><xacro:property name="a" value="2"/><v x="${a ** 3}" y="${a == 2 or False}" z="${max(a, 5)}" w="${python.abs(-1)}"/></r>'); // abs() is only in xacro's python namespace
     expect(out).toContain('x="8"');
-    expect(out).toContain('y="true"');
+    expect(out).toContain('y="True"'); // Python str(True)
     expect(out).toContain('z="5"');
     expect(out).toContain('w="1"');
   });

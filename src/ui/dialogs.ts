@@ -8,7 +8,7 @@ import { FieldItem, MissionItem, CropRow, cropParams, CropType, CROP_PRESETS, Mi
 import { generateOrchard, buildFieldMap, rectPolygon, makeHeadlandZones, makeCanopyZones } from '../agri/orchard';
 import { planMission, generateHarvestProgram } from '../agri/missions';
 import { Component, makeConveyor, makeFeeder, makeProcess, makeSink, makeBuffer } from '../vc/component';
-import { dialog, MenuEntry, toast, downloadText, h, pickFiles } from './dom';
+import { dialog, MenuEntry, toast, downloadText, h, pickFiles, pickFolder } from './dom';
 import { transl, mul, rotz, DEG, poseToXyzrpw, xyzrpwToPose, multiply, invert, getPos } from '../core/math/pose';
 import { ROBOT_LIBRARY } from '../core/items/library';
 import { ONLINE_ROBOT_LIBRARY, ONLINE_REPOS } from '../io/library/online_library';
@@ -62,7 +62,7 @@ export function itemContextMenu(app: App, item: Item): MenuEntry[] {
   if (item instanceof Tool && item.parent instanceof Robot) add({ label: 'Set as active tool', action: () => app.cmd(() => (item.parent as Robot).setTool(item)) });
   if (item instanceof Program) {
     add({ label: 'Run', action: () => app.runProgram(item) });
-    add({ label: 'Validate', action: () => { const r = app.sim.compile(item); toast(r.ok ? `OK: ${r.duration.toFixed(1)} s, ${(r.distance / 1000).toFixed(2)} m` : r.problems.map((p) => p.message).join('; '), r.ok ? 'ok' : 'error', 6000); } });
+    add({ label: 'Validate', action: () => { const r = app.validateProgram(item)!; toast(r.ok ? `OK: ${r.duration.toFixed(1)} s, ${(r.distance / 1000).toFixed(2)} m` : r.problems.map((p) => p.message).join('; '), r.ok ? 'ok' : 'error', 6000); } });
     add({ label: 'Export (post processor)…', action: () => exportDialog(app, item) });
   }
   if (item instanceof FieldItem) {
@@ -486,7 +486,13 @@ export async function exportDialog(app: App, program: Program | null = app.activ
 }
 
 export async function importDialog(app: App): Promise<void> {
-  const files = await pickFiles('.vbstation,.json,.geojson,.urdf,.xacro,.stl,.obj,.step,.stp,.iges,.igs,.brep,.dh,.rdk,.robot,.tool,.sld,.src,.mod,.prg,.ls,.script,.csv,.txt,.nc,.gcode,.ngc,.tap,.pcd,.ply,.glb,.gltf,.dae,.zip,.vcmx,.vcm', true);
+  const files = await pickFiles('.vbstation,.json,.geojson,.urdf,.xacro,.stl,.obj,.step,.stp,.iges,.igs,.brep,.dh,.rdk,.robot,.tool,.sld,.src,.mod,.prg,.ls,.script,.csv,.txt,.nc,.gcode,.ngc,.tap,.pcd,.ply,.glb,.gltf,.dae,.zip,.vcmx,.vcm,.wbt,.proto', true);
+  if (files.length) await app.openFiles(files);
+}
+
+/** Open a folder: a ROS package (package.xml, urdf/, meshes/) or a Webots project (worlds/*.wbt, protos/). */
+export async function importFolderDialog(app: App): Promise<void> {
+  const files = await pickFolder();
   if (files.length) await app.openFiles(files);
 }
 

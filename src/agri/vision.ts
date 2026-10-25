@@ -1,12 +1,15 @@
 /**
- * Simulated perception: project fruit / plants into a camera item and return detections
- * (pixel boxes, range, ripeness), with occlusion approximated by depth ordering and canopy density.
- * Enables "detect → pick" scenarios without real images.
+ * Simulated perception of fruit: project fruit into a camera item (the studio camera model, cameraIntrinsics) and
+ * return detections (pixel boxes, range, ripeness). Occlusion: solid geometry (objects, walls, robots, tools,
+ * vehicles — ray cast against the same triangles the camera renders), nearer fruit, and a canopy-density model
+ * (leaves around a fruit). Enables "detect → pick" scenarios without real images.
  */
 import { Station, Camera as CameraItem, ItemType } from '../core/items/item';
 import { CropRow } from './items';
 import { fruitWorldPositions } from './orchard';
-import { multiply, invert } from '../core/math/pose';
+import { multiply, invert, Vec3 } from '../core/math/pose';
+import { cameraIntrinsics } from '../vision/camera_model';
+import { sceneMeshes, firstHit, SceneMesh } from '../vision/sensing';
 
 export interface Detection {
   /** World position (mm). */
@@ -20,11 +23,10 @@ export interface Detection {
 }
 
 /** Project world points into a pinhole camera (camera looks along +Z of the item, X right, Y down). */
-export function detectFruit(station: Station, camera: CameraItem, opts: { onlyRipe?: boolean; maxRange?: number; occlusionPerMeter?: number } = {}): Detection[] {
-  const inv = invert(camera.poseAbs());
-  const fx = (camera.width / 2) / Math.tan(((camera.fov * Math.PI) / 180) / 2);
-  const fy = fx;
-  const cx = camera.width / 2, cy = camera.height / 2;
+export function detectFruit(station: Station, camera: CameraItem, opts: { onlyRipe?: boolean; maxRange?: number; occlusionPerMeter?: number; solids?: SceneMesh[] } = {}): Detection[] {
+  const camWorld = camera.poseAbs();
+  const inv = invert(camWorld);
+  const { fx, fy, cx, cy } = cameraIntrinsics(camera);
   const maxRange = opts.maxRange ?? camera.far;
   const out: Detection[] = [];
   for (const row of station.itemsOfType<CropRow>(ItemType.CROP_ROW)) {
@@ -36,6 +38,20 @@ export function detectFruit(station: Station, camera: CameraItem, opts: { onlyRi
       if (u < 0 || v < 0 || u >= camera.width || v >= camera.height) continue;
       const size = (fx * f.fruit.d) / z;
       out.push({ p: f.p, u, v, w: size, h: size, range: z, ripe: f.fruit.ripe, rowId: row.id, fruit: f.fruit });
+    }
+  }
+  // solid occluders between the camera and the fruit centre (fields excluded: canopy occlusion is statistical below)
+  if (out.length) {
+    const solids = opts.solids ?? sceneMeshes(station, { fields: false });
+    if (solids.length) {
+      const o: Vec3 = [camWorld[12], camWorld[13], camWorld[14]];
+      for (let i = out.length - 1; i >= 0; i--) {
+        const d = out[i], dir: Vec3 = [d.p[0] - o[0], d.p[1] - o[1], d.p[2] - o[2]];
+        const len = Math.hypot(dir[0], dir[1], dir[2]);
+        // from the near plane to just before the fruit surface
+        const hit = firstHit(solids, o, dir, Math.max(0, 1 - (d.fruit.d / 2) / len), { tMin: camera.near / len });
+        if (hit) out.splice(i, 1);
+      }
     }
   }
   // occlusion: sort by range, drop detections whose box is mostly covered by a nearer one, plus

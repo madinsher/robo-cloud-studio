@@ -1,0 +1,11 @@
+{
+ "ok": true,
+ "error": null,
+ "log": "\"RunMessage\" function not implemented.\nInvalid DO index: \"OUT_A\". Use [1,] range or \"AO_X\".\nInvalid DI index: \"IN_B\". Use [1,] range or \"DI_X\".\nSubprograms not supported yet. \"Inline subprograms\" in Tools-Options-Program or uncheck \"Include available subprograms\" to remove this error.\n",
+ "files": [
+  "Prog_Name_That_Is_Very_Long_123.jks",
+  "Prog_Name_That_Is_Very_Long_123.zip",
+  "Prog_Name_That_Is_Very_Long_123.zu",
+  "variable.vi"
+ ]
+}

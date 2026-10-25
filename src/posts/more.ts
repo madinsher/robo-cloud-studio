@@ -149,17 +149,6 @@ registerPost(linePost({
   comment: (t) => [`' ${t}`], call: (n) => [`CallP "${safeName(n).toUpperCase()}"`], tool: (m, n) => [`Tool (${xyzrpw(m).join(',')})  ' ${n}`], frame: (m, n) => [`Base (${xyzrpw(m).join(',')})  ' ${n}`],
 }));
 
-/** KUKA KRC2 (KRL, older syntax with PTP/LIN and $VEL). */
-registerPost(linePost({
-  id: 'KUKA_KRC2', name: 'KUKA KRC2 (KRL)', brand: 'KUKA', extension: 'src',
-  header: (p) => [`&ACCESS RVP`, `&REL 1`, `DEF ${safeName(p.name).toUpperCase()} ( )`, `;FOLD INI`, `  BAS (#INITMOV,0 )`, `;ENDFOLD (INI)`, `$VEL.CP = 0.25`, `$APO.CDIS = 5`, `$ADVANCE = 3`], footer: () => [`END`],
-  moveJ: (q, ev) => [`PTP {A1 ${f(q[0])},A2 ${f(q[1])},A3 ${f(q[2])},A4 ${f(q[3])},A5 ${f(q[4])},A6 ${f(q[5])}} ; ${ev.name}`],
-  moveL: (m, ev, s) => { const [x, y, z, a, b, c] = poseToKuka(m); return [`$VEL.CP = ${f(s.speedL / 1000, 3)}`, `LIN {X ${f(x)},Y ${f(y)},Z ${f(z)},A ${f(a)},B ${f(b)},C ${f(c)}}${s.rounding > 0 ? ' C_DIS' : ''} ; ${ev.name}`]; },
-  moveC: (via, m) => { const p = (mm: Float64Array) => { const [x, y, z, a, b, c] = poseToKuka(mm); return `{X ${f(x)},Y ${f(y)},Z ${f(z)},A ${f(a)},B ${f(b)},C ${f(c)}}`; }; return [`CIRC ${p(via)}, ${p(m)}`]; },
-  pause: (ms) => [ms < 0 ? `HALT` : `WAIT SEC ${f(ms / 1000, 2)}`], setDO: (io, v) => [`$OUT[${io.replace(/\D/g, '') || 1}] = ${v ? 'TRUE' : 'FALSE'}`], waitDI: (io, v) => [`WAIT FOR $IN[${io.replace(/\D/g, '') || 1}] == ${v ? 'TRUE' : 'FALSE'}`],
-  comment: (t) => [`; ${t}`], call: (n) => [`${safeName(n).toUpperCase()}()`], tool: (m, n) => { const [x, y, z, a, b, c] = poseToKuka(m); return [`$TOOL = {FRAME: X ${f(x)},Y ${f(y)},Z ${f(z)},A ${f(a)},B ${f(b)},C ${f(c)}} ; ${n}`]; }, frame: (m, n) => { const [x, y, z, a, b, c] = poseToKuka(m); return [`$BASE = {FRAME: X ${f(x)},Y ${f(y)},Z ${f(z)},A ${f(a)},B ${f(b)},C ${f(c)}} ; ${n}`]; },
-}));
-
 /** AUBO (Lua script). */
 registerPost(linePost({
   id: 'AUBO', name: 'AUBO (Lua)', brand: 'AUBO', extension: 'lua',
@@ -200,26 +189,6 @@ registerPost(linePost({
   speed: (s) => [`dash.SpeedL(${Math.min(100, Math.round(s.speedL / 20))})`, `dash.SpeedJ(${s.speedJ})`],
   pause: (ms) => [`move.Sync(); time.sleep(${f(Math.max(0, ms) / 1000, 3)})`], setDO: (io, v) => [`dash.DO(${io.replace(/\D/g, '') || 1}, ${v ? 1 : 0})`], waitDI: (io, v) => [`while dash.DI(${io.replace(/\D/g, '') || 1}) != ${v ? 1 : 0}: time.sleep(0.01)`],
   comment: (t) => [`# ${t}`], message: (t) => [`print("${t}")`], call: (n) => [`${safeName(n)}()`], tool: (m, n) => [`dash.SetTool(1, ${xyzrpw(m).join(', ')})  # ${n}`, `dash.Tool(1)`], frame: (m, n) => [`dash.SetUser(1, ${xyzrpw(m).join(', ')})  # ${n}`, `dash.User(1)`],
-}));
-
-/** Fanuc RJ3 (older TP syntax). */
-registerPost(linePost({
-  id: 'Fanuc_RJ3', name: 'Fanuc RJ3/RJ3iB (LS)', brand: 'Fanuc', extension: 'ls',
-  header: (p) => [`/PROG  ${safeName(p.name).toUpperCase().slice(0, 12)}`, `/ATTR`, `OWNER\t\t= MNEDITOR;`, `COMMENT\t\t= "VerticalBot";`, `/MN`], footer: () => [`/POS`, `/END`],
-  moveJ: (q, ev, s) => [`  ${s.n}:J P[${s.n}] ${s.speedJ}% FINE ; ! ${ev.name} ${j6(q).join(' ')}`],
-  moveL: (m, ev, s) => [`  ${s.n}:L P[${s.n}] ${f(s.speedL, 0)}mm/sec ${s.rounding > 0 ? `CNT${Math.min(100, Math.round(s.rounding))}` : 'FINE'} ; ! ${ev.name} ${poseToFanuc(m).map((v) => f(v)).join(' ')}`],
-  pause: (ms) => [ms < 0 ? `  PAUSE ;` : `  WAIT ${f(ms / 1000, 2)}(sec) ;`], setDO: (io, v) => [`  DO[${io.replace(/\D/g, '') || 1}]=${v ? 'ON' : 'OFF'} ;`], waitDI: (io, v) => [`  WAIT DI[${io.replace(/\D/g, '') || 1}]=${v ? 'ON' : 'OFF'} ;`],
-  comment: (t) => [`  ! ${t.slice(0, 32)} ;`], call: (n) => [`  CALL ${safeName(n).toUpperCase()} ;`],
-}));
-
-/** ABB S4C (RAPID for legacy controllers). */
-registerPost(linePost({
-  id: 'ABB_RAPID_S4C', name: 'ABB RAPID (S4C legacy)', brand: 'ABB', extension: 'prg',
-  header: (p) => [`%%%`, `  VERSION:1`, `  LANGUAGE:ENGLISH`, `%%%`, `MODULE ${safeName(p.name)}`, `  PERS tooldata tTool:=[TRUE,[[0,0,0],[1,0,0,0]],[1,[0,0,50],[1,0,0,0],0,0,0]];`, `  PROC main()`], footer: () => [`  ENDPROC`, `ENDMODULE`], indent: '    ',
-  moveJ: (q, ev) => [`MoveAbsJ [[${j6(q).join(',')}],[9E9,9E9,9E9,9E9,9E9,9E9]],v500,fine,tTool;  ! ${ev.name}`],
-  moveL: (m, ev, s) => { const [x, y, z] = getPos(m); const [w, a, b, c] = poseToQuat(m); return [`MoveL [[${f(x)},${f(y)},${f(z)}],[${f(w, 6)},${f(a, 6)},${f(b, 6)},${f(c, 6)}],[0,0,0,0],[9E9,9E9,9E9,9E9,9E9,9E9]],v${Math.round(s.speedL)},${s.rounding > 0 ? `z${Math.min(200, Math.round(s.rounding))}` : 'fine'},tTool;  ! ${ev.name}`]; },
-  pause: (ms) => [ms < 0 ? `Stop;` : `WaitTime ${f(ms / 1000, 2)};`], setDO: (io, v) => [`SetDO ${safeName(io)},${v ? 1 : 0};`], waitDI: (io, v) => [`WaitDI ${safeName(io)},${v ? 1 : 0};`],
-  comment: (t) => [`! ${t}`], message: (t) => [`TPWrite "${t}";`], call: (n) => [`${safeName(n)};`],
 }));
 
 export { registerPost };

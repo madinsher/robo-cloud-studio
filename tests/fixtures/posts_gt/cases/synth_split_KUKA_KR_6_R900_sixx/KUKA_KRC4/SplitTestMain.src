@@ -1,0 +1,10 @@
+&ACCESS RVP
+&REL 1
+&PARAM TEMPLATE = C:\KRC\Roboter\Template\vorgabe
+&PARAM EDITMASK = *
+DEF SplitTestMain ( )
+SplitTest()
+SplitTest1()
+SplitTest2()
+SplitTest3()
+END

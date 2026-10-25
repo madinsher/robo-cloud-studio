@@ -1,0 +1,43 @@
+#VRML_SIM R2025a utf8
+# template language: javascript
+# Synthetic template PROTO for the importer tests: a for loop over MFFloat levels, an if on an SFBool,
+# an enumerated SFString and DEF/USE between children and boundingObject.
+
+PROTO Shelf [
+  field SFVec3f    translation 0 0 0
+  field SFRotation rotation    0 0 1 0
+  field SFString   name        "shelf"
+  field SFVec3f    size        1.0 0.4 1.5
+  field MFFloat    levels      [ 0.5, 1.0 ]
+  field SFBool     showBack    TRUE
+  field SFString{"wood",
+                 "metal"}      material "metal"
+]
+{
+  %< const sx = fields.size.value.x; const sy = fields.size.value.y; >%
+  Solid {
+    translation IS translation
+    rotation IS rotation
+    name IS name
+    children [
+      DEF BODY Group {
+        children [
+          %< for (let i = 0; i < fields.levels.value.length; ++i) { >%
+          Pose {
+            translation 0 0 %<= fields.levels.value[i] - 0.01 >%
+            children [ Shape { appearance PBRAppearance { baseColor %<= fields.material.value === 'metal' ? '0.7 0.7 0.7' : '0.6 0.4 0.2' >% } geometry Box { size %<= sx >% %<= sy >% 0.02 } } ]
+          }
+          %< } >%
+          %< if (fields.showBack.value) { >%
+          Pose {
+            translation 0 %<= sy / 2 >% %<= fields.size.value.z / 2 >%
+            children [ Shape { geometry Box { size %<= sx >% 0.01 %<= fields.size.value.z >% } } ]
+          }
+          %< } >%
+        ]
+      }
+    ]
+    boundingObject USE BODY
+  }
+}
+# trailing comment with a closing brace }

@@ -355,10 +355,12 @@ describe('ProgramSimulator', () => {
     sim.events.on('message', (e) => messages.push(e.text));
     sim.events.on('io', (e) => ios.push(`${e.name}=${e.value}`));
     const res = sim.compile(prog);
-    expect(res.problems.filter((p) => p.severity === 'error')).toEqual([]);
-    expect(res.problems.map((p) => p.message)).toContain('Conditional: simulated "then" branch');
+    // Navigate / Follow need a mobile robot: an arm program reports them (they are executed, not silently skipped)
+    expect(res.problems.filter((p) => p.severity === 'error').map((p) => p.message)).toEqual(['Program has no mobile robot', 'Program has no mobile robot']);
+    // IF is evaluated at run time: signal "c" is not set, so the then-branch is not executed and nothing is reported
+    expect(res.problems.map((p) => p.message)).not.toContain('Conditional: simulated "then" branch');
     expect(res.problems.map((p) => p.message)).toContain('Thread uses the same robot as the main program');
-    expect(res.ok).toBe(true);
+    expect(res.ok).toBe(false);
     expect(res.executed).toBeGreaterThan(30);
     expect(res.distance).toBeGreaterThan(500);
     expect(prog.lastResult).toBe(res);
@@ -408,7 +410,9 @@ describe('ProgramSimulator', () => {
     while (sim.tick(0.5) && ticks < 1000) ticks++;
     expect(sim.playing).toBe(false);
     expect(ticks).toBeGreaterThan(0);
-    expect(sim.time).toBe(sim.duration);
+    // RoboDK plays up to the first error (the Navigate instruction near the end), not past it
+    expect(sim.errorTime).toBeGreaterThan(0);
+    expect(sim.time).toBe(sim.errorTime);
     expect(robot.state.moving).toBe(false);
     expect(sim.tick(1)).toBe(false);
     sim.play(); // restarts from 0 when at the end

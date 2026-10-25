@@ -1,0 +1,9 @@
+{
+ "ok": true,
+ "error": null,
+ "log": "Circular moves not supported\nSetting Digital Outputs is not implemented (3=1)\nSetting Digital Outputs is not implemented (DO_GRIP=0)\nWaiting for Digital Input is not implemented (5==1)\nWaiting for Digital Input is not implemented (DI_PART==1)\nShow message on teach pendant not implemented (Hello operator)\nStop not supported\n\nSetting Digital Outputs is not implemented (7=1)\n",
+ "files": [
+  "FeatureTest.txt",
+  "SubPick.txt"
+ ]
+}

@@ -227,16 +227,21 @@ describe('App', () => {
     const t0 = app.station.itemsOfType<Target>(ItemType.TARGET)[0]; expect(t0.isJointTarget).toBe(true);
     r.setJoints([20, -80, 90, -100, -90, 10]);
     app.teach('MoveL'); expect(prog.instructions().length).toBe(2); expect((prog.instructions()[1].data as any).moveType).toBe('MoveL');
-    const simEv: Array<{ playing: boolean; time: number; duration: number }> = []; app.events.on('simulation', (e) => simEv.push(e));
+    const simEv: Array<{ playing: boolean; time: number; duration: number; paused?: boolean }> = []; app.events.on('simulation', (e) => simEv.push(e));
     app.previewProgram(); expect(app.sim.duration).toBeGreaterThan(0); expect(simEv.at(-1)!.playing).toBe(false);
-    const d = app.sim.duration;
-    app.runProgram(); expect(app.sim.playing).toBe(true); expect(simEv.at(-1)).toEqual({ playing: true, time: 0, duration: d });
-    (app as any).tick(0.1); expect(app.sim.time).toBeCloseTo(0.1, 5); expect(simEv.at(-1)!.time).toBeCloseTo(0.1, 5);
-    app.simSpeed = 2; (app as any).tick(0.1); expect(app.sim.time).toBeCloseTo(0.3, 5);
-    app.pauseProgram(); expect(app.sim.playing).toBe(false); expect(simEv.at(-1)!.playing).toBe(false);
-    app.seekProgram(d); expect(app.sim.time).toBeCloseTo(d, 5);
-    app.stopProgram(); expect(app.sim.time).toBe(0);
-    let still = true; app.runProgram(prog); for (let i = 0; i < 200 && still; i++) still = app.sim.tick(1); expect(still).toBe(false);
+    const d = app.sim.duration; const home = r.joints();
+    // playback runs on the station runtime; app.sim.playing mirrors it for older callers
+    app.runProgram(); expect(app.isPlaying()).toBe(true); expect(app.sim.playing).toBe(true); expect(simEv.at(-1)).toMatchObject({ playing: true, time: 0, duration: d });
+    (app as any).tick(0.1); expect(app.simTime).toBeCloseTo(0.1, 5); expect(simEv.at(-1)!.time).toBeCloseTo(0.1, 5);
+    app.simSpeed = 2; (app as any).tick(0.1); expect(app.simTime).toBeCloseTo(0.3, 5); app.simSpeed = 1;
+    app.pauseProgram(); expect(app.isPlaying()).toBe(false); expect(simEv.at(-1)).toMatchObject({ playing: false, paused: true });
+    const qPaused = r.joints(); (app as any).tick(0.5); expect(app.simTime).toBeCloseTo(0.3, 5); expect(r.joints()).toEqual(qPaused); // frozen while paused
+    app.runProgram(); expect(app.isPlaying()).toBe(true); expect(app.simTime).toBeCloseTo(0.3, 5); expect(app.runs.length).toBe(1); // Play resumes, it does not restart
+    app.seekProgram(d); expect(app.simTime).toBeCloseTo(d, 5);
+    app.stopProgram(); expect(app.isPlaying()).toBe(false); expect(app.atHome).toBe(false);
+    app.resetSimulation(); expect(app.simTime).toBe(0); expect(r.joints()).toEqual(home); // Reset restores the home state
+    app.runProgram(prog); for (let i = 0; i < 200 && app.isPlaying(); i++) (app as any).tick(1); expect(app.isPlaying()).toBe(false); expect(app.runs.at(-1)!.status).toBe('done');
+    const t2 = app.station.itemsOfType<Target>(ItemType.TARGET)[1]; r.joints().forEach((v, i) => expect(v).toBeCloseTo(t2.joints![i], 3));
     app.setActiveProgram(null); app.previewProgram(); app.runProgram(); expect(app.logs.at(-1)!.text).toBe('No program selected');
     const m = app.addMobileRobot(); const mp = app.addProgram(m); expect(app.activeProgram).toBe(mp); app.previewProgram(); // non-arm program: no trajectory preview
     expect(rendererCalls.filter((c) => c === 'showTrajectoryPreview').length).toBeGreaterThan(2);

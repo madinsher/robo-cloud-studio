@@ -1,0 +1,1 @@
+<robot name="t" xmlns:xacro="http://www.ros.org/wiki/xacro"><xacro:macro name="setp"><xacro:property name="gp" value="0.33" scope="global"/></xacro:macro><xacro:setp/><link name="l"><visual><geometry><box size="${gp} 1 1"/></geometry></visual></link></robot>

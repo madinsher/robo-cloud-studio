@@ -1,0 +1,1 @@
+<robot name="t" xmlns:xacro="http://www.ros.org/wiki/xacro"><xacro:property name="a" value="${b*2}"/><xacro:property name="b" value="0.25"/><link name="l"><visual><geometry><box size="${a} 1 1"/></geometry></visual></link></robot>

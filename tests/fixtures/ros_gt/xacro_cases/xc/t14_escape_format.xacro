@@ -1,0 +1,1 @@
+<robot name="t" xmlns:xacro="http://www.ros.org/wiki/xacro"><xacro:property name="p" value="arm"/><link name="${'%s_link' % p}"/><link name="${p + '_tool'}"/><gazebo><plugin name="x" filename="y"><param>$${not_expanded}</param></plugin></gazebo></robot>

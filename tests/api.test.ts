@@ -31,9 +31,12 @@ describe('RoboDK-compatible API', () => {
     expect(RDK.ItemList(ITEM_TYPE_TARGET).length).toBe(2);
     expect(RDK.Item('', ITEM_TYPE_ROBOT).Name()).toBe('Universal Robots UR5e');
     expect(RDK.Item('prog', ITEM_TYPE_PROGRAM).Valid()).toBe(true);
-    const [ok, code] = prog.MakeProgram('', 'Universal_Robots');
+    // RoboDK MakeProgram returns (success, log, transfer_ok); the generated files are kept in RDK.generated
+    const [ok, log, transferred] = prog.MakeProgram('', 'Universal_Robots') as [boolean, string, boolean];
     expect(ok).toBe(true);
-    expect(code).toContain('movel');
+    expect(log).toMatch(/generated/);
+    expect(transferred).toBe(false);
+    expect(RDK.generated.get(prog.item!.id)[0].content).toContain('movel');
     const q = robot.SolveIK(robot.SolveFK([10, -80, 80, -90, -90, 10]));
     expect(q.length).toBe(6);
   });

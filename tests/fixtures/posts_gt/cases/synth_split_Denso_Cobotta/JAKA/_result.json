@@ -1,0 +1,11 @@
+{
+ "ok": true,
+ "error": null,
+ "log": "",
+ "files": [
+  "SplitTest.jks",
+  "SplitTest.zip",
+  "SplitTest.zu",
+  "variable.vi"
+ ]
+}

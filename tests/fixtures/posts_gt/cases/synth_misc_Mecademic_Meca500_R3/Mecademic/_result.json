@@ -1,0 +1,8 @@
+{
+ "ok": true,
+ "error": null,
+ "log": "Show message on teach pendant not implemented (Say \"hi\" to the operator)\nSetting Digital Outputs is not implemented (12=0)\nSetting Digital Outputs is not implemented (OUT_A=1)\nWaiting for Digital Input is not implemented (4==0)\nWaiting for Digital Input is not implemented (IN_B==1)\n",
+ "files": [
+  "Prog_Name_That_Is_Very_Long_123.txt"
+ ]
+}

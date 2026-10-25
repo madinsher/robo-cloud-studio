@@ -1,17 +1,27 @@
 /**
  * Executors that run a control model on the station: an automaton document as a set of parallel state machines
- * with entry actions, and a Petri net as a cell controller whose transitions are robot operations. Actions are the
- * studio's programming artefacts — robot programs, targets, mobile zones, component signals — bound to states /
- * transitions with `action` lines (edited in the diagram inspector). The same world bindings as the behavior-tree
- * runtime are used, so a program written in the Program tab, a target taught in the 3D view or a zone drawn on the
- * map become the body of a state or a transition.
+ * with entry actions, and a Petri net as a cell controller whose transitions are robot operations (the hierarchical
+ * FSM executor is in fsm.ts). Actions are the studio's programming artefacts — robot programs, targets, mobile zones,
+ * component signals — bound to states / transitions with `action` lines (edited in the diagram inspector). The same
+ * world bindings as the behavior-tree runtime are used (ctl/runtime.ts `hostBindings`: programs of different robots run
+ * concurrently through the program backend, one action per robot at a time).
+ *
+ * Run-time inputs: every tick the blackboard receives the world's `sense()` values (station signals, robot IO, program
+ * state, mobile robot state); `guard` expressions read it, `sensor` lines raise events on its rising edges, and the
+ * world's events (arrivals, actions' `event emit=`) drive uncontrollable transitions.
+ *
+ * End of a run: `verdict` is `done` when the model reaches a final configuration (all automata in marked states / a
+ * declared `final` marking or tokens only in sink / resource places), `deadlock` when nothing can happen anymore
+ * elsewhere, `failed` when an action failed without a failure outcome.
  */
 import type { ActionHandler, BTNode, BTStatus, TickContext } from './bt';
-import type { DesDoc, ActionBinding } from './dsl';
+import type { DesDoc, ActionBinding, SensorSpec } from './dsl';
 import type { PetriDoc } from './graphdoc';
-import { DES, SupervisorRuntime, SupervisorTable, SupervisorViolation } from './des';
+import { DES, SupervisorRuntime, SupervisorTable } from './des';
 import { PetriNet } from './petri';
 import type { WorldBindings } from './runtime';
+import { setValue } from './runtime';
+import { expr, Env } from './expr';
 
 /** The world seen by an executor: shared host actions (program, move, signal, wait, set, event) and per-robot bindings. */
 export interface ExecutorWorld {
@@ -21,9 +31,13 @@ export interface ExecutorWorld {
   step?(dt: number): void;
   /** Uncontrollable events reported by the world since the last call (arrivals, sensors, operator). */
   events?(): string[];
+  /** Blackboard values of the whole world (host signals + mobile robots); default: host.sense(). */
+  sense?(): Env;
 }
+/** World sense values (falls back to the host's). */
+export const worldSense = (w: ExecutorWorld): Env => w.sense?.() ?? w.host.sense?.() ?? {};
 
-interface Running { binding: ActionBinding; handler: ActionHandler; args: Record<string, unknown>; node: BTNode; halt?: (ctx: TickContext, args: Record<string, unknown>) => void }
+export interface Running { binding: ActionBinding; handler: ActionHandler; args: Record<string, unknown>; node: BTNode; started: number; halt?: (ctx: TickContext, args: Record<string, unknown>, node?: BTNode) => void; /** set when the action ended by its timeout */ timedOut?: boolean; /** outcome of an action that finished on its first tick (not ticked again) */ result?: BTStatus }
 let seq = 0;
 const fakeNode = (): BTNode => ({ id: `x${seq++}`, status: 'idle' } as unknown as BTNode);
 
@@ -32,34 +46,56 @@ export function resolveAction(world: ExecutorWorld, b: ActionBinding): { handler
   const robotLib = world.forRobot(b.robot);
   const pick = (name: string, args: Record<string, unknown>, withRobot = true) => { const lib = robotLib?.actions[name] ? robotLib : world.host.actions[name] ? world.host : null; return lib ? { handler: lib.actions[name], args: { ...(withRobot && b.robot ? { robot: b.robot } : {}), ...b.args, ...args }, halt: lib.halt?.[name] } : null; };
   switch (b.kind) {
-    case 'program': return pick('program', { name: b.value });
+    case 'program': return pick('program', { program: b.value });
     case 'target': return pick('move', { target: b.value });
     case 'goto': return pick('goto', { zone: b.value });
-    case 'signal': return pick('signal', { component: b.component, name: b.value, value: b.args.value ?? true }, false);
+    case 'signal': return pick('signal', { component: b.component, signal: b.value, value: b.args.value ?? true }, false);
     case 'wait': return pick('wait', { seconds: Number(b.value) }, false);
     case 'event': return pick('event', { emit: b.value }, false);
+    case 'await': return pick('await', { expr: b.value }, false);
+    case 'skill': return pick(b.value, {});
     case 'set': { const { value: _v, ...rest } = b.args; void _v; return pick('set', { ...rest, [b.value]: b.args.value ?? true }, false); }
   }
 }
 
-class Runner {
+/** Starts, ticks and halts bound actions; enforces the binding's `timeout=`. Shared by the automaton, Petri and FSM executors. */
+export class Runner {
   readonly bb: Record<string, unknown> = {};
   constructor(readonly world: ExecutorWorld, readonly log: (m: string) => void) {}
   start(b: ActionBinding, time: number): Running | null {
     const r = resolveAction(this.world, b);
-    if (!r) { this.log(`no world action for '${b.kind}' (${b.target}${b.robot ? `, robot ${b.robot}` : ''})`); return null; }
-    const run: Running = { binding: b, handler: r.handler, args: r.args, node: fakeNode(), halt: r.halt };
-    void time; return run;
+    if (!r) { this.log(`no world action for '${b.kind}${b.kind === 'skill' ? ' ' + b.value : ''}' (${b.target}${b.robot ? `, robot ${b.robot}` : ''})`); return null; }
+    return { binding: b, handler: r.handler, args: r.args, node: fakeNode(), halt: r.halt, started: time };
   }
   tick(run: Running, ctx: TickContext): BTStatus {
+    if (run.binding.timeout !== undefined && ctx.time - run.started >= run.binding.timeout - 1e-9) { this.stop(run, ctx); run.timedOut = true; this.log(`${run.binding.kind} ${run.binding.value}: timeout after ${run.binding.timeout} s`); return 'failure'; }
     const st = run.handler(ctx, run.args, run.node) ?? 'success';
     run.node.status = st;
     return st;
   }
-  stop(run: Running, ctx: TickContext): void { if (run.node.status === 'running') run.halt?.(ctx, run.args); run.node.status = 'idle'; }
+  stop(run: Running, ctx: TickContext): void { if (run.node.status === 'running') run.halt?.(ctx, run.args, run.node); run.node.status = 'idle'; }
 }
 
-export interface ExecSummary { time: number; ticks: number; status: 'running' | 'idle' | 'stopped'; fired: number; mismatches: number; denied: number; failed: number; running: string[]; where: string }
+export type Verdict = 'running' | 'done' | 'deadlock' | 'failed' | 'stopped' | 'timeout';
+export interface ExecSummary { time: number; ticks: number; status: 'running' | 'idle' | 'stopped'; verdict: Verdict; fired: number; mismatches: number; denied: number; failed: number; running: string[]; where: string }
+
+const envOf = (bb: Record<string, unknown>): Env => { const e: Env = {}; for (const [k, v] of Object.entries(bb)) if (typeof v === 'number' || typeof v === 'boolean' || typeof v === 'string') e[k] = v; return e; };
+/** Guard / sensor evaluation that never throws (a malformed expression is false and logged once). */
+export function makeEval(log: (m: string) => void): (src: string, bb: Record<string, unknown>) => boolean {
+  const bad = new Set<string>();
+  return (src, bb) => { try { return expr(src).bool(envOf(bb)); } catch (e) { if (!bad.has(src)) { bad.add(src); log(`expression '${src}': ${(e as Error).message}`); } return false; } };
+}
+/** Rising-edge detector for `sensor` lines. */
+export class Sensors {
+  private prev = new Map<string, boolean>();
+  constructor(readonly specs: SensorSpec[], readonly evalFn: (src: string, bb: Record<string, unknown>) => boolean) {}
+  /** Events of the expressions that became true since the last poll (the first poll only records the baseline). */
+  poll(bb: Record<string, unknown>): string[] {
+    const out: string[] = [];
+    for (const s of this.specs) { const k = `${s.expr}|${s.event}`; const v = this.evalFn(s.expr, bb); const p = this.prev.get(k); if (v && p === false) out.push(s.event); this.prev.set(k, v); }
+    return out;
+  }
+}
 
 // ---------------------------------------------------------------------------------------------
 // Automata with entry actions
@@ -69,9 +105,11 @@ export interface AutomatonExecOptions { doc: DesDoc; world: ExecutorWorld; super
 
 /**
  * Every `automaton` block runs as a state machine; components synchronise on shared events. Entering a state starts
- * its bound action; when the action succeeds the `done=` event is fired (it must be enabled there). Controllable
- * events are fired automatically when enabled in every component that shares them and allowed by the supervisor;
- * a state with a bound action waits for the action before firing. Uncontrollable events come from the world.
+ * its bound action; when the action succeeds the `done=` event is fired, when it fails the `fail=` event (without
+ * `fail=` the component stops there: verdict `failed`). Controllable events are fired automatically when enabled in
+ * every component that shares them, allowed by the supervisor and by their `guard` (data-driven decisions); a state
+ * with a bound action waits for the action. Uncontrollable events come from the world (`event` actions, sensors,
+ * mobile arrivals). Unobservable events move the plant but not the supervisor (its table is built over the observer).
  */
 export class AutomatonExecutor {
   readonly comps: DES[];
@@ -79,35 +117,40 @@ export class AutomatonExecutor {
   readonly running = new Map<string, Running>();
   /** components whose entry action already completed in the current state (or that have none) */
   private settled = new Set<string>();
+  /** components stopped by a failed action without a `fail=` outcome */
+  readonly blocked = new Set<string>();
   readonly supervisor: SupervisorRuntime | null;
   readonly log: string[] = []; readonly trace: Array<{ t: number; event: string; states: string }> = [];
-  private runner: Runner; private uc: Set<string>;
+  private runner: Runner; private uc: Set<string>; private evalFn: (src: string, bb: Record<string, unknown>) => boolean; private sensors: Sensors;
   /** last firing tick per controllable event — auto-firing is fair (least recently fired first), so no component starves */
   private lastFired = new Map<string, number>();
-  time = 0; ticks = 0; fired = 0; mismatches = 0; denied = 0; failed = 0; status: ExecSummary['status'] = 'running';
+  time = 0; ticks = 0; fired = 0; mismatches = 0; denied = 0; failed = 0; status: ExecSummary['status'] = 'running'; verdict: Verdict = 'running';
   constructor(readonly opts: AutomatonExecOptions) {
     this.comps = opts.doc.plant.map((a) => DES.fromSpec(a));
     for (const c of this.comps) this.state.set(c.name, c.x0);
     this.uc = new Set(opts.doc.uncontrollable);
     this.supervisor = opts.supervisor ? new SupervisorRuntime(opts.supervisor) : null;
     this.runner = new Runner(opts.world, (m) => this.say(m));
+    this.evalFn = makeEval((m) => this.say(m)); this.sensors = new Sensors(opts.doc.sensors ?? [], this.evalFn);
+    Object.assign(this.runner.bb, worldSense(opts.world), opts.doc.blackboard ?? {});
     for (const c of this.comps) this.enter(c);
   }
+  get bb(): Record<string, unknown> { return this.runner.bb; }
   private say(m: string): void { this.log.push(`[${this.time.toFixed(1)}] ${m}`); this.opts.log?.(m); }
   private actionFor(c: DES, s: string): ActionBinding | undefined { return this.opts.doc.actions.find((a) => a.target === `${c.name}.${s}`) ?? this.opts.doc.actions.find((a) => !a.target.includes('.') && a.target === s && c.X.has(s)); }
   private enter(c: DES): void {
     const s = this.state.get(c.name)!; const b = this.actionFor(c, s);
-    this.settled.delete(c.name);
+    this.settled.delete(c.name); this.blocked.delete(c.name);
     if (!b) { this.settled.add(c.name); return; }
     const run = this.runner.start(b, this.time);
-    if (run) { this.running.set(c.name, run); this.say(`${c.name} enters ${s}: ${b.kind} ${b.value}${b.robot ? ` on ${b.robot}` : ''}`); } else { this.settled.add(c.name); this.failed++; }
+    if (run) { this.running.set(c.name, run); this.say(`${c.name} enters ${s}: ${b.kind} ${b.value}${b.robot ? ` on ${b.robot}` : ''}`); } else { this.failed++; this.blocked.add(c.name); }
   }
   /** Fire an event in every component whose alphabet contains it. */
-  fire(ev: string, source: 'auto' | 'done' | 'world' = 'auto'): boolean {
+  fire(ev: string, source: 'auto' | 'done' | 'fail' | 'world' = 'auto'): boolean {
     const parts = this.comps.filter((c) => c.sigma.has(ev));
     if (!parts.length) { this.say(`event ${ev} belongs to no component`); this.mismatches++; return false; }
     for (const c of parts) if (c.next(this.state.get(c.name)!, ev) === undefined) { this.mismatches++; this.say(`model mismatch: ${ev} (${source}) not enabled in ${c.name}=${this.state.get(c.name)}`); return false; }
-    if (this.supervisor) { try { this.supervisor.observe(ev); } catch (e) { if (e instanceof SupervisorViolation) { this.mismatches++; this.say(`supervisor: ${e.message}`); } else throw e; } }
+    if (this.supervisor) { try { this.supervisor.observe(ev); } catch (e) { this.mismatches++; this.say(`supervisor: ${(e as Error).message}`); } }
     for (const c of parts) {
       const ctx = this.ctx(0); const run = this.running.get(c.name); if (run) { this.runner.stop(run, ctx); this.running.delete(c.name); }
       this.state.set(c.name, c.next(this.state.get(c.name)!, ev)!);
@@ -118,95 +161,161 @@ export class AutomatonExecutor {
   }
   private ctx(dt: number): TickContext { return { time: this.time, dt, bb: this.runner.bb, log: (m) => this.say(m) }; }
   where(): string { return this.comps.map((c) => `${c.name}=${this.state.get(c.name)}`).join(' '); }
-  /** Controllable events enabled in every component sharing them, allowed by the supervisor, from settled components. */
-  enabledAuto(): string[] {
+  /** Controllable events enabled in every component sharing them (all settled), whose guard holds; `countDenied` counts supervisor denials (once per tick). */
+  enabledAuto(countDenied = false): string[] {
     const out: string[] = [];
     for (const c of this.comps) {
       if (!this.settled.has(c.name)) continue;
       for (const ev of c.active(this.state.get(c.name)!)) {
         if (this.uc.has(ev) || out.includes(ev)) continue;
         if (!this.comps.every((d) => !d.sigma.has(ev) || (this.settled.has(d.name) && d.next(this.state.get(d.name)!, ev) !== undefined))) continue;
-        if (this.supervisor && !this.supervisor.allowed(ev)) { this.denied++; continue; }
+        const g = this.opts.doc.guards?.[ev]; if (g && !this.evalFn(g, this.runner.bb)) continue;
+        if (this.supervisor && !this.supervisor.allowed(ev)) { if (countDenied) this.denied++; continue; }
         out.push(ev);
       }
     }
     return out;
   }
+  /** Some component can still receive an uncontrollable event (from the world, a sensor or a running action). */
+  private waitingForWorld(): boolean { return this.comps.some((c) => !this.blocked.has(c.name) && [...c.active(this.state.get(c.name)!)].some((e) => this.uc.has(e))) && (!!this.opts.world.events || !!this.opts.doc.sensors?.length); }
   tick(dt = 0.1): ExecSummary['status'] {
     if (this.status !== 'running') return this.status;
     const w = this.opts.world; const ctx = this.ctx(dt);
-    Object.assign(this.runner.bb, w.host.sense?.() ?? {});
-    for (const ev of w.events?.() ?? []) this.fire(ev, 'world');
+    Object.assign(this.runner.bb, worldSense(w));
+    for (const ev of [...(w.events?.() ?? []), ...this.sensors.poll(this.runner.bb)]) this.fire(ev, 'world');
     for (const [name, run] of [...this.running]) {
+      if (this.running.get(name) !== run) continue;
       const st = this.runner.tick(run, ctx);
       if (st === 'running') continue;
-      this.running.delete(name); this.settled.add(name);
-      if (st === 'failure') { this.failed++; this.say(`${name}: action ${run.binding.kind} ${run.binding.value} failed`); continue; }
+      this.running.delete(name);
+      if (st === 'failure') {
+        this.failed++; this.say(`${name}: action ${run.binding.kind} ${run.binding.value} ${run.timedOut ? 'timed out' : 'failed'}${run.binding.fail ? ` → ${run.binding.fail}` : ' (no fail= outcome: the component stops)'}`);
+        if (run.binding.fail) { this.settled.add(name); this.fire(run.binding.fail, 'fail'); } else this.blocked.add(name);
+        continue;
+      }
+      this.settled.add(name);
       if (run.binding.done) this.fire(run.binding.done, 'done');
     }
-    if (this.opts.auto !== false) { const evs = this.enabledAuto(); if (evs.length) { const pick = evs.slice().sort((a, b) => (this.lastFired.get(a) ?? -1) - (this.lastFired.get(b) ?? -1))[0]; this.fire(pick, 'auto'); } }
+    if (this.opts.auto !== false) { const evs = this.enabledAuto(true); if (evs.length) { const pick = evs.slice().sort((a, b) => (this.lastFired.get(a) ?? -1) - (this.lastFired.get(b) ?? -1))[0]; this.fire(pick, 'auto'); } }
     w.step?.(dt);
     this.time += dt; this.ticks++;
-    if (!this.running.size && !this.enabledAuto().length && !(w.events && this.comps.some((c) => [...c.active(this.state.get(c.name)!)].some((e) => this.uc.has(e))))) { this.status = 'idle'; this.say(`quiescent at ${this.where()}`); }
+    if (!this.running.size && !this.enabledAuto().length && !this.waitingForWorld()) this.finish();
     return this.status;
   }
-  run(seconds: number, dt = 0.1, stopOn?: (x: AutomatonExecutor) => boolean): ExecSummary['status'] { const n = Math.ceil(seconds / dt); for (let i = 0; i < n && this.status === 'running'; i++) { this.tick(dt); if (stopOn?.(this)) break; } return this.status; }
-  stop(): void { const ctx = this.ctx(0); for (const run of this.running.values()) this.runner.stop(run, ctx); this.running.clear(); this.status = 'stopped'; }
-  summary(): ExecSummary { return { time: this.time, ticks: this.ticks, status: this.status, fired: this.fired, mismatches: this.mismatches, denied: this.denied, failed: this.failed, running: [...this.running.entries()].map(([c, r]) => `${c}: ${r.binding.kind} ${r.binding.value}`), where: this.where() }; }
+  private finish(): void {
+    this.status = 'idle';
+    const marked = this.comps.every((c) => c.xm.has(this.state.get(c.name)!)) && (!this.supervisor || this.supervisor.marked());
+    this.verdict = this.blocked.size ? 'failed' : marked ? 'done' : 'deadlock';
+    this.say(`${this.verdict === 'done' ? 'done' : this.verdict === 'failed' ? 'stopped by a failed action' : 'DEADLOCK'} at ${this.where()}${this.blocked.size ? ` (blocked: ${[...this.blocked].join(', ')})` : ''}`);
+  }
+  run(seconds: number, dt = 0.1, stopOn?: (x: AutomatonExecutor) => boolean): ExecSummary['status'] { const n = Math.ceil(seconds / dt - 1e-9); for (let i = 0; i < n && this.status === 'running'; i++) { this.tick(dt); if (stopOn?.(this)) break; } return this.status; }
+  stop(verdict: Verdict = 'stopped'): void { const ctx = this.ctx(0); for (const run of this.running.values()) this.runner.stop(run, ctx); this.running.clear(); this.status = 'stopped'; this.verdict = verdict; }
+  summary(): ExecSummary { return { time: this.time, ticks: this.ticks, status: this.status, verdict: this.verdict, fired: this.fired, mismatches: this.mismatches, denied: this.denied, failed: this.failed, running: [...this.running.entries()].map(([c, r]) => `${c}: ${r.binding.kind} ${r.binding.value}`), where: this.where() }; }
 }
 
 // ---------------------------------------------------------------------------------------------
 // Petri nets as cell controllers
 // ---------------------------------------------------------------------------------------------
 
-export interface PetriExecOptions { doc: PetriDoc; world: ExecutorWorld; log?: (m: string) => void; /** max firings per tick (zero-delay loops) */ maxPerTick?: number }
+export interface PetriExecOptions { doc: PetriDoc; world: ExecutorWorld; log?: (m: string) => void; /** max firings per tick (zero-delay loops) */ maxPerTick?: number; /** seed of the exponential delays of `rate=` transitions */ seed?: number }
 
 /**
- * Transitions fire when enabled (priority, then document order): the input tokens are removed, the bound action
- * runs on the station (or the `delay=` elapses), the output tokens are produced when it finishes. Conflicts are
- * resolved by priority; a transition whose robot is busy simply waits — the marking shows where the cell is.
+ * Interpreted Petri net: a transition starts when it is enabled by the marking (capacities respected), its `guard`
+ * holds, its input event (`on=`) occurred in this tick and fewer than `servers` (default 1) firings of it are in
+ * progress. Immediate transitions fire first (zero time, highest priority); others in priority, then document order.
+ * Starting removes the input tokens and runs the bound action (or the `delay=` / sampled `rate=` time); the output
+ * tokens appear when it finishes. A failed action returns the input tokens and disables the transition for the run.
  */
 export class PetriExecutor {
   readonly net: PetriNet; marking: number[];
   readonly active: Array<{ t: number; run: Running | null; end: number; start: number }> = [];
   readonly log: string[] = []; readonly firings: Record<string, number> = {};
-  private runner: Runner;
-  time = 0; ticks = 0; fired = 0; failed = 0; mismatches = 0; status: ExecSummary['status'] = 'running';
-  constructor(readonly opts: PetriExecOptions) { this.net = new PetriNet(opts.doc.spec); this.marking = [...this.net.m0]; this.runner = new Runner(opts.world, (m) => this.say(m)); }
+  readonly trace: Array<{ t: number; transition: string; phase: 'start' | 'end' | 'fail' }> = [];
+  private runner: Runner; private evalFn: (src: string, bb: Record<string, unknown>) => boolean; private sensors: Sensors; private faulted = new Set<number>(); private rng: () => number; private lastStart = new Map<number, number>();
+  time = 0; ticks = 0; fired = 0; failed = 0; mismatches = 0; status: ExecSummary['status'] = 'running'; verdict: Verdict = 'running';
+  constructor(readonly opts: PetriExecOptions) {
+    this.net = new PetriNet(opts.doc.spec); this.marking = [...this.net.m0]; this.runner = new Runner(opts.world, (m) => this.say(m));
+    this.evalFn = makeEval((m) => this.say(m)); this.sensors = new Sensors(opts.doc.sensors ?? [], this.evalFn);
+    Object.assign(this.runner.bb, worldSense(opts.world), opts.doc.blackboard ?? {});
+    let s = (opts.seed ?? 1) >>> 0; this.rng = () => { s = (s + 0x6d2b79f5) >>> 0; let t = s; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  }
+  get bb(): Record<string, unknown> { return this.runner.bb; }
   private say(m: string): void { this.log.push(`[${this.time.toFixed(1)}] ${m}`); this.opts.log?.(m); }
   private ctx(dt: number): TickContext { return { time: this.time, dt, bb: this.runner.bb, log: (m) => this.say(m) }; }
   where(): string { return this.net.places.map((p, i) => (this.marking[i] ? `${p.id}${this.marking[i] > 1 ? `×${this.marking[i]}` : ''}` : '')).filter(Boolean).join(' '); }
+  private inProgress(t: number): number { return this.active.filter((a) => a.t === t).length; }
+  /** Transitions that may start now (marking, servers, guard, input events still pending in `evs`). */
+  candidates(evs: string[] = []): number[] {
+    const out: number[] = [];
+    for (let j = 0; j < this.net.transitions.length; j++) {
+      const tr = this.net.transitions[j];
+      if (this.faulted.has(j) || !this.net.isEnabled(this.marking, j)) continue;
+      if (this.inProgress(j) >= (tr.servers ?? 1)) continue;
+      if (tr.on && !evs.includes(tr.on)) continue;
+      if (tr.guard && !this.evalFn(tr.guard, this.runner.bb)) continue;
+      out.push(j);
+    }
+    const imm = out.filter((j) => this.net.transitions[j].immediate);
+    const pool = imm.length ? imm : out;
+    const top = Math.max(...pool.map((j) => this.net.transitions[j].priority ?? 0));
+    // fair among equal priorities: the transition started least recently first (document order breaks ties), so no process starves
+    return pool.filter((j) => (this.net.transitions[j].priority ?? 0) === top).sort((a, b) => (this.lastStart.get(a) ?? -1) - (this.lastStart.get(b) ?? -1) || a - b);
+  }
+  private duration(t: number): number { const tr = this.net.transitions[t]; if (tr.immediate) return 0; if (tr.delay !== undefined) return tr.delay; if (tr.rate !== undefined && tr.rate > 0) return -Math.log(1 - this.rng()) / tr.rate; return 0; }
   tick(dt = 0.1): ExecSummary['status'] {
     if (this.status !== 'running') return this.status;
     const w = this.opts.world; const ctx = this.ctx(dt);
-    Object.assign(this.runner.bb, w.host.sense?.() ?? {});
-    // complete
-    for (let i = this.active.length - 1; i >= 0; i--) {
-      const a = this.active[i];
+    Object.assign(this.runner.bb, worldSense(w));
+    const evs = [...(w.events?.() ?? []), ...this.sensors.poll(this.runner.bb)];
+    // complete (document order of start)
+    for (const a of [...this.active]) {
       let done = false;
-      if (a.run) { const st = this.runner.tick(a.run, ctx); if (st === 'failure') { this.failed++; this.say(`${this.net.transitionId(a.t)}: action failed — tokens returned`); this.marking = this.marking.map((v, k) => v + this.net.pre[a.t][k]); this.active.splice(i, 1); continue; } done = st === 'success'; }
-      else done = this.time >= a.end;
-      if (done) { this.marking = this.marking.map((v, k) => v + this.net.post[a.t][k]); const id = this.net.transitionId(a.t); this.firings[id] = (this.firings[id] ?? 0) + 1; this.active.splice(i, 1); this.say(`${id} completed → ${this.where()}`); }
+      if (a.run) {
+        const st = a.run.result ?? this.runner.tick(a.run, ctx);
+        if (st === 'failure') {
+          const id = this.net.transitionId(a.t); this.failed++; this.faulted.add(a.t);
+          this.marking = this.marking.map((v, k) => v + this.net.pre[a.t][k]); this.active.splice(this.active.indexOf(a), 1);
+          this.trace.push({ t: this.time, transition: id, phase: 'fail' }); this.say(`${id}: action ${a.run.binding.kind} ${a.run.binding.value} ${a.run.timedOut ? 'timed out' : 'failed'} — tokens returned, ${id} disabled`); continue;
+        }
+        done = st === 'success' && this.time >= a.end - 1e-9;
+      } else done = this.time >= a.end - 1e-9;
+      if (done) { this.marking = this.marking.map((v, k) => v + this.net.post[a.t][k]); const id = this.net.transitionId(a.t); this.firings[id] = (this.firings[id] ?? 0) + 1; this.active.splice(this.active.indexOf(a), 1); this.trace.push({ t: this.time, transition: id, phase: 'end' }); this.say(`${id} completed → ${this.where()}`); }
     }
     // fire
-    let n = 0; const max = this.opts.maxPerTick ?? 20;
+    let n = 0; const max = this.opts.maxPerTick ?? 20; const pendingEv = [...evs];
     for (;;) {
-      const en = this.net.enabled(this.marking); if (!en.length || n++ >= max) break;
-      const top = Math.max(...en.map((j) => this.net.transitions[j].priority ?? 0)); const t = en.find((j) => (this.net.transitions[j].priority ?? 0) === top)!;
+      const en = this.candidates(pendingEv); if (!en.length || n++ >= max) break;
+      const t = en[0]; const tr = this.net.transitions[t];
       const id = this.net.transitionId(t); const b = this.opts.doc.actions.find((x) => x.target === id);
       let run: Running | null = null;
-      if (b) { run = this.runner.start(b, this.time); if (!run) { this.failed++; this.mismatches++; break; } }
+      if (b) { run = this.runner.start(b, this.time); if (!run) { this.failed++; this.mismatches++; this.faulted.add(t); continue; } }
+      if (tr.on) pendingEv.splice(pendingEv.indexOf(tr.on), 1);
       this.marking = this.marking.map((v, k) => v - this.net.pre[t][k]);
-      this.active.push({ t, run, start: this.time, end: this.time + (this.net.transitions[t].delay ?? 0) });
-      this.fired++; this.say(`${id} started${b ? `: ${b.kind} ${b.value}${b.robot ? ` on ${b.robot}` : ''}` : ''} → ${this.where()}`);
-      if (run) { const st = this.runner.tick(run, ctx); if (st !== 'running') { /* instantaneous action: complete on the next tick */ } }
+      const d = this.duration(t);
+      this.active.push({ t, run, start: this.time, end: this.time + d });
+      this.fired++; this.lastStart.set(t, this.ticks * 1e6 + n); this.trace.push({ t: this.time, transition: id, phase: 'start' }); this.say(`${id} started${b ? `: ${b.kind} ${b.value}${b.robot ? ` on ${b.robot}` : ''}` : d ? ` (${d.toFixed(2)} s)` : ''} → ${this.where()}`);
+      if (!run && d === 0) { this.marking = this.marking.map((v, k) => v + this.net.post[t][k]); this.firings[id] = (this.firings[id] ?? 0) + 1; this.active.pop(); this.trace.push({ t: this.time, transition: id, phase: 'end' }); }
+      else if (run) { const st = this.runner.tick(run, ctx); if (st !== 'running') run.result = st; /* completion is reported on the next tick */ }
     }
     w.step?.(dt);
     this.time += dt; this.ticks++;
-    if (!this.active.length && !this.net.enabled(this.marking).length) { this.status = 'idle'; this.say(`no enabled transition at marking {${this.where()}} — ${this.fired ? 'deadlock or end of the run' : 'nothing to do'}`); }
+    const waitsForEvent = this.net.transitions.some((tr, j) => !this.faulted.has(j) && (tr.on || tr.guard) && this.net.isEnabled(this.marking, j) && this.inProgress(j) < (tr.servers ?? 1));
+    if (!this.active.length && !this.candidates().length && !waitsForEvent) this.finish();
     return this.status;
   }
-  run(seconds: number, dt = 0.1, stopOn?: (x: PetriExecutor) => boolean): ExecSummary['status'] { const n = Math.ceil(seconds / dt); for (let i = 0; i < n && this.status === 'running'; i++) { this.tick(dt); if (stopOn?.(this)) break; } return this.status; }
-  stop(): void { const ctx = this.ctx(0); for (const a of this.active) if (a.run) this.runner.stop(a.run, ctx); this.active.length = 0; this.status = 'stopped'; }
-  summary(): ExecSummary { return { time: this.time, ticks: this.ticks, status: this.status, fired: this.fired, mismatches: this.mismatches, denied: 0, failed: this.failed, running: this.active.map((a) => `${this.net.transitionId(a.t)}${a.run ? `: ${a.run.binding.kind} ${a.run.binding.value}` : ''}`), where: this.where() }; }
+  /** Final marking reached: a declared `final` marking (≤ for the places listed), else tokens only in sink places or resource / idle / monitor places. */
+  isFinal(): boolean {
+    const finals = this.opts.doc.finals;
+    if (finals?.length) return finals.some((f) => this.net.places.every((p, i) => (f[p.id] === undefined ? true : this.marking[i] === f[p.id])) && Object.keys(f).every((k) => this.net.pIndex.has(k)));
+    return this.net.places.every((p, i) => !this.marking[i] || this.net.placeOut(i).length === 0 || ['resource', 'idle', 'monitor'].includes(p.kind ?? ''));
+  }
+  private finish(): void {
+    this.status = 'idle';
+    this.verdict = this.isFinal() ? (this.faulted.size ? 'failed' : 'done') : this.faulted.size ? 'failed' : 'deadlock';
+    this.say(`no enabled transition at marking {${this.where()}} — ${this.verdict === 'done' ? 'final marking reached' : this.verdict === 'failed' ? `failed actions (${[...this.faulted].map((j) => this.net.transitionId(j)).join(', ')})` : this.fired ? 'DEADLOCK' : 'DEADLOCK: nothing can fire'}`);
+  }
+  run(seconds: number, dt = 0.1, stopOn?: (x: PetriExecutor) => boolean): ExecSummary['status'] { const n = Math.ceil(seconds / dt - 1e-9); for (let i = 0; i < n && this.status === 'running'; i++) { this.tick(dt); if (stopOn?.(this)) break; } return this.status; }
+  stop(verdict: Verdict = 'stopped'): void { const ctx = this.ctx(0); for (const a of this.active) if (a.run) this.runner.stop(a.run, ctx); this.active.length = 0; this.status = 'stopped'; this.verdict = verdict; }
+  summary(): ExecSummary { return { time: this.time, ticks: this.ticks, status: this.status, verdict: this.verdict, fired: this.fired, mismatches: this.mismatches, denied: 0, failed: this.failed, running: this.active.map((a) => `${this.net.transitionId(a.t)}${a.run ? `: ${a.run.binding.kind} ${a.run.binding.value}` : ''}`), where: this.where() }; }
 }
+export { setValue };

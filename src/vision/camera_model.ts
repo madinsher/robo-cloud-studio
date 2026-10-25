@@ -12,9 +12,47 @@ import { VISION_SENSORS, VisionSensor, VisionModality } from './stack';
 
 export interface Intrinsics { fx: number; fy: number; cx: number; cy: number; width: number; height: number }
 
-export function intrinsicsFromCamera(cam: { fov: number; width: number; height: number }): Intrinsics {
-  const fx = (cam.width / 2) / Math.tan(((cam.fov * Math.PI) / 180) / 2);
-  return { fx, fy: fx, cx: cam.width / 2, cy: cam.height / 2, width: cam.width, height: cam.height };
+/** What the pinhole model needs from a camera item. `fovAxis` defaults to 'vertical' (RoboDK Cam2D FOV and three.js). */
+export interface CameraLike { fov: number; width: number; height: number; fovAxis?: 'vertical' | 'horizontal' }
+
+/**
+ * THE camera model of the studio (renderer, vision maths, wizard, RoboDK Cam2D, Webots/URDF importers, ROS CameraInfo):
+ * square pixels, principal point at the image centre, focal length from `fov` spanning the `fovAxis` of the image.
+ * For an output of another size (`width`×`height`) the fov along `fovAxis` is kept — exactly what three.js does with
+ * PerspectiveCamera(fov, aspect) for the vertical axis — so overlays drawn at any canvas size line up with the render.
+ */
+export function cameraIntrinsics(cam: CameraLike, width = cam.width, height = cam.height): Intrinsics {
+  const fov = Math.min(179, Math.max(0.1, cam.fov));
+  const f = ((cam.fovAxis === 'horizontal' ? width : height) / 2) / Math.tan((fov * Math.PI) / 360);
+  return { fx: f, fy: f, cx: width / 2, cy: height / 2, width, height };
+}
+/** Same as cameraIntrinsics at the camera resolution (kept for existing callers). */
+export function intrinsicsFromCamera(cam: CameraLike): Intrinsics { return cameraIntrinsics(cam); }
+/** Vertical field of view (deg) for THREE.PerspectiveCamera rendering this camera into a width×height target. */
+export function threeFovDeg(cam: CameraLike, width = cam.width, height = cam.height): number {
+  const K = cameraIntrinsics(cam, width, height);
+  return (2 * Math.atan(height / 2 / K.fy) * 180) / Math.PI;
+}
+/** Horizontal / vertical field of view (deg) of the camera at its own resolution. */
+export function cameraFovs(cam: CameraLike): { h: number; v: number } {
+  const K = cameraIntrinsics(cam);
+  return { h: (2 * Math.atan(K.width / 2 / K.fx) * 180) / Math.PI, v: (2 * Math.atan(K.height / 2 / K.fy) * 180) / Math.PI };
+}
+/** Set fov/fovAxis so that the camera has the given focal length (px) at its resolution (FOCAL_LENGTH/PIXELSIZE, K from a calibration). */
+export function setFocalLengthPx(cam: CameraLike, fPx: number): void {
+  cam.fov = (2 * Math.atan(((cam.fovAxis === 'horizontal' ? cam.width : cam.height) / 2) / fPx) * 180) / Math.PI;
+}
+/**
+ * Configure a camera item as a catalogue sensor: resolution (capped at `maxWidth`, aspect kept) and the sensor's
+ * HORIZONTAL fov (datasheets quote hfov; the rendered hfov then equals the datasheet value exactly).
+ */
+export function applySensorToCamera(cam: CameraLike & { far?: number; near?: number; kind?: string }, s: VisionSensor, opts: { maxWidth?: number } = {}): void {
+  if (s.modality === 'lidar3d') { cam.fov = s.hfov; cam.fovAxis = 'horizontal'; if (s.depthRange && cam.far !== undefined) cam.far = Math.max(cam.far, s.depthRange[1] * 1000); return; }
+  const maxW = opts.maxWidth ?? 1280;
+  const [rw, rh] = s.resolution[0] ? s.resolution : [1280, 720];
+  cam.width = Math.min(maxW, rw); cam.height = Math.round((cam.width * rh) / rw);
+  cam.fovAxis = 'horizontal'; cam.fov = s.hfov;
+  if (s.depthRange) { if (cam.far !== undefined) cam.far = Math.max(cam.far, s.depthRange[1] * 1000); if (cam.near !== undefined) cam.near = Math.max(1, s.depthRange[0] * 1000 * 0.5); }
 }
 export function intrinsicsFromSensor(s: VisionSensor): Intrinsics {
   const [w, h] = s.resolution[0] ? s.resolution : [1024, 768];

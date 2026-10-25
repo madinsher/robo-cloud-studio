@@ -1,0 +1,4 @@
+<?xml version="1.0"?>
+<robot name="r" xmlns:xacro="http://www.ros.org/wiki/xacro">
+<xacro:property name="cond" value="false"/><xacro:if value="${cond}"><no/></xacro:if><xacro:unless value="${cond}"><yes/></xacro:unless><xacro:if value="0"><no2/></xacro:if><xacro:if value="${0.0}"><no3/></xacro:if><xacro:if value="${2}"><yes2/></xacro:if><xacro:if value="${'true'}"><yes3/></xacro:if>
+</robot>

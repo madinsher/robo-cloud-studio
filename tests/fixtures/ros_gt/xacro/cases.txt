@@ -1,0 +1,28 @@
+murca_robot|murca_description|urdf/murca_robot.urdf.xacro|
+murca_robot_alt|murca_description|urdf/murca_robot.urdf.xacro|slot_front:=lidar2d use_manipulator:=false slot_top:=lidar2d slot_cargo:=spray_tank
+murca_robot_manip|murca_description|urdf/murca_robot.urdf.xacro|use_manipulator:=true slot_cargo:=crate
+aerial_platform|murca_description|urdf/aerial_platform.urdf.xacro|
+utp_g|murca_webots|urdf/utp_g.urdf.xacro|
+utp_a|murca_webots|urdf/utp_a.urdf.xacro|
+rs_d415|realsense2_description|urdf/test_d415_camera.urdf.xacro|
+rs_d435|realsense2_description|urdf/test_d435_camera.urdf.xacro|
+rs_d435i|realsense2_description|urdf/test_d435i_camera.urdf.xacro|
+rs_d455|realsense2_description|urdf/test_d455_camera.urdf.xacro|
+rs_l515|realsense2_description|urdf/test_l515_camera.urdf.xacro|
+rs_r410|realsense2_description|urdf/test_r410_camera.urdf.xacro|
+rs_r430|realsense2_description|urdf/test_r430_camera.urdf.xacro|
+rs_multi|realsense2_description|urdf/test_d435_multiple_cameras.urdf.xacro|
+rs_one_of_each|realsense2_description|tests/one_of_each.xacro|
+tb4|nav2_minimal_tb4_description|urdf/standard/turtlebot4.urdf.xacro|
+ur5e|ur_description|urdf/ur.urdf.xacro|ur_type:=ur5e name:=ur
+ur5e_prefixed|ur_description|urdf/ur.urdf.xacro|ur_type:=ur5e name:=ur tf_prefix:=left_ use_fake_hardware:=true
+ur5e_gripper_noargs|webots_ros2_universal_robot|resource/ur5e_with_gripper.urdf.xacro|
+ur5e_gripper|webots_ros2_universal_robot|resource/ur5e_with_gripper.urdf.xacro|name:=UR5e ur_type:=ur5e
+rsp_test_desc|robot_state_publisher|urdf/test-desc.urdf.xacro|
+palletizer|palletizer_model_pkg|urdf/palletizer_model.urdf.xacro|
+tb3_gz_waffle|nav2_minimal_tb3_sim|urdf/gz_waffle.sdf.xacro|
+tb3_sandbox_world|nav2_minimal_tb3_sim|worlds/tb3_sandbox.sdf.xacro|
+robin_srdf|moveit_ros_planning|rdf_loader/test/data/robin.srdf.xacro|
+lpb_parameter|launch_param_builder|config/parameter.xacro|
+msc_ros2_control|moveit_setup_controllers|templates/config/ros2_control.xacro|
+msc_modified|moveit_setup_controllers|templates/config/modified.urdf.xacro|
