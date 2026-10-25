@@ -151,7 +151,7 @@ fallback root
     const labels = (k: Parameters<typeof controlExports>[0], src: string) => controlExports(k, src, 'm').map((e) => e.id);
     expect(labels('des', TEMPLATES.des)).toEqual(['robodk', 'ros2', 'st', 'scxml', 'smv', 'uppaal']);
     expect(labels('petri', TEMPLATES.petri)).toEqual(['robodk', 'ros2', 'st', 'sfc', 'pnml', 'smv']);
-    expect(labels('fsm', TEMPLATES.fsm)).toEqual(['robodk', 'ros2', 'scxml']);
+    expect(labels('fsm', TEMPLATES.fsm)).toEqual(['robodk', 'ros2', 'st', 'sfc', 'scxml']); // FSM ST + flattened SFC (tests/ctl_fsm_st.test.ts)
     expect(labels('bt', TEMPLATES.bt)).toEqual(['robodk', 'ros2']);
     for (const e of controlExports('petri', TEMPLATES.petri, 'm')) expect(e.files().length).toBeGreaterThan(0);
   });

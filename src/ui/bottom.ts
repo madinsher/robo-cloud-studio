@@ -2,11 +2,12 @@ import { App } from '../app';
 import { ProgramEditor } from './program-editor';
 import { h, clear, fmt, icon } from './dom';
 import { ItemType } from '../core/items/item';
-import { FleetItem } from '../fleet/fleet';
+import { FleetItem, FleetManager } from '../fleet/fleet';
 import { MobileRobot } from '../mobile/items';
 import { MissionItem } from '../agri/items';
 import { Camera as CameraItem, Item } from '../core/items/item';
 import { detectFruit } from '../agri/vision';
+import { rescalePixel } from '../vision/camera_model';
 import { Robolink, robomath, RobolinkItem, Mat } from '../api/robolink';
 import * as RobolinkConsts from '../api/robolink';
 import { t } from './i18n';
@@ -119,12 +120,30 @@ export class BottomPanel {
       const table = h('table', { class: 'grid' }, h('thead', null, h('tr', null, ...['Robot', 'Status', 'Battery', 'Task', 'Speed', 'Odometer', 'Busy'].map((c) => h('th', null, c)))),
         h('tbody', null, ...robots.map((r: MobileRobot) => { const pr = k.perRobot[r.id]; return h('tr', { onClick: () => this.app.select(r) }, h('td', null, r.name), h('td', { class: `st-${r.state.status}` }, r.state.status), h('td', null, this.bar(r.batteryLevel())), h('td', null, r.state.taskId ?? '—'), h('td', null, `${fmt(r.state.v / 1000, 2)} m/s`), h('td', null, `${fmt(r.state.odometer / 1000, 0)} m`), h('td', null, `${fmt((pr?.busyTime ?? 0) / Math.max(1, fm.time) * 100, 0)} %`)); })));
       body.appendChild(table);
+      body.appendChild(this.kpiGroups(k, robots));
       const tasks = f.tasks.slice(-40).reverse();
       body.appendChild(h('table', { class: 'grid small' }, h('thead', null, h('tr', null, ...['Task', 'Type', 'Status', 'Robot', 'Row', 'Wait', 'Duration'].map((c) => h('th', null, c)))),
         h('tbody', null, ...tasks.map((t) => { const rb = t.robotId ? this.app.station.findById(t.robotId) : null; return h('tr', { class: `task-${t.status}` }, h('td', null, t.id), h('td', null, t.type), h('td', null, t.status), h('td', null, rb?.name ?? '—'), h('td', null, t.meta?.rowId ? (this.app.station.findById(t.meta.rowId)?.name ?? '') + (t.meta.side ? (t.meta.side > 0 ? ' R' : ' L') : '') : '—'), h('td', null, t.startedAt !== undefined ? `${fmt(t.startedAt - t.createdAt, 0)} s` : '—'), h('td', null, t.finishedAt !== undefined ? `${fmt(t.finishedAt - (t.startedAt ?? t.createdAt), 0)} s` : '—')); }))));
       const missions = this.app.station.itemsOfType<MissionItem>(ItemType.MISSION).filter((m) => !m.fleetId || m.fleetId === f.id);
       if (missions.length) body.appendChild(h('div', null, ...missions.map((m) => h('div', { class: 'mission-row' }, h('span', null, `${m.name} (${m.missionType}) — ${m.status}`), h('progress', { value: m.progress, max: 1 })))));
     }
+  }
+
+  /** Fleet KPI groups: contacts, traffic management, process results (spraying, harvest, ...) and equipment reconfiguration. */
+  private kpiGroups(k: ReturnType<FleetManager['kpis']>, robots: MobileRobot[]): HTMLElement {
+    const num = (v: number) => (Number.isInteger(v) ? String(v) : fmt(v, Math.abs(v) >= 100 ? 0 : 2));
+    const group = (title: string, rows: Array<[string, string]>) => h('div', { class: 'kpi-group', dataset: { kpi: title.toLowerCase() } }, h('b', null, title), ...rows.map(([n, v]) => h('div', { class: 'kv' }, h('span', null, n), h('span', null, v))));
+    const c = k.contacts, tr = k.traffic;
+    const groups: HTMLElement[] = [
+      group('Contacts', [['robot–obstacle events', String(c?.robotObstacle ?? 0)], ['robot–robot events', String(c?.robotRobot ?? 0)], ['steps in contact (obstacle / robot)', `${c?.robotObstacleSteps ?? 0} / ${c?.robotRobotSteps ?? 0}`], ['max depth', `${fmt(c?.maxDepth ?? 0, 0)} mm`]]),
+      group('Traffic', [['waiting', `${fmt(tr?.waitSeconds ?? 0, 1)} s`], ['replans', String(tr?.replans ?? 0)], ['yields', String(tr?.yields ?? 0)], ['deadlocks resolved', String(tr?.deadlocks ?? 0)]]),
+    ];
+    const proc = Object.entries(k.process ?? {}).filter(([kind]) => kind !== 'equipment');
+    groups.push(group('Process', proc.length ? proc.flatMap(([kind, vals]) => Object.entries(vals).map(([n, v]) => [`${kind}: ${n}`, num(v)] as [string, string])) : [['—', 'no process results yet']]));
+    const eq = k.process?.equipment ?? {};
+    const fitted = robots.filter((r) => r.equipment?.length).map((r) => `${r.name}: ${r.equipment.join(', ')}`);
+    groups.push(group('Equipment', [...Object.entries(eq).map(([n, v]) => [n, num(v)] as [string, string]), ...fitted.map((t) => ['fitted', t] as [string, string]), ...(!Object.keys(eq).length && !fitted.length ? [['—', 'no reconfiguration']] as Array<[string, string]> : [])]));
+    return h('div', { class: 'kpi-groups' }, ...groups);
   }
 
   /** Small canvas chart: cumulative output (green) and WIP (blue) over process time. */
@@ -186,9 +205,9 @@ export class BottomPanel {
       if (cam instanceof CameraItem) {
         const det = detectFruit(this.app.station, cam, { onlyRipe: false, maxRange: 6000 });
         const ctx = this.camCanvas.getContext('2d')!;
-        const sx = this.camCanvas.width / cam.width, sy = this.camCanvas.height / cam.height;
         ctx.lineWidth = 2;
-        for (const d of det) { ctx.strokeStyle = d.ripe >= 0.5 ? '#ff4d4d' : '#ffd43b'; ctx.strokeRect((d.u - d.w / 2) * sx, (d.v - d.h / 2) * sy, Math.max(4, d.w * sx), Math.max(4, d.h * sy)); }
+        // the canvas renders with the camera model (fov along cam.fovAxis): map each detection box corner through K
+        for (const d of fruitOverlayBoxes(cam, det, this.camCanvas.width, this.camCanvas.height)) { ctx.strokeStyle = d.ripe >= 0.5 ? '#ff4d4d' : '#ffd43b'; ctx.strokeRect(d.x, d.y, d.w, d.h); }
         txt += ` — ${det.length} fruit detections (${det.filter((d) => d.ripe >= 0.5).length} ripe)`;
       }
       this.camInfo.textContent = txt;
@@ -249,6 +268,19 @@ export class BottomPanel {
     const fn = new Function(...names, `"use strict"; return (async () => { ${body} })();`);
     return fn(...vals);
   }
+}
+
+/**
+ * Fruit detection boxes (camera pixels at the camera's own resolution) in a width×height view rendered with the same
+ * camera model: both corners go through rescalePixel (K of the camera vs K of the view), so the boxes stay on the fruit
+ * whatever the view's aspect ratio. Boxes are at least 4 px wide / high.
+ */
+export function fruitOverlayBoxes(cam: CameraItem, det: Array<{ u: number; v: number; w: number; h: number; ripe: number }>, width: number, height: number): Array<{ x: number; y: number; w: number; h: number; ripe: number }> {
+  return det.map((d) => {
+    const [x0, y0] = rescalePixel(cam, d.u - d.w / 2, d.v - d.h / 2, width, height);
+    const [x1, y1] = rescalePixel(cam, d.u + d.w / 2, d.v + d.h / 2, width, height);
+    return { x: x0, y: y0, w: Math.max(4, x1 - x0), h: Math.max(4, y1 - y0), ripe: d.ripe };
+  });
 }
 
 function formatValue(v: any): string {

@@ -57,7 +57,9 @@ they match the pose (no IK per target), else IK seeded with them; RoboDK `conf_R
 the via joints; per-move speed / rounding overrides become explicit `setSpeed` / `setRounding` events; the exported
 program starts with its frame and tool; no expressible move is dropped (unreachable targets are kept and reported);
 mechanisms (grippers, turntables) move by their stored joints; calls to station programs passed as code are compiled
-as sub-programs; station-script threads become comments. `tests/posts_library.test.ts`: every program of the 57
+as sub-programs; station-script threads become comments; analog outputs (RoboDK "Set AO", `io` with `analog: true`)
+become `setAO` events written in vendor syntax (KUKA `$ANOUT[n]=v`, ABB `SetAO`, Fanuc `AO[n]=(v)`, UR
+`set_standard_analog_out`, Motoman `AOUT AO#(n) v`; other posts fall back to their `setDO`). `tests/posts_library.test.ts`: every program of the 57
 Library stations compiles in < 30 s (the whole Library in about 30 s), keeps every move and posts with its robot's
 post.
 
@@ -75,9 +77,21 @@ the body once and report it (`tests/posts_control.test.ts`).
   `POST /posts/native/run {post, job, source?}` runs a RoboDK post (compiled or source, or a user post text) with
   RoboDK's embedded Python (env `ROBODK_PYTHON`) and returns every file (`ProgSave` into a temporary folder; archives
   as base64). In the browser `src/posts/native_client.ts` (`setNativePostServer`, `registerNativePosts`) registers
-  them as asynchronous posts.
+  them as asynchronous posts `RDK_<name>`: the app does this when it is opened with `?server=ws://host:port`, so
+  RoboDK's posts appear in the post selectors. A RoboDK post name the studio has no built-in post for resolves to its
+  native post (robot files keep working). The server registers them for its own headless station too
+  (`setLocalNativePosts`): `prog.MakeProgram()` of an API client (the official `robodk` package included) with
+  `robot.setParam('PostProcessor', 'RDK_KUKA_KRC2')` runs RoboDK's post in-process.
+* **Export dialog**: asynchronous posts (Python / native) go through `generateProgram` (`App.exportProgramAsync`),
+  synchronous ones through `App.exportProgramChecked`; the dialog lists the compiler problems and the post's own
+  warnings (`PostProgram.problems`) above the preview, and binary files (`encoding: 'base64'`) download as such.
+  `Robolink.MakeProgram` uses the same `generateProgram` path.
+* `tests/e2e/server.e2e.test.ts`: the built server, the official `robodk` package over the binary protocol, Library
+  Example 01.b: `MakeProgram` with RoboDK's KUKA_KRC2 post (native) and with the built-in KUKA_KRC2 both equal the
+  `DrillingPart.src` RoboDK 5.9.4 generated itself (`tests/fixtures/robodk_gt/code`).
 * **Browser** (Pyodide, `python_post.ts`): only *source* posts can run there (RoboDK's compiled `libspp` modules are
-  native Windows extensions). The job goes through `post_shim.run_job_source` (sub-programs, `ProgSave`, all files,
+  native Windows extensions). The in-browser `robodk.robolink` stub carries RoboDK's own constants
+  (`officialConstants()` of `python/robodk/_official.py`: `INS_TYPE_MOVE = 0`, `INS_TYPE_CODE = 8`, ...). The job goes through `post_shim.run_job_source` (sub-programs, `ProgSave`, all files,
   post log); imported post files are written next to each other so sibling imports work. `Program › Import RoboDK post
   processors` classifies the files: source posts -> Pyodide, compiled wrappers -> server posts (or skipped with a note
   when no server is configured). All 151 posts of RoboDK 5.9.4 are classified.

@@ -42,6 +42,41 @@ export interface LinkVisual {
   origin: Mat4;
   color?: string;
   scale?: Vec3;
+  /** RoboDK mesh link this visual came from (collision map entity of imported robots; passive links ride on a chain link). */
+  meshLink?: number;
+  /**
+   * Passive "look-at" part (counterbalance cylinder / rod): its frame sits at pivot `a` (a point of link `linkA`) or
+   * `b` (a point of link `linkB`), its X axis points from a to b and its Y axis is the Z axis of link `axisLink`
+   * (the J2 axis). The visual hangs on the link it is attached to; `visualOrigin()` gives its current origin.
+   */
+  passive?: PassiveLookAt;
+}
+
+export interface PassiveLookAt { at: 'a' | 'b'; a: Vec3; linkA: number; b: Vec3; linkB: number; axisLink: number }
+
+/**
+ * Origin of a link visual relative to its link for the current link poses (`fk.linkPoses`): `v.origin`, or for a
+ * passive look-at part the frame described by `v.passive` (RoboDK counterbalances: verified against RoboDK's link
+ * poses of KUKA KR 90 / KR 100, ABB IRB 6640 / 6700, Fanuc R-2000iB at several J2 / J3 values).
+ */
+export function visualOrigin(linkPoses: Mat4[], link: number, v: LinkVisual): Mat4 {
+  const p = v.passive;
+  if (!p || !linkPoses[p.linkA] || !linkPoses[p.linkB] || !linkPoses[p.axisLink] || !linkPoses[link]) return v.origin;
+  const at = (m: Mat4, q: Vec3): Vec3 => [m[0] * q[0] + m[4] * q[1] + m[8] * q[2] + m[12], m[1] * q[0] + m[5] * q[1] + m[9] * q[2] + m[13], m[2] * q[0] + m[6] * q[1] + m[10] * q[2] + m[14]];
+  const A = at(linkPoses[p.linkA], p.a), B = at(linkPoses[p.linkB], p.b);
+  const ax = linkPoses[p.axisLink];
+  let x: Vec3 = [B[0] - A[0], B[1] - A[1], B[2] - A[2]];
+  const lx = Math.hypot(x[0], x[1], x[2]);
+  if (lx < 1e-9) return v.origin;
+  x = [x[0] / lx, x[1] / lx, x[2] / lx];
+  const y0: Vec3 = [ax[8], ax[9], ax[10]];
+  let z: Vec3 = [x[1] * y0[2] - x[2] * y0[1], x[2] * y0[0] - x[0] * y0[2], x[0] * y0[1] - x[1] * y0[0]];
+  const lz = Math.hypot(z[0], z[1], z[2]) || 1;
+  z = [z[0] / lz, z[1] / lz, z[2] / lz];
+  const y: Vec3 = [z[1] * x[2] - z[2] * x[1], z[2] * x[0] - z[0] * x[2], z[0] * x[1] - z[1] * x[0]];
+  const o = p.at === 'a' ? A : B;
+  const F = Float64Array.from([x[0], x[1], x[2], 0, y[0], y[1], y[2], 0, z[0], z[1], z[2], 0, o[0], o[1], o[2], 1]) as Mat4;
+  return multiply(invert(linkPoses[link]), F);
 }
 
 export interface LinkDef {

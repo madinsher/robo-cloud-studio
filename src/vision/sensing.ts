@@ -108,7 +108,9 @@ function geometryRefTris(r: { mesh?: string; primitive?: any; origin?: ArrayLike
 
 /** Procedural robot link pieces in the link frame — mirrors SceneRenderer.addProceduralLink (same three.js geometries). */
 const procCache = new Map<string, Array<{ tris: Float32Array; local: Mat4; dark: boolean }>>();
-function proceduralLink(robot: Robot, linkIndex: number): Array<{ tris: Float32Array; local: Mat4; dark: boolean }> {
+/** The procedural shapes the 3D view draws for a robot link without meshes (link frame, mm): also the solids of the
+ *  estimated inertials of the URDF export. */
+export function proceduralLink(robot: Robot, linkIndex: number): Array<{ tris: Float32Array; local: Mat4; dark: boolean }> {
   const chain = robot.chain;
   const reach = Math.max(300, robot.reach);
   const key = `${robot.id}:${linkIndex}:${chain.joints.length}:${reach.toFixed(1)}:${chain.joints.map((j) => Array.from(j.origin).map((v) => v.toFixed(2)).join(',') + j.type).join('|')}:${Array.from(chain.flange).map((v) => v.toFixed(2)).join(',')}`;
@@ -502,6 +504,10 @@ export function regionsFromRender(r: CameraRender): Map<string, RenderRegion> {
 // ---------------------------------------------------------------------------------------------
 
 interface TriBVH { nodes: Float64Array; /* per node: minx,miny,minz,maxx,maxy,maxz */ left: Int32Array; right: Int32Array; start: Int32Array; count: Int32Array; order: Int32Array }
+// BVHs live in mesh-local coordinates: shared by every SceneMesh built on the same triangle soup (sceneMeshes is
+// rebuilt per frame by the sensor loops; the soups are cached per geometry)
+const bvhCache = new WeakMap<Float32Array, TriBVH>();
+function bvhOf(t: Float32Array): TriBVH { let b = bvhCache.get(t); if (!b) { b = buildBVH(t); bvhCache.set(t, b); } return b; }
 function buildBVH(t: Float32Array): TriBVH {
   const nt = t.length / 9;
   const order = new Int32Array(nt); for (let i = 0; i < nt; i++) order[i] = i;
@@ -565,7 +571,7 @@ export function firstHit(meshes: SceneMesh[], o: Vec3, d: Vec3, tMax: number, op
     const t = m.tris, nt = t.length / 9;
     const consider = (tri: number) => { const h = triHit(t, tri * 9, ro, rd); if (h > tMin && h < best) { best = h; bestM = m; } };
     if (nt <= 64) { for (let k = 0; k < nt; k++) consider(k); continue; }
-    if (!m.bvh) m.bvh = buildBVH(t);
+    if (!m.bvh) m.bvh = bvhOf(t);
     const b = m.bvh, rinv = [1 / rd[0], 1 / rd[1], 1 / rd[2]];
     const stack = [0];
     while (stack.length) {

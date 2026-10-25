@@ -86,15 +86,39 @@ reaching their altitude.
 **Process components** (`src/vc`) share the station's single signal table with robot programs and control models:
 a program can wait on a conveyor sensor or stop a conveyor.
 
+## Greenhouses, rails, palletizing, per-robot controllers
+
+- **Greenhouse layout** (`buildGreenhouse`, src/agri/greenhouse.ts; the greenhouse demo): a hanging gutter per row
+  (with wires), a pair of Ø 51 mm heating pipes 550 mm apart in every path, a concrete corridor across the row heads,
+  and a rail network. **Pipe-rail trolleys** (`useRails`: navigation method `rail_1d`) route on that network
+  (src/mobile/rails.ts): on a rail they drive along its axis only (forward or backward, never turning on it), they turn
+  and pass each other on the corridor (right-hand lanes); a turnaround on the same rail goes through the corridor.
+  Arms mounted on the trolley centreline (turret) work both rows of a path without turning.
+- **Navigation method → planner / controller** (Navigation & SLAM stack of a robot): Nav2 Smac Hybrid-A* + RPP =
+  curvature-limited Hybrid A* for every drive (no rotation in place) and regulated pure pursuit (speed × r / 0.9 m on
+  tighter curves, anticipated over the braking distance); NavFn + DWB / Smac 2D + MPPI = 2-D footprint grid planner;
+  line following = the fixed straight route (blocked = no path); rail = the rail network; no stack = default.
+- **Arm motion during fleet harvest**: mission setting `animateArm` (or `harvestAnimation.enabled`): one IK solve per
+  fruit, linear joint motion that reaches the fruit at its pick time, back to the travel pose between stops.
+- **Per-robot FSM** (src/fleet/fleet_fsm.ts, `attachFleetFsm`): a studio `fsm` document is a fleet robot's own
+  controller — it gets a task only in a state with `skill=fleet_execute`, charges when its FSM decides
+  (`fleet_charge`), waits (`wait=`); the trace is its lifecycle with the task ids.
+- **MuRKA contract net allocator** (`fleet.allocation = 'murka'`): the article's cost (1), ≤ 2 contracts per robot,
+  battery ≥ 15 %, reconfiguration bids through the depot (src/fleet/murka_alloc.ts); MURKA reproduction in
+  docs/murka-agro.md.
+- **Palletizing in the packing line**: the KR16 is a robot-driven transfer component (`motion`): it picks every crate at
+  the conveyor end, the crate rides on the gripper, it stacks the crate on its pallet slot; the pallet goes to the truck
+  when full (`releaseWhenFull`); the equivalent program "Palletize" can be posted for the robot. The VerticalBot demo
+  stacks 4 cartons from a table onto the pallet.
+
 ## Limits (honest list)
 
-- Greenhouse layouts are rectangular fields with gutters as rows; pipe-rail trolleys are simulated as free
-  differential robots driving the inter-rows (no rail constraint, no heating pipes, benches or central corridor).
-- The fleet process models time the arm (base stops, seconds per fruit); the arm itself is animated only when
-  `harvestAnimation.enabled`; full joint-level picking runs through the harvest *program* (step 5).
-- The packing and VerticalBot demos are unchanged process / palletizer stations (the palletizer of the packing line has
-  no program).
-- Selected navigation methods of the navigation stack drive the estimator (localization error), not the planner.
+- The fleet process models time the arm (base stops, seconds per fruit) unless `animateArm` is on; full joint-level
+  picking with collision checks runs through the harvest *program* (step 5).
+- Two harvesters in narrow 3 m orchards with short headlands can deadlock in the FleetManager (they keep re-planning
+  around each other); MURKA's legacy apple garden is harvested with one platform (docs/murka-agro.md).
+- Greenhouse benches, trolley lifts and rail switching hardware are not modelled (the trolley changes rails on the
+  corridor).
 
 ## Verification
 
@@ -105,6 +129,7 @@ lane, allocators, save–load mid-mission (`mobile_traffic`); Ackermann alley-to
 (`mobile_kinematics`); docking and program motion (`mobile_navigate`); harvest / spray programs and the detect → pick
 loop (`agri_programs`); process models and generators (`agri_processes`); equipment and depot reconfiguration
 (`agri_equipment`); group control on Ackermann robots (`mobile_group`); component ↔ program signals
-(`agri_vc_signals`).
+(`agri_vc_signals`); greenhouse rails (`agri_greenhouse`); palletizer cells (`agri_vc_palletizer`); navigation method →
+planner / controller (`mobile_navmethod`); per-robot FSM controllers (`mobile_fleet_fsm`).
 
 Models are parametric and deterministic (seeded), so scenarios are reproducible for what-if studies.

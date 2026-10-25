@@ -4,8 +4,8 @@ import { Robot } from '../items/robot';
 import { Program, Instruction, ProgramRunResult } from '../items/program';
 import { Trajectory, sampleAt } from './trajectory';
 import { EventBus } from '../events';
-import { CollisionPair, CollisionOptions, Collider, robotCollisionChecker } from '../collision/collision';
-import { recordProgram, RecordedStep, StationSnapshot, StationRuntime } from './runtime';
+import { CollisionPair, CollisionOptions, Collider, robotCollisionChecker, checkCollisionsMapped } from '../collision/collision';
+import { recordProgram, RecordedStep, StationSnapshot, StationRuntime, programRobot } from './runtime';
 import type { MotionGroup } from './planner';
 import type { Pose2D } from './mobile_hook';
 
@@ -32,6 +32,12 @@ export interface Step {
   t0: number;
   t1: number;
   apply?: () => void;
+  /** Run that executed the step (the main program's run, or a thread it started). */
+  runId?: string;
+  /** Item.Update() time of a move (RoboDK cycle-time model). */
+  estimate?: number;
+  /** Joints at the move's target (blended moves pass beside it). */
+  qTarget?: number[];
 }
 
 /**
@@ -55,7 +61,7 @@ export class ProgramSimulator {
   /** Object -> tool attachment (object id -> tool and pose relative to the tool) during simulation. */
   attachments = new Map<string, { tool: Tool; local: Float64Array }>();
   /** Collision checking during compile (sampled along trajectories). */
-  collisionOptions: (CollisionOptions & { enabled: boolean; sampleStep?: number; /** Joint motion (deg / mm) between samples (default 2). */ jointStep?: number; /** Sample budget of one check (default 20000; the joint step grows for longer programs). */ maxSamples?: number; /** Colliding instructions listed before the check stops (default 20). */ maxCollisions?: number; /** Wall-clock budget of the check (ms, default 60000). */ timeBudgetMs?: number }) = { enabled: false, sampleStep: 0.02 };
+  collisionOptions: (CollisionOptions & { enabled: boolean; sampleStep?: number; /** Joint motion (deg / mm) between samples (default 2). */ jointStep?: number; /** Sample budget of one check (default 20000; the joint step grows for longer programs). */ maxSamples?: number; /** Colliding instructions listed before the check stops (default 20). */ maxCollisions?: number; /** Wall-clock budget of the check (ms, default 60000). */ timeBudgetMs?: number; /** RoboDK Item.Update(COLLISION_ON) semantics: show / hide / attach / detach events are not applied during the check and only the program robot's own moves are checked (RoboDK 5.9.4: 05.e Paint's "Show Paint gun" does not show the gun for its collision check; threads / calls into other robots' programs are not checked, 06.f). */ ignoreEvents?: boolean }) = { enabled: false, sampleStep: 0.02 };
   collisions: Array<{ instructionId: string; t: number; pairs: CollisionPair[] }> = [];
   /**
    * 'ignore' reproduces RoboDK's Item.Update() cycle-time estimate (Set speed instructions are not applied there;
@@ -71,6 +77,8 @@ export class ProgramSimulator {
   private recRuntime: StationRuntime | null = null;
   private robotEndJoints = new Map<string, number[]>();
   private replaying = false;
+  private skipEvents = false;
+  private checkedProgram: Program | null = null;
   private lastMotion = new Map<string, Step>();
   private version = 0;
 
@@ -96,7 +104,9 @@ export class ProgramSimulator {
     this.recRuntime = rec.runtime;
     this.snapshot = rec.snapshot;
     this.steps = rec.steps.map((s: RecordedStep): Step => {
-      const st: Step = { instruction: s.instruction, robot: s.robot, t0: s.t0, t1: s.t1 };
+      const st: Step = { instruction: s.instruction, robot: s.robot, t0: s.t0, t1: s.t1, runId: s.runId };
+      if (s.estimate !== undefined) st.estimate = s.estimate;
+      if (s.qTarget) st.qTarget = s.qTarget;
       if (s.trajectory) st.trajectory = s.trajectory;
       if (s.group) st.group = s.group;
       if (s.mobile) st.mobile = s.mobile;
@@ -112,6 +122,7 @@ export class ProgramSimulator {
     this.time = 0;
     this.currentStep = -1;
     this.lastMotion.clear();
+    this.checkedProgram = program;
     if (this.collisionOptions.enabled) this.checkTrajectoryCollisions(problems);
     const firstErr = problems.find((p) => p.severity === 'error');
     if (firstErr) {
@@ -119,7 +130,7 @@ export class ProgramSimulator {
       this.errorTime = Math.min(tCol, firstRecErr?.t ?? Infinity);
       if (!Number.isFinite(this.errorTime)) this.errorTime = 0;
     }
-    this.result = { ok: !firstErr, duration: rec.duration, distance: rec.distance, problems, executed: rec.executed };
+    this.result = { ok: !firstErr, duration: rec.duration, distance: rec.distance, problems, executed: rec.executed, updateTime: rec.updateTime };
     program.lastResult = this.result;
     return this.result;
   }
@@ -170,7 +181,7 @@ export class ProgramSimulator {
         for (const m of this.lastMotion.values()) this.applyMotion(m, s.t0);
         const key = this.motionKey(s);
         if (key) this.lastMotion.set(key, s);
-        if (s.apply) { s.apply(); this.version++; }
+        if (s.apply && !(this.skipEvents && s.instruction.data.kind === 'event')) { s.apply(); this.version++; }
         this.events.emit('instruction', { program: s.instruction.parent as Program, instruction: s.instruction, index: i });
       }
       this.currentStep = stepIdx;
@@ -250,14 +261,47 @@ export class ProgramSimulator {
   private checkTrajectoryCollisions(problems: ProgramRunResult['problems']): void {
     const step = Math.max(1e-3, this.collisionOptions.sampleStep ?? 0.1);
     const opts = this.collisionOptions;
-    const motionSteps = this.steps.filter((s) => s.robot && s.trajectory && s.trajectory.samples.length);
+    this.skipEvents = !!opts.ignoreEvents;
+    try { this.checkSamples(problems, step, opts); } finally { this.skipEvents = false; }
+  }
+
+  private checkSamples(problems: ProgramRunResult['problems'], step: number, opts: ProgramSimulator['collisionOptions']): void {
+    let motionSteps = this.steps.filter((s) => s.robot && s.trajectory && s.trajectory.samples.length);
+    if (opts.ignoreEvents && this.checkedProgram) {
+      // RoboDK Item.Update(COLLISION_ON) checks the program's own robot and the moves of called programs of other robots
+      // that really move (06.f Gripper1PickInput closing the gripper: collision; Gripper2DropOutput opening an open
+      // gripper: none); threads are not run (06.f Init: none)
+      const prog = this.checkedProgram;
+      const top = programRobot(prog);
+      const main = motionSteps.find((s) => s.instruction.parent === prog)?.runId ?? motionSteps[0]?.runId;
+      const moves = (s: Step) => { const k = s.trajectory!.samples; const a = k[0].joints, b = k[k.length - 1].joints; return a.some((v, i) => Math.abs(v - (b[i] ?? v)) > 1e-9); };
+      motionSteps = motionSteps.filter((s) => s.runId === main && (!(top instanceof Robot) || (s.group?.robot ?? s.robot) === top || moves(s)));
+    }
     if (!motionSteps.length) return;
     const robots = [...new Set(motionSteps.map((s) => s.group?.robot ?? s.robot!))];
     const checkers = new Map(robots.map((r) => [r, robotCollisionChecker(this.station, r, opts)]));
     const keyOf = (p: CollisionPair) => `${p.a.item.id}/${p.a.part}|${p.b.item.id}/${p.b.part}`;
     const initial = new Map<string, number>();
     const reported = new Set<string>();
+    // RoboDK semantics on stations with RoboDK's collision map: every checked pair in contact counts, also at the start
+    // and between items the program does not move (RoboDK 5.9.4 reports 02.i Wood_Holder x Finish_Part1, 06.e
+    // UR10 A x GripperA Opened, 06.f gripper fingers, 01.d Camera 2 x Camera view from the first row of
+    // InstructionListJoints(COLLISION_ON)); studio stations keep ignoring initial contacts (approximate geometry)
+    const rdkMap = Array.isArray((this.station.params.collisionMap as { entities?: unknown } | undefined)?.entities);
+    const first = motionSteps.reduce((a, s) => (s.t0 < a.t0 ? s : a), motionSteps[0]);
+    const collideAt = (t: number, s: Step, pairs: CollisionPair[]) => {
+      this.collisions.push({ instructionId: s.instruction.id, t, pairs });
+      const p = pairs[0];
+      problems.push({ instructionId: s.instruction.id, message: `Collision: ${p.a.item.name}${p.a.part !== p.a.item.name ? '/' + p.a.part : ''} × ${p.b.item.name}${p.b.part !== p.b.item.name ? '/' + p.b.part : ''} at ${t.toFixed(2)} s`, severity: 'error' });
+    };
     this.seek(0);
+    if (rdkMap) {
+      const moving = new Set<Item>(robots.flatMap((r) => [...r.walk()]));
+      const atStart: CollisionPair[] = [];
+      for (const r of robots) atStart.push(...checkers.get(r)!.check(this.version));
+      for (const p of checkCollisionsMapped(this.station, { ...opts, meshAccurate: opts.meshAccurate ?? !!opts.assets })) if (!moving.has(p.a.item) && !moving.has(p.b.item)) atStart.push(p);
+      if (atStart.length) { collideAt(first.t0, first, atStart); this.seek(0); this.restoreInitial(); this.time = 0; return; }
+    }
     for (const r of robots) {
       for (const p of checkers.get(r)!.check(this.version)) {
         if (p.a.item === p.b.item || (p.a.item instanceof Tool && p.a.item.parent === p.b.item) || (p.b.item instanceof Tool && p.b.item.parent === p.a.item)) continue;
@@ -320,13 +364,14 @@ export class ProgramSimulator {
 }
 
 /**
- * Convenience: estimate cycle time & validity without touching robot state. `roboDKUpdate` reproduces RoboDK's
- * Item.Update() numbers (programmed Set speed instructions ignored, see ProgramSimulator.speedInstructions).
+ * Convenience: estimate cycle time & validity without touching robot state. `roboDKUpdate` reports RoboDK's
+ * Item.Update() cycle time as `duration` (moves rest to rest at the robot's own motion state, see planner
+ * UpdateModel); the default is the simulated time (programmed speeds, accelerations and blending).
  */
 export function estimateProgram(station: Station, program: Program, opts: { roboDKUpdate?: boolean } = {}): ProgramRunResult {
   const sim = new ProgramSimulator(station);
-  if (opts.roboDKUpdate) sim.speedInstructions = 'ignore';
-  return sim.compile(program);
+  const r = sim.compile(program);
+  return opts.roboDKUpdate ? { ...r, duration: r.updateTime ?? r.duration } : r;
 }
 
 export { Item, SceneObject };

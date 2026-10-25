@@ -259,6 +259,11 @@ export interface ProgramRunResult {
   problems: Array<{ instructionId: string; message: string; severity: 'error' | 'warning' }>;
   /** Number of instructions executed. */
   executed: number;
+  /**
+   * RoboDK Item.Update() cycle-time estimate (s): every move rest to rest at the robot's own motion state, Set speed /
+   * rounding instructions not applied (what RoboDK reports as the program cycle time). `duration` is the simulated time.
+   */
+  updateTime?: number;
 }
 
 /** Path / trajectory item (2D-3D polyline used by mobile robots, conveyors, crop rows). */

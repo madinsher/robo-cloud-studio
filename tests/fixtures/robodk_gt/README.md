@@ -28,3 +28,23 @@ finished). They were dumped again with `DUMP_NO_MAKE=1` (no generated code) and,
 (+ its ground truth) covers what the Library lacks — IO set/wait, analog output, "Stop", rounding, joint speeds and
 accelerations, every RunInstruction variant, inline joint/pose moves, MoveC, duplicate target names, a station
 Python program and parameter, Cyrillic names; `T1-collision.rdk` pins the collision map layout.
+
+## Simulation ground truth (round 2, R1)
+
+`sim/<file>.json.gz` (`dump_sim.py`, RoboDK 5.9.4): every program of the 57 Library stations run from the station AS
+LOADED — the station is reloaded before every program (dump_gt.py updated the machining projects first, which made
+RoboDK regenerate their programs, and chained the programs: every `Update(COLLISION_ON)` leaves the robot where it
+stopped). Per program: `start` (joints of every robot), `update` = `Update(COLLISION_OFF)`, `jl` =
+`InstructionListJoints(5 mm, 5 deg, flags=1)` rows at every MOVE_ID change (every listed move end, also inside calls)
+and every 20th row, `updateCollision` = `Update(COLLISION_ON)` and, after a collision, the colliding items.
+
+```bash
+C:/RoboDK/Python37/python -I dump_sim.py "C:/RoboDK/Library/<file>.rdk" sim/<file>_.json <api-port>   # then gzip
+C:/RoboDK/Python37/python -I dump_turntable.py "<05.b file>" sim/<05.b>_.positioner.json <port> Turntable 0 90 180 270
+C:/RoboDK/Python37/python -I dump_linkposes.py "<file>" <port> "<robot>" passive/<tag>.json
+```
+
+- `sim/Example-05.b…positioner.json`: `Update()` of every 05.b program with the turntable set beforehand to 0/90/180/270°
+  (RoboDK's Update() keeps a positioner where it stands although the program turns it through a called program).
+- `passive/*.json`: `ObjectLink(k).PoseAbs()` of every link (counterbalance links 7 / 8 included) of KR 90, KR 100,
+  IRB 6640, IRB 6700 and R-2000iB at 6 joint vectors (joints as RoboDK applied them).

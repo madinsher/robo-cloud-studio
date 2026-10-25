@@ -8,6 +8,7 @@ import { t, getLang, setLang } from './i18n';
 import { collisionMapDialog, measureDialog, cameraDialog, VideoRecorder, exportHtml3D, exportGlb, exportAnimationGltf, exportUrdfPackage, importRoboDKPosts, saveForBlender } from './tools';
 import { Camera as CameraItem } from '../core/items/item';
 import { Robot } from '../core/items/robot';
+import { murkaMenu } from './murka_ui';
 
 export class MenuBar {
   el: HTMLElement;
@@ -23,6 +24,7 @@ export class MenuBar {
         { label: 'Save station (.vbstation)', shortcut: 'Ctrl+S', action: () => this.save() },
         { separator: true },
         { label: 'Demo stations', children: demos.map((d) => ({ label: d.name, action: () => { app.setStation(d.build()); toast(d.description, 'info', 6000); } })) },
+        { label: 'MURKA examples', children: murkaMenu(app) },
         { separator: true },
         { label: 'Export program (post processor)…', action: () => exportDialog(app) },
         { label: 'Export station as RoboDK API script (.py)', action: () => downloadText(`${app.station.name.replace(/\W+/g, '_')}_robodk.py`, app.exportRoboDKScript()) },
@@ -90,6 +92,7 @@ export class MenuBar {
         { separator: true },
         { label: 'Navigation & SLAM stack…', action: async () => { const m = app.station.selection.find((i) => i instanceof MobileRobot) as MobileRobot | undefined ?? app.station.itemsOfType<MobileRobot>(ItemType.MOBILE_ROBOT)[0]; if (!m) return toast('Add a mobile robot first', 'warn'); const { navStackDialog } = await import('./navstack_ui'); navStackDialog(app, m); } },
         { label: 'Export ROS 2 navigation package (Nav2 + SLAM)…', action: async () => { const m = app.station.selection.find((i) => i instanceof MobileRobot) as MobileRobot | undefined ?? app.station.itemsOfType<MobileRobot>(ItemType.MOBILE_ROBOT)[0]; if (!m) return toast('Add a mobile robot first', 'warn'); const { exportNavPackage } = await import('./navstack_ui'); exportNavPackage(app, m); } },
+        { label: 'Play scripted fleet (Webots supervisor script, MURKA Mission B)…', action: () => this.scriptedFleetDialog() },
         { separator: true },
         { label: 'Start world simulation', action: () => app.startWorld() },
         { label: 'Pause world', action: () => app.pauseWorld() },
@@ -184,9 +187,11 @@ export class MenuBar {
   async rosDialog(): Promise<void> {
     const r = await dialog<{ url: string; mode: any; rate: number }>('Connect to ROS 2 (rosbridge_server)', [
       { key: 'url', label: 'rosbridge websocket URL', type: 'text', value: 'ws://localhost:9090' },
-      { key: 'mode', label: 'Mode', type: 'select', value: 'both', options: [{ value: 'both', label: 'Publish sim state + follow /joint_states' }, { value: 'publish', label: 'Publish only (drive real robots)' }, { value: 'follow', label: 'Follow only (digital twin of real robots)' }] },
+      { key: 'mode', label: 'Mode', type: 'select', value: 'both', options: [{ value: 'both', label: 'Publish sim state + follow /joint_states' }, { value: 'publish', label: 'Publish only (drive real robots)' }, { value: 'follow', label: 'Follow only (digital twin of real robots)' }, { value: 'sim', label: 'Simulator backend (the studio replaces Webots / Gazebo: /clock, /odom, /scan, cameras, /cmd_vel)' }] },
       { key: 'rate', label: 'Publish rate (Hz)', type: 'number', value: 10 },
-    ], { body: h('p', { class: 'hint' }, 'Publishes /cmd_joint_state, /cmd_point, /tcp_pose per arm and /cmd_vel, /robot_pose, /battery_state per mobile robot (namespaced). Subscribes to /joint_states and /odom. Run: ros2 launch rosbridge_server rosbridge_websocket_launch.xml') });
+    ], { body: h('div', null,
+      h('p', { class: 'hint' }, 'Publishes /cmd_joint_state, /cmd_point, /tcp_pose per arm and /cmd_vel, /robot_pose, /battery_state per mobile robot (namespaced). Subscribes to /joint_states and /odom. Run: ros2 launch rosbridge_server rosbridge_websocket_launch.xml'),
+      h('p', { class: 'hint' }, 'Simulator backend: the studio plays the role of the robot simulator for ROS 2 nodes (MURKA Webots interface) — /clock, /odom + TF, /joint_states, /scan, /imu, camera images + camera_info, depth; it follows /cmd_vel and joint trajectories.')) });
     if (!r) return;
     const { RosBridge } = await import('../ros/rosbridge');
     try {
@@ -195,6 +200,9 @@ export class MenuBar {
       (this.app as any).ros = rb;
     } catch (e: any) { toast(e.message, 'error'); }
   }
+
+  /** Play a scripted fleet (agromarca scripted_fleet JSON) on the world clock; default: MURKA Mission B. */
+  async scriptedFleetDialog(): Promise<void> { const { scriptedFleetDialog } = await import('./murka_ui'); return scriptedFleetDialog(this.app); }
 
   serverInfo(): void {
     const body = h('div', { class: 'help' },

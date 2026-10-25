@@ -101,7 +101,9 @@ resolved from the pose stored in the instruction), MoveJ / MoveL / MoveC with ta
 hide / replace objects), calls, `Run` = thread, calls to routines and Python programs = code calls (`SetRPM(70)`).
 Python programs: `ItemType.PROGRAM_PYTHON` with `params.pythonCode` (exact source). Machining projects: links to
 robot, frame, tool, part, generated program and the NC / APT input file. Not reproduced (listed per file): machining
-settings, animated counterbalance / delta rod / 4-bar gripper links (drawn rigid), camera and notes contents.
+settings, Comau parallelogram rods / delta rods / 4-bar gripper links (drawn rigid; KUKA / ABB / Fanuc counterbalances
+follow J2 like RoboDK), camera and notes contents. Simulation parity with RoboDK 5.9.4 (validity, Item.Update() cycle
+time, joints, collisions) is checked program by program on the whole Library: docs/robodk-library-sim.md.
 
 ### RoboDK post processors
 

@@ -88,7 +88,13 @@ export function applyCapabilityOntology(station: Station, text: string): { updat
 
 const safe = (s: string) => s.replace(/[^A-Za-z0-9_]/g, '_');
 
-export interface GroupFsmOptions { doc: FsmDoc; world: ExecutorWorld; station: Station; log?: (m: string) => void }
+export interface GroupFsmOptions {
+  doc: FsmDoc; world: ExecutorWorld; station: Station; log?: (m: string) => void;
+  /** Contract-net bid of a member (default: distance to the zone in m + 5·(1 − battery)); null = no bid (MuRKA cost (1), …). */
+  bid?: (member: GroupMember, contract: Contract) => number | null;
+  /** Message model of the contract net (R4): announce and bid each take `latency` s; every bid is lost with probability `loss` (seeded). */
+  network?: { latency?: number; loss?: number; seed?: number };
+}
 
 export class GroupFsmExecutor {
   readonly members: GroupMember[] = [];
@@ -97,7 +103,12 @@ export class GroupFsmExecutor {
   readonly messages: Array<{ t: number; from: string; to: string; msg: string }> = [];
   time = 0; ticks = 0; status: 'running' | 'idle' | 'stopped' = 'running';
   private seq = 0;
+  /** Contract-net message counters: announcements, bids sent, bids lost in the network. */
+  readonly netStats = { announced: 0, bids: 0, lost: 0 };
+  private rngState = 0;
+  private rand(): number { let t = (this.rngState = (this.rngState + 0x6d2b79f5) | 0); t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }
   constructor(readonly opts: GroupFsmOptions) {
+    this.rngState = opts.network?.seed ?? 1;
     const { doc, world, station } = opts; const g = doc.group ?? { all: true };
     const robots = station.itemsOfType<MobileRobot>(ItemType.MOBILE_ROBOT);
     const capsOf = (r: MobileRobot) => doc.capabilities?.[r.name] ?? r.capabilities ?? [];
@@ -138,12 +149,18 @@ export class GroupFsmExecutor {
   private award(): void {
     const zones = this.opts.station.itemsOfType<ZoneItem>(ItemType.ZONE);
     for (const c of this.contracts) {
-      if (c.state !== 'PROPOSED' || c.history[0].t >= this.time) continue;
+      const lat = this.opts.network?.latency ?? 0;
+      if (c.state !== 'PROPOSED' || c.history[0].t + 2 * lat >= this.time) continue; // announce + bid travel
+      this.netStats.announced++;
       const z = zones.find((x) => x.name === c.zone); const at = z ? z.centroid() : null;
       for (const m of this.members) {
         if (m.name === c.manager || (c.cap && !m.caps.includes(c.cap)) || m.exec.bb.busy === true || m.exec.status !== 'running') continue;
         const d = at ? Math.hypot(m.robot.state.x - at[0], m.robot.state.y - at[1]) / 1000 : 0;
-        c.bids.push({ robot: m.name, cost: Number((d + 5 * (1 - m.robot.batteryLevel())).toFixed(3)) });
+        const cost = this.opts.bid ? this.opts.bid(m, c) : Number((d + 5 * (1 - m.robot.batteryLevel())).toFixed(3));
+        if (cost === null || !Number.isFinite(cost)) continue;
+        this.netStats.bids++;
+        if ((this.opts.network?.loss ?? 0) > 0 && this.rand() < this.opts.network!.loss!) { this.netStats.lost++; continue; }
+        c.bids.push({ robot: m.name, cost });
       }
       const mg = this.member(c.manager);
       if (!c.bids.length) { this.setState(c, 'CANCELLED'); if (mg) this.deliver('contract-net', mg, 'no_bidder'); continue; }

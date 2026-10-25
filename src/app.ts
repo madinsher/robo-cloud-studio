@@ -19,11 +19,11 @@ import { importTargets } from './io/robodk/targets';
 import { importRdkBestEffort } from './io/robodk/rdk_container';
 import { parseOBJ } from './io/mesh/obj';
 import { parseDHText, robotFromDH } from './io/robodk/dh';
-import { isRdkExport, postProcessRdkExport } from './io/robodk/rdk_import';
+import { isRdkExport, postProcessRdkExport, importRdkExport } from './io/robodk/rdk_import';
 import { parseGcode, gcodeToMachiningCurves, gcodeStats } from './io/programs/gcode';
 import { isCadFile, importCad } from './io/mesh/step';
 import { stationToRoboDKScript } from './io/robodk/station_script';
-import { compileForPost, getPost, listPosts, PostFile } from './posts/index';
+import { compileForPost, getPost, listPosts, generateProgram, PostFile } from './posts/index';
 import { MobileRobot, MapItem, ZoneItem } from './mobile/items';
 import { FleetItem, FleetManager } from './fleet/fleet';
 import { ProcessSimulator, Component } from './vc/component';
@@ -31,6 +31,7 @@ import { FieldItem, MissionItem, CropRow } from './agri/items';
 import { updateMissionProgress } from './agri/missions';
 import { workerImportRdk, workerCompile, workerAvailable, cancelWorkerJobs, ImportProgress } from './scene/worker_client';
 import { toast } from './ui/dom';
+import { viewpointLook } from './io/webots/shots';
 
 export interface AppEvents extends Record<string, unknown> {
   stationChanged: { station: Station };
@@ -105,7 +106,7 @@ export class App {
   /** Runs of the current session (since the last reset). */
   runs: RunInfo[] = [];
   /** Starts of the current session (time + options), replayed for deterministic seeking. */
-  private session: Array<{ program: Program; at: number; opts: RunOptions }> = [];
+  private session: Array<{ program: Program | Item; at: number; opts: RunOptions }> = [];
   /** True while the station is in its home state (nothing ran since load / reset). */
   atHome = true;
   /** Restart from the home state when Play is pressed after the session finished (repeatable runs). */
@@ -230,7 +231,17 @@ export class App {
     this.renderer?.showTrajectoryPreview(null, []);
     this.renderer?.setCollisionHighlight([]);
     this.emitSim();
-    setTimeout(() => this.renderer?.fitAll(), 50);
+    setTimeout(() => this.applyInitialView(st), 50);
+  }
+
+  /** Initial 3D view of a station: the Viewpoint of an imported Webots world (station.settings.viewpoint), else fit all. */
+  applyInitialView(st: Station = this.station): void {
+    if (!this.renderer || st !== this.station) return;
+    const vp = st.settings.viewpoint as { position?: number[]; orientation?: number[]; fieldOfView?: number } | undefined;
+    if (vp && Array.isArray(vp.position) && vp.position.length >= 3 && Array.isArray(vp.orientation) && vp.orientation.length >= 4) {
+      const look = viewpointLook({ position: [vp.position[0], vp.position[1], vp.position[2]], orientation: [vp.orientation[0], vp.orientation[1], vp.orientation[2], vp.orientation[3]], fieldOfView: Number(vp.fieldOfView ?? 0.785398) });
+      this.renderer.lookAt(look.eye, look.target, look.up, look.fovDeg, 'horizontal');
+    } else this.renderer.fitAll();
   }
 
   newStation(): void {
@@ -536,7 +547,7 @@ export class App {
   /** Estimated end of the session (s): program start time + its cycle-time estimate. */
   get simDuration(): number {
     let d = 0;
-    for (const s of this.session) d = Math.max(d, s.at + (s.program.lastResult?.duration ?? 0));
+    for (const s of this.session) d = Math.max(d, s.at + (s.program instanceof Program ? s.program.lastResult?.duration ?? 0 : 0));
     if (!this.session.length && this.activeProgram?.lastResult) d = this.activeProgram.lastResult.duration;
     return Math.max(d, this.simTime);
   }
@@ -551,7 +562,8 @@ export class App {
    * the station is restored to its home state first (repeatable runs); `restartFromHome=false` continues
    * from the current state like RoboDK.
    */
-  runProgram(p: Program | null = this.activeProgram, opts: RunOptions = {}): RunInfo | null {
+  /** Play a program, or a station Python program (RoboDK PROGRAM_PYTHON item: runs through the registered script runners). */
+  runProgram(p: Program | Item | null = this.activeProgram, opts: RunOptions = {}): RunInfo | null {
     if (!p) { this.log('No program selected', 'warn'); return null; }
     if (this.simState === 'paused') this.resumeProgram();
     const running = this.activeRuns().find((r) => r.program === p);
@@ -563,12 +575,12 @@ export class App {
       if (!this.atHome && this.restartFromHome) this.resetSimulation();
       if (this.atHome) { this.runtime.captureHome(); this.atHome = false; }
     }
-    if (!p.lastResult && p.instructions().length <= PREVIEW_LIMIT && p.robot() instanceof Robot) this.compilePreview(p, false);
+    if (p instanceof Program && !p.lastResult && p.instructions().length <= PREVIEW_LIMIT && p.robot() instanceof Robot) this.compilePreview(p, false);
     const start: Record<string, unknown> = {};
-    const robot = p.robot();
+    const robot = p instanceof Program ? p.robot() : null;
     if (robot) start.robot = robot;
     if (opts.args) start.args = opts.args;
-    if (opts.fromIndex !== undefined && opts.fromIndex > 0) {
+    if (opts.fromIndex !== undefined && opts.fromIndex > 0 && p instanceof Program) {
       start.fromIndex = opts.fromIndex;
       const q = this.jointsBefore(p, opts.fromIndex);
       if (q && robot instanceof Robot) { start.startJoints = q; robot.setJoints(q); }
@@ -698,8 +710,9 @@ export class App {
       for (const s of replay) {
         if (s.at > t) break;
         this.advance(s.at - this.simTime);
-        const from = s.opts.fromIndex ?? 0, rb = s.program.robot();
-        const q = from > 0 ? this.jointsBefore(s.program, from) : null;
+        const prog = s.program instanceof Program ? s.program : null;
+        const from = prog ? s.opts.fromIndex ?? 0 : 0, rb = prog?.robot() ?? null;
+        const q = prog && from > 0 ? this.jointsBefore(prog, from) : null;
         const h = this.runtime.start(s.program, { ...(rb ? { robot: rb } : {}), ...(s.opts.args ? { args: s.opts.args } : {}), ...(q && rb instanceof Robot ? { startJoints: q } : {}), ...(from > 0 ? { fromIndex: from } : {}) } as any) as unknown as RunInfo;
         if (from > 0) this.startAt(h, from);
         this.runs.push(h);
@@ -722,16 +735,109 @@ export class App {
     this.simTime += dt;
   }
 
-  /** Run every active program to its end (bounded by `maxSeconds` of simulated time). */
-  runToEnd(maxSeconds = 36000): void {
+  /**
+   * Run every active program to its end (bounded by `maxSeconds` of simulated time). Synchronous unless a run waits for
+   * a station script (Python program / script runner call): script runners answer asynchronously, so the clock stands
+   * still while the page yields until the script returns (at most `scriptWaitMs` of wall time per wait, then the clock
+   * moves on as during live playback); the returned promise resolves at the end.
+   */
+  runToEnd(maxSeconds = 36000, scriptWaitMs = 60000): void | Promise<void> {
     let left = maxSeconds;
-    while (this.activeRuns().length && left > 0) {
-      const step = Math.min(left, Math.max(1, this.simDuration - this.simTime + 0.5));
-      this.advance(step);
-      left -= step;
+    let waitSince = 0;
+    // a station whose programs may call scripts is stepped finely, so the clock stops close to a script call
+    const fine = this.mayCallScripts();
+    // a script wait left open by the previous call (its budget ended during the wait) is settled by this one
+    let waitClock = this.pendingScriptClock;
+    this.pendingScriptClock = -1;
+    const finish = () => {
+      this.fastForward = false;
+      if (this.waitingForScript()) this.pendingScriptClock = waitClock >= 0 ? waitClock : this.runtime.time;
+      else if (waitClock >= 0) this.resumeScriptsAtCall(waitClock);
+      if (!this.activeRuns().length) this.simState = 'idle';
+      this.emitSim();
+    };
+    this.fastForward = true;
+    const loop = (): void | Promise<void> => {
+      while (this.activeRuns().length && left > 0) {
+        if (this.waitingForScript()) {
+          const now = Date.now();
+          if (!waitSince) { waitSince = now; if (waitClock < 0) waitClock = this.runtime.time; }
+          if (now - waitSince < scriptWaitMs) return this.yieldForScript().then(loop);
+        } else { waitSince = 0; }
+        // the simulated time a waiting run did not use is given back to the budget
+        if (waitClock >= 0) { left += this.resumeScriptsAtCall(waitClock); waitClock = -1; }
+        const big = Math.min(left, Math.max(1, this.simDuration - this.simTime + 0.5));
+        // one run: a script wait found after a big step resumes at the call (resumeScriptsAtCall), nothing else moved
+        // meanwhile; several runs: fine steps, so the others do not run far ahead of a run waiting for its script
+        left -= fine && this.runtimeRunCount() > 1 ? this.advanceUntilScript(big) : (this.advance(big), big);
+      }
+      finish();
+    };
+    return loop();
+  }
+
+  /**
+   * A script that answered without consuming simulated time (its runner declined, or the script did not move the clock
+   * past `clock`, the time when the wait was seen) resumes its run at the call itself, not at the end of the sub-step in
+   * which the call happened: runToEnd then gives the same timing as a runtime without script runners.
+   */
+  private resumeScriptsAtCall(clock: number): number {
+    const ctxs = (this.runtime as unknown as { ctxs?: Array<{ cursor: number; block?: { kind?: string; state?: { done?: boolean; at?: number } } | null }> }).ctxs ?? [];
+    let rewind = 0;
+    for (const c of ctxs) {
+      const st = c.block?.kind === 'script' ? c.block.state : undefined;
+      if (st?.done && st.at !== undefined && st.at <= clock + 1e-12 && c.cursor < st.at) { rewind = Math.max(rewind, st.at - c.cursor); st.at = c.cursor; }
     }
-    if (!this.activeRuns().length) this.simState = 'idle';
-    this.emitSim();
+    return rewind;
+  }
+
+  /** Set while runToEnd drives the clock (the live tick stands still). */
+  private fastForward = false;
+  /** Runtime time when a script wait began that the last runToEnd left open (-1: none). */
+  private pendingScriptClock = -1;
+
+  /**
+   * Let a script runner answer: microtasks first (runners that decline or finish synchronously answer within a few promise
+   * hops, without paying for a rendered frame per call), then a macrotask (network, Pyodide loading, the server).
+   */
+  private async yieldForScript(): Promise<void> {
+    for (let i = 0; i < 64 && this.waitingForScript(); i++) await null;
+    if (this.waitingForScript()) await new Promise<void>((r) => setTimeout(r, 2));
+  }
+
+  /** Runs of the station runtime (threads and API runs included, not only the app's own runs). */
+  private runtimeRunCount(): number {
+    const rt = this.runtime as unknown as { ctxs?: unknown[]; queue?: unknown[] };
+    return (rt.ctxs?.length ?? 0) + (rt.queue?.length ?? 0);
+  }
+
+  /** true while a run is blocked in a station script call whose runner has not answered yet. */
+  private waitingForScript(): boolean {
+    const ctxs = (this.runtime as unknown as { ctxs?: Array<{ block?: { kind?: string; state?: { done?: boolean } } | null }> }).ctxs ?? [];
+    return ctxs.some((c) => c.block?.kind === 'script' && !c.block.state?.done);
+  }
+
+  /** Station Python programs or calls / function-call code that no program of the station resolves: runs may wait for script runners. */
+  private mayCallScripts(): boolean {
+    for (const it of this.station.walk()) {
+      if (it.type === ItemType.PROGRAM_PYTHON) return true;
+      if (it instanceof Program) for (const ins of it.instructions()) { const d = ins.data as { kind: string; asFunctionCall?: boolean; programId?: string | null }; if ((d.kind === 'code' && d.asFunctionCall) || (d.kind === 'call' && !d.programId)) return true; }
+    }
+    return false;
+  }
+
+  /**
+   * advance up to dt in 0.05 s sub-steps that stop as soon as a run starts waiting for a script (the waiting run resumes
+   * at the time its runner answers: the clock must not run past the call). Returns the time advanced.
+   */
+  private advanceUntilScript(dt: number): number {
+    if (this.waitingForScript()) { this.advance(Math.min(dt, 0.05)); return Math.min(dt, 0.05); }
+    const n = Math.max(1, Math.ceil(dt / 0.05)), h = dt / n;
+    for (let i = 0; i < n; i++) {
+      this.advance(h);
+      if (this.waitingForScript()) return h * (i + 1);
+    }
+    return dt;
   }
 
   /**
@@ -789,6 +895,35 @@ export class App {
     return fm;
   }
   startWorld(): void { this.worldRunning = true; }
+
+  /**
+   * Play a Webots supervisor fleet script (agromarca scripted_fleet JSON; default: MURKA Mission B) on the world clock:
+   * the script's time is the world time since this call, poses go to the station items named like the Webots nodes.
+   * Throws when the station lacks a node the script drives. Returns the fleet (errors / warnings) and the script end.
+   */
+  async playScriptedFleet(script?: unknown, opts: { depotModules?: string[] } = {}): Promise<{ fleet: import('./io/webots/scripted_fleet').ScriptedFleet; tEnd: number }> {
+    const { ScriptedFleet, StationFleetWorld } = await import('./io/webots/scripted_fleet');
+    const data = (script ?? (await import('./io/webots/murka_missions')).defaultMissionBScript()) as Parameters<typeof ScriptedFleet.fromScript>[0];
+    const fleet = ScriptedFleet.fromScript(data);
+    const world = new StationFleetWorld(this.station);
+    // shelf poses of the depot modules are taken before the first tick (as the Webots supervisor does)
+    if (opts.depotModules?.length) fleet.snapshotDepotModules(world, opts.depotModules);
+    fleet.requireWorld(world);
+    fleet.log = (m) => this.log(`[scripted fleet] ${m}`);
+    const tEnd = Math.max(0, ...(data.waypoints ?? []).map((w) => Number(w.end_s) || 0), ...(data.carries ?? []).map((c) => Number(c.end_s) || 0), ...(data.reconfigs ?? []).map((r) => (Number(r.start_s) || 0) + (Number(r.transfer_s) || 0)));
+    let t = 0;
+    const st = this.station;
+    const hook = (h: number) => {
+      if (this.station !== st) return;
+      t += h;
+      fleet.tick(world, t);
+      if (t > tEnd + 1) { const i = this.worldHooks.indexOf(hook); if (i >= 0) this.worldHooks.splice(i, 1); this.log(`Scripted fleet finished at ${t.toFixed(1)} s${fleet.errors.length ? ` with ${fleet.errors.length} error(s): ${fleet.errors.slice(0, 3).join('; ')}` : ''}`, fleet.errors.length ? 'warn' : 'info'); }
+    };
+    this.worldHooks.push(hook);
+    this.startWorld();
+    this.log(`Scripted fleet: ${data.waypoints?.length ?? 0} waypoints, ${data.reconfigs?.length ?? 0} reconfigurations, ${tEnd.toFixed(0)} s`);
+    return { fleet, tEnd };
+  }
   pauseWorld(): void { this.worldRunning = false; }
   resetWorld(): void {
     this.worldRunning = false;
@@ -801,7 +936,8 @@ export class App {
   }
 
   private tick(dt: number): void {
-    if (this.simState === 'playing') {
+    // runToEnd owns the clock while it waits for a script runner: the animation loop must not advance it meanwhile
+    if (this.simState === 'playing' && !this.fastForward) {
       const step = dt * this.simSpeed;
       this.runtime.tick(step);
       this.simTime += step;
@@ -834,7 +970,8 @@ export class App {
   /** Read every file of a drop / picker into a path -> bytes map (paths relative to the dropped folder). */
   static async filesToMap(files: File[]): Promise<Map<string, Uint8Array>> {
     const m = new Map<string, Uint8Array>();
-    for (const f of files) m.set(((f as any).webkitRelativePath || (f as any).relativePath || f.name).replace(/\\/g, '/'), new Uint8Array(await f.arrayBuffer()));
+    // a file that cannot be read (cloud placeholder of a synced folder, broken link) is left out instead of failing the import
+    for (const f of files) { try { m.set(((f as any).webkitRelativePath || (f as any).relativePath || f.name).replace(/\\/g, '/'), new Uint8Array(await f.arrayBuffer())); } catch { /* unreadable: skipped */ } }
     return m;
   }
 
@@ -931,8 +1068,9 @@ export class App {
       try {
         if (ext === 'vbstation' || (ext === 'json' && /station/i.test(name))) {
           const data = JSON.parse(await f.text());
-          const st = loadStation(data, this.assets);
-          if (isRdkExport(st)) {
+          // an rdk_export.py / rdk2vbs.py file carrying the RoboDK-saved .rdk (station.params.rdkFile) is decoded losslessly
+          const st = (await this.loadRdkExportFile(data)) ?? loadStation(data, this.assets);
+          if (isRdkExport(st) && !st.params.rdkConvertedBy) {
             const rep = postProcessRdkExport(st);
             for (const r of rep.robots) this.log(`RoboDK robot ${r.name}: ${r.source === 'dh' ? 'kinematics from DH table' : r.source === 'library' ? `matched library ${r.matched}` : 'no kinematics found (placeholder)'}`, r.source === 'none' ? 'warn' : 'info');
             for (const p of rep.programs) this.log(`RoboDK program ${p.name}: ${p.instructions} instructions`);
@@ -1116,13 +1254,31 @@ export class App {
       const res = await fetch(`${base}/convert/rdk`, { method: 'POST', body: await f.arrayBuffer(), headers: { 'x-filename': encodeURIComponent(f.name) } });
       if (!res.ok) { const j = await res.json().catch(() => ({})); this.log(`RoboDK converter not available on the server (${j.error ?? res.status}); using best-effort import`, 'warn'); return false; }
       const data = await res.json();
-      const st = loadStation(data, this.assets);
-      if (isRdkExport(st)) postProcessRdkExport(st);
+      const st = (await this.loadRdkExportFile(data)) ?? loadStation(data, this.assets);
+      if (isRdkExport(st) && !st.params.rdkConvertedBy) postProcessRdkExport(st);
       if (f.name.toLowerCase().endsWith('.rdk')) this.setStation(st);
       else this.cmd(() => this.mergeImported(st, f.name.toLowerCase().endsWith('.tool')));
       this.log(`${f.name} converted with RoboDK (lossless)`);
       return true;
     } catch { return false; }
+  }
+
+  /**
+   * Lossless path for RoboDK exports (rdk2vbs.py / rdk_export.py): the RoboDK-saved .rdk embedded in
+   * station.params.rdkFile is decoded by the binary reader and cross-checked with RoboDK's listing. Null when the file
+   * carries no embedded station (then loadStation + postProcessRdkExport apply).
+   */
+  private async loadRdkExportFile(data: unknown): Promise<Station | null> {
+    try {
+      const r = await importRdkExport(data, this.assets);
+      if (!r) return null;
+      for (const n of r.report.notes ?? []) this.log(String(n), r.report.fidelity === 'full' ? 'info' : 'warn');
+      for (const d of r.report.dropped ?? []) this.log(String(d), 'warn');
+      return r.station;
+    } catch (e) {
+      this.log(`Embedded RoboDK station could not be decoded (${(e as Error).message}); using the exported item tree`, 'warn');
+      return null;
+    }
   }
 
   /** HTTP base of the studio server if the page was opened with ?server=ws://host:port. */
@@ -1147,12 +1303,35 @@ export class App {
   }
 
   exportProgram(postId: string, program: Program | null = this.activeProgram): PostFile[] {
-    if (!program) { this.log('No program to export', 'warn'); return []; }
+    const r = this.exportProgramChecked(postId, program);
+    for (const p of r.problems) this.log(p, 'warn');
+    return r.files;
+  }
+
+  /** Synchronous post-processing with its problems (compiler problems plus the post's warnings); an asynchronous post returns its placeholder. */
+  exportProgramChecked(postId: string, program: Program | null = this.activeProgram): { files: PostFile[]; problems: string[] } {
+    if (!program) { this.log('No program to export', 'warn'); return { files: [], problems: [] }; }
     const post = getPost(postId);
-    if (!post) { this.log(`Unknown post ${postId}`, 'error'); return []; }
+    if (!post) { this.log(`Unknown post ${postId}`, 'error'); return { files: [], problems: [] }; }
     const compiled = compileForPost(this.station, program);
-    for (const p of compiled.problems) this.log(p, 'warn');
-    return post.generate(compiled);
+    const files = post.generate(compiled);
+    return { files, problems: [...compiled.problems] };
+  }
+
+  /** true when the post generates asynchronously (user Python posts, RoboDK native posts on the server). */
+  isAsyncPost(postId: string): boolean { return !!getPost(postId)?.generateAsync; }
+
+  /**
+   * Post-process with the post's asynchronous path when it has one (user Python posts in Pyodide, RoboDK's native posts
+   * on the studio server). `problems` = compiler problems plus the warnings the post reported while generating.
+   */
+  async exportProgramAsync(postId: string, program: Program | null = this.activeProgram): Promise<{ files: PostFile[]; problems: string[] }> {
+    if (!program) { this.log('No program to export', 'warn'); return { files: [], problems: [] }; }
+    const post = getPost(postId);
+    if (!post) { this.log(`Unknown post ${postId}`, 'error'); return { files: [], problems: [] }; }
+    const compiled = compileForPost(this.station, program);
+    const files = await generateProgram(post, compiled);
+    return { files, problems: [...compiled.problems] };
   }
 
   exportRoboDKScript(): string {

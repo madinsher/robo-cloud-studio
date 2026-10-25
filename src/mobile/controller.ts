@@ -14,7 +14,7 @@
  */
 import { MobileRobot, MobileKinematics } from './items';
 import { DEG, RAD } from '../core/math/pose';
-import { pathLength } from './planner';
+import { pathLength, regulatedMinRadius } from './planner';
 import { reedsSheppPath } from './reeds_shepp';
 
 export interface VelocityCommand {
@@ -437,6 +437,19 @@ export function trackPath(robot: MobileRobot, opts: PurePursuitOptions = {}): Ve
     let v = Math.min(vlim, Math.sqrt(2 * decel * Math.max(0, rem - legTol * 0.3)) + 20);
     const kAbs = Math.max(Math.abs(kappa), Math.abs(kp));
     if (kAbs > 1e-6) v = Math.min(v, Math.sqrt(1500 / kAbs)); // lateral acceleration ~1.5 m/s²
+    // Nav2 regulated pure pursuit (navigation method of the robot's stack): v·r/r_min on curves tighter than r_min
+    const rpp = regulatedMinRadius(robot);
+    if (rpp !== null) {
+      if (Math.abs(kp) > 1e-9 && 1 / Math.abs(kp) < rpp) v = Math.min(v, (vlim * (1 / Math.abs(kp))) / rpp);
+      // anticipate tighter curves ahead (braking distance): v ≤ sqrt(v_curve² + 2·a·s)
+      let s = segLen * (1 - bestT);
+      for (let i = bestI + 1; i < leg.b && s < 4000; i++) {
+        const sl = Math.hypot(path[i + 1][0] - path[i][0], path[i + 1][1] - path[i][1]);
+        const ki = sl > 1 ? Math.abs(wrap180(path[i + 1][2] - path[i][2]) * DEG) / sl : 0;
+        if (ki > 1e-9 && 1 / ki < rpp) v = Math.min(v, Math.sqrt(((vlim / ki) / rpp) ** 2 + 2 * decel * s));
+        s += sl;
+      }
+    }
     if (opts.slowdownDistance !== undefined && last && rem < opts.slowdownDistance) v = Math.min(v, Math.max(150, vlim * (rem / opts.slowdownDistance)));
     let creep = 25;
     if (k.drive === 'ackermann') {

@@ -14,7 +14,8 @@ import { Program, Instruction, InstructionType, InstructionData, MoveInstruction
 import { createRobotFromLibrary, ROBOT_LIBRARY } from '../core/items/library';
 import { Mat4, identity, multiply, invert, transl, rotx, roty, rotz, xyzrpwToPose, poseToXyzrpw, kukaToPose, poseToKuka, fanucToPose, poseToFanuc, urToPose, poseToUr, quatToPose, poseToQuat, toRows, fromRows, DEG } from '../core/math/pose';
 import { ProgramSimulator } from '../core/motion/simulator';
-import { compileForPost, getPost } from '../posts/index';
+import { compileForPost, getPost, generateProgram } from '../posts/index';
+import { robotSolveFK } from '../core/kinematics/combined';
 import { MobileRobot } from '../mobile/items';
 import { Camera as CameraItem } from '../core/items/item';
 import { renderCamera } from '../vision/sensing';
@@ -250,8 +251,8 @@ export class RobolinkItem {
   /** Flange pose w.r.t. the robot base for joints q (RoboDK: independent of the active tool); optional tool/reference. */
   SolveFK(q: number[], tool?: PoseLike | null, reference?: PoseLike | null): Mat {
     const r = this.req<Robot>();
-    let m = r.solveFK(flat(q), identity());
-    if (tool) m = multiply(m, toMat4(tool));
+    // a joint vector longer than the arm carries the synchronised external axes (rail, turntable: RoboDK 7/8/9 joints)
+    let m = robotSolveFK(r, flat(q), tool ? toMat4(tool) : null);
     if (reference) m = multiply(invert(toMat4(reference)), m);
     return new Mat(m);
   }
@@ -262,15 +263,13 @@ export class RobolinkItem {
     if (tool) m = multiply(m, invert(toMat4(tool)));
     if (reference) m = multiply(toMat4(reference), m);
     const seed = jointsApprox && flat(jointsApprox).length >= r.dof ? flat(jointsApprox).slice(0, r.dof) : undefined;
-    const res = r.solveIK(m, { seed }, identity());
+    // flange-based RoboDK semantics (Robot.solveIKRef): closest solution to the seed, default the current joints
+    const res = r.solveIKRef(m, seed ? { seed } : {});
     return res.ok && r.jointsValid(res.joints) ? res.joints : [];
   }
   SolveIK_All(p: PoseLike, tool?: PoseLike | null, reference?: PoseLike | null): number[][] {
     const r = this.req<Robot>();
-    let m = toMat4(p);
-    if (tool) m = multiply(m, invert(toMat4(tool)));
-    if (reference) m = multiply(toMat4(reference), m);
-    return r.solveIKAll(m, identity()).filter((q) => r.jointsValid(q));
+    return r.solveIKAllRef(toMat4(p), tool ? toMat4(tool) : null, reference ? toMat4(reference) : null).filter((q) => r.jointsValid(q));
   }
   Connect(_ip?: string): number { return ROBOTCOM_READY; }
   ConnectedState(): number { return ROBOTCOM_READY; }
@@ -475,6 +474,9 @@ export class RobolinkItem {
     if (it.type === ItemType.MACHINING) { const res = this.rdk.updateMachining(it); const p = this.getLink(ITEM_TYPE_PROGRAM); return p.item instanceof Program ? p.Update(check_collisions) : [0, 0, 0, 0, res ? 'OK' : 'Machining project has no part/curves']; }
     const p = this.req<Program>();
     const sim = new ProgramSimulator(this.rdk.station);
+    // RoboDK's Update() estimate does not apply Set speed instructions (T3 item 10: Library GT, 124 of 168 programs
+    // within 15 % in this mode vs 99 with speeds honoured); playback (RunProgram) still applies them
+    sim.speedInstructions = 'ignore';
     if (check_collisions) sim.collisionOptions = { ...sim.collisionOptions, enabled: true, assets: this.rdk.assets } as any;
     const r = sim.compile(p);
     const errs = r.problems.filter((x) => x.severity === 'error');
@@ -513,6 +515,8 @@ export class RobolinkItem {
     const k = String(key);
     if (it instanceof Program && k === 'Add' && value) { const d = typeof value === 'string' ? JSON.parse(value) : value; return this.addFromDict(d); }
     if (k === 'PostProcessor' && it instanceof Robot) { const p = getPost(String(value)); if (!p) throw new Error(`InputError: unknown post processor ${value}`); it.postProcessor = p.id; it.setParam('PostProcessor', String(value)); return 'OK'; }
+    // camera: setParam('Settings') returns RoboDK's settings string (FOV=.. FAR_LENGTH=.. SIZE=WxH); a value applies it
+    if (k === 'Settings' && it instanceof CameraItem) { if (value !== '' && value !== undefined && value !== null) this.rdk.Cam2D_SetParams(String(value), this); return this.rdk.Cam2D_Settings(this); }
     if (/^(Tree|Display|Recalculate|UpdatePath|Clear|DeleteCurves|Open|Settings)$/.test(k)) {
       if (k === 'Clear' || k === 'DeleteCurves') { if (it instanceof SceneObject) { if (k === 'DeleteCurves' || /Curve/i.test(String(value))) it.curves = []; if (/Point/i.test(String(value))) it.points = []; it.notify('geometry'); } }
       if (k === 'UpdatePath' && it.type === ItemType.MACHINING) this.rdk.updateMachining(it);
@@ -785,8 +789,9 @@ export class RobolinkItem {
   JointsConfig(joints: number[]): number[] {
     const r = this.req<Robot>();
     const q = flat(joints);
-    const f = r.configFlags(q);
-    return [f.front ? 0 : 1, f.elbowUp ? 0 : 1, f.wristFlip ? 1 : 0, ...q.map((v) => Math.trunc(v / 360))];
+    // RoboDK conf_RLF from the analytic arm geometry (Robot.jointsConfig), then the turn of every joint
+    const f = r.jointsConfig(q.slice(0, r.dof));
+    return [f[0], f[1], f[2], ...q.map((v) => Math.trunc(v / 360))];
   }
   setJointsHome(joints: number[]): this {
     const r = this.req<Robot>();
@@ -1191,7 +1196,8 @@ export class Robolink {
       return res;
     };
     const prog = compileForPost(this.station, p);
-    if (pp.generateAsync && !sync) return pp.generateAsync(prog).then(finish);
+    // asynchronous posts (Python posts, RoboDK's native posts) through generateProgram; Finish() needs the sync path
+    if (pp.generateAsync && !sync) return generateProgram(pp, prog).then(finish);
     return finish(pp.generate(prog));
   }
 
@@ -1348,6 +1354,9 @@ export class Robolink {
     const res = await runVisionCall(this.station, [it.name], { robot: robot?.item ?? null, signals: this.exec.rt().signals ?? null, time: this.exec.rt().time });
     return res.found;
   }
+
+  /** Studio extension: alias of Cam2D_Detect (run the camera's vision stack, refresh the pick targets, return the count found). */
+  Vision_Run(cam?: RobolinkItem | number | null, robot?: RobolinkItem | null): Promise<number> { return this.Cam2D_Detect(cam, robot); }
 
   // ---- calibration & measurement ----
   /** Points are joints (use_joints=true, FK with the robot's tool) or XYZ in the robot base frame. */

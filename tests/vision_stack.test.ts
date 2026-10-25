@@ -334,7 +334,15 @@ describe('ROS 2 perception package', () => {
     expect(pkg.files['launch/perception.launch.py']).toMatch(/detect_3d_node/);
     expect(pkg.files['launch/perception.launch.py']).toMatch(/--frame-id', 'tool0'/);
     expect(pkg.files['config/detector.yaml']).toMatch(/yolov8s\.engine/);
-    expect(pkg.files['config/detector.yaml']).toMatch(/"apple","trunk"/);
+    // typed ROS parameter YAML (src/ros/yaml.ts): a string sequence, doubles always with a '.', the integer parameters
+    // as integers (the old assertion expected the JSON array of the former untyped writer)
+    const det = pkg.files['config/detector.yaml'];
+    expect(det).toMatch(/^ {4}classes: \[apple, trunk\]$/m);
+    expect(det).toMatch(/^ {4}threshold: 0\.4$/m);
+    expect(det).toMatch(/^ {4}iou: 0\.5$/m);
+    expect(det).toMatch(/^ {4}imgsz_width: 640$/m);
+    expect(det).toMatch(/^ {4}image_reliability: 2$/m);
+    expect(det).toMatch(/^ {4}half: true$/m);
     expect(pkg.files['config/vlm.yaml']).toMatch(/jetson:11434/);
     expect(pkg.files['scripts/vla_bridge.py']).toMatch(/openpi/);
     expect(pkg.files['scripts/cloud_pipeline.py']).toMatch(/segment_plane/);

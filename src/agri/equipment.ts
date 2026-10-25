@@ -11,6 +11,7 @@
 import { ItemType } from '../core/items/item';
 import { MobileRobot, ZoneItem } from '../mobile/items';
 import { FleetManager, registerReconfigurer } from '../fleet/fleet';
+import '../fleet/murka_alloc'; // registers the MuRKA contract-net allocator `murka`
 
 export type MountSlot = 'top' | 'front' | 'rear' | 'cargo' | 'gimbal';
 
@@ -135,3 +136,34 @@ registerReconfigurer({
   },
   apply(_fm, robot, recipe) { applyEquipment(robot, RECIPES[recipe] ?? []); },
 });
+
+// ---------------------------------------------------------------------------------------------------------------
+// MURKA configuration-dependent energy (abstract units of agromarca article_experiments: u/s and u/m)
+// ---------------------------------------------------------------------------------------------------------------
+
+/** Energy profile of a configuration: platform entropy ε_base, Σ module entropy, drive cost per metre, mass. */
+export interface EnergyProfile { baseEntropy: number; equipmentOverhead: number; driveCostPerM: number; massKg: number }
+
+/** ε_total = ε_base + Σ ε_module. */
+export function entropyRate(p: EnergyProfile): number { return p.baseEntropy + p.equipmentOverhead; }
+
+/** c_drive = c_base·(1 + W_eq / W_max). */
+export function driveCost(cBase: number, equipmentMassKg: number, maxPayloadKg: number): number { return cBase * (1 + equipmentMassKg / maxPayloadKg); }
+
+/** One step of E(t+Δt) = E(t) − ε_total·Δt − c_action, the drive action costing c_drive per metre driven (ds). */
+export function energyStep(E: number, p: EnergyProfile, dt: number, ds: number, cAction = 0): number {
+  return E - entropyRate(p) * dt - p.driveCostPerM * ds - cAction;
+}
+
+/** Closed form of `energyStep` over a route of `lengthM` at constant `speed` (m/s): ε_total·L/v + c_drive·L. */
+export function routeEnergy(p: EnergyProfile, lengthM: number, speed: number): { energy: number; duration: number } {
+  const duration = lengthM / speed;
+  return { energy: entropyRate(p) * duration + p.driveCostPerM * lengthM, duration };
+}
+
+/** Energy profile of a studio equipment set: ε from module powers (W → u/s by `wPerUnit`), c_drive from the mass ratio. */
+export function profileOfEquipment(ids: string[], base: { entropy: number; cBase: number; maxPayloadKg: number; platformMassKg: number; wPerUnit?: number }): EnergyProfile {
+  const specs = ids.map((id) => { const e = EQUIPMENT[id]; if (!e) throw new Error(`Unknown equipment ${id}`); return e; });
+  const mass = specs.reduce((a, e) => a + e.massKg, 0);
+  return { baseEntropy: base.entropy, equipmentOverhead: specs.reduce((a, e) => a + e.powerW, 0) / (base.wPerUnit ?? 10000), driveCostPerM: driveCost(base.cBase, mass, base.maxPayloadKg), massKg: base.platformMassKg + mass };
+}

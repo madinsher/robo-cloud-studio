@@ -51,9 +51,15 @@ They run when double-clicked (`RunCode`/`RunProgram` on the item) or when a prog
   `quit()`/`sys.exit(n)` are honoured and the script's threads are joined. `headlessGui` (`STUDIO_HEADLESS_GUI=1`)
   replaces tkinter by `python/robodk/_headless_gui` for unattended runs: `mainloop()` presses the main button with
   the default values, message boxes / file dialogs return their defaults, matplotlib uses Agg.
-- **Pyodide runner** (browser without server: src/api/runner_pyodide.ts, `installPyodideRunner(RDK)`): the drop-in is
-  written into Pyodide's file system and talks to the page's `Robolink` through a synchronous in-process transport;
-  waits, blocking moves and `time.sleep()` advance the station clock (virtual time).
+- **Pyodide runner** (browser without server: src/api/runner_pyodide.ts, `installPyodideRunner(RDK)`, installed by
+  `src/main.ts` at start-up, Pyodide downloaded on the first call): the drop-in is written into Pyodide's file system
+  and talks to the page's `Robolink` through a synchronous in-process transport; waits, blocking moves and
+  `time.sleep()` advance the station clock (virtual time). The tree's "Run Python program" (RoboDK double-click) and
+  `App.runProgram(pythonItem)` start a script item. `tests/e2e/pyodide.e2e.test.ts` runs real Pyodide in Chrome on
+  Library stations 06.a (Gripper(1)/Gripper(0): fingers at ±6·arg), 01.a (SprayOn(1)/SprayOn(0): gun on, paint
+  deposited, gun off at the end) and 07.a (DoWeld: the TCP passes the 6 hexagon vertices < 1 mm, ends at Home).
+- `App.runToEnd` ("⏭ End") waits for script runners: the clock stands still while a script answers (a declining runner
+  resumes the run at the call), so the end state equals a run without the browser's runners (Library sweep).
 - While the page is connected to a server, station scripts run on the server's CPython (POST /python/run).
 - A call naming no station Python program (e.g. `SetRPM(70)`, meant for the controller) is ignored in simulation.
 - A program blocked in a script call does not hold its robot: the script may move that robot (RoboDK behaviour).
@@ -74,6 +80,19 @@ Use `robodk_ip='127.0.0.1'` (not the default `'localhost'`): when the official c
 starts RoboDK itself.
 
 Desktop-only commands (cursor projection, window docking, hover selection) answer with an explicit RoboDK error.
+
+`Item.Update()` reports RoboDK's estimate: Set speed instructions are not applied there (RoboDK's own Update ignores
+them; Library GT: 124 of 168 programs within 15 % in this mode, 99 with speeds applied), while `RunProgram` playback
+applies them. Studio extensions: `RDK.Cam2D_Detect(cam, robot)` / its alias `RDK.Vision_Run(cam, robot)` (also in the
+Python drop-in) run a camera's vision stack and refresh its pick targets; `camera.setParam('Settings')` returns
+RoboDK's camera settings string (`FOV=.. FAR_LENGTH=.. NEAR_LENGTH=.. SIZE=WxH`) and applies one given as value. The
+server installs the vision script runner (`VisionDetect("<camera>")` in programs) with the headless station's meshes.
+
+`tests/e2e/server.e2e.test.ts` (built server, official package, `robodk_ip='127.0.0.1'`): `/health` reports the RoboDK
+converter with RoboDK's own `robodk` package, `AddFile` of Library Example 01.b, `Update()` = RoboDK's
+`[22, 7.4786 s, 1283.61 mm, 1]`, `RunProgram` until `Busy() == 0` ends at RoboDK's last joint row (< 0.01°), and
+`MakeProgram` with RoboDK's native KUKA_KRC2 post equals the program RoboDK generated itself; a page opened with
+`?server=` lists the server's RoboDK posts and its Export through RoboDK's Universal_Robots post equals the built-in one.
 
 ## Acceptance tests
 

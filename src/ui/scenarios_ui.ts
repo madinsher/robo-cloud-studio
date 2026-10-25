@@ -37,6 +37,9 @@ export async function scenariosDialog(app: App, initial: 'all' | 'navigation' | 
   };
   const runOne = async (s: Scenario) => {
     status.textContent = `${t('Running')} ${s.title}…`;
+    // a macrotask between scenarios: the status line paints and the page stays responsive during "Run all" (the
+    // scenarios themselves are mostly synchronous; without it the whole suite ran in one frozen task)
+    await new Promise<void>((r) => setTimeout(r, 0));
     const r = await s.run();
     results.set(s.id, r);
     app.log(`${r.pass ? 'PASS' : 'FAIL'} ${r.title}: ${r.metrics.map((m) => `${m.name}=${m.value}${m.unit ?? ''}`).join(', ')}`, r.pass ? 'info' : 'warn');

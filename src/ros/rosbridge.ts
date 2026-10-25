@@ -1,7 +1,9 @@
 /**
  * Minimal rosbridge (rosbridge_suite websocket) client: publish/subscribe/advertise/call service.
  * Modes:
- *  - 'sim': the studio is the simulator backend of a ROS 2 stack (./twin.ts RosTwin): /clock, /joint_states (every
+ *  - 'sim': the studio is the simulator backend of a ROS 2 stack. A station holding a decomposed MUROM robot (MURKA
+ *    retail store) gets the exact MURKA Webots interface (./murom_sim.ts: driver + supervisor topics, head camera and
+ *    range finder, lidar, /murom/sim/attach|detach services); any other station gets ./twin.ts RosTwin: /clock, /joint_states (every
  *    joint, URDF names), /robot_description, /tf (odom -> base), <ns>/odom, <ns>/scan (sensor-relative), <ns>/imu,
  *    ground truth; subscribes <ns>/cmd_vel and JointTrajectory topics — the webots_ros2 / MURKA topic set.
  *  - 'publish': mirrors the simulation (the standard state topics of 'sim' without /clock and commands, plus the
@@ -18,6 +20,10 @@ import { visionRuntimeOf } from '../vision/pipeline';
 import { getVisionStack } from '../vision/stack';
 import { Camera as CameraItem } from '../core/items/item';
 import { RosTwin, RosTwinOptions } from './twin';
+import { MuromSimInterface, findMurom, type MuromSimOptions } from './murom_sim';
+import { rosJsonStringify, rosJsonParse, type RosServiceHandler } from './rosbridge_client';
+import { stationStep } from './sim_backend';
+import { renderCamera, cameraRendererRegistered } from '../vision/sensing';
 
 export interface RosBridgeOptions {
   url: string;
@@ -27,6 +33,8 @@ export interface RosBridgeOptions {
   mode?: 'publish' | 'follow' | 'both' | 'sim';
   /** Digital twin options ('sim' / 'publish'). */
   twin?: RosTwinOptions;
+  /** MURKA interface options ('sim' on a station with a MUROM robot). */
+  murom?: MuromSimOptions;
 }
 
 export class RosBridge {
@@ -36,6 +44,7 @@ export class RosBridge {
   private subs = new Map<string, (msg: any) => void>();
   private advertised = new Set<string>();
   private jointNamesByRobot = new Map<string, string[]>();
+  private services = new Map<string, { type: string; handler: RosServiceHandler }>();
 
   constructor(readonly app: App, readonly opts: RosBridgeOptions) {}
 
@@ -53,8 +62,9 @@ export class RosBridge {
       ws.onclose = () => { this.connected = false; this.app.log('rosbridge disconnected', 'warn'); if (this.timer) { clearInterval(this.timer); this.timer = null; } };
       ws.onmessage = (ev) => {
         try {
-          const m = JSON.parse(ev.data);
+          const m = rosJsonParse(ev.data);
           if (m.op === 'publish') this.subs.get(m.topic)?.(m.msg);
+          else if (m.op === 'call_service' && this.services.has(m.service)) void this.serve(m);
         } catch { /* ignore */ }
       };
     });
@@ -65,7 +75,19 @@ export class RosBridge {
   }
 
   private send(o: any) {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(o));
+    // non-finite floats (LaserScan inf) as the Infinity / NaN tokens rosbridge's Python json accepts
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.send(rosJsonStringify(o));
+  }
+
+  /** Serve a ROS service through rosbridge (advertise_service; calls arrive as call_service ops). */
+  advertiseService(service: string, type: string, handler: RosServiceHandler): void {
+    this.services.set(service, { type, handler });
+    this.send({ op: 'advertise_service', service, type });
+  }
+  private async serve(m: { id?: string; service: string; args?: any }): Promise<void> {
+    const s = this.services.get(m.service)!;
+    try { this.send({ op: 'service_response', service: m.service, id: m.id, values: (await s.handler(m.args ?? {})) ?? {}, result: true }); }
+    catch (e) { this.app.log(`ROS service ${m.service} failed: ${(e as Error).message}`, 'error'); this.send({ op: 'service_response', service: m.service, id: m.id, values: {}, result: false }); }
   }
 
   advertise(topic: string, type: string, latch = false): void {
@@ -88,10 +110,23 @@ export class RosBridge {
 
   /** The digital twin ('sim' and 'publish' modes). */
   twin: RosTwin | null = null;
+  /** The MURKA simulator interface ('sim' mode on a station with a MUROM robot). */
+  murom: MuromSimInterface | null = null;
   private lastTick = 0;
 
   private setup() {
     const mode = this.opts.mode ?? 'both';
+    if (mode === 'sim' && findMurom(this.app.station)) {
+      // MURKA backend: control frame = the world's basicTimeStep, own sim clock paced by the wall clock (RTF 1);
+      // head camera / range finder from the WebGL buffers when the 3D view registered its renderer
+      const dt = stationStep(this.app.station);
+      const render = (st: typeof this.app.station, cam: CameraItem, req: { rgb: boolean }) => (cameraRendererRegistered() ? renderCamera(st, cam, { rgb: req.rgb }) : null);
+      this.murom = new MuromSimInterface(this.app.station, this, { render, log: (m, l) => this.app.log(m, l === 'error' ? 'error' : l === 'warn' ? 'warn' : 'info'), ...this.opts.murom });
+      this.murom.start(this.app.station.simTime ?? 0);
+      let t = this.murom.time;
+      this.timer = window.setInterval(() => { t += dt; this.murom!.step(dt, t); this.app.station.simTime = t; }, dt * 1000);
+      return;
+    }
     if (mode === 'sim' || mode === 'publish') {
       this.twin = new RosTwin(this.app.station, this, mode === 'sim' ? { ...this.opts.twin } : { commands: false, clock: false, scan: false, ...this.opts.twin });
       this.twin.start(this.app.simTime ?? 0);

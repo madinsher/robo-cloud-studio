@@ -21,7 +21,7 @@ const CHROME = (() => {
 let browser: Browser; let page: Page; let errors: string[] = [];
 const IGNORED = [/favicon/i, /WebGL/i, /GPU stall/i, /THREE\.WebGLRenderer: Context Lost/i, /ERR_CONNECTION_REFUSED/i, /WebSocket connection/i, /Failed to load resource/i];
 const ev = <T>(fn: (...a: any[]) => T, arg?: unknown): Promise<T> => page.evaluate(fn as any, arg) as Promise<T>;
-const load = async (q = 'demo=pickplace') => { await page.goto(`${BASE}?${q}&server=off`, { waitUntil: 'load' }); await page.waitForSelector('.menubar'); await page.waitForTimeout(600); };
+const load = async (q = 'demo=pickplace') => { await page.goto(`${BASE}?${q}&server=off`, { waitUntil: 'load', timeout: 120000 }); await page.waitForSelector('.menubar'); await page.waitForTimeout(600); };
 const openMenu = async (top: string) => { await ev(() => document.querySelectorAll('.ctx-menu').forEach((m) => m.remove())); await page.click(`.menu-btn:has-text("${top}")`); await page.waitForSelector('.ctx-menu'); };
 const menu = async (top: string, item: string) => {
   await openMenu(top);

@@ -260,3 +260,9 @@ progress { accent-color: var(--accent-2); }
 .progress-pill { position: fixed; left: 50%; bottom: 34px; transform: translateX(-50%); background: var(--panel-2); border: 1px solid var(--border); border-radius: 14px; padding: 4px 14px; font-size: 12px; z-index: 90; pointer-events: none; }
 .vlist-pad { flex: none; }
 .sim-state { margin-left: 8px; color: var(--muted); }
+
+/* Fleet tab KPI groups */
+.kpi-groups { display: flex; flex-wrap: wrap; gap: 6px 18px; margin: 6px 0; }
+.kpi-group { min-width: 220px; }
+.kpi-group .kv { display: flex; flex-direction: row; justify-content: space-between; gap: 10px; font-size: 12px; }
+.export-problems { max-height: 120px; overflow: auto; margin: 4px 0; }

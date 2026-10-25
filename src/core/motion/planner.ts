@@ -19,7 +19,7 @@ import { Item, Target } from '../items/item';
 import type { MoveInstruction } from '../items/program';
 import { carrierOf, solveIKWithCarrier } from '../kinematics/combined';
 import { actuatedIndices } from '../kinematics/chain';
-import { wristSingularity } from '../kinematics/ik_analytic';
+import { wristSingularity, analyzeChain } from '../kinematics/ik_analytic';
 import type { Trajectory, TrajectorySample } from './trajectory';
 
 export interface MotionSettings { speedLinear: number; speedJoints: number; accelLinear: number; accelJoints: number; rounding: number }
@@ -240,7 +240,18 @@ export interface ChainMoveSpec {
 }
 
 const TOL_P = 0.1, TOL_R = 0.1 / RAD, MAX_STEP = 15;
+/** RoboDK's wrist-singularity tolerance of linear moves (deg between axes 4 and 6). */
+export const WRIST_TOL_DEG = 2.5;
 const maxDelta = (a: number[], b: number[], n = a.length) => { let m = 0; for (let i = 0; i < n; i++) m = Math.max(m, Math.abs(a[i] - b[i])); return m; };
+/**
+ * Comau arms (RoboDK jointsType 11, J2/J3 parallelogram): RoboDK checks the J3 limits on q3 - q2 (09.c T1toT2 fails at
+ * Pt 2 with q3 -34.96 inside [-284, -31.8] but q3 - q2 = -17.1 outside; only Pt 1 is valid in RoboDK).
+ */
+function coupledJ3Ok(g: MotionGroup, q: number[], tol = 0.5): boolean {
+  if (g.robot.chain.jointsType !== 11 || g.dof < 3) return true;
+  const v = q[2] - q[1];
+  return v >= g.lower[2] - tol && v <= g.upper[2] + tol;
+}
 const lerpQ = (a: number[], b: number[], f: number) => a.map((v, i) => v + ((b[i] ?? v) - v) * f);
 const posOf = (m: Mat4): Vec3 => [m[12], m[13], m[14]];
 
@@ -331,6 +342,7 @@ class GeomBuilder {
         geom.error = endR && !endR.ok && endR.posError >= 1 ? `${label} unreachable at ${(sn * 100).toFixed(1)}% (target out of reach by ${endR.posError.toFixed(1)} mm)` : this.failMsg(label, sn, r.posError, r.rotError);
         break;
       }
+      if (!coupledJ3Ok(g, r.q)) { geom.ok = false; geom.error = `${label} reaches the J3 joint limit (J2/J3 coupled) at ${(sn * 100).toFixed(0)}%`; break; }
       const dq = maxDelta(r.q, prev.q, dof);
       if (dq > MAX_STEP) {
         geom.ok = false;
@@ -346,6 +358,14 @@ class GeomBuilder {
       prev = kn;
     }
     for (let i = 1; i < knots.length; i++) geom.pathLen += norm(sub3(knots[i].x, knots[i - 1].x));
+    // RoboDK rejects a linear / circular move passing within 2.5 deg of the wrist singularity of a spherical wrist
+    // (axes 4 and 6 aligned): Library 03.a Oil MoveL 312 (2.42 deg) and 03.d Polish MoveL 424 (1.8 deg) fail in RoboDK,
+    // the moves before them pass at 2.52 .. 3.0 deg (03.a MoveL 307-311). Blend zones are checked with their moves.
+    if (geom.ok && label !== 'Blend' && knots.length > 1 && analyzeChain(this.robot.chain).kind === 'spherical6') {
+      let worst = Infinity, at_ = 0;
+      for (const k of knots) { const ws = wristSingularity(this.robot.chain, k.q.slice(0, dof)); if (ws !== null && ws < worst) { worst = ws; at_ = k.s; } }
+      if (worst < Math.sin(WRIST_TOL_DEG / RAD)) { geom.ok = false; geom.error = `${label} passes the wrist singularity at ${(at_ * 100).toFixed(0)}% (axes 4 and 6 within ${(Math.asin(worst) * RAD).toFixed(1)} deg)`; }
+    }
     return geom;
   }
 
@@ -410,7 +430,7 @@ function moveGeometry(b: GeomBuilder, q0: number[], spec: ChainMoveSpec, extEnd?
   const tf = spec.targetFrame ?? null;
   const relFrame = (t: Target | null): boolean => !!(tf && t && t.parent !== tf);
   const targetAbs = (t: Target, e: number[]): Mat4 => (relFrame(t) ? multiply(g.refAbs(tf, e), t.pose()) : g.refAbs(t, e));
-  const inLimits = (q: number[], tol = 0.5) => q.every((v, i) => Number.isFinite(v) && v >= g.lower[i] - tol && v <= g.upper[i] + tol);
+  const inLimits = (q: number[], tol = 0.5) => q.every((v, i) => Number.isFinite(v) && v >= g.lower[i] - tol && v <= g.upper[i] + tol) && coupledJ3Ok(g, q, tol);
   const clampQ = (q: number[]) => q.map((v, i) => Math.min(g.upper[i], Math.max(g.lower[i], v)));
   if (d.moveType === 'MoveJ') {
     let q1: number[] | null = null;
@@ -422,8 +442,12 @@ function moveGeometry(b: GeomBuilder, q0: number[], spec: ChainMoveSpec, extEnd?
       else {
         const e1 = extOf(target) ?? e0;
         const P = multiply(invert(g.baseAbs(e1)), targetAbs(target, e1));
-        const stored = j && j.length >= dof && j.slice(0, dof).every(Number.isFinite) ? j.slice(0, dof) : null;
-        const r = robot.solveIK(P, { seed: stored ?? q0.slice(0, dof) }, tool);
+        // the stored joints pick the configuration; stored joints outside the joint limits (taught elsewhere, 03.g
+        // Out Approach 2: J3 -251 deg) carry none: RoboDK keeps the current configuration (rear / lower arm / flip)
+        // and takes its solution closest to the current joints
+        const stored = j && j.length >= dof && j.slice(0, dof).every(Number.isFinite) && inLimits(g.full(j.slice(0, dof), q0)) ? j.slice(0, dof) : null;
+        let r = robot.solveIK(P, stored ? { seed: stored } : { seed: q0.slice(0, dof), config: robot.hasAnalyticIK() && dof >= 6 ? robot.jointsConfig(q0.slice(0, dof)).slice(0, 3) : undefined }, tool);
+        if (!r.ok && !stored) r = robot.solveIK(P, { seed: q0.slice(0, dof) }, tool);
         if (r.ok) q1 = [...r.joints, ...e1];
         else if (g.hasCarrier && !extOf(target) && g.ext.length === 1) {
           const c = g.carrier!;
@@ -499,7 +523,13 @@ function moveGeometry(b: GeomBuilder, q0: number[], spec: ChainMoveSpec, extEnd?
 
 // ---- chain planning ---------------------------------------------------------------------------------------------------
 
-export interface PlannedMove { trajectory: PlannedTrajectory; t0: number; t1: number; qEnd: number[]; warnings: string[] }
+export interface PlannedMove {
+  trajectory: PlannedTrajectory; t0: number; t1: number; qEnd: number[]; warnings: string[];
+  /** RoboDK Item.Update() time of this move (rest to rest, robot motion state), when an UpdateModel was given. */
+  estimate?: number;
+  /** Joints at the move's target (a blended move does not pass through it: the blend zone cuts the corner). */
+  qTarget?: number[];
+}
 export interface ChainResult { moves: PlannedMove[]; duration: number; failed?: { index: number; message: string } }
 
 interface TPiece { move: number; knots: Knot[]; cart: boolean; settings: MotionSettings; stopBefore: boolean }
@@ -543,7 +573,41 @@ function sAtLength(geo: Geom, r: number, fromEnd: boolean): number {
 }
 
 /** Plan a chain of consecutive moves from joints q0 (blending where the rounding of a move is > 0). */
-export function planChain(g: MotionGroup, q0: number[], specs: ChainMoveSpec[]): ChainResult {
+// ---- RoboDK Item.Update() cycle-time model -------------------------------------------------------------------------
+
+/**
+ * RoboDK's Item.Update() cycle-time estimate, measured on RoboDK 5.9.4 (Library stations, robots of every brand):
+ * - the robot's own motion state is used (robot speed / acceleration / rounding as stored with the robot or set with
+ *   robot.setSpeed); Set speed, Set acceleration and Set rounding instructions of the program do not change it;
+ * - every move starts and ends at rest: linear moves (MoveL / MoveC) take trapezoid(TCP path length, v, a); joint moves,
+ *   and linear moves without TCP translation, take trapezoid(largest joint travel, vj, aj) over the arm and carrier
+ *   axes (deg, or mm for a rail);
+ * - a robot rounding > 0 removes the acceleration phases (time = length / speed);
+ * - a robot table without joint speed / acceleration (0) runs joints at 2·v deg/s and 2·a deg/s²;
+ * - pauses add their time, everything else (IO, events, calls) none.
+ */
+export interface UpdateModel { v: number; a: number; vj: number; aj: number; blend: boolean }
+
+export function updateModelOf(robot: Robot): UpdateModel {
+  const m = robot.motion;
+  const v = m.speedLinear > 0 ? m.speedLinear : 1000, a = m.accelLinear > 0 ? m.accelLinear : 0;
+  return { v, a, vj: m.speedJoints > 0 ? m.speedJoints : 2 * v, aj: m.accelJoints > 0 ? m.accelJoints : 2 * a, blend: m.rounding > 0 };
+}
+
+/** Rest-to-rest time over `d` (trapezoid, or d / v without acceleration). */
+export function restToRest(d: number, v: number, a: number, blend = false): number {
+  if (!(d > 0) || !(v > 0)) return 0;
+  if (blend || !(a > 0)) return d / v;
+  return d * a >= v * v ? d / v + v / a : 2 * Math.sqrt(d / a);
+}
+
+/** Item.Update() time of one move: TCP path length (linear moves) or largest joint travel (joint moves). */
+export function updateMoveTime(m: UpdateModel, cart: boolean, pathLen: number, jointTravel: number): number {
+  if (cart && pathLen > 1e-3) return restToRest(pathLen, m.v, m.a, m.blend);
+  return restToRest(jointTravel, m.vj, m.aj, m.blend);
+}
+
+export function planChain(g: MotionGroup, q0: number[], specs: ChainMoveSpec[], opts: { estimate?: UpdateModel } = {}): ChainResult {
   const b = new GeomBuilder(g);
   const geoms: Geom[] = [];
   let q = g.full(q0, g.current());
@@ -693,7 +757,17 @@ export function planChain(g: MotionGroup, q0: number[], specs: ChainMoveSpec[]):
     t += tl;
     const ok = geo.ok;
     const tr = new PlannedTrajectory(samples, profiles, len, ok, geo.error);
-    moves.push({ trajectory: tr, t0, t1: t, qEnd: samples[samples.length - 1].joints, warnings: geo.warnings });
+    const pm: PlannedMove = { trajectory: tr, t0, t1: t, qEnd: samples[samples.length - 1].joints, warnings: geo.warnings };
+    if (geo.knots.length) pm.qTarget = geo.knots[geo.knots.length - 1].q;
+    if (opts.estimate && geo.knots.length) {
+      // rest-to-rest geometry: from the previous target to this one (blend zones do not exist for Item.Update())
+      const qa = geo.knots[0].q, qb = geo.knots[geo.knots.length - 1].q;
+      const ci = g.carrier ? g.ext.indexOf(g.carrier) : -1;
+      let travel = maxDelta(qa, qb, g.dof);
+      if (ci >= 0) for (let i = g.offsets[ci]; i < g.offsets[ci] + g.ext[ci].dof; i++) travel = Math.max(travel, Math.abs((qb[i] ?? 0) - (qa[i] ?? 0)));
+      pm.estimate = updateMoveTime(opts.estimate, geo.cart, geo.pathLen, travel);
+    }
+    moves.push(pm);
   }
   return { moves, duration: t, failed };
 }

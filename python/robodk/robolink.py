@@ -516,6 +516,15 @@ class Robolink(RobolinkAPI):
         pose, stats = self._call("CalibrateReference", [pts, method, use_joints, robot])
         return (pose, list(stats)) if stats and len(stats) > 3 else pose
 
+    def Cam2D_Detect(self, cam_handle=0, robot=None):
+        """Studio extension: run the camera's vision stack once, refresh its Pick / Pick approach targets and set the
+        station parameters VISION_FOUND / VISION_TARGET. Returns the number of objects found."""
+        return self._call("Cam2D_Detect", [cam_handle, robot])
+
+    def Vision_Run(self, cam_handle=0, robot=None):
+        """Studio extension, alias of Cam2D_Detect."""
+        return self._call("Vision_Run", [cam_handle, robot])
+
     def Cam2D_Snapshot(self, file_save_img='', cam_handle=0, params=''):
         if type(file_save_img) is not str:
             raise Exception('The first argument must be a valid file name (str)')

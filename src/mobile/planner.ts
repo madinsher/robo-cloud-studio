@@ -230,7 +230,8 @@ export function orderRowsNearest(rows: Array<{ start: number[]; end: number[] }>
 // ---------------------------------------------------------------------------------------------------------------
 import type { MobileRobot } from './items';
 import { CollisionWorld, CircleObstacle, Pose2 } from './footprint';
-import { planGridFootprint, planHybridAStar, PosePathResult } from './hybrid_astar';
+import { planGridFootprint, planHybridAStar, PosePathResult, footprintChecker } from './hybrid_astar';
+import { railRoute, RailNetwork, locateOnRails } from './rails';
 import { minTurnRadius } from './controller';
 
 export interface RobotPlanOptions {
@@ -264,10 +265,37 @@ export function planForRobot(robot: MobileRobot, start: Pose2, goal: { x: number
     for (let i = 1; i <= n; i++) path.push([start.x + ((goal.x - start.x) * i) / n, start.y + ((goal.y - start.y) * i) / n, th, 1]);
     return { ok: true, path, length: len, expanded: 0, method: 'straight' };
   }
-  if (k.drive === 'ackermann') {
-    return planHybridAStar(o.world, start, { x: goal.x, y: goal.y, theta: o.goalHeading }, { ...base, radius: minTurnRadius(k) * 1.15, allowReverse: o.allowReverse ?? true });
+  // the navigation method selected in the robot's navigation stack (Navigation & SLAM dialog) picks the planner
+  const method = navMethodOf(robot);
+  const rails = robot.params?.railNetwork as unknown as RailNetwork | undefined;
+  if (method === 'rail_1d' && rails?.rails?.length) {
+    // pipe-rail trolley: along the rails (forward or backward, never turning on a rail), lanes of the corridor
+    let poly = railRoute(rails, [start.x, start.y], [goal.x, goal.y]);
+    // same rail but the goal heading is the other way round: turn on the corridor (never on a rail)
+    const ls = locateOnRails(rails, [start.x, start.y]), lg = locateOnRails(rails, [goal.x, goal.y]);
+    if (o.goalHeading !== undefined && ls.rail >= 0 && ls.rail === lg.rail && Math.abs(((((o.goalHeading - start.theta) + 180) % 360 + 360) % 360) - 180) > 90) {
+      const J = rails.rails[ls.rail][0];
+      poly = [...railRoute(rails, [start.x, start.y], J), ...railRoute(rails, J, [goal.x, goal.y]).slice(1)];
+    }
+    const path = railPosePath(start, poly, rails, o.goalHeading);
+    let length = 0; for (let i = 1; i < poly.length; i++) length += Math.hypot(poly[i][0] - poly[i - 1][0], poly[i][1] - poly[i - 1][1]);
+    return { ok: true, path, length, expanded: 0, method: 'rail' };
+  }
+  if (method === 'line_following' || method === 'rail_1d') {
+    // fixed route: straight segment, no avoidance — blocked means no path
+    const th = Math.atan2(goal.y - start.y, goal.x - start.x) * 180 / Math.PI;
+    const len = Math.hypot(goal.x - start.x, goal.y - start.y);
+    const free = footprintChecker(o.world, base);
+    for (let s = 0; s <= len; s += 100) if (!free(start.x + ((goal.x - start.x) * s) / Math.max(1, len), start.y + ((goal.y - start.y) * s) / Math.max(1, len), th)) return { ok: false, path: [], length: 0, expanded: 0, error: 'Fixed route blocked', method: 'line' };
+    return { ok: true, path: [[start.x, start.y, th, 1], [goal.x, goal.y, th, 1]], length: len, expanded: 0, method: 'line' };
+  }
+  if (k.drive === 'ackermann' || method === 'nav2_smac_hybrid_rpp') {
+    // Smac Hybrid-A*: curvature-limited arcs for every drive (no rotation in place)
+    const radius = k.drive === 'ackermann' ? minTurnRadius(k) * 1.15 : Math.max(800, k.footprint[1]);
+    return planHybridAStar(o.world, start, { x: goal.x, y: goal.y, theta: o.goalHeading }, { ...base, radius, allowReverse: o.allowReverse ?? true });
   }
   const g = planGridFootprint(o.world, start, goal, base);
+  if (method === 'nav2_navfn_dwb' || method === 'nav2_smac2d_mppi') return g; // 2-D planners: no hybrid fallback
   if (g.ok) return g;
   const h = planHybridAStar(o.world, start, { x: goal.x, y: goal.y, theta: o.goalHeading }, { ...base, radius: Math.max(800, k.footprint[1]), inPlace: true, allowReverse: o.allowReverse ?? true, reverseCost: 1.5 });
   return h.ok ? h : { ...g, error: `${g.error}; hybrid: ${h.error}` };
@@ -300,3 +328,46 @@ export function headlandTurns(exit: { x: number; y: number; theta: number }, ent
   return out;
 }
 import { reedsSheppPath } from './reeds_shepp';
+
+/** Navigation method id of a robot's navigation stack (robot.params.navStack.navigation), or null. */
+export function navMethodOf(robot: MobileRobot): string | null {
+  const c = robot.params?.navStack as { navigation?: string; localization?: string } | undefined;
+  return c && c.localization && c.navigation ? c.navigation : null;
+}
+/** Regulated pure pursuit (Nav2 RPP): linear speed scaled by r / r_min on curves tighter than r_min (mm), null otherwise. */
+export function regulatedMinRadius(robot: MobileRobot): number | null {
+  const m = navMethodOf(robot);
+  if (m !== 'nav2_smac_hybrid_rpp' && m !== 'row_following' && m !== 'gnss_waypoints') return null;
+  const r = (robot.params?.navStack as { params?: Record<string, unknown> } | undefined)?.params?.regulated_linear_scaling_min_radius;
+  return typeof r === 'number' ? r * 1000 : 900;
+}
+
+/**
+ * Pose path of a rail route: on a rail the trolley keeps its axis heading and drives forward or backward; it turns in
+ * place only on the corridor (route vertices off the rails), facing the goal heading (± the rail axis) before entering
+ * the goal rail.
+ */
+function railPosePath(start: Pose2, poly: number[][], net: RailNetwork, goalHeading?: number): number[][] {
+  const w = (a: number) => ((((a + 180) % 360) + 360) % 360) - 180;
+  const onCorridor = (p: number[]) => { const a = net.corridor[0], b = net.corridor[1]; const ab = [b[0] - a[0], b[1] - a[1]]; const l = Math.hypot(ab[0], ab[1]) || 1; const d = Math.abs((p[0] - a[0]) * ab[1] - (p[1] - a[1]) * ab[0]) / l; return d <= net.corridorWidth / 2 + 1; };
+  let th = start.theta;
+  const out: number[][] = [[start.x, start.y, th, 1]];
+  for (let i = 1; i < poly.length; i++) {
+    const a = poly[i - 1], b = poly[i];
+    const L = Math.hypot(b[0] - a[0], b[1] - a[1]);
+    if (L < 1) continue;
+    const seg = Math.atan2(b[1] - a[1], b[0] - a[0]) * 180 / Math.PI;
+    const last = i === poly.length - 1;
+    // the heading to drive this segment with: along it (forward) or against it (backward); on the corridor the
+    // trolley may turn first — before the goal rail it turns to the goal heading
+    let want = seg;
+    if (onCorridor(a) && goalHeading !== undefined && (last || !onCorridor(b))) want = Math.abs(w(goalHeading - seg)) <= 90 ? seg : w(seg + 180);
+    const fwd = Math.abs(w(seg - th)) <= 8, bwd = Math.abs(w(seg + 180 - th)) <= 8;
+    if (onCorridor(a) && !(fwd && want === seg) && !(bwd && want !== seg)) { th = want; out.push([a[0], a[1], th, 0]); }
+    else if (!fwd && !bwd && onCorridor(a)) { th = want; out.push([a[0], a[1], th, 0]); }
+    const dir = Math.abs(w(seg - th)) <= 90 ? 1 : -1;
+    const n = Math.max(1, Math.ceil(L / 200));
+    for (let k = 1; k <= n; k++) out.push([a[0] + ((b[0] - a[0]) * k) / n, a[1] + ((b[1] - a[1]) * k) / n, th, dir]);
+  }
+  return out;
+}

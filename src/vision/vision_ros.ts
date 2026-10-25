@@ -9,6 +9,7 @@ import { Robot } from '../core/items/robot';
 import { Mat4, fromArray, multiply, invert, rotx, rotz } from '../core/math/pose';
 import { VisionStackConfig, VISION_SENSORS, COMPUTE_TARGETS, VISION_MODELS, VisionSensor, TASK_LABELS } from './stack';
 import { cameraIntrinsics } from './camera_model';
+import { toRosYaml } from '../ros/yaml';
 
 // ---------------------------------------------------------------------------------------------
 // Frames: the studio camera item IS the optical frame (+Z forward, +X right, +Y down). ROS (REP 103 / 105):
@@ -69,7 +70,10 @@ const DRIVER_LAUNCH: Record<string, (s: VisionSensor, ns: string) => { pkg: stri
   prophesee_evk: () => ({ pkg: 'metavision_driver', node: 'driver_node', params: { serial: '' }, topics: { image: 'event_camera/events', info: '' } }),
 };
 
-const yaml = (o: Record<string, unknown>, ind = 0): string => Object.entries(o).map(([k, v]) => v && typeof v === 'object' && !Array.isArray(v) ? `${' '.repeat(ind)}${k}:\n${yaml(v as Record<string, unknown>, ind + 2)}` : `${' '.repeat(ind)}${k}: ${Array.isArray(v) ? JSON.stringify(v) : typeof v === 'string' ? JSON.stringify(v) : v}`).join('\n');
+/** Integer ROS parameters of the generated configs (everything else numeric is a double, as the nodes declare). */
+export const VISION_INT_PARAMS = ['imgsz_width', 'imgsz_height', 'image_reliability', 'max_det', 'track_buffer', 'depth_image_units_divisor', 'depth_image_reliability', 'depth_info_reliability', 'min_points'];
+/** Typed ROS 2 parameter YAML (src/ros/yaml.ts): doubles always with a '.', the integer parameters as integers. */
+const yaml = (o: Record<string, unknown>): string => toRosYaml(o, { intKeys: VISION_INT_PARAMS }).trimEnd();
 
 export function generateRosVisionPackage(cam: CameraItem, cfg: VisionStackConfig, opts: { packageName?: string; namespace?: string } = {}): RosVisionPackage {
   const s = VISION_SENSORS.find((x) => x.id === cfg.sensor) ?? VISION_SENSORS[0];

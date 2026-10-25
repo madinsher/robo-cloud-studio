@@ -18,8 +18,8 @@
  */
 import { Robot, RobotBrand } from '../../core/items/robot';
 import { SceneObject, Tool } from '../../core/items/item';
-import type { ChainDef } from '../../core/kinematics/chain';
-import { forwardKinematics } from '../../core/kinematics/chain';
+import type { ChainDef, LinkVisual } from '../../core/kinematics/chain';
+import { forwardKinematics, visualOrigin } from '../../core/kinematics/chain';
 import { chainFromRobodk, rdkParamsFromTable } from '../../core/kinematics/rdk_model';
 import { fromRows, getPos, identity, invert, multiply, rotx, transl } from '../../core/math/pose';
 import type { Mat4 } from '../../core/math/pose';
@@ -191,30 +191,47 @@ export function decodeRobotTable(r: RdkBytes, at: number, end: number, fallbackN
   const ml = readMeshLinks(r, meshAt, end);
   const meshEnd = ml?.next ?? end;
   let triangles = 0;
+  let meshLinkOf: number[] | null = null;
   if (!ml) notes.push(`${name}: link mesh section could not be read`);
   else {
     if (ml.links.length !== nMesh) notes.push(`${name}: ${ml.links.length} mesh links stored, table says ${nMesh}`);
     const placeDelta = delta ? deltaVisuals(chain, tab) : null;
-    let passive = 0;
+    let passive = 0, animated = 0;
+    // counterbalance (table [1060..1065] or [1080..]: mesh A, mesh B (1-based), A = (ax, 0, ay) in link 1, B = (bx, by,
+    // 0) in link 2): the cylinder hangs at A, the rod at B, both aimed from A to B with Y along the J2 axis (verified
+    // against RoboDK's link poses: KR 90 / KR 100, IRB 6640 / 6700, R-2000iB). Comau's parallelogram rods differ: rigid.
+    let look: { ma: number; mb: number; a: [number, number, number]; b: [number, number, number] } | null = null;
+    for (const k of [1060, 1080]) {
+      if (look || !(t(k) > dof && t(k + 1) > dof && t(k) < 32) || conv === 11 || dof < 3) continue;
+      look = { ma: Math.round(t(k)) - 1, mb: Math.round(t(k + 1)) - 1, a: [t(k + 2), 0, t(k + 3)], b: [t(k + 4), t(k + 5), 0] };
+    }
+    meshLinkOf = [];
     ml.links.forEach((shapes, li) => {
+      meshLinkOf![li] = li <= dof ? li : -1;
       if (!shapes.length) return;
       let link = li, origin: Mat4 = identity();
       if (placeDelta) ({ link, origin } = placeDelta(li));
       else if (gripper) {
         // body, finger 1, finger 2 (class 15); the 4-bar parts of a class 17 gripper stay on the body
         link = cls === 15 && li <= 2 ? li : 0;
-        if (link === 0) origin = base;
+        // the body mesh is stored in the robot base frame, not in the base-offset frame of the fingers (RoboDK 5.9.4:
+        // ObjectLink(0) of the 06.f Hand-E grippers; probe shapes at its vertices collide only without the offset)
       } else if (li > dof) {
         // passive parts (counterbalance cylinder + rod, dress pack): carried rigidly by the link they hang on
         link = li === dof + 1 ? 1 : Math.min(2, dof);
         passive++;
       } else if (li === 0) origin = base;
+      meshLinkOf![li] = link;
+      const lookAt = look && (li === look.ma || li === look.mb) && !placeDelta && !gripper ? { at: li === look.ma ? 'a' as const : 'b' as const, a: look.a, linkA: 1, b: look.b, linkB: 2, axisLink: 2 } : undefined;
+      if (lookAt) { link = lookAt.at === 'a' ? 1 : 2; meshLinkOf![li] = link; animated++; }
       for (const v of registerShapes(assets, name, shapes, `${name} link ${li}`)) {
-        chain.links[link].visuals.push({ mesh: v.mesh, origin, color: v.color });
+        const vis: LinkVisual = { mesh: v.mesh, origin, color: v.color, meshLink: li };
+        if (lookAt) { vis.passive = lookAt; vis.origin = visualOrigin(forwardKinematics(chain, Array.from({ length: dof }, (_, i) => t(700 + i))).linkPoses, link, vis); }
+        chain.links[link].visuals.push(vis);
         triangles += v.triangles;
       }
     });
-    if (passive) notes.push(`${name}: ${passive} passive mesh link(s) (counterbalance) attached rigidly to links 1/2, not animated`);
+    if (passive > animated) notes.push(`${name}: ${passive - animated} passive mesh link(s) (counterbalance) attached rigidly to links 1/2, not animated`);
     if (delta) notes.push(`${name}: delta lower-arm rods are drawn rigidly at the import pose (not re-aimed when the robot moves)`);
     if (gripper && cls === 17) notes.push(`${name}: 4-bar finger linkage shown static at its build pose`);
   }
@@ -235,6 +252,8 @@ export function decodeRobotTable(r: RdkBytes, at: number, end: number, fallbackN
   robot.params.rdkConvention = conv;
   robot.params.rdkMeshes = triangles;
   robot.params.rdkMeshLinks = ml?.links.length ?? 0;
+  // mesh link -> chain link (RoboDK collision map entities are mesh links; KR 90 R3100: 9 meshes on 7 links)
+  if (meshLinkOf) robot.params.rdkMeshLinkOf = meshLinkOf;
   // passive-link definition (mesh link numbers + pivot data) kept for a later animated counterbalance
   for (const k of [1060, 1080]) if (t(k) > dof && t(k + 1) > dof && t(k) < 32) robot.params.rdkPassive = Array.from(tab.subarray(k, k + 6));
   if (conv === 3) {
@@ -324,14 +343,23 @@ export function decodeObjectTable(r: RdkBytes, at: number, end: number, fallback
   if (asTool) item.setPose(rd(160));
   else item.setPose(rd(96));
   if (t(48) === 0) item.setVisible(false);
-  const origin = Array.from(rd(32));
+  // table [32..] is the item frame expressed in the geometry frame: the meshes sit at its inverse (verified against
+  // RoboDK 5.9.4 collisions with probe shapes at mesh vertices: 06.c Europallet, 02.c Spindle, 01.a Paint gun)
+  const origin = Array.from(invert(rd(32)));
   const sh = readShapes(r, at + count * 8, end);
   let o = sh?.next ?? end;
   if (!sh) notes.push(`${name}: mesh section could not be read`);
   else if (sh.shapes.length) {
     for (const v of registerShapes(assets, name, sh.shapes, name)) item.geometry.push({ mesh: v.mesh, origin: origin.slice(), color: v.color });
     const min: [number, number, number] = [Infinity, Infinity, Infinity], max: [number, number, number] = [-Infinity, -Infinity, -Infinity];
-    for (const s of sh.shapes) for (let i = 0; i < 3; i++) { min[i] = Math.min(min[i], s.min[i]); max[i] = Math.max(max[i], s.max[i]); }
+    // bounds in the item frame: the shape bounds (geometry frame) through the geometry origin
+    for (const s of sh.shapes) for (let k = 0; k < 8; k++) {
+      const c = [k & 1 ? s.max[0] : s.min[0], k & 2 ? s.max[1] : s.min[1], k & 4 ? s.max[2] : s.min[2]];
+      for (let i = 0; i < 3; i++) {
+        const v = origin[i] * c[0] + origin[4 + i] * c[1] + origin[8 + i] * c[2] + origin[12 + i];
+        min[i] = Math.min(min[i], v); max[i] = Math.max(max[i], v);
+      }
+    }
     item.bbox = { min, max };
     item.params.rdkMeshes = sh.shapes.reduce((n, s) => n + s.triangles, 0);
   }

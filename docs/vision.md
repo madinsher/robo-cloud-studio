@@ -89,7 +89,11 @@ bottom-up, depth / FAR_LENGTH · (2³² − 1), as `Macros/Depth_Camera.py` and 
 
 - `publishCameraFrame(ros, cam, frame)`: `sensor_msgs/Image` (rgb8 / bgr8 / rgba8 / bgra8), `CameraInfo` with the render
   K (principal point W/2 − 0.5 in the ROS integer-pixel convention), 32FC1 depth in metres (NaN = no return) with its
-  CameraInfo, and TF `map → <cam>_link → <cam>_optical_frame`. The Vision tab publishes them when "Publish to ROS 2" is on.
+  CameraInfo, and TF `map → <cam>_link → <cam>_optical_frame`. The Vision tab publishes them when "Publish to ROS 2" is on;
+  rosbridge mode `sim` publishes every rgb / depth camera at 5 Hz (generic twin) or the MURKA head camera / range finder.
+- Generated parameter files are typed ROS 2 YAML (`toRosYaml`: doubles always with a decimal point, the integer
+  parameters `imgsz_*`, `*_reliability`, `max_det`, `track_buffer`, `depth_image_units_divisor`, `min_points` as integers).
+- `detectFruit` skips harvested (`picked`) fruit, so a detect → pick loop never re-detects them.
 - Perception package export (`generateRosVisionPackage`): driver, yolo_ros, depth → 3D, cloud / VLM / VLA bridge nodes as
   ament_python `console_scripts`, hand-eye static TF `base_link` (eye-to-hand) or `tool0` (eye-in-hand) → `camera_link`
   (REP 103 body frame) → `camera_optical_frame`. Verified with `colcon build` + `ros2 pkg executables` on ROS 2 Jazzy.
@@ -107,5 +111,7 @@ bottom-up, depth / FAR_LENGTH · (2³² − 1), as `Macros/Depth_Camera.py` and 
 - Appearance is flat-shaded (no textures / lighting model): detectors trained on real images are exercised on geometry,
   not photorealism; the simulated detectors are statistical.
 - Canopy occlusion of fruit is a density model, not leaf geometry.
-- MURKA's `perception_node` has not been run against studio topics (formats verified; rosbridge not available in the
-  test WSL).
+- MURKA's `perception_node` has not been run against studio topics: the studio now serves the MURKA head camera
+  (bgra8) and range finder (32FC1) through rosbridge (docs/ros.md "Studio as the MURKA simulator backend"), but the
+  node's SKU colour prototypes are calibrated per simulator (`appearance_<sim>.yaml`) and none exists for the studio's
+  flat-shaded renders.

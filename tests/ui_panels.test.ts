@@ -33,7 +33,7 @@ describe('MenuBar', () => {
   it('has 13 menus with the expected entries', () => {
     expect(menu.el.querySelectorAll('.menu-btn').length).toBe(13);
     expect(menu.el.querySelector('.menu-title')!.textContent).toBe('VerticalBot Studio');
-    const expected: Record<string, [number, number]> = { File: [11, 2], Edit: [4, 1], Add: [12, 2], Program: [11, 2], Robot: [9, 2], 'Mobile & Fleet': [9, 2], Agriculture: [5, 1], Control: [7, 2], Group: [7, 2], Tools: [12, 2], Connect: [5, 2], View: [12, 2], Help: [4, 0] };
+    const expected: Record<string, [number, number]> = { File: [12, 2], Edit: [4, 1], Add: [12, 2], Program: [11, 2], Robot: [9, 2], 'Mobile & Fleet': [10, 2], Agriculture: [5, 1], Control: [7, 2], Group: [7, 2], Tools: [12, 2], Connect: [5, 2], View: [12, 2], Help: [4, 0] };
     for (const [name, [items, seps]] of Object.entries(expected)) {
       const m = openMenu(name);
       expect(m.querySelectorAll('.ctx-item').length, name).toBe(items);
@@ -261,7 +261,8 @@ describe('BottomPanel', () => {
     expect(body.querySelector('canvas.mini-chart')).not.toBeNull(); expect(body.querySelectorAll('table.grid tbody tr').length).toBe(app.station.itemsOfType(ItemType.COMPONENT).length);
     app.startWorld(); for (let i = 0; i < 12; i++) { (app as any).tick(1); bottom.show('process'); } app.pauseWorld();
     expect(body.textContent).toMatch(/Process clock [\d.]+ s/); expect(body.textContent).toMatch(/output \d+/);
-    app.processSim.setSignal('door', true); bottom.show('process'); expect(body.textContent).toContain('Signals: door=true');
+    // the packing demo's own components publish signals too (R4: gripper of the pick & place cell): door is one of them
+    app.processSim.setSignal('door', true); bottom.show('process'); expect(body.textContent).toMatch(/Signals: (.*, )?door=true/);
     (body.querySelector('table.grid tbody tr') as HTMLElement).click(); expect(app.station.selection[0]).toBeInstanceOf(Component);
     app.newStation(); bottom.show('process'); expect(body.textContent).toContain('No process components');
     app.resetWorld();
@@ -478,7 +479,8 @@ describe('PropertiesPanel', () => {
       app.select(c); change(fieldIn('Enabled'), 'false'); expect(b.enabled).toBe(false); b.enabled = true;
       if ('next' in b) { app.select(c); const other = comps.find((x) => x !== c)!; change(fieldIn('Output to'), other.id); expect(b.next).toBe(other.id); }
     }
-    expect([...types].sort()).toEqual(['buffer', 'conveyor', 'feeder', 'process', 'sink']);
+    // the five editable behaviours are all present (the packing demo also has transfer / signal components since R4)
+    expect([...types].sort()).toEqual(expect.arrayContaining(['buffer', 'conveyor', 'feeder', 'process', 'sink']));
     const cam = addCamera(app); app.select(cam);
     expect(sectionTitles()).toContain('Camera / sensor'); expect(body().textContent).toContain('Machine vision'); expect(body().textContent).toContain('not configured');
     change(fieldIn('Kind'), 'lidar2d'); expect(cam.kind).toBe('lidar2d'); app.select(cam); change(fieldIn('Field of view (deg)'), '120'); expect(cam.fov).toBe(120);

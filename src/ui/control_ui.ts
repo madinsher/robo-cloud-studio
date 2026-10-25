@@ -25,7 +25,7 @@ import { AutomatonExecutor, PetriExecutor, ExecutorWorld } from '../ctl/exec';
 import { FsmExecutor, parseFsm } from '../ctl/fsm';
 import { GroupFsmExecutor, GARDEN_GROUP_FSM, applyCapabilityOntology } from '../ctl/group_fsm';
 import { programBackendFor, mapSignals, mergeSignals, withSignals, ProgramBackend } from '../ctl/host';
-import { makeStationWorld, StationWorld } from '../ctl/world';
+import { makeStationWorld, StationWorld, stationFsmExecutor } from '../ctl/world';
 import { synthesizeSupervisor, applyDeadlockMonitors } from '../ctl/supervisor';
 import { buildCourseStationA, buildCourseStationB, YOUBOT_STATION_DES, YOUBOT_STATION_BT, CELL_STATION_PETRI } from '../ctl/course_stations';
 import { controlExports, ExportEntry, GenFile } from '../ctl/codegen';
@@ -441,8 +441,11 @@ export function startFleetRun(app: App, model: ControlModelItem, opts: { maxSeco
 /** Run an automaton, Petri-net or FSM model on the station until it ends (verdict done / deadlock / failed), or stopped. */
 export function startModelRun(app: App, model: ControlModelItem, opts: { maxSeconds?: number } = {}): ActiveRun {
   if (model.kind !== 'des' && model.kind !== 'petri' && model.kind !== 'fsm') throw new Error('only automata (des), Petri nets (petri) and FSMs (fsm) can be executed here');
-  const world = stationWorld(app);
   const log = (m: string) => app.log(`[${model.name}] ${m}`, /mismatch|failed|denied|deadlock|DEADLOCK|timeout|not mapped/.test(m) ? 'warn' : 'info');
+  // a domain module may run this FSM on its own simulation (MURKA retail robot: skills murom.*)
+  const own = model.kind === 'fsm' ? stationFsmExecutor(app.station, model.source, log) : null;
+  if (own) return startOwnFsmRun(app, model, own, opts.maxSeconds ?? 3600);
+  const world = stationWorld(app);
   let exec: AutomatonExecutor | PetriExecutor | FsmExecutor;
   if (model.kind === 'des') {
     const doc = parseDes(model.source);
@@ -477,6 +480,31 @@ export function startModelRun(app: App, model: ControlModelItem, opts: { maxSeco
   app.worldHooks.push(run.hook);
   app.startWorld();
   app.log(`[control] ${model.kind === 'des' ? 'automaton' : model.kind === 'petri' ? 'Petri net' : 'FSM'} "${model.name}" started on the station (${exec instanceof AutomatonExecutor ? exec.comps.length + ' components' : exec instanceof PetriExecutor ? exec.net.places.length + ' places' : exec.where()}; programs: ${world.programs.kind})`);
+  return run;
+}
+
+/** Run an FSM executor supplied by a domain module (its world steps its own simulation) on the app's world clock. */
+function startOwnFsmRun(app: App, model: ControlModelItem, own: { exec: FsmExecutor; stop?(): void }, maxSeconds: number): ActiveRun {
+  const exec = own.exec;
+  const end = (why?: string) => {
+    run.done = true; const i = app.worldHooks.indexOf(run.hook); if (i >= 0) app.worldHooks.splice(i, 1); own.stop?.();
+    const s = exec.summary(); const bad = s.verdict !== 'done' || /fail|abort|error/i.test(exec.outcome ?? '');
+    const msg = `${model.name}: ${why ?? s.verdict} after ${s.time.toFixed(1)} s · outcome ${exec.outcome ?? '—'} — ${s.fired} transitions · ${s.where}`;
+    app.log(`[control] ${msg}`, bad ? 'warn' : 'info'); toast(msg, bad ? 'warn' : 'ok', 6000);
+  };
+  const run: ActiveRun = {
+    model, exec, done: false,
+    hook: (dt) => {
+      if (run.done) return;
+      try { const st = exec.tick(dt); if (st !== 'running') end(); else if (exec.time >= maxSeconds) { exec.stop('timeout'); end(`time limit (${maxSeconds} s)`); } } catch (e) { exec.stop('failed'); end(`error: ${(e as Error).message}`); }
+    },
+    stop: () => { const i = app.worldHooks.indexOf(run.hook); if (i >= 0) app.worldHooks.splice(i, 1); run.done = true; exec.stop(); own.stop?.(); },
+    status: () => { const s = exec.summary(); return `${run.done ? '⏹' : '▶'} ${model.name}: ${s.status === 'running' ? 'running' : s.verdict} · t=${fmt(s.time, 1)} s · ${s.fired} ${t('firings')} · ${s.where}`; },
+    logLines: () => exec.log,
+  };
+  app.worldHooks.push(run.hook);
+  app.startWorld();
+  app.log(`[control] FSM "${model.name}" started on the station's own simulation (${exec.where()})`);
   return run;
 }
 

@@ -85,13 +85,17 @@ the robot under it; the importer does the same.
 
 `u64 nLinks`; per link (`link > 0`: two zero u64) `u64 nShapes`; shape = `u64 nTri, RGBA f32, nTri·3 × (xyz f32 +
 2 bytes)`. Link 0 is drawn in the base-offset frame, link i in DHM frame i. Extra mesh links are passive parts:
-counterbalance cylinder / rod (rigid on links 1 / 2, not animated), delta lower-arm rods (aimed at the import pose),
+counterbalance cylinder / rod (look-at parts: [1060..1065] = mesh A, mesh B (1-based), A = (ax, 0, ay) in link 1,
+B = (bx, by, 0) in link 2; the cylinder frame sits at A, the rod's at B, X from A to B, Y along the J2 axis — RoboDK's
+link poses of KR 90 / KR 100 / IRB 6640 / 6700 / R-2000iB, `tests/kin_passive.test.ts`; Comau's parallelogram rods
+follow another linkage and stay rigid), delta lower-arm rods (aimed at the import pose),
 the 4-bar linkage of the RobotiQ 2F-85 (static). The importer merges the shapes of a link per colour (one mesh and
 draw call per colour) and keeps every triangle (UR5e 264 588, IRB 6700 LeanID 445 929).
 
 ## Object / tool table (.tool, .sld, tool and object chunks)
 
-1600 doubles: `[32..47]` geometry origin, `[48]` visible, `[50]` tool flag, `[96..111]` object pose, `[160..175]` TCP,
+1600 doubles: `[32..47]` the item frame in the geometry frame (the meshes sit at its inverse; checked against RoboDK's
+collisions with probe shapes at mesh vertices), `[48]` visible, `[50]` tool flag, `[96..111]` object pose, `[160..175]` TCP,
 `[1440]` name (UTF-8 signed chars). Then `u64 nShapes` + shapes, `u64 nPoints` + points
 (`i32 -1 | str name, RGBA, xyz, xyz, normal, f32 size`), `u64 nCurves` + curves
 (`u64 n, str name | i32 -1, RGBA, n × (f32 flag, xyz, normal, tangent, xyz)`); curve normals may be NaN (edges

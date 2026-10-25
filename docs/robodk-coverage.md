@@ -11,12 +11,12 @@ Legend: ✅ implemented · 🟡 partial / simplified · ❌ not implemented
 | Import geometry: STL, OBJ, COLLADA (.dae) | ✅ | COLLADA reader handles unit scale, Y-up conversion, node transforms |
 | Import geometry: STEP/IGES/BREP | ✅ | OpenCascade WebAssembly (occt-import-js), loaded on demand; SLDPRT/3DS/WRL ❌ |
 | Program playback of recorded joint paths (RoboDK InstructionListJoints, ROS bags, CSV logs) | ✅ | `jointPath` instruction: exact replay in the simulator, exported through posts as joint moves; created automatically for RoboDK programs whose robot kinematics could not be rebuilt |
-| .rdk station load/save | ✅ | native reader checked against RoboDK 5.9.4 for all 96 Library files (tree, poses, FK, targets, programs by item reference incl. IO / threads / code calls, Python programs, curves / points, station parameters, collision map; `docs/robodk-library-compat.md`); not reproduced: machining settings, animated passive links (listed in the import report); `POST /convert/rdk` re-saves files of other RoboDK versions; export via `rdk_export.py` + API script |
+| .rdk station load/save | ✅ | native reader checked against RoboDK 5.9.4 for all 96 Library files (tree, poses, FK, targets, programs by item reference incl. IO / threads / code calls, Python programs, curves / points, station parameters, collision map; `docs/robodk-library-compat.md`); not reproduced: machining settings, Comau / delta / 4-bar passive links (KUKA / ABB / Fanuc counterbalances follow J2; listed in the import report); `POST /convert/rdk` re-saves files of other RoboDK versions; export via `rdk_export.py` + API script |
 | .robot / .tool file build ("Robot builder") | ✅ | `BuildMechanism` (1R/1T/2R/2T/3R/3T/4R/4T/6DOF/7DOF/SCARA), `setRobotParams` (modified DH), DH import/export |
 | Targets: cartesian / joint, teach, configuration flags | ✅ | flags derived (elbow/wrist/front), no explicit conf editing |
 | Programs: MoveJ/MoveL/MoveC, speed, rounding, frame/tool, pause, IO, code, comment, message, call | ✅ | |
 | Program instruction types: Wait, thread start | ✅ | threads compile on parallel timelines |
-| Program simulation, timeline, cycle time, run modes | ✅ | RUN_ON_ROBOT only via ROS bridge |
+| Program simulation, timeline, cycle time, run modes | ✅ | every Library program checked against RoboDK 5.9.4 (validity, `Item.Update()` cycle time ±10 %, joints, collisions: docs/robodk-library-sim.md); RUN_ON_ROBOT only via ROS bridge |
 | Collision checking (mesh-accurate, collision map, `Collision_SetPair`, `Collision_Line`) | ✅ | BVH triangle checks for meshes, collision map with pair rules + dialog, ray casting |
 | Singularity / joint limit / reach checks in linear moves | ✅ | |
 | Post processors (~100 vendor posts in RoboDK) | 🟡 | 27 built-in posts + any RoboDK Python post via Pyodide: KUKA KRC2/KRC4, ABB IRC5/S4C, Fanuc R30/RJ3, UR, Motoman, Stäubli, Doosan, Mecademic, Denso, Kawasaki, Nachi, Comau, Epson, Techman/Omron TM, Hanwha, Kinova, Mitsubishi, AUBO, JAKA, Elite, Dobot, CSV, JSON, RoboDK, ROS 2; **original RoboDK posts import unmodified** (`Program › Import RoboDK post processors`, Pyodide + official robomath/robofileio + headless robodialogs) |
@@ -85,7 +85,8 @@ robots replace their DH tables instead).
 
 ## Remaining gaps
 
-- RoboDK binary files are read natively (format: docs/robodk-file-format.md); machining project settings and animated passive links are not reproduced.
+- RoboDK binary files are read natively (format: docs/robodk-file-format.md); machining project settings and Comau / delta / 4-bar passive links are not reproduced.
+- `Update()` time is RoboDK's estimate model (moves rest to rest at the robot's motion state, Set speed / rounding instructions ignored: `ProgramRunResult.updateTime`); playback honours the programmed speeds (`duration`).
 - Native (non-ROS) drivers exist for UR, ABB (RWS) and KUKA (KVP); other brands connect through their ROS 2 drivers.
 - Depth/segmentation camera buffers, 3D PDF export, Simulink blocks and C++ add-ins are not implemented.
 - `EmbedWindow` and file-path based `AddFile` do not apply to a browser application.

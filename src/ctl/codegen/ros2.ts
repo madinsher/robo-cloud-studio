@@ -362,10 +362,11 @@ class VState(State):
                     return s['otherwise']
             else:
                 st = a.tick(ctx.now())
+                named = rt.named_outcomes(s)
                 if st == 'success':
-                    return s['action'].get('done') or 'ok'
+                    return a.outcome or (named[0] if named else (s['action'].get('done') or 'ok'))
                 if st == 'failure':
-                    return 'timeout' if a.timed_out else (s['action'].get('fail') or 'fail')
+                    return 'timeout' if a.timed_out else (a.outcome or (named[-1] if named else (s['action'].get('fail') or 'fail')))
             time.sleep(DT)
 
     def execute(self, blackboard):

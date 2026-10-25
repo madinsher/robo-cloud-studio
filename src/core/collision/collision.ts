@@ -10,6 +10,7 @@
  */
 import { Station, Item, ItemType, SceneObject, Tool } from '../items/item';
 import { Robot } from '../items/robot';
+import { visualOrigin } from '../kinematics/chain';
 import { MobileRobot } from '../../mobile/items';
 import { Component } from '../../vc/component';
 import { Mat4, multiply, transformPoint, getPos, sub, dot, cross, norm, add, scale, invert, transformDir } from '../math/pose';
@@ -29,6 +30,8 @@ export interface Collider {
   linkIndex?: number;
   /** Procedural (approximate) geometry — self-collision rules are more lenient. */
   approx?: boolean;
+  /** RoboDK mesh link of an imported robot visual (collision map entity; differs from linkIndex for passive links). */
+  meshLink?: number;
   shape: Shape;
 }
 
@@ -53,6 +56,8 @@ export interface CollisionOptions {
   robotsOnly?: boolean;
   /** Check only links/tools belonging to the same robot. */
   selfOnly?: boolean;
+  /** Ray casts (collisionLine): consider only this item and what it carries (RoboDK ProjectPoints onto one object). */
+  only?: Item;
 }
 
 // ---- shape builders -------------------------------------------------------------
@@ -81,7 +86,7 @@ export function collidersOf(item: Item, opts: CollisionOptions = {}): Collider[]
       const linkPose = multiply(base, fk.linkPoses[i]);
       const link = chain.links[i];
       if (link.visuals.length) {
-        for (const v of link.visuals) out.push(...visualColliders(item, link.name, i, multiply(linkPose, v.origin), v, opts));
+        for (const v of link.visuals) for (const c of visualColliders(item, link.name, i, multiply(linkPose, v.passive ? visualOrigin(fk.linkPoses, i, v) : v.origin), v, opts)) { if (v.meshLink !== undefined) c.meshLink = v.meshLink; out.push(c); }
       } else if (!hasMeshes) {
         // capsule from the joint pivot to the link end (mirrors the procedural renderer)
         const radius = 0.85 * r0 * (1 - 0.55 * (i / Math.max(1, chain.joints.length)));
@@ -263,12 +268,19 @@ export function shapeDistance(s1: Shape, s2: Shape): number {
 }
 
 /** Triangle-triangle intersection (Möller) for mesh-accurate confirmation. */
+/** Distance (mm) under which two faces count as touching: RoboDK reports parts resting on each other as colliding (02.i). */
+const TOUCH_MM = 1e-3;
+
 function triTri(a: V[], b: V[]): boolean {
-  const planeSide = (t: V[], p: V) => { const n = cross(sub(t[1], t[0]), sub(t[2], t[0])); return dot(n, sub(p, t[0])); };
-  const s1 = b.map((p) => planeSide(a, p));
-  if (s1.every((v) => v > 1e-9) || s1.every((v) => v < -1e-9)) return false;
-  const s2 = a.map((p) => planeSide(b, p));
-  if (s2.every((v) => v > 1e-9) || s2.every((v) => v < -1e-9)) return false;
+  const na = cross(sub(a[1], a[0]), sub(a[2], a[0])), nb = cross(sub(b[1], b[0]), sub(b[2], b[0]));
+  const la = norm(na), lb = norm(nb);
+  if (la < 1e-12 || lb < 1e-12) return false;
+  const s1 = b.map((p) => dot(na, sub(p, a[0])) / la);
+  if (s1.every((v) => v > TOUCH_MM) || s1.every((v) => v < -TOUCH_MM)) return false;
+  const s2 = a.map((p) => dot(nb, sub(p, b[0])) / lb);
+  if (s2.every((v) => v > TOUCH_MM) || s2.every((v) => v < -TOUCH_MM)) return false;
+  // coplanar faces (a part resting in its holder): overlap of the two triangles in their common plane
+  if (s1.every((v) => Math.abs(v) <= TOUCH_MM)) return coplanarOverlap(a, b, na);
   // edges of a vs triangle b and vice versa (segment-triangle tests)
   const segTri = (p: V, q: V, t: V[]) => {
     const d = sub(q, p);
@@ -291,6 +303,24 @@ function triTri(a: V[], b: V[]): boolean {
     if (segTri(b[i], b[(i + 1) % 3], a)) return true;
   }
   return false;
+}
+
+/** Two coplanar triangles overlap (projected on the plane of the largest normal component): crossing edges or containment. */
+function coplanarOverlap(a: V[], b: V[], n: V): boolean {
+  const ax = Math.abs(n[0]), ay = Math.abs(n[1]), az = Math.abs(n[2]);
+  const [i, j] = ax >= ay && ax >= az ? [1, 2] : ay >= az ? [0, 2] : [0, 1];
+  const A = a.map((p) => [p[i], p[j]]), B = b.map((p) => [p[i], p[j]]);
+  const orient = (p: number[], q: number[], r: number[]) => (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0]);
+  const segs = (p: number[], q: number[], r: number[], s: number[]) => {
+    const d1 = orient(r, s, p), d2 = orient(r, s, q), d3 = orient(p, q, r), d4 = orient(p, q, s);
+    return ((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) && ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0));
+  };
+  for (let k = 0; k < 3; k++) for (let m = 0; m < 3; m++) if (segs(A[k], A[(k + 1) % 3], B[m], B[(m + 1) % 3])) return true;
+  const inside = (p: number[], T: number[][]) => {
+    const d1 = orient(T[0], T[1], p), d2 = orient(T[1], T[2], p), d3 = orient(T[2], T[0], p);
+    return !((d1 < 0 || d2 < 0 || d3 < 0) && (d1 > 0 || d2 > 0 || d3 > 0));
+  };
+  return inside(A[0], B) || inside(B[0], A);
 }
 
 function meshMesh(m1: Extract<Shape, { kind: 'mesh' }>, m2: Extract<Shape, { kind: 'mesh' }>, budget = 20_000): boolean {
@@ -409,6 +439,11 @@ function heldBy(obj: Item, other: Item): boolean {
 }
 
 /** Pairs never checked, whatever the collision map says: one link with itself, a part with the tool holding it. */
+/** Two colliders of the same mesh part (one RoboDK collision entity). */
+function samePart(A: Collider, B: Collider): boolean {
+  return A.item === B.item && (A.meshLink ?? A.linkIndex ?? -1) === (B.meshLink ?? B.linkIndex ?? -1);
+}
+
 function hardSkip(A: Collider, B: Collider): boolean {
   if (A.item === B.item && (A.linkIndex === B.linkIndex || A.linkIndex === undefined || B.linkIndex === undefined)) return true;
   if (heldBy(A.item, B.item) || heldBy(B.item, A.item)) return true;
@@ -422,8 +457,16 @@ function pairDepth(A: Collider, B: Collider, opts: CollisionOptions, margin = op
   let d = shapeDistance(A.shape, B.shape) + margin;
   // self-collision with approximate capsules: shrink both radii by 30% to avoid false positives at the wrist/shoulder
   if (A.item === B.item && A.shape.kind === 'capsule' && B.shape.kind === 'capsule') d -= 0.3 * (A.shape.r + B.shape.r);
-  if (d <= 0) return d;
-  if (opts.meshAccurate && (A.shape.kind === 'mesh' || B.shape.kind === 'mesh')) return exactHit(A.shape, B.shape, margin) ? Math.max(1, Math.min(d, 1)) : -1;
+  const exact = opts.meshAccurate && (A.shape.kind === 'mesh' || B.shape.kind === 'mesh');
+  // exact meshes: boxes that only touch go on to the triangle test (RoboDK reports faces in contact: the JAKA Zu5 tool
+  // on its flange collides at 0 mm and not 0.001 mm away)
+  if (d <= 0 && !(exact && d >= -TOUCH_MM)) return d;
+  if (exact) {
+    // two meshes: first each mesh against the other's box (cheap, one box per BVH): no triangle of one inside or across
+    // the other's box means no contact (a robot link inside a cage enclosure: the cage bars miss the link's box)
+    if (A.shape.kind === 'mesh' && B.shape.kind === 'mesh' && (!exactHit(B.shape, A.shape.obb, Math.max(margin, TOUCH_MM)) || !exactHit(A.shape, B.shape.obb, Math.max(margin, TOUCH_MM)))) return -1;
+    return exactHit(A.shape, B.shape, margin) ? 1 : -1;
+  }
   return d;
 }
 
@@ -493,7 +536,11 @@ export function setCollisionPair(station: Station, a: Item, b: Item, linkA = -1,
   station.notify('collisionMap');
 }
 
-function pairState(m: CollisionMapData, A: Collider, B: Collider): 'enabled' | 'disabled' | 'default' {
+/**
+ * 'map-on': RoboDK's imported map checks the pair; then only the same mesh part is skipped — RoboDK also checks a part
+ * against the tool holding it (02.i Wood_Holder x Finish_Part1) and a tool against its robot when its map says so.
+ */
+function pairState(m: CollisionMapData, A: Collider, B: Collider): 'enabled' | 'disabled' | 'default' | 'map-on' {
   const match = (p: [string, number, string, number]) => {
     const f = (id: string, link: number, c: Collider) => id === c.item.id && (link < 0 || link === (c.linkIndex ?? -1));
     return (f(p[0], p[1], A) && f(p[2], p[3], B)) || (f(p[0], p[1], B) && f(p[2], p[3], A));
@@ -502,12 +549,13 @@ function pairState(m: CollisionMapData, A: Collider, B: Collider): 'enabled' | '
   if (m.enabled.some(match)) return 'enabled';
   const r = rdkMap(m);
   if (r) {
-    // a robot whose RoboDK mesh links do not map 1:1 onto its chain links (KR 90 R3100: 9 meshes, 7 links, extra
-    // counterbalance parts) cannot be matched link by link: its pairs follow the default rules
-    const unmapped = (c: Collider) => c.item instanceof Robot && c.item.params.rdkMeshLinks !== undefined && Number(c.item.params.rdkMeshLinks) !== c.item.chain.links.length;
-    const ent = (c: Collider) => (unmapped(c) ? undefined : r.index.get(`${c.item.id}|${c.linkIndex ?? -1}`) ?? (c.linkIndex !== undefined ? undefined : r.index.get(`${c.item.id}|-1`)));
+    // robot entities are RoboDK mesh links: an imported visual knows its mesh link (passive counterbalance parts ride
+    // on chain link 1/2 but are entities of their own); a robot whose mesh links do not map 1:1 onto its chain links
+    // and whose visuals carry no mesh link (stations saved before the mapping) follows the default rules
+    const unmapped = (c: Collider) => c.meshLink === undefined && c.item instanceof Robot && c.item.params.rdkMeshLinks !== undefined && Number(c.item.params.rdkMeshLinks) !== c.item.chain.links.length;
+    const ent = (c: Collider) => (unmapped(c) ? undefined : r.index.get(`${c.item.id}|${c.meshLink ?? c.linkIndex ?? -1}`) ?? (c.linkIndex !== undefined ? undefined : r.index.get(`${c.item.id}|-1`)));
     const i = ent(A), j = ent(B);
-    if (i !== undefined && j !== undefined) return r.pairs.has(Math.min(i, j) * m.entities!.length + Math.max(i, j)) ? 'enabled' : 'disabled';
+    if (i !== undefined && j !== undefined) return r.pairs.has(Math.min(i, j) * m.entities!.length + Math.max(i, j)) ? 'map-on' : 'disabled';
   }
   return 'default';
 }
@@ -522,7 +570,18 @@ export function checkCollisionsMapped(station: Station, opts: CollisionOptions =
     if (it.type === ItemType.FIELD || it.type === ItemType.CROP_ROW || it.type === ItemType.MAP || it.type === ItemType.ZONE) continue;
     colliders.push(...collidersOf(it, opts));
   }
-  const pairs = checkColliders(colliders, opts).filter((p) => pairState(m, p.a, p.b) !== 'disabled');
+  const ignore = new Set((opts.ignore ?? []).map(([a, b]) => `${a}|${b}`));
+  const pairs: CollisionPair[] = [];
+  for (let i = 0; i < colliders.length; i++) {
+    for (let j = i + 1; j < colliders.length; j++) {
+      const A = colliders[i], B = colliders[j];
+      const state = pairState(m, A, B);
+      if (state === 'disabled') continue;
+      if (state === 'map-on' ? samePart(A, B) : state === 'enabled' ? hardSkip(A, B) : skipPair(A, B, opts, ignore)) continue;
+      const d = pairDepth(A, B, opts, opts.margin ?? 0);
+      if (d > 0) pairs.push({ a: A, b: B, depth: d });
+    }
+  }
   // explicitly enabled pairs are checked even if default rules skip them
   for (const e of m.enabled) {
     const as = colliders.filter((c) => c.item.id === e[0] && (e[1] < 0 || c.linkIndex === e[1]));
@@ -610,7 +669,7 @@ export function collisionLine(station: Station, p1: V, p2: V, opts: CollisionOpt
   if (len < 1e-9) return null;
   const d = scale(dir, 1 / len) as V;
   let best: RayHit | null = null;
-  for (const it of station.walk()) {
+  for (const it of opts.only ? opts.only.walk() : station.walk()) {
     if (it === station || !it.visible) continue;
     if (it.type === ItemType.FIELD || it.type === ItemType.CROP_ROW || it.type === ItemType.MAP || it.type === ItemType.ZONE) continue;
     for (const c of collidersOf(it, opts)) {
@@ -842,6 +901,13 @@ function closestOnTri(p: V, a: V, b: V, c: V): V {
 
 type MeshShape = Extract<Shape, { kind: 'mesh' }>;
 
+/**
+ * Triangle tests of one exact mesh/mesh check before the meshes are taken as touching (coplanar contact, a robot base
+ * standing on its pedestal, makes the traversal explode). 250 k reported robot links inside the bars of a cage
+ * enclosure as touching (06.d); RoboDK checks those exactly.
+ */
+export const EXACT_BUDGET = 4_000_000;
+
 /** Exact (triangle-level) intersection test of a mesh against another shape. */
 export function exactHit(s1: Shape, s2: Shape, margin = 0): boolean {
   if (s1.kind !== 'mesh') { if (s2.kind !== 'mesh') return shapeDistance(s1, s2) + margin > 0; return exactHit(s2, s1, margin); }
@@ -852,23 +918,36 @@ export function exactHit(s1: Shape, s2: Shape, margin = 0): boolean {
   if (s2.kind === 'mesh') {
     const b2 = localBVH(s2.positions);
     if (!b2.count.length) return false;
+    // boxes within TOUCH_MM overlap: faces in contact are separated by rounding only after the transforms (JAKA tool on
+    // its flange: the boxes touch, the triangles are coplanar to 1e-11 mm)
+    margin = Math.max(margin, TOUCH_MM);
     const T = multiply(inv, s2.pose); // mesh 2 -> mesh 1 coordinates
+    const Ti = invert(T); // mesh 1 -> mesh 2 coordinates
     const stack: number[] = [0, 0];
     let budget = 0;
+    const tB3: V[] = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+    const lo: V = [0, 0, 0], hi: V = [0, 0, 0];
     while (stack.length) {
       const j = stack.pop()!, i = stack.pop()!;
+      // node boxes tested both ways (each box transformed into the other mesh's frame): rotated meshes inflate an AABB
       const [c, h] = xfBox(T, b2.min, b2.max, j);
       if (!boxOverlap(bvh, i, c, h, margin)) continue;
+      const [c1, h1] = xfBox(Ti, bvh.min, bvh.max, i);
+      if (!boxOverlap(b2, j, c1, h1, margin)) continue;
       const leafA = bvh.left[i] < 0, leafB = b2.left[j] < 0;
       if (leafA && leafB) {
-        for (let x = bvh.start[i]; x < bvh.start[i] + bvh.count[i]; x++) {
-          bvh.tri(bvh.order[x], tA);
-          for (let y = b2.start[j]; y < b2.start[j] + b2.count[j]; y++) {
-            b2.tri(b2.order[y], tB);
-            if (triTri(tA, [xf(T, tB[0]), xf(T, tB[1]), xf(T, tB[2])])) return true;
+        for (let y = b2.start[j]; y < b2.start[j] + b2.count[j]; y++) {
+          b2.tri(b2.order[y], tB);
+          for (let k = 0; k < 3; k++) tB3[k] = xf(T, tB[k]);
+          for (let a = 0; a < 3; a++) { lo[a] = Math.min(tB3[0][a], tB3[1][a], tB3[2][a]) - margin; hi[a] = Math.max(tB3[0][a], tB3[1][a], tB3[2][a]) + margin; }
+          for (let x = bvh.start[i]; x < bvh.start[i] + bvh.count[i]; x++) {
+            bvh.tri(bvh.order[x], tA);
+            // triangle boxes first: most pairs of a leaf pair are apart
+            if (Math.max(tA[0][0], tA[1][0], tA[2][0]) < lo[0] || Math.min(tA[0][0], tA[1][0], tA[2][0]) > hi[0] || Math.max(tA[0][1], tA[1][1], tA[2][1]) < lo[1] || Math.min(tA[0][1], tA[1][1], tA[2][1]) > hi[1] || Math.max(tA[0][2], tA[1][2], tA[2][2]) < lo[2] || Math.min(tA[0][2], tA[1][2], tA[2][2]) > hi[2]) continue;
+            if (triTri(tA, tB3)) return true;
             // coplanar contact (a robot base standing on its pedestal) can make the traversal explode: past this many
             // triangle tests the meshes are taken as touching
-            if (++budget > 250_000) return true;
+            if (++budget > EXACT_BUDGET) return true;
           }
         }
       } else if (leafA) stack.push(i, b2.left[j], i, b2.right[j]);
@@ -987,7 +1066,7 @@ export function robotCollisionChecker(station: Station, robot: Robot, opts: Coll
       const test = (A: { c: Collider; box: AABB }, B: { c: Collider; box: AABB }) => {
         const state = map ? pairState(map, A.c, B.c) : 'default';
         if (state === 'disabled') return;
-        if (state === 'enabled' ? hardSkip(A.c, B.c) : skipPair(A.c, B.c, o, ignore)) return;
+        if (state === 'map-on' ? samePart(A.c, B.c) : state === 'enabled' ? hardSkip(A.c, B.c) : skipPair(A.c, B.c, o, ignore)) return;
         if (skip && skip(A.c, B.c)) return;
         if (!aabbOverlap(A.box, B.box, margin)) return;
         // exact mesh tests are expensive: reuse the result while neither mesh moved (base link vs its pedestal, two

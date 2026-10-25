@@ -9,14 +9,20 @@ import robomathSrc from '../../python/robodk/robomath.py?raw';
 import robodialogsSrc from '../../python/robodk/robodialogs.py?raw';
 import robofileioSrc from '../../python/robodk/robofileio.py?raw';
 import shimSrc from '../../python/post_shim.py?raw';
+import officialSrc from '../../python/robodk/_official.py?raw';
 
-/** Minimal robodk.robolink for posts running inside the browser: constants + helpers posts commonly touch. */
-const ROBOLINK_STUB = `
-ITEM_TYPE_STATION=1; ITEM_TYPE_ROBOT=2; ITEM_TYPE_FRAME=3; ITEM_TYPE_TOOL=4; ITEM_TYPE_OBJECT=5; ITEM_TYPE_TARGET=6
-ITEM_TYPE_PROGRAM=8; ITEM_TYPE_INSTRUCTION=9; ITEM_TYPE_PROGRAM_PYTHON=10; ITEM_TYPE_MACHINING=11; ITEM_TYPE_FOLDER=17
-INS_TYPE_MOVE=1; INS_TYPE_MOVEC=2; INS_TYPE_CHANGESPEED=3; INS_TYPE_CHANGEFRAME=4; INS_TYPE_CHANGETOOL=5; INS_TYPE_PAUSE=7; INS_TYPE_CODE=9; INS_TYPE_PRINT=10
-MOVE_TYPE_JOINT=1; MOVE_TYPE_LINEAR=2; MOVE_TYPE_CIRCULAR=3
-RUNMODE_SIMULATE=1; RUNMODE_MAKE_ROBOTPROG=3
+/**
+ * Constant assignments (NAME = number / string literal) of the official robolink module: python/robodk/_official.py is
+ * generated from RoboDK's own robolink.py, so ITEM_TYPE_*, INS_TYPE_* (MOVE = 0, MOVEC = 1, ...), MOVE_TYPE_*, RUNMODE_*
+ * carry RoboDK's values inside posts too.
+ */
+export function officialConstants(src: string = officialSrc): string {
+  return src.split(/\r?\n/).filter((l) => /^[A-Z][A-Z0-9_]*\s*=\s*(-?\d+(\.\d+)?|'[^'\\]*'|"[^"\\]*")\s*(#.*)?$/.test(l)).join('\n');
+}
+
+/** Minimal robodk.robolink for posts running inside the browser: RoboDK's constants + helpers posts commonly touch. */
+export const ROBOLINK_STUB = `
+${officialConstants()}
 def import_install(module_name, pip_name=None, rdk=None, upgrade_pip=False):
     import importlib
     return importlib.import_module(module_name)

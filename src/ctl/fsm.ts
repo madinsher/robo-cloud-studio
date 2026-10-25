@@ -26,7 +26,8 @@
  *   state Finish
  *     ok -> done
  *
- * Skill outcomes: `ok` (or done=), `fail` (or fail=), `timeout` (state `timeout S` or binding timeout=; falls back to the
+ * Skill outcomes: `ok` (or done=), `fail` (or fail=), any list given with `outcomes=a,b,c` (the action names the one it ended
+ * with in `node.outcome`), `timeout` (state `timeout S` or binding timeout=; falls back to the
  * fail mapping when unmapped), `canceled` (cancel(); propagates up to the first machine that maps it). A state with no
  * skill and no decision yields `ok`. An outcome without a transition that names an outcome of the enclosing machine
  * ends that machine with it (as in yasmin). The blackboard holds the declared variables, the station signals and the world's
@@ -50,11 +51,20 @@ const WHEN_RE = /^when\s+(?:"([^"]*)"|'([^']*)'|(.+?))\s*-+>\s*([A-Za-z_][\w.-]*
 /** Outcomes a state can produce. */
 export function stateOutcomes(s: FsmState): string[] {
   switch (s.kind) {
-    case 'skill': return [s.action?.done ?? 'ok', s.action?.fail ?? 'fail', ...(s.timeout !== undefined || s.action?.timeout !== undefined ? ['timeout'] : [])];
+    case 'skill': { const named = skillOutcomes(s); return [...(named ?? [s.action?.done ?? 'ok', s.action?.fail ?? 'fail']), ...(s.timeout !== undefined || s.action?.timeout !== undefined ? ['timeout'] : [])]; }
     case 'decision': return [...new Set([...s.when.map((w) => w.outcome), ...(s.otherwise ? [s.otherwise] : [])])];
     case 'machine': return s.machine?.outcomes ?? [];
     case 'pass': return ['ok'];
   }
+}
+/**
+ * Named outcomes of a skill (`do skill=murom.plan outcomes=found,none_left,error`, yasmin states with several outcomes):
+ * the action reports the outcome by setting `node.outcome` before it finishes; without it success / failure map to
+ * the first / last listed outcome.
+ */
+export function skillOutcomes(s: FsmState): string[] | null {
+  const o = s.action?.args.outcomes;
+  return typeof o === 'string' && o.trim() ? o.split(',').map((x) => x.trim()).filter(Boolean) : null;
 }
 export const initialState = (m: FsmMachine): FsmState | undefined => m.states.find((s) => s.initial) ?? m.states[0];
 
@@ -264,7 +274,13 @@ export class FsmExecutor {
       else if (s.kind === 'decision') { const hit = s.when.find((wh) => this.evalFn(wh.expr, this.runner.bb)); o = hit?.outcome ?? s.otherwise ?? null; }
       else if (s.kind === 'skill') {
         if (!f.run) o = s.action?.fail ?? 'fail';
-        else { const st: BTStatus = this.runner.tick(f.run, ctx); if (st === 'success') o = s.action?.done ?? 'ok'; else if (st === 'failure') { o = f.run.timedOut ? 'timeout' : (s.action?.fail ?? 'fail'); if (!f.run.timedOut) this.failed++; } }
+        else {
+          const st: BTStatus = this.runner.tick(f.run, ctx);
+          const named = skillOutcomes(s); const said = (f.run.node as unknown as { outcome?: unknown }).outcome;
+          const pick = (dflt: string) => (typeof said === 'string' && said ? said : named ? (st === 'success' ? named[0] : named[named.length - 1]) : dflt);
+          if (st === 'success') o = pick(s.action?.done ?? 'ok');
+          else if (st === 'failure') { o = f.run.timedOut ? 'timeout' : pick(s.action?.fail ?? 'fail'); if (!f.run.timedOut && !named) this.failed++; }
+        }
       }
       if (o === null) break; // waiting (running skill or decision without a true condition)
       this.resolve(i, o);

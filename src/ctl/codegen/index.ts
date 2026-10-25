@@ -7,6 +7,8 @@
  *  - ros2.ts       ROS 2 packages: rclpy supervisor node, yasmin FSM, BehaviorTree.CPP v4 XML with skill stubs, launch
  *  - interchange.ts PNML, SCXML, NuSMV .smv, UPPAAL XML
  */
+import { fsmToST } from './plc_fsm';
+import { fsmToPlcOpen } from './plc_fsm_sfc';
 import type { Station } from '../../core/items/item';
 import type { ControlKind } from '../model';
 import { robodkStationScript } from './robodk';
@@ -42,7 +44,7 @@ export function controlExports(kind: ControlKind, source: string, name: string, 
     add('pnml', 'PNML (ISO/IEC 15909-2)', () => [petriToPnml(source, name)]);
     add('smv', 'NuSMV / nuXmv model (.smv)', () => [petriToSmv(source, name)]);
   }
-  if (kind === 'fsm') add('scxml', 'SCXML state chart', () => [fsmToScxml(source, name)]);
+  if (kind === 'fsm') { add('st', 'IEC 61131-3 Structured Text + I/O map', () => fsmToST(source, name)); add('sfc', 'PLCopen XML (SFC, flattened hierarchy)', () => [fsmToPlcOpen(source, name)]); add('scxml', 'SCXML state chart', () => [fsmToScxml(source, name)]); }
   if (kind === 'smv') add('smv', 'NuSMV / nuXmv model (.smv)', () => [smvDocToNuSmv(source, name)]);
   void n;
   return out;

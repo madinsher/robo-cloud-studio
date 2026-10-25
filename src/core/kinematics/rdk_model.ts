@@ -158,7 +158,9 @@ export function rdkParamsFromTable(t: ArrayLike<number>, name = 'Robot'): RdkRob
     lower: range(600, dof), upper: range(620, dof), home: range(680, dof), robotClass: at(20),
   };
   const [vl, al, rnd, vj, aj] = range(120, 5);
-  if (vl > 0 && al > 0 && vj > 0 && aj > 0) out.motion = { speedLinear: vl, accelLinear: al, rounding: rnd, speedJoints: vj, accelJoints: aj };
+  // no joint speed / acceleration in the table (0: ABB IRB 6640, KUKA KR 120 of the Library): RoboDK moves the joints at
+  // 2·v deg/s and 2·a deg/s² (measured with Item.Update() on 03.h / 05.c)
+  if (vl > 0 && al > 0) out.motion = { speedLinear: vl, accelLinear: al, rounding: rnd, speedJoints: vj > 0 ? vj : 2 * vl, accelJoints: aj > 0 ? aj : 2 * al };
   return out;
 }
 

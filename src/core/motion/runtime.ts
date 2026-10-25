@@ -19,7 +19,7 @@ import { Robot } from '../items/robot';
 import { Program, Instruction, InstructionData, MoveInstruction } from '../items/program';
 import { EventBus } from '../events';
 import { Mat4, identity, multiply, invert, fromArray } from '../math/pose';
-import { motionGroupFor, planChain, ChainMoveSpec, MotionSettings, MotionGroup, PlannedTrajectory } from './planner';
+import { motionGroupFor, planChain, ChainMoveSpec, MotionSettings, MotionGroup, PlannedTrajectory, updateModelOf, updateMoveTime } from './planner';
 import type { Trajectory, TrajectorySample } from './trajectory';
 import { getMobileMotionPlanner, Pose2D } from './mobile_hook';
 
@@ -200,6 +200,8 @@ export interface RunHandle {
   instructionIndex?: number;
   /** Run that started this one with a thread instruction. */
   parentId?: string;
+  /** RoboDK Item.Update() cycle-time estimate of this run (moves rest to rest at the robot motion state, pauses; see planner UpdateModel). */
+  estimate?: number;
 }
 export interface StartOptions {
   robot?: Robot | Item | null;
@@ -232,6 +234,10 @@ export interface RecordedStep {
   t1: number;
   apply?: () => void;
   runId: string;
+  /** Item.Update() time of this move (RoboDK cycle-time model, see planner UpdateModel). */
+  estimate?: number;
+  /** Joints at the move's target (blended moves pass beside it). */
+  qTarget?: number[];
 }
 
 /** Hooks the program simulator uses to mirror state changes it replays. */
@@ -250,7 +256,13 @@ interface RobotRunState {
 }
 /** Placement restored by a RoboDK "Replace objects" event: object id, parent frame id and pose relative to it (16 numbers, column-major). */
 export interface ObjectPlacement { id: string; parentId?: string | null; pose?: number[]; visible?: boolean }
-interface Frame { program: Program; list: Instruction[]; pc: number; robot: Robot | null; mover: Item | null; repeat: number }
+interface Frame {
+  program: Program; list: Instruction[]; pc: number; robot: Robot | null; mover: Item | null; repeat: number;
+  /** Called program of another robot than its caller's: its first move starts, for Item.Update(), from that robot's joints at the start (RoboDK does not carry other robots' simulated state from call to call). */
+  foreign?: boolean;
+  /** The program failed: its remaining instructions do not count for Item.Update(). */
+  noEstimate?: boolean;
+}
 interface MotionSeg { t0: number; t1: number; traj?: Trajectory; group?: MotionGroup; mobile?: { item: Item; sample: (t: number) => Pose2D }; ins?: Instruction; index?: number }
 type Block =
   | { kind: 'motion'; t1: number; segs: MotionSeg[]; events: Array<{ t: number; fn: () => void }>; ei: number; cur?: number; fail?: { ins: Instruction; message: string } }
@@ -258,7 +270,13 @@ type Block =
   | { kind: 'cond'; test: () => boolean; names: string[]; deadline: number; label: string; ins: Instruction; step?: RecordedStep }
   | { kind: 'script'; state: { done: boolean; error?: unknown; at?: number }; ins: Instruction | null; step?: RecordedStep }
   | { kind: 'user'; step?: RecordedStep };
-interface Ctx { handle: RunHandle; frames: Frame[]; cursor: number; block: Block | null; robot: Robot | null; resolve: (h: RunHandle) => void; parent?: Ctx; children: Ctx[] }
+interface Ctx {
+  handle: RunHandle; frames: Frame[]; cursor: number; block: Block | null; robot: Robot | null; resolve: (h: RunHandle) => void; parent?: Ctx; children: Ctx[];
+  /** Robots this run drives (its own moves and those of the programs it calls; threads are runs of their own). */
+  holds: Set<Robot>;
+  /** Item.Update() estimate accumulated by this run (calls included, threads are runs of their own). */
+  estimate: number;
+}
 
 const PASSTHROUGH = new Set(['speed', 'rounding', 'print', 'io', 'signal']);
 const CHAIN_MAX = 400;
@@ -359,7 +377,9 @@ export class StationRuntime {
   /** Robot state that persists across program calls and runs (RoboDK: speed, rounding, tool and frame belong to the robot). */
   robotState(robot: Robot): RobotRunState {
     let s = this.rstates.get(robot);
-    if (!s) this.rstates.set(robot, (s = { settings: { ...robot.motion }, toolId: robot.activeToolId, frameId: robot.activeFrameId }));
+    // a robot imported from RoboDK keeps RoboDK's rule from the start: Cartesian targets are relative to the active
+    // reference frame even before a Set Ref. (01.c DrillingPart run alone is invalid in RoboDK: robot-base frame)
+    if (!s) this.rstates.set(robot, (s = { settings: { ...robot.motion }, toolId: robot.activeToolId, frameId: robot.activeFrameId, frameSet: robot.params.rdkClass !== undefined && !!robot.activeFrameId }));
     return s;
   }
 
@@ -374,7 +394,9 @@ export class StationRuntime {
     const done = new Promise<RunHandle>((r) => (resolve = r));
     const handle: RunHandle = { id: `run${++runCounter}`, program, robot, status: 'queued', done };
     const arm = robot instanceof Robot ? robot : null;
-    const c: Ctx = { handle, frames: [], cursor: this.time, block: null, robot: arm, resolve, children: [] };
+    // a run holds the robots it moves, not the robot its program is linked to: RoboDK 06.e StartSimulation (UR10 A)
+    // only calls TakeConveyor (UR10 B) while its thread FeedConveyor drives UR10 A
+    const c: Ctx = { handle, frames: [], cursor: this.time, block: null, robot: arm, resolve, children: [], holds: program instanceof Program ? this.movedRobots(program, arm) : new Set(), estimate: 0 };
     if (program instanceof Program) {
       const fr = this.frameFor(program, arm);
       if (opts.fromIndex && opts.fromIndex > 0) this.skipTo(fr, Math.min(opts.fromIndex, fr.list.length));
@@ -387,9 +409,32 @@ export class StationRuntime {
     }
     if (opts.startJoints && arm) (c as any).startJoints = opts.startJoints;
     this.runs.push(handle);
-    if (arm && this.robotBusy(arm)) this.queue.push(c);
+    if (this.holdsBusy(c)) this.queue.push(c);
     else this.begin(c);
     return handle;
+  }
+
+  /** Robots moved by `program` run on `robot` (own moves, calls, loops, branches; threads excluded). */
+  private movedRobots(program: Program, robot: Robot | null, out = new Set<Robot>(), seen = new Set<Program>()): Set<Robot> {
+    if (seen.has(program) || seen.size > 256) return out;
+    seen.add(program);
+    const r = programRobot(program) ?? robot;
+    const arm = r instanceof Robot ? r : robot;
+    for (const ins of program.instructions()) {
+      const d = ins.data;
+      if ((d.kind === 'move' || d.kind === 'jointPath') && arm) out.add(arm);
+      let sub: Item | null = null;
+      if (d.kind === 'call') sub = (d.programId ? this.station.findById(d.programId) : null) ?? (d.programName ? this.findProgram(parseCallText(d.programName).name) : null);
+      else if (d.kind === 'code' && d.asFunctionCall) sub = this.findProgram(parseCallText(d.code).name);
+      else if (d.kind === 'loop') sub = d.bodyProgramId ? this.station.findById(d.bodyProgramId) : null;
+      else if (d.kind === 'if') { for (const id of [d.thenProgramId, d.elseProgramId]) { const b = id ? this.station.findById(id) : null; if (b instanceof Program) this.movedRobots(b, arm, out, seen); } }
+      if (sub instanceof Program) this.movedRobots(sub, arm, out, seen);
+    }
+    return out;
+  }
+  private holdsBusy(c: Ctx): boolean {
+    for (const r of c.holds) if (this.robotBusy(r)) return true;
+    return false;
   }
 
   /** "Run from here": robot state instructions before `index` take effect (no motion, no IO). */
@@ -419,7 +464,7 @@ export class StationRuntime {
   }
 
   private robotBusy(r: Robot): boolean {
-    return this.ctxs.some((c) => c.robot === r && c.handle.status === 'running');
+    return this.ctxs.some((c) => c.holds.has(r) && c.handle.status === 'running');
   }
 
   private begin(c: Ctx): void {
@@ -443,6 +488,7 @@ export class StationRuntime {
     c.handle.status = status;
     if (error) c.handle.error = error;
     c.handle.endTime = c.cursor;
+    c.handle.estimate = c.estimate;
     c.block = null;
     if (c.robot) c.robot.state.moving = false;
     this.ctxs = this.ctxs.filter((x) => x !== c);
@@ -451,7 +497,7 @@ export class StationRuntime {
     c.resolve(c.handle);
     // start queued runs whose robot became free
     for (const q of [...this.queue]) {
-      if (q.robot && this.robotBusy(q.robot)) continue;
+      if (this.holdsBusy(q)) continue;
       this.queue = this.queue.filter((x) => x !== q);
       q.cursor = Math.max(q.cursor, c.cursor);
       this.begin(q);
@@ -662,6 +708,9 @@ export class StationRuntime {
 
   private fail(c: Ctx, ins: Instruction, message: string): void {
     this.problem(c, ins, message, 'error');
+    // RoboDK Item.Update() stops counting a program at its failing instruction; a caller goes on after the call
+    const top = c.frames[c.frames.length - 1];
+    if (top) top.noEstimate = true;
     if (this.continueOnError) return;
     const prog = ins.parent instanceof Program ? ins.parent : null;
     this.finish(c, 'error', { message, instructionIndex: prog ? prog.instructions().indexOf(ins) : -1, instructionId: ins.id, program: prog?.name });
@@ -713,6 +762,7 @@ export class StationRuntime {
         const traj = new PlannedTrajectory(samples, [], length);
         const group = new MotionGroup(robot, []);
         this.distance += length;
+        this.addEstimate(c, tt);
         this.record(c, ins, robot, c.cursor, c.cursor + tt, { trajectory: traj, group });
         c.block = { kind: 'motion', t1: c.cursor + tt, segs: [{ t0: c.cursor, t1: c.cursor + tt, traj, group }], events: [], ei: 0 };
         return;
@@ -751,6 +801,7 @@ export class StationRuntime {
           return;
         }
         const t1 = c.cursor + d.timeMs / 1000;
+        this.addEstimate(c, d.timeMs / 1000);
         c.block = { kind: 'until', t: t1, step: this.record(c, ins, robot, c.cursor, t1) };
         return;
       }
@@ -768,7 +819,7 @@ export class StationRuntime {
       }
       case 'wait': {
         fr.pc++;
-        if (d.what === 'time') { const t1 = c.cursor + Math.max(0, d.timeMs ?? 0) / 1000; c.block = { kind: 'until', t: t1, step: this.record(c, ins, robot, c.cursor, t1) }; return; }
+        if (d.what === 'time') { const t1 = c.cursor + Math.max(0, d.timeMs ?? 0) / 1000; this.addEstimate(c, t1 - c.cursor); c.block = { kind: 'until', t: t1, step: this.record(c, ins, robot, c.cursor, t1) }; return; }
         if (d.what === 'signal' && d.signal) {
           const name = d.signal, value = d.value ?? true;
           const timeout = d.timeMs !== undefined && d.timeMs > 0 ? d.timeMs / 1000 : Infinity;
@@ -849,7 +900,8 @@ export class StationRuntime {
         }
         if (!(sub instanceof Program)) return this.fail(c, ins, `Thread program ${d.programName ?? d.programId} not found`);
         const subRobot = programRobot(sub);
-        if (subRobot && robot && subRobot === robot) this.problem(c, ins, 'Thread uses the same robot as the main program', 'warning');
+        // the thread waits for the robot only when this run moves it too (06.e StartSimulation only calls UR10 B)
+        if (subRobot instanceof Robot && c.holds.has(subRobot)) this.problem(c, ins, 'Thread uses the same robot as the main program', 'warning');
         this.record(c, ins, robot, c.cursor, c.cursor);
         this.nowCursor = c.cursor;
         const saved = this.time;
@@ -875,6 +927,7 @@ export class StationRuntime {
         const mobile = { item: mob, sample: plan.sample, duration: dur };
         this.record(c, ins, robot, c.cursor, c.cursor + dur, { mobile });
         this.distance += Math.hypot(plan.sample(dur).x - start.x, plan.sample(dur).y - start.y);
+        this.addEstimate(c, dur);
         c.block = { kind: 'motion', t1: c.cursor + dur, segs: [{ t0: c.cursor, t1: c.cursor + dur, mobile }], events: [], ei: 0 };
         return;
       }
@@ -912,7 +965,9 @@ export class StationRuntime {
   private pushCall(c: Ctx, fr: Frame, ins: Instruction, sub: Program): void {
     if (c.frames.some((f) => f.program === sub)) return this.fail(c, ins, `Recursive call to ${sub.name}`);
     if (c.frames.length > 32) return this.fail(c, ins, 'Recursion too deep');
-    c.frames.push(this.frameFor(sub, fr.robot));
+    const f = this.frameFor(sub, fr.robot);
+    if (f.robot && f.robot !== fr.robot) f.foreign = true;
+    c.frames.push(f);
   }
 
   private runnersFor(): ScriptRunner[] { return [...this.runners, ...globalRunners]; }
@@ -1026,7 +1081,7 @@ export class StationRuntime {
       break;
     }
     const group = motionGroupFor(robot, specs.flatMap((s) => [s.target, s.via]));
-    const res = planChain(group, group.current(), specs);
+    const res = planChain(group, group.current(), specs, { estimate: updateModelOf(robot) });
     const t0 = c.cursor;
     // a failing move is not executed: the robot stops at the end of the previous move (RoboDK stops the program at the
     // instruction it cannot execute)
@@ -1036,8 +1091,17 @@ export class StationRuntime {
       const m = res.moves[k];
       segs.push({ t0: t0 + m.t0, t1: t0 + m.t1, traj: m.trajectory, group, ins: chainIns[k], index: chainIdx[k] });
       this.distance += m.trajectory.length;
+      let est = m.estimate ?? 0;
+      if (k === 0 && fr.foreign) {
+        // RoboDK Item.Update(): a call into a program of another robot starts from that robot's joints at the start of
+        // the update, not from where an earlier call left it (06.d Stamp1: ToolLoad 0 s, UnloadMachine full)
+        fr.foreign = false;
+        const q0 = this.home?.snap.jointsOf(robot);
+        if (q0 && res.moves.length) est = this.estimateFrom(robot, q0, specs[0], m, tool);
+      }
+      this.addEstimate(c, est);
       for (const w of m.warnings) this.warnOnce(c, chainIns[k], `${fr.program.id}:${w}`, w);
-      this.record(c, chainIns[k], robot, t0 + m.t0, t0 + m.t1, { trajectory: m.trajectory, group });
+      this.record(c, chainIns[k], robot, t0 + m.t0, t0 + m.t1, { trajectory: m.trajectory, group, estimate: m.estimate, qTarget: m.qTarget });
       if (k > 0) this.executed++;
     }
     const events: Array<{ t: number; fn: () => void }> = [];
@@ -1067,6 +1131,21 @@ export class StationRuntime {
       st.settings = settingsAfterLast;
       c.block = { kind: 'motion', t1: t0 + res.duration, segs, events, ei: 0 };
     }
+  }
+
+  /** Add to the Item.Update() estimate of a run unless the executing program (or a caller) already failed. */
+  private addEstimate(c: Ctx, dt: number): void {
+    if (!c.frames.some((f) => f.noEstimate)) c.estimate += dt;
+  }
+
+  /** Item.Update() time of a planned move re-measured from other start joints (rest to rest). */
+  private estimateFrom(robot: Robot, q0: number[], spec: ChainMoveSpec, m: { trajectory: Trajectory; qEnd: number[] }, tool: Mat4): number {
+    const qb = m.qEnd.slice(0, robot.dof), qa = q0.slice(0, robot.dof);
+    const travel = qa.reduce((a, v, i) => Math.max(a, Math.abs((qb[i] ?? v) - v)), 0);
+    const model = updateModelOf(robot);
+    if (spec.data.moveType === 'MoveJ') return updateMoveTime(model, false, 0, travel);
+    const pa = robot.solveFK(qa, tool), pb = robot.solveFK(qb, tool);
+    return updateMoveTime(model, true, Math.hypot(pb[12] - pa[12], pb[13] - pa[13], pb[14] - pa[14]), travel);
   }
 
   /** Robot settings after executing the speed/rounding instructions between list indices [from, to). */
@@ -1273,7 +1352,8 @@ export function recordProgram(station: Station, program: Program, opts: { startJ
   for (const s of rt.recorded) if (s.trajectory?.samples.length && s.robot) endJoints.set(s.robot.id, s.trajectory.samples[s.trajectory.samples.length - 1].joints);
   const mainEnd = (main as RunHandle | null)?.endTime ?? 0;
   const total = Math.max(mainEnd, ...rt.runs.map((h) => h.endTime ?? 0), ...rt.recorded.map((s) => s.t1));
-  return { runtime: rt, steps: rt.recorded, problems: rt.problems, duration: mainEnd, totalDuration: total, distance: rt.distance, executed: rt.executed, endJoints, snapshot: snap };
+  const updateTime = (main as RunHandle | null)?.estimate ?? 0;
+  return { runtime: rt, steps: rt.recorded, problems: rt.problems, duration: mainEnd, totalDuration: total, distance: rt.distance, executed: rt.executed, endJoints, snapshot: snap, updateTime };
 }
 
 export { MotionGroup };

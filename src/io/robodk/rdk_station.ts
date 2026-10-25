@@ -426,10 +426,12 @@ function decodeProgram(r: RdkBytes, pp: Pending['programs'][number], at: (ref: n
         const sub = r.u32(d);
         const s = r.str(d + 4, 1 << 20);
         const text = s?.text ?? label.replace(/^(Call|Run)\s+/i, '');
-        const callee = text.match(/^\s*([^\s(]+)\s*(\((.*)\))?\s*$/);
-        const name = callee ? callee[1] : text;
-        const found = callables.get(name) ?? null;
-        const target = callee && !callee[2] ? found : null;
+        // a program or Python item named exactly like the whole text ("Pick 1", 06.f) wins: RoboDK calls it by name
+        const whole = callables.get(text.trim()) ?? null;
+        const callee = whole ? null : text.match(/^\s*([^\s(]+)\s*(\((.*)\))?\s*$/);
+        const name = whole ? text.trim() : callee ? callee[1] : text;
+        const found = whole ?? callables.get(name) ?? null;
+        const target = whole ?? (callee && !callee[2] ? found : null);
         const py = found && found.type === ItemType.PROGRAM_PYTHON ? found : null;
         if (sub === 0) data = target instanceof Program ? { kind: 'call', programId: target.id, programName: target.name } : { kind: 'code', code: text, asFunctionCall: true };
         else if (sub === 1) data = { kind: 'code', code: text, asFunctionCall: false };

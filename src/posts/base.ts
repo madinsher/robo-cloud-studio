@@ -326,7 +326,8 @@ export function compileForPost(station: Station, program: Program, options: Comp
         events.push({ kind: 'pause', timeMs: d.timeMs });
         break;
       case 'io':
-        events.push(d.wait ? { kind: 'waitDI', io: d.io, value: d.value, timeoutMs: d.timeoutMs ?? -1 } : { kind: 'setDO', io: d.io, value: d.value });
+        // analog outputs (RoboDK "Set AO") go to the post's setAO (vendor analog syntax); analog waits use waitDI like RoboDK
+        events.push(d.wait ? { kind: 'waitDI', io: d.io, value: d.value, timeoutMs: d.timeoutMs ?? -1 } : d.analog ? { kind: 'setAO', io: d.io, value: typeof d.value === 'boolean' ? (d.value ? 1 : 0) : d.value } : { kind: 'setDO', io: d.io, value: d.value });
         break;
       case 'code': {
         // a function call naming a program of the station is a program call (RoboDK "Call program")

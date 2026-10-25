@@ -239,9 +239,31 @@ export class SceneRenderer {
     const c = box.getCenter(new THREE.Vector3());
     const size = Math.max(box.getSize(new THREE.Vector3()).length(), 1000);
     this.controls.target.copy(c);
+    this.camera.up.set(0, 0, 1);
+    this.camera.fov = 45;
     this.camera.position.set(c.x + size * 0.7, c.y - size * 0.9, c.z + size * 0.6);
     this.camera.far = Math.max(1e6, size * 20);
     this.camera.updateProjectionMatrix();
+    this.dirty = true;
+  }
+
+  /**
+   * Place the 3D view camera (eye / look-at point / up, mm). `fovDeg` along `fovAxis` (a Webots Viewpoint's fieldOfView is
+   * horizontal) sets the view angle; fitAll restores the default 45° vertical.
+   */
+  lookAt(eye: ArrayLike<number>, target: ArrayLike<number>, up: ArrayLike<number> = [0, 0, 1], fovDeg?: number, fovAxis: 'horizontal' | 'vertical' = 'vertical'): void {
+    this.camera.position.set(eye[0], eye[1], eye[2]);
+    this.camera.up.set(up[0], up[1], up[2]).normalize();
+    this.controls.target.set(target[0], target[1], target[2]);
+    if (fovDeg && fovDeg > 0 && fovDeg < 179) {
+      const half = (fovDeg * Math.PI) / 360;
+      this.camera.fov = fovAxis === 'horizontal' ? (2 * Math.atan(Math.tan(half) / (this.camera.aspect || 1)) * 180) / Math.PI : fovDeg;
+    }
+    const d = Math.hypot(eye[0] - target[0], eye[1] - target[1], eye[2] - target[2]);
+    this.camera.far = Math.max(1e6, d * 50);
+    this.camera.updateProjectionMatrix();
+    this.camera.lookAt(this.controls.target);
+    this.controls.update();
     this.dirty = true;
   }
 
@@ -344,7 +366,8 @@ export class SceneRenderer {
       live.add(item.id);
       this.ensureEntry(item);
     }
-    for (const id of [...this.entries.keys()]) if (!live.has(id)) this.removeEntry(this.entries.get(id)!.item);
+    // removeEntry drops a whole subtree: an id listed here may already be gone with its parent
+    for (const id of [...this.entries.keys()]) { const e = this.entries.get(id); if (e && !live.has(id)) this.removeEntry(e.item); }
     this.structural.clear();
     this.dirty = true;
   }
@@ -381,7 +404,7 @@ export class SceneRenderer {
 
   private signature(item: Item): string {
     if (item instanceof Robot) return `robot:${item.chain.joints.length}:${item.chain.links.map((l) => l.visuals.length).join(',')}:${item.color}:${this.showReach}`;
-    if (item instanceof Tool || item instanceof SceneObject) return `obj:${JSON.stringify((item as SceneObject).geometry)}:${item.color}:${(item as any).curves?.length}:${(item as any).points?.length}`;
+    if (item instanceof Tool || item instanceof SceneObject) return `obj:${JSON.stringify((item as SceneObject).geometry)}:${item.color}:${(item as any).curves?.length}:${(item as any).points?.length}:${JSON.stringify(item.params.display ?? null)}`;
     if (item instanceof MobileRobot) return `mob:${JSON.stringify(item.kin.footprint)}:${JSON.stringify(item.geometry)}:${item.color}`;
     if (item instanceof FieldItem) return `field:${JSON.stringify(item.polygon)}:${item.rows().map((r) => r.plants.length + ':' + r.plants.reduce((s, p) => s + p.fruit.filter((f) => f.picked).length, 0)).join(',')}:${item.crop.crop}`;
     if (item instanceof CropRow) return `row`;
@@ -426,9 +449,20 @@ export class SceneRenderer {
       root.add(triad);
     } else if (item instanceof SceneObject) {
       const g = buildGeometry(item.geometry, this.assets, item.color ?? '#9aa3ad');
+      const disp = item.params.display as { pointSize?: number; color?: string; alpha?: number } | undefined;
+      if (disp?.pointSize && disp.pointSize > 0) {
+        // RoboDK setParam('Display', 'POINTSIZE=4 COLOR=#AARRGGBB'): the object is drawn as a point cloud of its vertices
+        root.add(pointCloudOf(g, disp.pointSize, disp.color ?? item.color ?? '#9aa3ad', disp.alpha ?? 1));
+        g.traverse((o) => { if ((o as THREE.Mesh).isMesh) o.visible = false; });
+      }
       root.add(g);
       for (const c of item.curves) root.add(polylineObject(c.points, 0xffcc00));
-      if (item.points.length > 50) {
+      if (disp?.pointSize && item.points.length) {
+        const n = item.points.length; const pos = new Float32Array(n * 3);
+        item.points.forEach((p, i) => { pos[i * 3] = p.point[0]; pos[i * 3 + 1] = p.point[1]; pos[i * 3 + 2] = p.point[2]; });
+        const pg = new THREE.BufferGeometry(); pg.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+        root.add(new THREE.Points(pg, new THREE.PointsMaterial({ size: disp.pointSize, sizeAttenuation: false, color: new THREE.Color(disp.color ?? '#9aa3ad'), transparent: (disp.alpha ?? 1) < 1, opacity: disp.alpha ?? 1 })));
+      } else if (item.points.length > 50) {
         // point cloud (imported .pcd/.ply or vision export): coloured by height
         const n = item.points.length; const pos = new Float32Array(n * 3); const col = new Float32Array(n * 3);
         let zMin = Infinity, zMax = -Infinity; for (const p of item.points) { zMin = Math.min(zMin, p.point[2]); zMax = Math.max(zMax, p.point[2]); }
@@ -454,7 +488,7 @@ export class SceneRenderer {
       /* rendered by the field */
     } else if (item instanceof MapItem) this.buildMap(item, e);
     else if (item instanceof ZoneItem) {
-      const color = item.kind === 'nogo' ? 0xe03131 : item.kind === 'charging' ? 0x1c7ed6 : item.kind === 'headland' ? 0xf59f00 : item.kind === 'gnss_denied' ? 0x9c36b5 : 0x2f9e44;
+      const color = item.kind === 'nogo' ? 0xe03131 : item.kind === 'charging' ? 0x1c7ed6 : item.kind === 'headland' ? 0xf59f00 : item.kind === 'gnss_denied' ? 0x9c36b5 : item.kind === 'lane' ? 0xfab005 : item.kind === 'depot' ? 0x7048e8 : 0x2f9e44;
       root.add(polygonMesh(item.polygon, color, 0.25, 2));
       root.add(polylineObject(item.polygon, color, true, 3));
     } else if (item instanceof PathItem) {
@@ -962,3 +996,29 @@ function hasScene(item: Item): boolean {
 }
 
 export { Program };
+
+/**
+ * Point cloud of every mesh vertex under `obj` (positions in `obj`'s frame), drawn with a fixed screen size in px like
+ * RoboDK's POINTSIZE display mode. userData.pointCloud marks it (tests / picking).
+ */
+export function pointCloudOf(obj: THREE.Object3D, size: number, color: string, alpha = 1): THREE.Points {
+  obj.updateMatrixWorld(true);
+  const inv = new THREE.Matrix4().copy(obj.matrixWorld).invert();
+  const chunks: Float32Array[] = [];
+  const v = new THREE.Vector3();
+  obj.traverse((o) => {
+    const m = o as THREE.Mesh;
+    if (!m.isMesh || !m.geometry?.attributes?.position) return;
+    const pos = m.geometry.attributes.position as THREE.BufferAttribute;
+    const rel = new THREE.Matrix4().multiplyMatrices(inv, m.matrixWorld);
+    const out = new Float32Array(pos.count * 3);
+    for (let i = 0; i < pos.count; i++) { v.fromBufferAttribute(pos, i).applyMatrix4(rel); out[i * 3] = v.x; out[i * 3 + 1] = v.y; out[i * 3 + 2] = v.z; }
+    chunks.push(out);
+  });
+  const all = new Float32Array(chunks.reduce((n, c) => n + c.length, 0));
+  let k = 0; for (const c of chunks) { all.set(c, k); k += c.length; }
+  const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.BufferAttribute(all, 3));
+  const pts = new THREE.Points(g, new THREE.PointsMaterial({ size, sizeAttenuation: false, color: new THREE.Color(color), transparent: alpha < 1, opacity: alpha }));
+  pts.userData.pointCloud = true;
+  return pts;
+}

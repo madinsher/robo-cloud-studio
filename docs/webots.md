@@ -64,6 +64,9 @@ Every import returns a `report` (one line per approximation or unsupported featu
 * **Orchard** `upgradeOrchard`: tree Solids grouped into `FieldItem`s with `CropRow`s; apples of the tree geometry become
   fruit of the plant records.
 
+* **MURKA retail mission**: `buildMurkaRetailStation` / `runMurkaRetailMission` (src/murka/retail) build on these
+  overlays and reproduce the whole МУРОМ scenario (navigation, manipulation, perception, FSM) — docs/murka-retail.md.
+
 ## Scripted fleet player (MURKA Mission B)
 
 `src/io/webots/scripted_fleet.ts` is a port of the agromarca `garden_supervisor/scripted_fleet.py` (v2): the same

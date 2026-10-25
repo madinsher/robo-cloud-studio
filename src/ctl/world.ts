@@ -59,3 +59,16 @@ export function makeStationWorld(sh: StationHost, opts: { inFleet?: (r: MobileRo
     stop: () => { sh.programs.stopAll(); for (const r of robots()) if (mobiles.has(r.id)) { r.state.path = null; r.state.v = 0; r.state.status = 'idle'; } },
   };
 }
+
+/**
+ * Station-specific FSM executors: a domain module (the MURKA retail robot, src/murka/retail) can run `fsm` documents
+ * whose skills it implements (`skill=murom.scan` …) with its own simulation as the executor world. The Control tab's
+ * "Run on station" asks the providers first; null = not handled (the generic station world is used).
+ */
+export type StationFsmProvider = (station: Station, source: string, log: (m: string) => void) => { exec: import('./fsm').FsmExecutor; stop?(): void } | null;
+const fsmProviders: StationFsmProvider[] = [];
+export function registerStationFsmProvider(p: StationFsmProvider): () => void { fsmProviders.push(p); return () => { const i = fsmProviders.indexOf(p); if (i >= 0) fsmProviders.splice(i, 1); }; }
+export function stationFsmExecutor(station: Station, source: string, log: (m: string) => void): { exec: import('./fsm').FsmExecutor; stop?(): void } | null {
+  for (const p of fsmProviders) { const r = p(station, source, log); if (r) return r; }
+  return null;
+}

@@ -23,7 +23,8 @@ import type { Program } from '../core/items/program';
 import type { Target } from '../core/items/item';
 import type { Trajectory } from '../core/motion/trajectory';
 import { MapItem } from '../mobile/items';
-import { followPath, stepMobile } from '../mobile/controller';
+import { followPath, stepMobile, powerDraw } from '../mobile/controller';
+import { planAndFollow, NavResult } from '../mobile/navigate';
 import { planPath } from '../mobile/planner';
 import { ProgramBackend, ProgramRunHandle, planArmMove, robotForTarget, sampleAt, carryAttachedObjects } from './host';
 import { invert } from '../core/math/pose';
@@ -128,7 +129,12 @@ export function gotoPath(station: Station, robot: MobileRobot, goal: [number, nu
 
 export interface StationWorldOptions { robot: MobileRobot; station: Station; /** seconds for timed actions */ durations?: Partial<Record<'grasp' | 'place' | 'dock' | 'stow' | 'reach', number>>; humanPosition?: () => [number, number] | null; /** arm programs replacing the timed skills (a mobile manipulator: Reach / Stow / Grasp / Place programs of its arm) */ skills?: Partial<Record<'reach' | 'stow' | 'grasp' | 'place', (ctx: TickContext, args: Record<string, unknown>, node: BTNode) => BTStatus | void>> }
 
-/** Bind BT actions to a mobile robot in the station: goto zone=<name>, dock, grasp, place, stow, reach, halt, wait seconds=, set key=value, event emit=<uncontrollable event>. */
+/**
+ * Bind BT actions to a mobile robot in the station: goto zone=<name>, dock, grasp, place, stow, reach, halt, wait seconds=,
+ * set key=value, event emit=<uncontrollable event>. `goto` plans with planAndFollow (I8: footprint- / drive-aware path on
+ * the map and the crop obstacles, simulated with the drive model) and plays that trajectory; a planner registered with
+ * registerGotoPlanner replaces it by its waypoints followed with the path tracker.
+ */
 export function stationBindings(o: StationWorldOptions): WorldBindings & { stepRobot(dt: number): void } {
   const { robot, station } = o; const dur = { grasp: 4, place: 3, dock: 5, stow: 2, reach: 2, ...(o.durations ?? {}) };
   const timers = new Map<string, number>();
@@ -137,6 +143,8 @@ export function stationBindings(o: StationWorldOptions): WorldBindings & { stepR
   const timed = (key: string, seconds: number, ctx: TickContext, node: BTNode, onDone?: () => void): BTStatus => { const k = `${key}#${node.id}`; if (node.status !== 'running') timers.set(k, ctx.time); if (ctx.time - (timers.get(k) ?? ctx.time) >= seconds) { timers.delete(k); onDone?.(); return 'success'; } return 'running'; };
   const pending: string[] = [];
   let arrivedLast = false;
+  /** goto in progress: the planned + simulated drive (I8) being played. */
+  let drive: { nav: NavResult; t: number } | null = null;
   /** A skill run by an arm program (o.skills); null when the skill has no program (the timed stand-in is used). */
   const viaArm = (name: 'reach' | 'stow' | 'grasp' | 'place', ctx: TickContext, args: Record<string, unknown>, node: BTNode, onOk: () => void, onFail?: () => void): BTStatus | null => {
     const h = o.skills?.[name]; if (!h) return null;
@@ -156,12 +164,24 @@ export function stationBindings(o: StationWorldOptions): WorldBindings & { stepR
       goto: (ctx, args, node) => {
         const name = String(args.zone ?? args.target ?? ''); const z = zoneByName(name);
         if (!z) { ctx.bb.error = `zone ${name} not found`; return 'failure'; }
-        if (node.status !== 'running') { const path = gotoPath(station, robot, z.centroid()); if (!path) { ctx.bb.error = `no collision-free path to ${name}`; ctx.log?.(String(ctx.bb.error)); return 'failure'; } followPath(robot, path); return 'running'; }
-        if (robot.state.path) return 'running';
+        if (node.status !== 'running') {
+          drive = null;
+          if (!gotoPlanner) {
+            // I8: footprint- and drive-aware plan on the station's collision world, simulated with the drive model;
+            // the simulated trajectory is played on the robot (no straight line through obstacles)
+            const c = z.centroid();
+            const nav = planAndFollow(station, robot, { x: c[0], y: c[1] });
+            if (!nav.ok) { ctx.bb.error = `no collision-free path to ${name}: ${nav.error ?? ''}`; ctx.log?.(String(ctx.bb.error)); return 'failure'; }
+            drive = { nav, t: 0 }; robot.state.path = null; robot.state.status = 'moving';
+            return 'running';
+          }
+          const path = gotoPath(station, robot, z.centroid()); if (!path) { ctx.bb.error = `no collision-free path to ${name}`; ctx.log?.(String(ctx.bb.error)); return 'failure'; } followPath(robot, path); return 'running';
+        }
+        if (drive || robot.state.path) return 'running';
         if (typeof args.arrive === 'string') pending.push(args.arrive);
         return z.contains(robot.state.x, robot.state.y) || Math.hypot(robot.state.x - z.centroid()[0], robot.state.y - z.centroid()[1]) < 600 ? 'success' : 'failure';
       },
-      halt: () => { robot.state.path = null; robot.state.v = 0; robot.state.omega = 0; robot.state.status = 'idle'; return 'success'; },
+      halt: () => { drive = null; robot.state.path = null; robot.state.v = 0; robot.state.omega = 0; robot.state.status = 'idle'; return 'success'; },
       wait: (ctx, args, node) => timed('wait', Number(args.seconds ?? 1), ctx, node),
       dock: (ctx, _a, node) => timed('dock', dur.dock, ctx, node, () => { robot.state.status = 'charging'; }),
       undock: () => { robot.state.status = 'idle'; return 'success'; },
@@ -175,8 +195,22 @@ export function stationBindings(o: StationWorldOptions): WorldBindings & { stepR
       select_target: (ctx) => ((ctx.bb.targets as number) > 0 ? 'success' : 'failure'),
       refine_pose: (ctx, _a, node) => timed('refine', 1, ctx, node),
     },
-    halt: { goto: () => { robot.state.path = null; robot.state.v = 0; robot.state.status = 'idle'; } },
-    stepRobot: (dt) => { const vmax = robot.params.vmaxOverride as number | undefined; stepMobile(robot, dt, vmax ? { speed: vmax * 1000 } : {}); },
+    halt: { goto: () => { drive = null; robot.state.path = null; robot.state.v = 0; robot.state.status = 'idle'; } },
+    stepRobot: (dt) => {
+      if (drive) {
+        // play the simulated planAndFollow trajectory (I8) on the robot
+        drive.t += dt;
+        const p = drive.nav.sample(drive.t); const st = robot.state;
+        const v = Math.hypot(p.x - st.x, p.y - st.y) / Math.max(1e-9, dt);
+        st.omega = (((p.heading - st.theta + 540) % 360) - 180) / Math.max(1e-9, dt);
+        st.x = p.x; st.y = p.y; st.theta = p.heading; st.v = v; st.odometer += v * dt;
+        robot.syncPoseFromState();
+        robot.battery.levelWh = Math.max(0, robot.battery.levelWh - (powerDraw(robot) * dt) / 3600);
+        if (drive.t >= drive.nav.duration) { drive = null; st.v = 0; st.omega = 0; st.status = 'idle'; }
+        return;
+      }
+      const vmax = robot.params.vmaxOverride as number | undefined; stepMobile(robot, dt, vmax ? { speed: vmax * 1000 } : {});
+    },
   };
   return bindings;
 }

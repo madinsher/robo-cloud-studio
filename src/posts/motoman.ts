@@ -147,7 +147,8 @@ export class MotomanPost extends RoboPost {
   override setZoneData(z: number): void { this.pl = z < 0 ? '' : ` PL=${pyRound(Math.min(z, 8))}`; }
   protected onoff(v: number | boolean | string) { return (typeof v === 'string' ? ['1', 'true', 'on'].includes(v.toLowerCase()) : Number(v) > 0) ? 'ON' : 'OFF'; }
   override setDO(io: IoName, v: number | boolean | string): void { this.addline(`DOUT ${typeof io === 'number' ? `OT#(${io})` : io} ${this.onoff(v)}`); }
-  override setAO(io: IoName, v: number | string): void { this.setDO(io, v); }
+  /** Analog output: INFORM AOUT AO#(n) <value>. */
+  override setAO(io: IoName, v: number | string): void { this.addline(`AOUT ${typeof io === 'number' ? `AO#(${io})` : io} ${v}`); }
   override waitDI(io: IoName, v: number | boolean | string, timeoutMs = -1): void {
     this.addline(`WAIT ${typeof io === 'number' ? `IN#(${io})` : io}=${this.onoff(v)}${timeoutMs > 0 ? ` T=${fx(timeoutMs / 1000, 2)}` : ''}`);
   }

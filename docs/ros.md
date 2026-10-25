@@ -58,8 +58,8 @@ Tests: `tests/ros_package.test.ts`.
 
 ## Live interface (`src/ros/twin.ts`, `src/ros/rosbridge.ts`, `server/drivers/ros2.ts`)
 
-rosbridge mode **`sim`** makes the studio the simulator backend of a ROS 2 stack with the topic set of webots_ros2 /
-the MURKA robots (`docs/interfaces.md` §1–2 of robot-retailer-murka-v2):
+rosbridge mode **`sim`** makes the studio the simulator backend of a ROS 2 stack. Stations with the MURKA MUROM
+robot get the exact MURKA interface (next section); any other station gets the webots_ros2-style twin:
 
 | Topic | Type | |
 |---|---|---|
@@ -83,8 +83,93 @@ The server driver (`server/drivers/ros2.ts`) maps joints by name: the command jo
 prismatic joints are converted m ↔ mm from the robot_description joint types; DO topics are advertised as
 `std_msgs/Bool`, DI topics subscribed. Tests: `tests/ros_driver.test.ts`.
 
+Camera items of non-MURKA stations are published by the twin in `sim` mode (5 Hz, option `twin.cameras`):
+`<ns>/<cam>/image_raw` (rgb8), `/camera_info` (render K), `/depth/image_raw` (32FC1 metres, NaN = no return) and TF
+`map → <cam>_link → <cam>_optical_frame` (`tests/ros_exports_r5.test.ts`).
+
+## Studio as the MURKA simulator backend
+
+A station holding the decomposed MUROM robot (Webots import of `retail_store.wbt`: `MobileRobot "murom"` with
+`left/right_wheel_joint`, `Robot` `murom_left_arm` / `murom_right_arm` / `murom_head`; products from
+`murom_world/config` with `params.sku` / `params.slot`, e.g. `buildMurkaRetailStation()` of docs/murka-retail.md) is
+served with **exactly the interface of the Webots backend** (`murom_webots`: MuromDriver + SupervisorPlugin + the
+webots_ros2 sensor plugins of `murom_webots.urdf`) and of `murom_mujoco/sim_node.py` — robot-retailer-murka-v2
+`docs/interfaces.md` §1–2 (`src/ros/murom_sim.ts`, chosen automatically by rosbridge mode `sim` and by the headless
+backend). The ROS side runs exactly what `webots.launch.py` starts besides Webots: rosbridge_server and
+robot_state_publisher with `murom.urdf` (all robot TF frames, `laser_frame`, `imu_link`, `camera_link_optical`).
+
+| Interface | Type | Behaviour (sim time, control frame = world `basicTimeStep` 32 ms) |
+|---|---|---|
+| `/clock` | rosgraph_msgs/Clock | every frame (31 Hz) |
+| `/odom` + `/tf` `odom → base_link` | nav_msgs/Odometry | every frame; odom = start pose; exact (no wheel slip) |
+| `/joint_states` | sensor_msgs/JointState | 20 Hz; the 16 joints in the driver order: wheels (angle, commanded wheel speed), `l_*`, `r_*`, head, wrists |
+| `/imu` | sensor_msgs/Imu | every frame, `imu_link`: world orientation, gyro, acceleration + g |
+| `/scan` | sensor_msgs/LaserScan | 10 Hz, `laser_frame`, 640 beams over 4.189 rad **left to right** like webots_ros2 Ros2Lidar (`angle_min = +fov/2`, negative increment), `+inf` outside [0.15, 8] m, Webots noise (std = noise × maxRange); ray cast on the scene geometry except the robot (hall + products, like `LIDAR_GROUPS` of murom_mujoco) |
+| `/head_camera/image_color` + `/camera_info` | Image bgra8 + CameraInfo | 5 Hz (`cameraRate`), 320×240, `camera_link_optical`; K of the unified camera model (fx = W / 2 tan(fov/2) = 233.87 px; principal point W/2 − 0.5, the ROS integer-pixel convention — webots_ros2 writes W/2) |
+| `/head_depth/image` + `/camera_info` | Image 32FC1 | depth along the optical axis (m), `+inf` outside [0.1, 5] m (geometry nearer than 0.1 m is `inf`, not see-through) |
+| `/murom/ground_truth_pose` | geometry_msgs/PoseStamped | every frame, `map`, same stamp as `/odom` |
+| `/murom/sim/tool_tips` | geometry_msgs/PoseArray | every frame, `map`, [left, right] forearm tips (forearm + 0.248 m = `l/r_tool_link`) |
+| `/murom/sim/objects` | murom_msgs/ProductArray | 2 Hz; sku, name, `location_id` (slot, `carried_*`, `basket_*`, `packing_*`), pose in `map` |
+| `/cmd_vel` (sub) | geometry_msgs/Twist | differential drive r = 0.177 m, b = 0.441 m, wheel speed ≤ 18 rad/s (curvature kept), 0.6 s watchdog |
+| `/murom/joint_trajectory` (sub) | trajectory_msgs/JointTrajectory | linear interpolation from the current position; a new message replaces the active trajectory; unknown joint → warning, message ignored; Webots motor servo v = clip(10 (target − q), ±maxVelocity); wrist limits clip |
+| `/murom/sim/attach`, `/murom/sim/detach` | murom_msgs/srv/AttachObject, DetachObject | SupervisorPlugin rules and messages: v2 grip point = palm surface centre within `MUROM_ATTACH_MAX_DIST` (0.18 m) of the top face; two hands: palm midpoint ≤ 0.15 m from the centre and the palm distance = box width ± 0.03 m; the product follows the palm (or the tips); detach with `place_pose` sets it upright with the yaw it had in the hand; `basket_*` items ride with the robot |
+| `/murom/sim/screenshot`, `/murom/sim/record` | std_srvs/srv/SetBool | answered `success: false` (use the studio window) unless the host provides a screenshot hook |
+
+Images: in the browser the WebGL buffers of the 3D view (when registered), in Node the software rasterizer of
+`src/vision/sensing.ts` (same camera model; flat shading). Transport (`src/ros/rosbridge_client.ts`, also used by
+`src/ros/rosbridge.ts`): rosbridge v2 with `advertise_service` (ROS service calls arrive as `call_service` ops and are
+answered with `service_response`), non-finite floats written as the `Infinity` / `NaN` tokens that rosbridge's
+JSON backends read (Python json, and ujson 5.9 of the Ubuntu 24.04 package — checked; JSON `null` is rejected for float
+fields), `uint8[]` as base64. QoS: rosbridge publishers are reliable / volatile (latched topics transient local), which matches
+the `SensorDataQoS().reliable()` of the webots_ros2 sensor plugins and serves best-effort subscribers (Nav2 costmaps).
+The interface also runs on a URDF import of `murom.urdf` (wrist chains as separate robots; no products).
+
+Headless backend (`src/ros/sim_backend.ts`, CLI `src/ros/sim_cli.ts`):
+
+```bash
+npx vite build --ssr src/ros/sim_cli.ts --outDir dist/ros-sim            # once
+# WSL / Linux: rosbridge_server + robot_state_publisher (+ localization / Nav2 / the whole bringup with sim:=none)
+ros2 run rosbridge_server rosbridge_websocket --ros-args -p port:=9090 -p use_sim_time:=true &
+ros2 launch murom_description description.launch.py use_sim_time:=true &
+ros2 launch murom_bringup retail_simulation.launch.py sim:=none use_rviz:=false enable_perception:=false &
+node dist/ros-sim/sim_cli.js --murka "<MURKA_Simulation>" --url ws://127.0.0.1:9090 [--rtf 1] [--camera-rate 5]
+```
+
+Verified (`tests/fixtures/ros_gt/tools/murka_sim/`: `setup_ws.sh` builds rosbridge_suite (branch `jazzy`, Python deps
+with `pip --target`, no sudo) and a copy of the MURKA `ros2_ws`; `run_stack.sh` / `stop_stack.sh` / `smoke.sh` /
+`mission.sh`):
+
+- `tests/ros_murka_sim.test.ts` — contract tests through a fake rosbridge over a real websocket: types, advertise
+  before publish, subscriptions, services, rates and stamps in sim time, frames, units, joint order, `/scan` vs an
+  analytic ray / box intersection with the hall (all 640 beams < 1 mm), camera layouts and K, depth vs a ray cast,
+  the 50 products at their `locations.yaml` slots, tool tips and palms vs `murom.urdf` FK (< 1 mm), `/cmd_vel`
+  kinematics + watchdog + saturation, trajectory interpolation + servo law, attach / detach / basket / two-hand
+  messages; the same interface on the C1 station (`buildMurkaRetailStation`).
+- `ROS_WSL=1 npx vitest run tests/ros_murka_e2e.test.ts` — MURKA's own `scripts/smoke_test.py` (unmodified) prints
+  **SMOKE PASS** against the studio (all topics, 640 beams, 16 joints, 50 products, 0.75 m reverse drive,
+  |odom − gt| 0.000 m, RTF 1.0); and the real **MURKA FSM + Nav2 + navigate_server** (`murom_bringup` with `sim:=none`)
+  run `mission_test.py --mission undock` and `--mission dock`: both **MISSION PASS**, the studio robot ends 1.1 cm from
+  the dock pose.
+
+## MoveIt 2 config and inertials (`src/io/urdf/moveit_export.ts`, `src/io/urdf/inertia.ts`)
+
+- URDF export of studio-native robots writes `<inertial>` estimated from the geometry: every visual (or, for robots
+  drawn procedurally, the capsules of the 3D view) is a uniform solid — closed meshes by exact tetrahedral integration,
+  primitives analytically, parallel-axis combination; density 1200 kg/m³ or scaled to `robot.params.massKg`.
+- `exportMoveItConfig(robot)` writes `<robot>_description` + `<robot>_moveit_config` in the MoveItConfigsBuilder layout:
+  `config/<robot>.urdf.xacro` (+ `ros2_control` with `mock_components/GenericSystem`), SRDF, `kinematics.yaml` (KDL),
+  `joint_limits.yaml`, `ros2_controllers.yaml` (joint_state_broadcaster + JointTrajectoryController),
+  `moveit_controllers.yaml`, `initial_positions.yaml`, `pilz_cartesian_limits.yaml`, `launch/bringup.launch.py`
+  (headless, mock hardware), `demo.launch.py` (RViz), `move_group.launch.py`. Verified in WSL Jazzy
+  (`ROS_WSL=1 npx vitest run tests/ros_exports_r5.test.ts -t "WSL Jazzy"`): colcon build, move_group ready, controller
+  active, `/plan_kinematic_path` SUCCESS, `follow_joint_trajectory` SUCCEEDED and `/joint_states` at the target.
+- SRDF `<disable_collisions>` of an imported package are honoured by the collision checker (the pair is skipped, the
+  other contacts are still reported — `tests/ros_exports_r5.test.ts`).
+
 ## Not covered
 
-- Camera images (`sensor_msgs/Image` bgra8 / depth 32FC1) and the MURKA simulator services (`/murom/sim/attach`,
-  `/murom/sim/objects` …) need custom message packages and rendering on the bridge side — not published yet.
+- MURKA `perception_node` on the studio images: the colour prototypes are calibrated per simulator
+  (`config/appearance_<sim>.yaml` by its `calibrate.py`); a studio appearance file is not provided, so the `scan`
+  stage of the mission was not run (the image / depth formats are verified).
+- `/murom/sim/record` (video) and `/murom/sim/viewpoint` are not implemented by the backend.
 - Native DDS from the browser is out of scope; everything goes through rosbridge.

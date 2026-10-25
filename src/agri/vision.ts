@@ -31,6 +31,7 @@ export function detectFruit(station: Station, camera: CameraItem, opts: { onlyRi
   const out: Detection[] = [];
   for (const row of station.itemsOfType<CropRow>(ItemType.CROP_ROW)) {
     for (const f of fruitWorldPositions(row, opts.onlyRipe ?? false)) {
+      if (f.fruit.picked) continue; // harvested: no longer on the plant (a detect -> pick loop must not see it again)
       const l = multiply(inv, Float64Array.from([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, f.p[0], f.p[1], f.p[2], 1]));
       const x = l[12], y = l[13], z = l[14];
       if (z < camera.near || z > maxRange) continue;

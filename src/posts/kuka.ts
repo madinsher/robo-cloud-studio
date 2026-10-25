@@ -160,6 +160,8 @@ export class KukaPost extends RoboPost {
   protected ioIn(io: IoName) { return typeof io === 'number' ? `$IN[${io}]` : io; }
   protected bool(v: number | boolean | string) { return (typeof v === 'string' ? ['1', 'true', 'on'].includes(v.toLowerCase()) : Number(v) > 0) ? 'TRUE' : 'FALSE'; }
   override setDO(io: IoName, v: number | boolean | string): void { this.addline(`${this.ioOut(io)}=${this.bool(v)}`); }
+  /** Analog output: KRL $ANOUT[n] (a named analog signal is assigned as is). */
+  override setAO(io: IoName, v: number | string): void { this.addline(`${typeof io === 'number' ? `$ANOUT[${io}]` : io}=${v}`); }
   override waitDI(io: IoName, v: number | boolean | string, timeoutMs = -1): void {
     const cond = `${this.ioIn(io)}==${this.bool(v)}`;
     if (timeoutMs <= 0) { this.addline(`WAIT FOR (${cond})`); return; }

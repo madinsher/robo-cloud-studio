@@ -267,7 +267,7 @@ async function compareFile(file: string): Promise<GtResult> {
     if ((gm.robot ?? '') !== nm(link.robotId)) issues.push(`machining ${gm.name}: robot "${nm(link.robotId)}" != "${gm.robot}"`);
   }
 
-  if (SIM) await simulate(gt, station, assets, res);
+  if (SIM) await simulate(gt, station, assets, res, file);
   res.ok = issues.length === 0;
   return res;
 }
@@ -349,57 +349,232 @@ function toolBefore(all: Instruction[], ins: Instruction, station: Station): Mat
   return tool;
 }
 
-/** Simulation checks against Item.Update() and InstructionListJoints(). */
-async function simulate(gt: GT, station: Station, assets: AssetStore, res: GtResult): Promise<void> {
+/** Simulation ground truth of `file` (tests/fixtures/robodk_gt/sim, dump_sim.py): every program from the station as loaded. */
+function loadSimGt(file: string): any | null {
+  const p = `${GT_DIR}/sim/${file}`;
+  if (!existsSync(p)) return null;
+  try { return JSON.parse(gunzipSync(readFileSync(p)).toString('utf8').replace(/\bNaN\b/g, 'null').replace(/-?\bInfinity\b/g, 'null')); } catch { return null; }
+}
+
+/**
+ * Move ends in the order RoboDK's InstructionListJoints lists them: the program's moves with every called program
+ * expanded the FIRST time it is called only (a second call of GoHome / DrillingPart / Rim is not listed again; 01.c,
+ * 05.a), threads not listed, and only the moves of the program's own robot (the Kawasaki of 05.a, not its turntable).
+ */
+function listedMoveEnds(steps: any[], top: Program, robot: string, dof: number, sampleAt: (tr: any, t: number) => { joints: number[] }): Array<number[] | null> {
+  const moves = steps.filter((s) => s.trajectory && s.trajectory.samples.length);
+  const main = moves.find((s) => s.instruction.parent === top)?.runId ?? moves[0]?.runId;
+  const seen = new Set<unknown>([top]);
+  const out: Array<number[] | null> = [];
+  let cur: unknown = null, last = -1, skip = false;
+  for (const s of moves) {
+    if (s.runId !== main) continue;
+    const p = s.instruction.parent as Program;
+    const idx = p ? p.instructions().indexOf(s.instruction) : -1;
+    // a new call instance starts when the executing program changes or its instruction index goes back
+    if (p !== cur || idx <= last) { skip = p !== top && seen.has(p); seen.add(p); cur = p; }
+    last = idx;
+    if (skip) continue;
+    // RoboDK lists the target of every move (also when the path is blended past it)
+    if (s.robot?.name === robot) out.push((s.qTarget ?? sampleAt(s.trajectory, s.trajectory.duration).joints).slice(0, dof));
+  }
+  return out;
+}
+
+/** A program and every program it calls (directly or through code calls by name). */
+function programTree(top: Program): Program[] {
+  const out: Program[] = [top];
+  for (let k = 0; k < out.length && out.length < 200; k++) {
+    for (const ins of out[k].instructions()) {
+      const d: any = ins.data;
+      const sub = d.kind === 'call' && d.programId ? top.station?.findById(d.programId) : d.kind === 'code' && d.asFunctionCall && top.station ? [...top.station.walk()].find((i) => i instanceof Program && i.name === String(d.code).replace(/\(.*$/, '').trim()) : null;
+      if (sub instanceof Program && !out.includes(sub)) out.push(sub);
+    }
+  }
+  return out;
+}
+
+/** Whether a program (with the programs it calls) calls some program more than once. */
+function repeatsCall(top: Program): boolean {
+  const seen = new Set<Program>();
+  const station = top.station;
+  const walk = (p: Program, depth: number): boolean => {
+    if (depth > 16) return false;
+    for (const ins of p.instructions()) {
+      const d: any = ins.data;
+      let sub: unknown = null;
+      if (d.kind === 'call') sub = d.programId ? station?.findById(d.programId) : null;
+      else if (d.kind === 'code' && d.asFunctionCall) sub = station ? [...station.walk()].find((i) => i instanceof Program && i.name === String(d.code).replace(/\(.*$/, '').trim()) : null;
+      if (!(sub instanceof Program)) continue;
+      if (seen.has(sub)) return true;
+      seen.add(sub);
+      if (walk(sub, depth + 1)) return true;
+    }
+    return false;
+  };
+  return walk(top, 0);
+}
+
+/** Positioner evidence of a file (dump_turntable.py): Item.Update() per program with the positioner set to given angles. */
+function loadPositionerGt(file: string): { positioner: string; angles: Record<string, Record<string, any[]>> } | null {
+  const p = `${GT_DIR}/sim/${file.replace(/.json.gz$/, '')}.positioner.json`;
+  if (!existsSync(p)) return null;
+  try { return JSON.parse(readFileSync(p, 'utf8')); } catch { return null; }
+}
+
+/** RoboDK Update(COLLISION_ON) result -> collision verdict (valid ratio < 1 because of a collision). */
+// (a collision-checked update that stopped on an unreachable target did not finish its check: no verdict)
+const gtCollides = (u: any[] | null | undefined): boolean | null => (!Array.isArray(u) ? null : /collision detected/i.test(String(u[4])) ? true : u[3] >= 0.999 ? false : null);
+/** Acceptance tolerances: cycle time vs RoboDK Item.Update(), joints at every move end vs InstructionListJoints. */
+const TIME_TOL = 0.10;
+const JOINT_TOL = 0.5;
+
+/**
+ * Simulation checks. With the simulation ground truth (sim/<file>, every program run by RoboDK from the station as
+ * loaded): validity (ours ok == RoboDK valid), cycle time within ±10 % of Item.Update(), joints at the end of every
+ * move within 0.5° of InstructionListJoints (also through calls) and, with ROBODK_GT_COLL=1, the collision verdict of
+ * Update(COLLISION_ON). Without it: the dump's sequential Update() numbers (older semantics, see dump_gt.py).
+ */
+async function simulate(gt: GT, station: Station, assets: AssetStore, res: GtResult, file: string): Promise<void> {
   const { ProgramSimulator } = await import('../src/core/motion/simulator');
   const { sampleAt } = await import('../src/core/motion/trajectory');
+  const sgt = loadSimGt(file);
+  const COLL = process.env.ROBODK_GT_COLL === '1';
+  const seen = new Map<string, number>();
+  const robots = [...station.walk()].filter((i): i is Robot => i instanceof Robot);
   for (const pr of res.programs) {
+    const k = seen.get(pr.name) ?? 0;
+    seen.set(pr.name, k + 1);
     const gp = gt.programs.find((p: any) => p.name === pr.name);
-    const prog = [...station.walk()].find((i) => i instanceof Program && i.name === pr.name) as Program | undefined;
+    const prog = [...station.walk()].filter((i) => i instanceof Program && i.name === pr.name)[k] as Program | undefined;
+    const sp = sgt ? (sgt.programs as any[]).filter((p) => p.name === pr.name)[k] : null;
     if (!gp || !prog) continue;
+    const upd: any[] | undefined = sp ? sp.update : gp.update;
+    pr.gtValid = upd?.[3]; pr.gtTime = upd?.[1];
+    // start state: the robots' joints when RoboDK ran the program (the stored joints for the sim ground truth)
+    let start: Map<string, number[]> | undefined;
+    if (sp?.start) {
+      start = new Map();
+      for (const r of robots) { const q = sp.start[r.name]; if (Array.isArray(q) && robots.filter((x) => x.name === r.name).length === 1) start.set(r.id, q.slice(0, r.joints().length)); }
+    }
     const sim = new ProgramSimulator(station);
-    (sim as any).collisionOptions = { enabled: false };
+    sim.collisionOptions = { enabled: false };
     let out;
-    try { out = sim.compile(prog); } catch (e) { pr.errors = [`compile threw: ${(e as Error).message}`]; res.issues.push(`sim ${pr.name}: compile threw`); continue; }
+    try { out = sim.compile(prog, start); } catch (e) { pr.errors = [`compile threw: ${(e as Error).message}`]; res.issues.push(`sim ${pr.name}: compile threw`); continue; }
     const errors = out.problems.filter((p) => p.severity === 'error').map((p) => p.message);
-    pr.ok = out.ok; pr.ourTime = +out.duration.toFixed(3); pr.errors = errors.slice(0, 3);
-    if ((gp.update?.[3] ?? 0) >= 0.999 && errors.length) res.issues.push(`sim ${pr.name}: errors where RoboDK is valid: ${errors.slice(0, 2).join(' | ')}`);
-    if (gp.update?.[1] > 0.2 && out.duration > 0) pr.timeRatio = +(out.duration / gp.update[1]).toFixed(3);
+    // RoboDK's cycle time is Item.Update(): moves rest to rest at the robot's motion state (ProgramRunResult.updateTime)
+    const ourTime = out.updateTime ?? out.duration;
+    pr.ok = out.ok; pr.ourTime = +ourTime.toFixed(3); pr.errors = errors.slice(0, 3);
+    const gtValid = (upd?.[3] ?? 0) >= 0.999;
+    // RoboDK rates a program valid when only a program it calls fails (the callee itself is rated invalid; 09.c
+    // MainProgram, 05.b Main): Item.Update() counts the caller's own instructions and the callees' time up to their
+    // failure, with the robot left where the callee stopped (the studio's validation goes on): time not compared
+    const calleeOnly = !!sp && gtValid && errors.length > 0 && out.problems.filter((p) => p.severity === 'error').every((p) => {
+      const ins = [...station.walk()].flatMap((i) => (i instanceof Program ? i.instructions() : [])).find((x) => x.id === p.instructionId);
+      const owner = ins?.parent;
+      const rec = owner instanceof Program && owner !== prog ? (sgt.programs as any[]).find((x) => x.name === owner.name) : null;
+      return !!rec && rec.update?.[3] < 0.999;
+    });
+    if (calleeOnly) res.notes.push(`sim ${pr.name}: RoboDK rates it valid although a called program fails (rated invalid by RoboDK too): ${errors[0]}`);
+    else if (gtValid && errors.length) res.issues.push(`sim ${pr.name}: errors where RoboDK is valid: ${errors.slice(0, 2).join(' | ')}`);
+    // positioner evidence (dump_turntable.py): RoboDK's Update() keeps a positioner at its current angle although the
+    // program turns it through a called program; at the angle where RoboDK rates the program valid the studio must give
+    // the same validity and cycle time from that start (05.b TopSurf / Inside1 / Side0 / Side180 / Side270, Main)
+    const posGt = loadPositionerGt(file);
+    if (sp && posGt) {
+      const mech = robots.find((r) => r.name === posGt.positioner);
+      const callsMech = !!mech && programTree(prog).some((p) => p !== prog && p.robot() === mech);
+      if (callsMech) {
+        const ent = Object.entries(posGt.angles as Record<string, Record<string, any[]>>).find(([, rec]) => rec[pr.name]?.[3] >= 0.999 && !programTree(prog).some((p) => p !== prog && rec[p.name] && rec[p.name][3] < 0.999));
+        let verified = '';
+        if (ent && !gtValid) {
+          const s2 = new Map(start ?? []);
+          s2.set(mech!.id, [Number(ent[0])]);
+          const vs = new ProgramSimulator(station);
+          vs.collisionOptions = { enabled: false };
+          const o2 = vs.compile(prog, s2);
+          const t2 = o2.updateTime ?? o2.duration, want = ent[1][pr.name][1];
+          if (o2.ok && Math.abs(t2 - want) <= Math.max(0.05, TIME_TOL * want)) verified = `from ${posGt.positioner} at ${ent[0]}° RoboDK and the studio agree (valid, ${t2.toFixed(2)} s vs ${(+want).toFixed(2)} s)`;
+          else res.issues.push(`sim ${pr.name}: from ${posGt.positioner} at ${ent[0]}° RoboDK rates it valid in ${(+want).toFixed(2)} s, the studio ${o2.ok ? `in ${t2.toFixed(2)} s` : `fails: ${o2.problems.find((p) => p.severity === 'error')?.message}`}`);
+        }
+        const sameTime = gtValid && !!upd && Math.abs(ourTime - upd[1]) <= Math.max(0.05, TIME_TOL * upd[1]);
+        if (verified || (gtValid && !sameTime)) {
+          res.notes.push(`sim ${pr.name}: RoboDK Item.Update() keeps ${posGt.positioner} at its stored angle although the program turns it (rated ${gtValid ? 'valid with the callees evaluated that way' : 'invalid'} as loaded; the studio turns it)${verified ? `; ${verified}` : ''}`);
+          pr.worstJointDeg = -1;
+          continue;
+        }
+      }
+    }
+    if (sp && !gtValid && out.ok && upd) res.issues.push(`sim ${pr.name}: valid here, RoboDK stops at ${(upd[3] * 100).toFixed(1)} % (${String(upd[4]).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 140)})`);
+    if (upd && upd[1] > 0.2 && ourTime > 0) pr.timeRatio = +(ourTime / upd[1]).toFixed(3);
+    if (sp && gtValid && out.ok && upd) {
+      const dt = Math.abs(ourTime - upd[1]);
+      if (dt > 0.05 && dt > TIME_TOL * upd[1]) res.issues.push(`sim ${pr.name}: cycle time ${ourTime.toFixed(2)} s, RoboDK ${(+upd[1]).toFixed(2)} s (ratio ${(ourTime / Math.max(1e-9, upd[1])).toFixed(3)}; distance ${out.distance.toFixed(0)} mm, RoboDK ${(+upd[2]).toFixed(0)} mm)`);
+    }
+    // collision verdict (Update(COLLISION_ON) from the same start)
+    if (sp && COLL && sp.updateCollision) {
+      const want = gtCollides(sp.updateCollision);
+      const cs = new ProgramSimulator(station);
+      // RoboDK's Update(COLLISION_ON) does not apply show / hide / attach events (verified on 05.e Paint): same here
+      cs.collisionOptions = { enabled: true, assets: assets as any, timeBudgetMs: 120000, ignoreEvents: true };
+      let got = false, first = '';
+      try { const o2 = cs.compile(prog, start); const c = o2.problems.find((p) => p.severity === 'error' && /^Collision/.test(p.message)); got = !!c; first = c?.message ?? ''; } catch (e) { first = `threw ${(e as Error).message}`; }
+      (pr as any).collision = { ours: got, roboDK: want, first, pairs: sp.collision?.pairs };
+      if (want !== null && got !== want) res.issues.push(`sim ${pr.name}: collision ${got ? `reported here (${first})` : 'not reported here'}, RoboDK ${want ? `reports one (${JSON.stringify(sp.collision?.pairs ?? [])})` : 'none'}`);
+    }
     const robotG = gt.robots.find((x: any) => x.name === gp.robot);
     const dof = robotG?.lower?.length ?? 6;
-    // a machining program RoboDK regenerated at load (other number of instructions) is not the program in the file
-    if (prog.params.machiningId && gp.count !== prog.instructions().length) {
-      res.notes.push(`sim ${pr.name}: regenerated by RoboDK at load (${gp.count} instructions, ${prog.instructions().length} stored), joints not compared`);
+    const rows: any[] | undefined = sp ? sp.jl : gp.jl;
+    if (!sp) {
+      // dump_gt.py semantics: machining programs regenerated by the dump, MOVE_ID restarting per call
+      if (prog.params.machiningId && gp.count !== prog.instructions().length) { res.notes.push(`sim ${pr.name}: regenerated by RoboDK at load (${gp.count} instructions, ${prog.instructions().length} stored), joints not compared`); pr.worstJointDeg = -1; continue; }
+      if (prog.instructions().some((i) => i.data.kind === 'call' || i.data.kind === 'thread' || (i.data.kind === 'code' && i.data.asFunctionCall))) { res.notes.push(`sim ${pr.name}: calls other programs, joints not compared move by move (MOVE_ID repeats per call)`); pr.worstJointDeg = -1; continue; }
+    }
+    // jl rows: [J.., ERROR, MM_STEP, DEG_STEP, MOVE_ID, TIME, X, Y, Z]; the last row of each run of one MOVE_ID is the end
+    // of that move. When RoboDK stops early (status < 0) only the moves before the failing one are complete.
+    const gtEnds: number[][] = [];
+    let failed = false;
+    const list = rows ?? [];
+    for (let i = 0; i < list.length; i++) {
+      const row = list[i], L = row.length, id = row[L - 5];
+      if (row[L - 8] !== 0) { failed = true; break; }
+      const next = list[i + 1];
+      if (!next || next[next.length - 5] !== id) gtEnds.push(row.slice(0, L - 8));
+    }
+    const status = sp ? sp.jlStatus : gp.jlStatus;
+    const partial = (status ?? 0) < 0 || failed;
+    if (partial && !sp) { res.notes.push(`sim ${pr.name}: RoboDK InstructionListJoints stopped (${gp.jlMsg ?? 'error'}); joints not compared`); pr.worstJointDeg = -1; continue; }
+    if (partial) gtEnds.pop(); // the move RoboDK stopped in
+    if (sp && repeatsCall(prog)) {
+      // InstructionListJoints lists a program called several times only once, and not with the state of its first call
+      // (01.c MainProgram lists DrillingPart at Part 2): the called programs are compared on their own
+      res.notes.push(`sim ${pr.name}: calls a program more than once, RoboDK InstructionListJoints lists it once; joints compared through the called programs`);
       pr.worstJointDeg = -1;
       continue;
     }
-    // MOVE_ID numbers the moves of RoboDK's expanded instruction list; the dump keeps only the last row of each id, so a
-    // program that calls others (the same ids repeat per call) cannot be compared move by move: validity + time only
-    if (prog.instructions().some((i) => i.data.kind === 'call' || i.data.kind === 'thread' || (i.data.kind === 'code' && i.data.asFunctionCall))) {
-      res.notes.push(`sim ${pr.name}: calls other programs, joints not compared move by move (MOVE_ID repeats per call)`);
-      pr.worstJointDeg = -1;
-      continue;
+    // InstructionListJoints does not move the robot to its first target: it places it there (the first row) and lists
+    // the program from that posture (stored target joints when they are valid, 01.c DrillProgram1; IK of the pose
+    // otherwise, 01.c GoHome). The listed motion is compared from the same posture.
+    let jsim = sim;
+    const row0 = list[0];
+    const rj = robots.find((x) => x.name === gp.robot);
+    if (sp && row0 && rj) {
+      const q = row0.slice(0, row0.length - 8).slice(0, rj.joints().length);
+      if (q.length === rj.joints().length && q.every(Number.isFinite)) {
+        const s2 = new Map(start ?? []);
+        s2.set(rj.id, q);
+        jsim = new ProgramSimulator(station);
+        jsim.collisionOptions = { enabled: false };
+        try { jsim.compile(prog, s2); } catch { jsim = sim; }
+      }
     }
-    // jl rows: [J.., ERROR, MM_STEP, DEG_STEP, MOVE_ID, TIME, X, Y, Z]; the last row of a MOVE_ID is the end of that move.
-    // When RoboDK stops early (status < 0, e.g. "Path is not continuous") only the moves before the failing one are complete.
-    const ends = new Map<number, number[]>();
-    let failedAt = Infinity;
-    for (const row of gp.jl ?? []) {
-      const L = row.length, id = row[L - 5];
-      if (row[L - 8] !== 0) { failedAt = Math.min(failedAt, id); continue; }
-      ends.set(id, row.slice(0, L - 8));
-    }
-    const partial = (gp.jlStatus ?? 0) < 0 || Number.isFinite(failedAt);
-    const gtEnds = [...ends.entries()].filter((e) => e[0] < failedAt && (!partial || e[0] < Math.max(...ends.keys()))).sort((a, b) => a[0] - b[0]).map((e) => e[1]);
-    // a stopped list was computed from the state Update() left behind (robot at the program end, last frame / tool):
-    // its joints are not comparable, only the validity and cycle time from Update() are
-    if (partial) { res.notes.push(`sim ${pr.name}: RoboDK InstructionListJoints stopped (${gp.jlMsg ?? 'error'}); joints not compared`); pr.worstJointDeg = -1; continue; }
-    const ourEnds = sim.steps.filter((s) => s.trajectory && s.trajectory.samples.length && (s.robot?.name === gp.robot)).map((s) => sampleAt(s.trajectory!, s.trajectory!.duration).joints.slice(0, dof));
-    let worst = 0;
-    for (let i = 0; i < Math.min(gtEnds.length, ourEnds.length); i++) worst = Math.max(worst, jdiff(ourEnds[i].slice(0, gtEnds[i].length), gtEnds[i].slice(0, ourEnds[i].length)));
+    const ourEnds: Array<number[] | null> = sp ? listedMoveEnds(jsim.steps, prog, gp.robot, dof, sampleAt) : sim.steps.filter((s) => s.trajectory && s.trajectory.samples.length && (s.robot?.name === gp.robot)).map((s) => sampleAt(s.trajectory!, s.trajectory!.duration).joints.slice(0, dof));
+    let worst = 0, worstAt = -1;
+    // with the sim ground truth the first listed move is RoboDK's placement (not a motion): compared from the second one
+    for (let i = sp ? 1 : 0; i < Math.min(gtEnds.length, ourEnds.length); i++) { const o = ourEnds[i]; if (!o) continue; const d = jdiff(o.slice(0, gtEnds[i].length), gtEnds[i].slice(0, o.length)); if (d > worst) { worst = d; worstAt = i; } }
     pr.worstJointDeg = Number.isFinite(worst) ? +worst.toFixed(3) : -1;
-    if (!partial && gtEnds.length && gtEnds.length !== ourEnds.length) res.issues.push(`sim ${pr.name}: ${ourEnds.length} moves, RoboDK ${gtEnds.length}`);
-    if (worst > 0.1) res.issues.push(`sim ${pr.name}: joints differ from RoboDK by ${worst.toFixed(2)}°`);
+    if (!partial && gtEnds.length && gtEnds.length !== ourEnds.length && (out.ok || !sp)) res.issues.push(`sim ${pr.name}: ${ourEnds.length} moves, RoboDK ${gtEnds.length}`);
+    if (worst > (sp ? JOINT_TOL : 0.1)) res.issues.push(`sim ${pr.name}: joints differ from RoboDK by ${worst.toFixed(2)}° at move ${worstAt + 1}`);
   }
 }
 

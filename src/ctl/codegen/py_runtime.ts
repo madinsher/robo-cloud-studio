@@ -104,6 +104,12 @@ def _sub(v, bb):
     return str(bb[v[1:]]) if isinstance(v, str) and v.startswith('$') and v[1:] in bb else v
 
 
+def named_outcomes(s):
+    """Outcome list of a skill state with several outcomes (do skill=... outcomes=a,b,c), else None."""
+    o = ((s.get('action') or {}).get('args') or {}).get('outcomes')
+    return [x.strip() for x in str(o).split(',') if x.strip()] if o else None
+
+
 class Action(object):
     def __init__(self, world, b, t):
         if str(b.get('value', '')).startswith('$') or any(isinstance(v, str) and v.startswith('$') for v in b.get('args', {}).values()):
@@ -111,6 +117,7 @@ class Action(object):
         _seq[0] += 1
         self.w, self.b, self.key, self.t0, self.state = world, b, 'a%d' % _seq[0], t, 'init'
         self.result = None
+        self.outcome = None   # named outcome reported by the skill (item.Outcome()), if any
         self.timed_out = False
 
     def tick(self, t):
@@ -140,6 +147,8 @@ class Action(object):
             if self.item.Busy():
                 return 'running'
             w.release(self.key)
+            oc = getattr(self.item, 'Outcome', None)
+            self.outcome = oc() if callable(oc) else None
             failed = getattr(self.item, 'Failed', None)
             return 'failure' if failed is not None and failed() else 'success'
         if k == 'target':
@@ -589,10 +598,11 @@ class FsmRun(object):
                     o = s.get('otherwise')
             elif s['kind'] == 'skill':
                 st = f['run'].tick(self.time)
+                named = named_outcomes(s)
                 if st == 'success':
-                    o = (s['action'].get('done') or 'ok')
+                    o = f['run'].outcome or (named[0] if named else (s['action'].get('done') or 'ok'))
                 elif st == 'failure':
-                    o = 'timeout' if f['run'].timed_out else (s['action'].get('fail') or 'fail')
+                    o = 'timeout' if f['run'].timed_out else (f['run'].outcome or (named[-1] if named else (s['action'].get('fail') or 'fail')))
             if o is None:
                 break
             self.resolve(i, o)

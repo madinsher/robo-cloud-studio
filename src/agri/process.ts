@@ -71,9 +71,21 @@ export function orientForArm(fm: FleetManager, task: FleetTask, robot: MobileRob
   const row = rowOf(fm, task);
   const arm = armOf(robot);
   if (!row || !arm || !task.workPath || task.workPath.length < 2 || !task.meta.side) return;
-  const sA = armMount(arm).side;
-  const d = rowDirWorld(row);
+  const mount = armMount(arm);
   const w = workDir(task);
+  if (Math.abs(mount.y) < 50) {
+    // centred arm (turret) reaches both sides: no turnaround for the side; start from the nearer end (rail trolleys
+    // cannot turn on a rail)
+    const p = robot.state, a = task.workPath[0], b = task.workPath[task.workPath.length - 1];
+    if (Math.hypot(b[0] - p.x, b[1] - p.y) < Math.hypot(a[0] - p.x, a[1] - p.y) - 1) {
+      task.workPath = [...task.workPath].reverse();
+      task.location = [task.workPath[0][0], task.workPath[0][1]];
+      task.goalHeading = Math.atan2(task.workPath[1][1] - task.workPath[0][1], task.workPath[1][0] - task.workPath[0][0]) * 180 / Math.PI;
+    }
+    return;
+  }
+  const sA = mount.side;
+  const d = rowDirWorld(row);
   // travelling along +d with the line on the row's side s, the row is on the robot's right for s = +1
   const want = -task.meta.side * sA; // +1: along the row direction
   if ((w[0] * d[0] + w[1] * d[1]) * want < 0) {
@@ -120,7 +132,8 @@ export function planStops(fm: FleetManager, task: FleetTask, robot: MobileRobot,
   for (let i = 0; i < items.length; i++) {
     if (done[i]) continue;
     const sArm = items[i].s + items[i].half * 0.9;
-    const s = Math.max(0, Math.min(len, sArm - mount.x));
+    // stops are reached while still on the work path (a stop at s = len was skipped: the work phase ends there)
+    const s = Math.max(0, Math.min(len - 50, sArm - mount.x));
     const armAt = s + mount.x;
     const st: Stop = { s, fruit: [] };
     for (let j = i; j < items.length; j++) {
@@ -133,16 +146,41 @@ export function planStops(fm: FleetManager, task: FleetTask, robot: MobileRobot,
   return { stops, unreachable };
 }
 
-/** Optional arm animation: point the arm at a fruit (one IK solve per pick). */
+/** Optional arm animation for every harvest (mission setting `animateArm` enables it per mission). */
 export const harvestAnimation = { enabled: false };
 
-function pointArm(arm: Robot, p: [number, number, number]) {
+/** Joints that put the TCP on a fruit, approaching from the arm base (one IK solve), or null. */
+function ikToFruit(arm: Robot, p: [number, number, number]): number[] | null {
   const base = arm.poseAbs();
   const bp = getPos(base);
   const dir = normalize([p[0] - bp[0], p[1] - bp[1], 0]);
-  const r = arm.solveIK(multiply(invert(base), poseFromZ(p, dir, [0, 0, -1])), { seed: arm.joints(), restarts: 0, maxIterations: 40 });
-  if (r.ok) arm.setJoints(r.joints);
+  const r = arm.solveIK(multiply(invert(base), poseFromZ(p, dir, [0, 0, -1])), { seed: arm.joints(), restarts: 1, maxIterations: 60 });
+  return r.ok ? r.joints : null;
 }
+/** World position of fruit `ref` = [plant, fruit] of a row. */
+function fruitWorld(row: CropRow, ref: number[]): [number, number, number] | null {
+  const w = fruitWorldPositions(row, false); let k = 0;
+  for (let i = 0; i < ref[0]; i++) k += row.plants[i].fruit.length;
+  return w[k + ref[1]]?.p ?? null;
+}
+/**
+ * Arm joint motion while harvesting: towards the next scheduled fruit (reached at its pick time, linear in joint space),
+ * back to the travel pose (2 s) when no pick is pending.
+ */
+function animateArm(fm: FleetManager, arm: Robot, row: CropRow, p: any): void {
+  const A = (p.anim ??= { home: arm.joints().slice(), from: arm.joints().slice(), to: arm.joints().slice(), t0: fm.time, t1: fm.time, key: 'home' });
+  const next = p.picks?.[0];
+  const key = next ? `${next.ref[0]}:${next.ref[1]}` : 'home';
+  if (A.key !== key) {
+    A.from = arm.joints().slice(); A.t0 = fm.time; A.key = key;
+    const fw = next ? fruitWorld(row, next.ref) : null;
+    if (next) { A.to = (fw && ikToFruit(arm, fw)) ?? A.from; A.t1 = Math.max(fm.time + 0.2, next.t - 0.1); A.ok = !!fw && A.to !== A.from; }
+    else { A.to = A.home; A.t1 = fm.time + 2; }
+  }
+  const f = A.t1 > A.t0 ? Math.min(1, Math.max(0, (fm.time - A.t0) / (A.t1 - A.t0))) : 1;
+  arm.setJoints(A.from.map((q: number, i: number) => q + (A.to[i] - q) * f));
+}
+
 
 function pickProcess(kind: 'harvest' | 'thin') {
   return {
@@ -181,6 +219,7 @@ function pickProcess(kind: 'harvest' | 'thin') {
       const fruitKg = task.meta.fruitKg ?? 0.18;
       // fruit removed at their pick time
       const arm = armOf(robot);
+      if (arm && (st.animateArm ?? harvestAnimation.enabled)) animateArm(fm, arm, row, p);
       while (p.picks?.length && p.picks[0].t <= fm.time) {
         const pk = p.picks.shift();
         const f = row.plants[pk.ref[0]]?.fruit[pk.ref[1]];
@@ -195,7 +234,6 @@ function pickProcess(kind: 'harvest' | 'thin') {
           const bin = resource(robot, 'bin', st.binCapacityKg ?? 400, 'kg', false);
           bin.level += fruitKg;
         } else fm.bookStat('thin', 'fruitRemoved', 1);
-        if (harvestAnimation.enabled && arm) { const w = fruitWorldPositions(row, false); let k = 0; for (let i = 0; i < pk.ref[0]; i++) k += row.plants[i].fruit.length; const fw = w[k + pk.ref[1]]; if (fw) pointArm(arm, fw.p); }
         row.notify('plants');
       }
       if (holding) return;

@@ -168,7 +168,10 @@ describe('simulation UX in the browser', () => {
     { file: 'Example-01.b-Robot Drilling - KUKA.rdk', main: 'DrillingPart' },
     { file: 'Example-01.a-Robot Painting - Universal Robots.rdk', main: 'MainProg' },
     { file: 'Example-06.b-Pick and place 2 tables.rdk', main: 'Pick and place', then: 'Replace objects', moves: '^ball', minMove: 300 },
-    { file: 'Example-06.d-Pick and stamp.rdk', main: 'MainProgram', then: 'Replace Objects', moves: '^Phone Case [123]$', minMove: 100 },
+    // 06.d was saved by RoboDK after a full cycle (every part in the Output frame) and MainProgram starts with
+    // "Replace Objects": its end state is the saved station, so no extra "Replace Objects" run afterwards (R2: the
+    // earlier `then` moved the parts back to the Input frame, away from RoboDK's saved poses)
+    { file: 'Example-06.d-Pick and stamp.rdk', main: 'MainProgram', moves: '^Phone Case [123]$', minMove: 100 },
     { file: 'Example-05.e-Manufacturing with 2 robots.rdk', main: 'Main_Program' },
   ];
   for (const s of LIBRARY) {
@@ -177,7 +180,7 @@ describe('simulation UX in the browser', () => {
       const prog = truth.programs.find((p: any) => p.name === s.main);
       await load('demo=none');
       await openFiles([`${LIB}/${s.file}`]);
-      const res = await ev((a) => {
+      const res = await ev(async (a) => {
         const app = (window as any).app;
         const progs = [...app.station.walk()].filter((i: any) => typeof i.instructions === 'function' || i.type === 10);
         const p = progs.find((x: any) => x.name === a.main);
@@ -187,14 +190,16 @@ describe('simulation UX in the browser', () => {
         // play in 0.25 s steps and keep, per object, the largest distance from its start (06.b ends with "Replace objects")
         const p0 = objPos(), far: number[] = p0.map(() => 0);
         const h = app.runProgram(p);
+        // runToEnd(0.25) instead of a seek: it waits for the station's script runners (Pyodide, vision), which answer
+        // asynchronously
         for (let t = 0; app.activeRuns().length && t < 3 * a.cycle + 60; t += 0.25) {
-          app.seekProgram(app.simTime + 0.25);
+          await app.runToEnd(0.25);
           objPos().forEach((e: any, i: number) => { far[i] = Math.max(far[i], Math.hypot(e[1][0] - p0[i][1][0], e[1][1] - p0[i][1][1])); });
         }
-        app.runToEnd(60);
+        await app.runToEnd(60);
         const out: any = { status: h.status, error: h.error?.message, t: typeof h.endTime === 'number' ? h.endTime - (h.startTime ?? 0) : app.simTime, joints: (h.robot ?? app.activeRobot)?.joints?.() ?? null };
         out.far = p0.map((e: any, i: number) => [e[0], far[i]]);
-        if (a.then) { const q = progs.find((x: any) => x.name === a.then); if (q) { const h2 = app.runProgram(q); app.runToEnd(60); out.thenStatus = h2.status; } }
+        if (a.then) { const q = progs.find((x: any) => x.name === a.then); if (q) { const h2 = app.runProgram(q); await app.runToEnd(60); out.thenStatus = h2.status; } }
         out.objects = objPos();
         return out;
       }, { main: s.main, then: s.then, cycle: prog.update[1] });

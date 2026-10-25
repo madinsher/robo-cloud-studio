@@ -13,6 +13,7 @@
  *              <ns>/scan (sensor_msgs/LaserScan, sensor-relative angles)           10 Hz (when a 2D LiDAR runs)
  *              <ns>/imu (sensor_msgs/Imu)                                           31 Hz
  *              <ns|/robot>/ground_truth_pose (geometry_msgs/PoseStamped, map)      31 Hz
+ *              <ns>/<cam>/image_raw, /camera_info, /depth/image_raw + camera TF    5 Hz (option cameras)
  *   subscribed <ns>/cmd_vel (geometry_msgs/Twist, watchdog 0.6 s like the MURKA driver)
  *              /<robot>/joint_trajectory, /joint_trajectory_controller/joint_trajectory
  *              (trajectory_msgs/JointTrajectory: linear interpolation, a new message replaces the trajectory of
@@ -20,6 +21,7 @@
  *
  * The robot description is the kept URDF of an imported robot (names, ros2_control … unchanged) or the station URDF
  * export with floating mobile bases, so robot_state_publisher reproduces every link from /joint_states.
+ * Stations with the MURKA MUROM robot use ./murom_sim.ts instead (the exact murom_webots interface).
  */
 import type { Station, Item } from '../core/items/item';
 import { ItemType } from '../core/items/item';
@@ -30,6 +32,9 @@ import { exportStationURDF, exportDescriptionURDF, urdfTreeRoot, sanitizeName } 
 import { parseXML, childElements } from '../io/urdf/xml';
 import { DEG, RAD, poseToQuat, rotz, transl, mul } from '../core/math/pose';
 import { laserScanMsg, scanHeading } from './publishers';
+import { Camera as CameraItem } from '../core/items/item';
+import { renderCamera } from '../vision/sensing';
+import { publishCameraFrame } from '../vision/vision_ros';
 
 export interface RosIO {
   publish(topic: string, type: string, msg: any, opts?: { latch?: boolean }): void;
@@ -50,6 +55,12 @@ export interface RosTwinOptions {
   trajectoryTopics?: string[];
   /** Publish a static `<mapFrame> -> odom` at each mobile robot's start pose (default: none, a localization node does). */
   mapFrame?: string;
+  /**
+   * Camera items (rgb / depth) published as sensor_msgs/Image (rgb8, or 32FC1 depth in m, NaN = no return) +
+   * CameraInfo (render K) + TF <world> -> <cam>_link -> <cam>_optical_frame, on <ns>/<cam>/image_raw, /camera_info,
+   * /depth/image_raw (default true in 'sim'; rate default 5 Hz; WebGL buffers in the browser, software render in Node).
+   */
+  cameras?: boolean | { rate?: number; worldFrame?: string };
 }
 
 export interface TwinJoint {
@@ -99,7 +110,7 @@ export class RosTwin {
   joints: TwinJoint[] = [];
   description = '';
   private mobiles: MobileCtx[] = [];
-  private acc = { js: 0, odom: 0, scan: 0 };
+  private acc = { js: 0, odom: 0, scan: 0, cam: 0 };
   private traj = new Map<string, { t: number; v: number }[]>();
   private prevPos = new Map<string, number>();
   private started = false;
@@ -224,7 +235,7 @@ export class RosTwin {
     const stamp = stampOf(this.time);
     if (this.opts.clock !== false) this.pub('/clock', 'rosgraph_msgs/msg/Clock', { clock: stamp });
     const rates = this.opts.rates ?? {};
-    const due = (key: 'js' | 'odom' | 'scan', hz: number) => { this.acc[key] += dt; if (this.acc[key] + 1e-9 >= 1 / hz) { const span = this.acc[key]; this.acc[key] = 0; return span; } return 0; };
+    const due = (key: 'js' | 'odom' | 'scan' | 'cam', hz: number) => { this.acc[key] += dt; if (this.acc[key] + 1e-9 >= 1 / hz) { const span = this.acc[key]; this.acc[key] = 0; return span; } return 0; };
     const jsSpan = due('js', rates.jointStates ?? 20);
     if (jsSpan) this.pub('/joint_states', 'sensor_msgs/msg/JointState', this.jointStateMsg(stamp, jsSpan));
     const odomSpan = due('odom', rates.odom ?? 31);
@@ -240,12 +251,28 @@ export class RosTwin {
         this.pub(`${c.ns || `/${sanitizeName(String(c.m.params.urdfName ?? c.m.name))}`}/ground_truth_pose`, 'geometry_msgs/msg/PoseStamped', { header: { stamp, frame_id: 'map' }, pose: { position: { x: st.x / 1000, y: st.y / 1000, z: 0 }, orientation: { x, y, z, w } } });
       }
     }
+    const camOpt = this.opts.cameras ?? (this.opts.commands !== false);
+    if (camOpt && due('cam', (typeof camOpt === 'object' ? camOpt.rate : undefined) ?? 5)) this.publishCameras(typeof camOpt === 'object' ? camOpt.worldFrame : undefined);
     if (this.opts.scan !== false && due('scan', rates.scan ?? 10)) {
       for (const c of this.mobiles) {
         const rt = (c.m as unknown as { _nav?: { lastScan?: any } })._nav;
         if (rt?.lastScan) this.pub(`${c.ns}/scan`, 'sensor_msgs/msg/LaserScan', laserScanMsg(rt.lastScan, String(c.m.params.laserFrame ?? `${c.frame}laser_frame`), this.time, scanHeading(c.m, rt as any)));
       }
     }
+  }
+
+  /** Render and publish every rgb / depth camera of the station (non-MURKA stations; MURKA: ./murom_sim.ts). */
+  publishCameras(worldFrame = this.opts.mapFrame ?? 'map'): string[] {
+    const topics: string[] = [];
+    for (const cam of this.station.itemsOfType<CameraItem>(ItemType.CAMERA)) {
+      if (cam.kind !== 'rgb' && cam.kind !== 'depth') continue;
+      const r = renderCamera(this.station, cam, { rgb: cam.kind === 'rgb', ground: true });
+      let ns = '';
+      for (let p: Item | null = cam.parent; p; p = p.parent) { const n = (p as { rosNamespace?: string }).rosNamespace; if (p.type === ItemType.MOBILE_ROBOT && n) { ns = normNs(n); break; } }
+      const io = { publish: (t: string, type: string, msg: any) => this.pub(t, type, msg) };
+      topics.push(...publishCameraFrame(io, cam, { rgba: r.rgba, depth: cam.kind === 'depth' ? r.depth : undefined, width: r.width, height: r.height, timeS: this.time }, { namespace: ns, worldFrame }));
+    }
+    return topics;
   }
 
   /** Pose of the base in the odom frame (odom = start pose), metres / rad. */

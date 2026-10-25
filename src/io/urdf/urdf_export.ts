@@ -19,6 +19,8 @@ import { writeSTL, MeshData } from '../mesh/stl';
 import { zipSync, strToU8 } from 'fflate';
 import { parseXML, serializeXML, XNode, childElements } from './xml';
 import { exportSRDF } from './srdf';
+import { linkMassProps, inertialXml } from './inertia';
+import { proceduralLink } from '../../vision/sensing';
 
 export interface URDFExportOptions {
   /** ROS package name (used in package:// URIs). Defaults to a sanitized robot/station name. */
@@ -35,6 +37,14 @@ export interface URDFExportOptions {
    * from the twin. Robots carried by a mobile robot are attached to its base link either way.
    */
   mobileBases?: 'fixed' | 'floating';
+  /**
+   * <inertial> of studio-native links estimated from their geometry (./inertia.ts: uniform solids, exact for closed
+   * meshes) — default true. `density` kg/m³ (default 1200) or `totalMass` kg (density scaled so the links sum to it;
+   * exportRobotURDF reads robot.params.massKg).
+   */
+  inertials?: boolean;
+  density?: number;
+  totalMass?: number;
 }
 
 export interface URDFExportResult {
@@ -75,6 +85,13 @@ class MeshWriter {
   private written = new Map<string, string>();
   warnings: string[] = [];
   constructor(private assets: AssetStore | undefined, private pkg: string) {}
+
+  /** Parsed mesh of an asset id (or its basename), null when not loaded. */
+  meshData(meshId: string): MeshData | null {
+    const base = (u: string) => u.split(/[\\/]/).pop()?.toLowerCase();
+    const a = this.assets?.get(meshId) ?? (this.assets ? [...this.assets.entries()].find(([id]) => base(id) === base(meshId))?.[1] : undefined);
+    return a?.mesh ?? null;
+  }
 
   /** Write a mesh (scene units = raw asset units × scale) as STL in metres; returns the package URI. */
   write(meshId: string, scale: [number, number, number] | undefined, baseName: string): string | null {
@@ -206,18 +223,28 @@ function jointXml(j: JointDef, parent: string, child: string): string {
 }
 
 /** URDF for one kinematic chain (robot). Link names are prefixed so several robots can share a package. */
-export function chainToURDF(chain: ChainDef, name: string, mw: MeshWriter, opts: URDFExportOptions, prefix = ''): { xml: string; rootLink: string; tipLink: string } {
+export function chainToURDF(chain: ChainDef, name: string, mw: MeshWriter, opts: URDFExportOptions, prefix = '', robot?: Robot): { xml: string; rootLink: string; tipLink: string } {
+  // links without meshes are drawn procedurally (capsules from the kinematics): their inertials come from those shapes
+  const solidsOf = (i: number) => (robot && !chain.links.some((l) => l.visuals.length) ? proceduralLink(robot, i) : []);
   const rn = sanitizeName(name);
   const lname = (i: number) => frameName(`${prefix}${chain.links[i]?.name ?? (i === 0 ? 'base_link' : `link_${i}`)}`);
   // Our chains may carry a static `post` transform after each joint motion (DH robots). URDF has no such
   // thing, so the post of joint i is folded into joint i+1's origin and into link i+1's visual origins.
   const postOf = (i: number): Mat4 | undefined => (i >= 0 && i < chain.joints.length ? chain.joints[i].post : undefined);
   let body = '';
+  const visualsOf = (i: number) => { const post = postOf(i - 1); return chain.links[i].visuals.map((v) => (post ? { ...v, origin: multiply(post, v.origin) } : v)); };
+  // estimated inertials (uniform solids); density from the total mass when it is known
+  let density = opts.density ?? 1200;
+  if (opts.inertials !== false && opts.totalMass && opts.totalMass > 0) {
+    const vol = chain.links.reduce((a, _l, i) => a + (linkMassProps(visualsOf(i), (id) => mw.meshData(id), 1, solidsOf(i))?.mass ?? 0), 0);
+    if (vol > 0) density = opts.totalMass / vol;
+  }
   for (let i = 0; i < chain.links.length; i++) {
     const l = chain.links[i];
-    const post = postOf(i - 1);
+    const vis = visualsOf(i);
     body += `  <link name="${lname(i)}">\n`;
-    for (const v of l.visuals) body += geometryXml(post ? { ...v, origin: multiply(post, v.origin) } : v, mw, `${rn}_${l.name ?? i}`, opts);
+    if (opts.inertials !== false) { const mp = linkMassProps(vis, (id) => mw.meshData(id), density, solidsOf(i)); if (mp) body += inertialXml(mp); }
+    for (const v of vis) body += geometryXml(v, mw, `${rn}_${l.name ?? i}`, opts);
     body += '  </link>\n';
   }
   for (let i = 0; i < chain.joints.length; i++) {
@@ -251,7 +278,8 @@ export function exportRobotURDF(robot: Robot, assets?: AssetStore, opts: URDFExp
   if (tree) return exportDescriptionURDF(tree, assets, opts);
   const pkg = sanitizeName(opts.packageName ?? `${robot.name}_description`).toLowerCase();
   const mw = new MeshWriter(assets, pkg);
-  const { xml, rootLink, tipLink } = chainToURDF(robot.chain, robot.name, mw, opts);
+  const massKg = Number(robot.params.massKg);
+  const { xml, rootLink, tipLink } = chainToURDF(robot.chain, robot.name, mw, { ...opts, totalMass: opts.totalMass ?? (massKg > 0 ? massKg : undefined) }, '', robot);
   let body = xml;
   for (const t of robot.tools()) {
     const tn = sanitizeName(t.name);
@@ -337,7 +365,7 @@ export function exportStationURDF(station: Station, assets?: AssetStore, opts: U
   for (const r of robots) {
     if (urdfTreeRoot(r)) continue;
     const prefix = `${uniq(r.name)}_`;
-    const { xml, rootLink, tipLink } = chainToURDF(r.chain, r.name, mw, opts, prefix);
+    const { xml, rootLink, tipLink } = chainToURDF(r.chain, r.name, mw, opts, prefix, r);
     jointNames.set(r, r.chain.joints.map((j) => frameName(`${prefix}${j.name}`)));
     body += xml;
     const mt = mount(r);

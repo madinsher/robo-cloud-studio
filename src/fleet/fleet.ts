@@ -238,6 +238,9 @@ export class FleetManager {
   /** Clock value when this manager started (KPI rates are measured from here). */
   private t0 = 0;
 
+  /** Robots whose task starts are decided by their own controller (per-robot FSM, fleet_fsm.ts): the allocator skips
+   *  them and automatic charging leaves them alone while held. */
+  readonly hold = new Set<string>();
   constructor(readonly station: Station, readonly fleet: FleetItem) {
     // resume the fleet clock of a station saved mid-mission (pending picks / holds are timed on it)
     if (fleet.tasks.some((t) => t.status === 'working' || t.status === 'travelling' || t.status === 'assigned')) this.time = this.t0 = fleet.simTime || 0;
@@ -433,7 +436,7 @@ export class FleetManager {
   /** Allocate pending tasks with the fleet's allocator; start tasks of idle robots (own queue first). */
   allocate(): void {
     const robots = this.robots();
-    const free = (r: MobileRobot) => !r.state.taskId && r.state.status !== 'charging' && r.state.status !== 'error' && !this.traffic.get(r.id)?.yield;
+    const free = (r: MobileRobot) => !r.state.taskId && r.state.status !== 'charging' && r.state.status !== 'error' && !this.traffic.get(r.id)?.yield && !this.hold.has(r.id);
     // idle robots start their queued tasks first
     for (const r of robots) if (free(r)) { const q = this.queued(r)[0]; if (q && !(q.meta?._rt?.retryAt > this.time)) this.startTask(r, q); }
     const pending = this.fleet.tasks.filter((t) => t.status === 'pending' && !(t.meta?._rt?.retryAt > this.time)).sort((a, b) => b.priority - a.priority || a.createdAt - b.createdAt);
@@ -441,7 +444,7 @@ export class FleetManager {
     const alloc = allocators.get(this.fleet.allocation) ?? allocators.get('auction')!;
     const claims: SegmentClaims = new Map();
     const ctx: AllocationContext = {
-      fm: this, robots: robots.filter((r) => r.state.status !== 'error'), tasks: pending, cost: (r, t, f) => this.taskCost(r, t, f, claims), queueEnd: (r) => this.queueEnd(r), queueLimit: this.fleet.queueLimit,
+      fm: this, robots: robots.filter((r) => r.state.status !== 'error' && !this.hold.has(r.id)), tasks: pending, cost: (r, t, f) => this.taskCost(r, t, f, claims), queueEnd: (r) => this.queueEnd(r), queueLimit: this.fleet.queueLimit,
       claim: (t, r, until) => { for (const sg of t.segments ?? []) { const c = claims.get(sg); if (!c || c.until < until) claims.set(sg, { robotId: r.id, until }); } },
     };
     for (const a of alloc(ctx)) {
@@ -566,18 +569,26 @@ export class FleetManager {
         if (r.batteryLevel() >= 0.95) { r.state.status = 'idle'; this.logMsg(`${r.name} charged`); }
         continue;
       }
-      if (r.state.taskId || r.state.status !== 'idle' || this.traffic.get(r.id)?.yield) continue;
+      if (r.state.taskId || r.state.status !== 'idle' || this.traffic.get(r.id)?.yield || this.hold.has(r.id)) continue;
       if (r.batteryLevel() > r.battery.lowThreshold) continue;
-      const home = r.home ?? (zones.length ? { ...(() => { const [x, y] = zones[0].centroid(); const abs = zones[0].poseAbs(); return { x: abs[12] + x, y: abs[13] + y }; })(), theta: 0 } : null);
-      if (!home) continue;
-      const path = this.planTo(r, [home.x, home.y], { goalHeading: r.home ? home.theta : undefined });
-      if (!path) continue;
-      const task = this.addTask({ type: 'charge', location: [home.x, home.y], priority: 100, robotId: r.id, status: 'travelling', startedAt: this.time });
-      this.rt(task).phase = 'travel';
-      r.state.taskId = task.id;
-      followPath(r, path);
-      this.logMsg(`${r.name} battery ${(r.batteryLevel() * 100).toFixed(0)}% -> charging`);
+      this.sendToCharge(r);
     }
+    void zones;
+  }
+
+  /** Send an idle robot to charge at its home (else the first charging zone); false when no place / no path. */
+  sendToCharge(r: MobileRobot): boolean {
+    const zones = this.station.itemsOfType<ZoneItem>(ItemType.ZONE).filter((z) => z.kind === 'charging');
+    const home = r.home ?? (zones.length ? { ...(() => { const [x, y] = zones[0].centroid(); const abs = zones[0].poseAbs(); return { x: abs[12] + x, y: abs[13] + y }; })(), theta: 0 } : null);
+    if (!home || r.state.taskId) return false;
+    const path = this.planTo(r, [home.x, home.y], { goalHeading: r.home ? home.theta : undefined });
+    if (!path) return false;
+    const task = this.addTask({ type: 'charge', location: [home.x, home.y], priority: 100, robotId: r.id, status: 'travelling', startedAt: this.time });
+    this.rt(task).phase = 'travel';
+    r.state.taskId = task.id;
+    followPath(r, path);
+    this.logMsg(`${r.name} battery ${(r.batteryLevel() * 100).toFixed(0)}% -> charging`);
+    return true;
   }
 
   /** Advance the fleet simulation by dt seconds. */

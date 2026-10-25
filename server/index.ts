@@ -28,9 +28,20 @@ import '../src/posts/index.ts';
 import { createDriver, drivers, RobotDriver } from './drivers/index.ts';
 import { Vda5050Service, mqttConnector } from './vda5050.ts';
 import { handleVisionHttp } from './vision.ts';
-import { handlePostsHttp } from './posts_native.ts';
+import { handlePostsHttp, runNativePost, listNativePosts, roboDKPython, roboDKPostsDir } from './posts_native.ts';
+import { setLocalNativePosts, registerNativePosts } from '../src/posts/native_client.ts';
+import { installVisionRunnerGlobal } from '../src/vision/program_vision.ts';
+import { setSensingAssets } from '../src/vision/sensing.ts';
 
 const PORT = Number(process.env.STUDIO_PORT ?? 20500);
+
+// RoboDK's own posts (compiled ones included) for the headless station: MakeProgram with post "RDK_<name>" (or a
+// RoboDK post name the studio has no built-in equivalent for) runs them in-process with RoboDK's embedded Python
+if (roboDKPython() && roboDKPostsDir()) {
+  setLocalNativePosts({ list: listNativePosts, run: (post, job, source) => runNativePost(post, job, { source }) });
+  const ids = await registerNativePosts();
+  console.log(`[studio-server] ${ids.length} RoboDK post processors registered (RDK_<name>)`);
+}
 const STATION_FILE = process.env.STUDIO_STATION ?? '';
 
 let initial = new Station('Headless station');
@@ -72,6 +83,10 @@ const host = await createNodeHost({
   afterHeadless: (req) => { if (STATION_FILE && !READ_ONLY_METHODS.has(req.method)) { try { writeFileSync(STATION_FILE, JSON.stringify(saveStation(host.station(), host.rdk.assets))); } catch { /* ignore */ } } },
 });
 const station = () => host.station();
+// VisionDetect("<camera>") in robot programs and Cam2D_Detect / Vision_Run of headless API clients: the vision runner
+// renders with the headless station's meshes
+installVisionRunnerGlobal();
+setSensingAssets(host.rdk.assets ?? null);
 
 /** VDA 5050 (AGV fleets over MQTT): master + digital-twin bridge, see server/vda5050.ts */
 const vda = new Vda5050Service(() => station(), (url, opts) => { throw new Error(`MQTT connector not ready for ${url} (${Object.keys(opts).length} opts)`); });

@@ -9,6 +9,9 @@ import { itemContextMenu } from './ui/dialogs';
 import { demos } from './demos';
 import { Robolink, robomath } from './api/robolink';
 import { connectToStudioServer } from './api/ws-client';
+import { installPyodideRunner } from './api/runner_pyodide';
+import { installVisionRunnerGlobal } from './vision/program_vision';
+import { setNativePostServer, registerNativePosts } from './posts/native_client';
 import { StationTabs, measureDialog } from './ui/tools';
 import { Station } from './core/items/item';
 
@@ -116,7 +119,14 @@ setInterval(() => {
 
 // Expose the API for scripting from the browser devtools and for the server bridge
 const RDK = new Robolink(app.station);
-app.events.on('stationChanged', () => { RDK.station = app.station; });
+// the API follows the active station; its spray simulator (RoboDK Spray_*) is per station and samples the station's
+// meshes through the app's asset store (RDK.assets is set below, before the first station is shown)
+const sprays = new WeakMap<Station, typeof RDK.spray>();
+app.events.on('stationChanged', () => {
+  const kept = sprays.get(app.station);
+  RDK.setStation(app.station);
+  if (kept) (RDK as { spray: typeof RDK.spray }).spray = kept; else sprays.set(app.station, RDK.spray);
+});
 RDK.onRunProgram = (p) => app.runProgram(p);
 RDK.onRender = () => {};
 RDK.onMessage = (m, popup) => (popup ? toast(m, 'info', 6000) : app.log(m));
@@ -131,14 +141,26 @@ RDK.simTime = { get: () => app.simTime, set: (t) => app.seekProgram(t) };
 RDK.onPluginLoad = (name) => { import(/* @vite-ignore */ name).then((mod) => { const plugin = mod.default ?? mod; RDK.registerPlugin(name, plugin); plugin.onLoad?.(app, RDK); app.log(`Plugin ${name} loaded`); }).catch((e) => app.log(`Plugin ${name} failed: ${e.message}`, 'error')); return true; };
 app.onStationEvent = (type, itemId, data) => RDK.events.push({ type, itemId, data });
 app.renderer.onAnimate((dt) => { if (app.isPlaying() || app.worldRunning) RDK.spray.step(dt * app.simSpeed); });
+// Station Python programs (RoboDK PROGRAM_PYTHON items, calls such as SprayOn(1)) run in the browser with Pyodide,
+// loaded on the first call; while the studio server is connected its CPython runner takes precedence (ws-client).
+const pyRunner = installPyodideRunner(RDK, { app, onOutput: (name, line, stream) => app.log(`${name}: ${line}`, stream === 'stderr' ? 'warn' : 'info') });
 (window as any).app = app;
 (window as any).RDK = RDK;
+(window as any).pyRunner = pyRunner;
+// the vision script runner (VisionDetect calls), registered by the Vision panel; exposed with the Pyodide runner so a
+// test can play programs without any script runner (same semantics as the headless runtime)
+(window as any).visionRunnerOff = installVisionRunnerGlobal();
 (window as any).robomath = robomath;
 
 // Optional WebSocket bridge to the studio server (python clients)
 const params = new URLSearchParams(location.search);
 const wsUrl = params.get('server') ?? (location.hostname ? `ws://${location.hostname}:20500` : '');
 if (wsUrl && params.get('server') !== 'off') connectToStudioServer(app, RDK, wsUrl).catch(() => {});
+// RoboDK's own post processors (compiled ones included) run on the studio server: list them in the post selectors
+if (params.get('server') && params.get('server') !== 'off') {
+  setNativePostServer(wsUrl);
+  registerNativePosts().then((ids) => { if (ids.length) app.log(`${ids.length} RoboDK post processors available through the studio server`); }).catch(() => {});
+}
 
 // Initial station: ?demo=<id>; ?demo=none (or an unknown id) opens an empty station
 const demoId = params.get('demo') ?? 'pickplace';
