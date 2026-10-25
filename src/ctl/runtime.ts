@@ -44,6 +44,19 @@ export interface WorldBindings {
 
 export interface RuntimeOptions { bt: BtDoc; supervisor?: SupervisorTable; monitors?: string[]; modes?: HybridSpec; bindings: WorldBindings; log?: (msg: string) => void }
 
+/** Instant bookkeeping actions that are not written to the mission log on success. */
+const QUIET_ACTIONS = new Set(['set', 'log', 'report', 'event', 'signal', 'select_target']);
+/** "program A_Pick on R1", "move to T1", "goto zone=dock" … for the mission log. */
+function describeAction(name: string, args: Record<string, unknown>): string {
+  const robot = typeof args.robot === 'string' && args.robot ? ` on ${args.robot}` : '';
+  if (name === 'program') return `program ${String(args.program ?? args.name ?? '?')}${robot}`;
+  if (name === 'move') return `move to ${String(args.target ?? '?')}${robot}`;
+  if (name === 'wait') return `wait ${String(args.seconds ?? 1)} s`;
+  if (name === 'await') return `await ${String(args.expr ?? args.await ?? args.condition ?? '')}`;
+  const rest = Object.entries(args).filter(([k]) => !['robot', 'event', 'done', 'fail', 'timeout'].includes(k)).map(([k, v]) => `${k}=${String(v)}`).join(' ');
+  return `${name}${rest ? ` ${rest}` : ''}${robot}`;
+}
+
 export class ControlRuntime {
   readonly tree: BehaviorTree;
   readonly supervisor: SupervisorRuntime | null;
@@ -68,7 +81,16 @@ export class ControlRuntime {
           if (!this.supervisor.allowed(ev)) { this.denied++; this.say(`supervisor denied ${ev} (${name}) in plant state ${this.supervisor.plantState().join(',')}`); ctx.bb.lastDenied = ev; return 'failure'; }
           this.observe(ev);
         }
+        const starting = node.status !== 'running';
         const st = fn(ctx, args, node) ?? 'success';
+        // mission log: an action that runs over several ticks is logged when it starts and when it ends, a failing
+        // one always (an arm-only tree of programs left the log empty)
+        if (!QUIET_ACTIONS.has(name) || st === 'failure') {
+          const what = `${node.name && node.name !== name ? `${node.name}: ` : ''}${describeAction(name, args)}`;
+          if (starting && st === 'running') this.say(`${what} started`);
+          else if (!starting && st !== 'running') this.say(`${what} ${st}`);
+          else if (starting && st === 'failure') this.say(`${what} failure`);
+        }
         if (st !== 'running') Object.assign(ctx.bb, b.sense()); // post-conditions see the world after the action
         if (st !== 'running' && typeof args.done === 'string' && this.supervisor && st === 'success') this.observe(args.done);
         return st;
@@ -89,7 +111,9 @@ export class ControlRuntime {
     this.bb.time = this.time;
     if (this.modes) { const env = envOf(this.bb); const m = this.modes.step(this.time, env); this.bb.mode = m; this.bb.vmax = this.modes.current().vMax ?? null; }
     if (this.supervisor) { this.bb.plantState = this.supervisor.plantState().join(','); this.bb.enabled = this.supervisor.enabled().join(' '); }
+    const prev = this.status;
     this.status = this.tree.tick(dt);
+    if (this.status !== prev && this.status !== 'running') this.say(`tree ${this.status}`);
     const env = envOf(this.bb);
     this.trace.t.push(this.time); this.trace.values.push(env);
     for (const m of this.monitors) {
@@ -267,7 +291,23 @@ export class RobotLocks {
     if (!q.includes(node)) q.push(node);
     return false;
   }
-  release(node: string): void { for (const [r, o] of [...this.owner]) if (o === node) this.owner.delete(r); for (const q of this.waiting.values()) { const i = q.indexOf(node); if (i >= 0) q.splice(i, 1); } }
+  release(node: string): void { for (const [r, o] of [...this.owner]) if (o === node) this.owner.delete(r); for (const q of this.waiting.values()) { const i = q.indexOf(node); if (i >= 0) q.splice(i, 1); } this.since.delete(node); }
+  /** When each waiting node first found its robot busy (sim time). */
+  private since = new Map<string, number>();
+  /**
+   * acquire() with the log lines of a contested robot: "<what> waits for <robot> (busy)" when the node first finds it
+   * busy, "<what> starts on <robot> after waiting N s" when it gets it — the transition / state / tree node that
+   * started the action is logged when it fires, the action itself only begins on a free robot.
+   */
+  acquireLogged(robotId: string, node: string, ctx: TickContext, what: string, robotName: string): boolean {
+    if (this.acquire(robotId, node)) {
+      const t0 = this.since.get(node);
+      if (t0 !== undefined) { this.since.delete(node); ctx.log?.(`${what} starts on ${robotName} after waiting ${(ctx.time - t0).toFixed(2)} s`); }
+      return true;
+    }
+    if (!this.since.has(node)) { this.since.set(node, ctx.time); ctx.log?.(`${what} waits for ${robotName} (busy)`); }
+    return false;
+  }
 }
 
 const parseValue = (v: unknown): unknown => (typeof v === 'number' || typeof v === 'boolean' ? v : v === 'false' ? false : v === 'true' ? true : typeof v === 'string' && v.trim() !== '' && Number.isFinite(Number(v)) ? Number(v) : v ?? true);
@@ -316,7 +356,7 @@ export function hostBindings(host: StationHost): WorldBindings & { locks: RobotL
           runs.set(node.id, { program: p, robot, run: null });
         }
         const s = runs.get(node.id)!;
-        if (!s.run) { if (s.robot && !locks.acquire(s.robot.id, node.id)) return 'running'; s.run = host.programs.start(s.program, { robot: s.robot }); }
+        if (!s.run) { if (s.robot && !locks.acquireLogged(s.robot.id, node.id, ctx, `program ${s.program.name}`, s.robot.name)) return 'running'; s.run = host.programs.start(s.program, { robot: s.robot }); }
         const status = s.run.status;
         if (status === 'queued' || status === 'running') return 'running';
         if (status === 'done') { locks.release(node.id); runs.delete(node.id); return 'success'; }
@@ -330,7 +370,7 @@ export function hostBindings(host: StationHost): WorldBindings & { locks: RobotL
         }
         const m = moves.get(node.id)!;
         if (!m.traj) {
-          if (!locks.acquire(m.robot.id, node.id)) return 'running';
+          if (!locks.acquireLogged(m.robot.id, node.id, ctx, `move to ${m.tgt.name}`, m.robot.name)) return 'running';
           const r = plan(m.robot, m.tgt, m.linear); if (!r.traj) return fail(ctx, node, r.error ?? `cannot move ${m.robot.name} to ${m.tgt.name}`);
           m.traj = r.traj; m.t0 = ctx.time;
         }
@@ -368,7 +408,7 @@ export function simulatedHost(opts: { programs?: Record<string, number>; moveSec
   const lane = (args: Record<string, unknown>, fallback: string) => (typeof args.robot === 'string' && args.robot ? args.robot : fallback);
   const timedOnLane = (key: string, laneId: string, seconds: number, ctx: TickContext, node: BTNode, label: string, onDone?: () => void): BTStatus => {
     const k = `${key}#${node.id}`;
-    if (!started.has(k)) { if (!locks.acquire(laneId, node.id)) return 'running'; started.set(k, ctx.time); out.runs.push(label); out.playing = label; out.log.push({ t: ctx.time, program: label, robot: laneId, event: 'start' }); }
+    if (!started.has(k)) { if (!locks.acquireLogged(laneId, node.id, ctx, label, laneId)) return 'running'; started.set(k, ctx.time); out.runs.push(label); out.playing = label; out.log.push({ t: ctx.time, program: label, robot: laneId, event: 'start' }); }
     if (ctx.time - started.get(k)! >= seconds - 1e-9) { started.delete(k); locks.release(node.id); out.log.push({ t: ctx.time, program: label, robot: laneId, event: 'end' }); if (out.playing === label) out.playing = null; onDone?.(); return 'success'; }
     return 'running';
   };

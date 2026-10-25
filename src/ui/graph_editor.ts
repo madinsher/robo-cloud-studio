@@ -52,6 +52,25 @@ export const num = (v: number | undefined, onChange: (n: number | undefined) => 
 export const text = (v: string, onChange: (s: string) => void, placeholder = '') => { const i = h('input', { type: 'text', value: v, placeholder, class: 'ge-text' }) as HTMLInputElement; i.addEventListener('change', () => onChange(i.value)); i.addEventListener('keydown', (e) => { if (e.key === 'Enter') i.blur(); }); return i; };
 export const check = (label: string, v: boolean, onChange: (b: boolean) => void) => { const i = h('input', { type: 'checkbox' }) as HTMLInputElement; i.checked = v; i.addEventListener('change', () => onChange(i.checked)); return h('label', { class: 'ge-check' }, i, ' ', t(label)); };
 
+/** Bow (px, at the control point) between neighbouring edges of the same node pair. */
+export const EDGE_FAN = 44;
+/**
+ * Path of an edge from node centre `a` (radius ra) to `b` (radius rb) bowed by `off` px along the left normal of a->b:
+ * a straight line for off = 0, else a quadratic arc whose end points also leave the node circles turned towards the
+ * bow (so two arcs of opposite edges stay apart up to the nodes). Returns the SVG path, its control polygon (start,
+ * control, end) and the label position (outside the bow).
+ */
+export function edgeGeometry(a: XY, b: XY, off: number, ra = R, rb = R): { d: string; pts: [XY, XY, XY]; label: XY } {
+  const dx = b[0] - a[0], dy = b[1] - a[1], dist = Math.hypot(dx, dy) || 1; const ux = dx / dist, uy = dy / dist; const nx = -uy, ny = ux;
+  const th = off ? Math.sign(off) * Math.min(0.6, Math.abs(off) / (2 * R)) : 0; const c = Math.cos(th), s = Math.sin(th);
+  const sx = a[0] + ra * (ux * c + nx * s), sy = a[1] + ra * (uy * c + ny * s), ex = b[0] + rb * (-ux * c + nx * s), ey = b[1] + rb * (-uy * c + ny * s);
+  const mx = (sx + ex) / 2 + nx * off, my = (sy + ey) / 2 + ny * off;
+  // the arc's lateral offset at 40 % of its length is ra·sin(th) + 0.48·off: the label sits 12 px outside it
+  const lo = off ? ra * s + 0.48 * off + Math.sign(off) * 12 : 8;
+  const label: XY = [sx + (ex - sx) * 0.4 + nx * lo, sy + (ey - sy) * 0.4 + ny * lo];
+  return { d: off ? `M ${sx} ${sy} Q ${mx} ${my} ${ex} ${ey}` : `M ${sx} ${sy} L ${ex} ${ey}`, pts: [[sx, sy], [mx, my], [ex, ey]], label };
+}
+
 export function buildGraphEditor(opts: { onChange: (source: string) => void; catalog?: () => ActionCatalog }): GraphEditor {
   let kind: EditorKind | null = null; let des: DesDoc | null = null; let petri: PetriDoc | null = null; let fsm: FsmDoc | null = null; let block = 0;
   let mode: EditorMode = 'select'; let sel: Selection = null; let arcFrom: string | null = null;
@@ -111,19 +130,21 @@ export function buildGraphEditor(opts: { onChange: (source: string) => void; cat
     marker.appendChild(svgEl('path', { d: 'M 0 0 L 10 5 L 0 10 z', fill: 'currentColor' })); defs.appendChild(marker); svg.appendChild(defs);
     svg.appendChild(svgEl('rect', { x: 0, y: 0, width: W, height: H, fill: 'transparent', class: 'ge-bg' }));
     const uc = new Set(des?.uncontrollable ?? []);
+    // edges between the same two nodes (both directions) fan out symmetrically: with n of them the k-th bows by
+    // (k - (n-1)/2) * EDGE_FAN to one side, so two opposite edges are two separate arcs whose 12 px hit strokes do not
+    // overlap anywhere (a straight edge next to a slightly bowed one shared its hit area with it)
+    const pairKey = (e: { from: string; to: string }) => (e.from < e.to ? `${e.from}|${e.to}` : `${e.to}|${e.from}`);
+    const pairCount = new Map<string, number>(); for (const e of g.edges) if (e.from !== e.to) pairCount.set(pairKey(e), (pairCount.get(pairKey(e)) ?? 0) + 1);
     const seen = new Map<string, number>();
     for (const e of g.edges) {
       const a = L[e.from], b = L[e.to]; if (!a || !b) continue;
-      const key = e.from < e.to ? `${e.from}|${e.to}` : `${e.to}|${e.from}`; const k = seen.get(key) ?? 0; seen.set(key, k + 1);
+      const key = pairKey(e); const k = seen.get(key) ?? 0; seen.set(key, k + 1); const n = pairCount.get(key) ?? 1;
       const cls = `ge-edge ctl-edge ${kind === 'des' && e.label && e.label.split(',').every((ev) => uc.has(ev)) ? 'uc' : ''} ${isSel({ type: 'edge', from: e.from, to: e.to }) ? 'ge-selected' : ''}`;
       let d: string; let lx: number, ly: number;
       if (e.from === e.to) { d = `M ${a[0] - 8} ${a[1] - R} C ${a[0] - 34} ${a[1] - R - 48}, ${a[0] + 34} ${a[1] - R - 48}, ${a[0] + 8} ${a[1] - R}`; lx = a[0]; ly = a[1] - R - 38; }
       else {
-        const dx = b[0] - a[0], dy = b[1] - a[1], dist = Math.hypot(dx, dy) || 1; const ux = dx / dist, uy = dy / dist; const nx = -uy, ny = ux;
-        const off = (k - (k > 0 ? 0.5 : 0)) * 26 * (e.from < e.to ? 1 : -1);
-        const rb = kind === 'petri' && g.nodes.find((n) => n.id === e.to)?.kind === 'transition' ? 12 : R; const ra = kind === 'petri' && g.nodes.find((n) => n.id === e.from)?.kind === 'transition' ? 12 : R;
-        const sx = a[0] + ux * ra, sy = a[1] + uy * ra, ex = b[0] - ux * rb, ey = b[1] - uy * rb; const mx = (sx + ex) / 2 + nx * off, my = (sy + ey) / 2 + ny * off;
-        d = off ? `M ${sx} ${sy} Q ${mx} ${my} ${ex} ${ey}` : `M ${sx} ${sy} L ${ex} ${ey}`; lx = sx + (ex - sx) * 0.4 + nx * (off * 0.6 + 8); ly = sy + (ey - sy) * 0.4 + ny * (off * 0.6 + 8);
+        const geo = edgeGeometry(a, b, (k - (n - 1) / 2) * EDGE_FAN * (e.from < e.to ? 1 : -1), kind === 'petri' && g.nodes.find((x) => x.id === e.from)?.kind === 'transition' ? 12 : R, kind === 'petri' && g.nodes.find((x) => x.id === e.to)?.kind === 'transition' ? 12 : R);
+        d = geo.d; [lx, ly] = geo.label;
       }
       const grp = svgEl('g', { class: cls });
       grp.appendChild(svgEl('path', { d, fill: 'none', stroke: 'currentColor', 'marker-end': e.label === 'o' ? undefined : 'url(#ge-arrow)', class: 'ge-line' }));

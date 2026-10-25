@@ -115,8 +115,9 @@ A station holding the decomposed MUROM robot (Webots import of `retail_store.wbt
 served with **exactly the interface of the Webots backend** (`murom_webots`: MuromDriver + SupervisorPlugin + the
 webots_ros2 sensor plugins of `murom_webots.urdf`) and of `murom_mujoco/sim_node.py` — robot-retailer-murka-v2
 `docs/interfaces.md` §1–2 (`src/ros/murom_sim.ts`, chosen automatically by rosbridge mode `sim` and by the headless
-backend). The ROS side runs exactly what `webots.launch.py` starts besides Webots: rosbridge_server and
-robot_state_publisher with `murom.urdf` (all robot TF frames, `laser_frame`, `imu_link`, `camera_link_optical`).
+backend). The ROS side runs exactly what `webots.launch.py` starts besides Webots: rosbridge_server (with rosapi, as
+`rosbridge_websocket_launch.xml` starts it) and robot_state_publisher with `murom.urdf` (all robot TF frames,
+`laser_frame`, `imu_link`, `camera_link_optical`).
 
 | Interface | Type | Behaviour (sim time, control frame = world `basicTimeStep` 32 ms) |
 |---|---|---|
@@ -125,8 +126,8 @@ robot_state_publisher with `murom.urdf` (all robot TF frames, `laser_frame`, `im
 | `/joint_states` | sensor_msgs/JointState | 20 Hz; the 16 joints in the driver order: wheels (angle, commanded wheel speed), `l_*`, `r_*`, head, wrists |
 | `/imu` | sensor_msgs/Imu | every frame, `imu_link`: world orientation, gyro, acceleration + g |
 | `/scan` | sensor_msgs/LaserScan | 10 Hz, `laser_frame`, 640 beams over 4.189 rad **left to right** like webots_ros2 Ros2Lidar (`angle_min = +fov/2`, negative increment), `+inf` outside [0.15, 8] m, Webots noise (std = noise × maxRange); ray cast on the scene geometry except the robot (hall + products, like `LIDAR_GROUPS` of murom_mujoco) |
-| `/head_camera/image_color` + `/camera_info` | Image bgra8 + CameraInfo | 5 Hz (`cameraRate`), 320×240, `camera_link_optical`; K of the unified camera model (fx = W / 2 tan(fov/2) = 233.87 px; principal point W/2 − 0.5, the ROS integer-pixel convention — webots_ros2 writes W/2) |
-| `/head_depth/image` + `/camera_info` | Image 32FC1 | depth along the optical axis (m), `+inf` outside [0.1, 5] m (geometry nearer than 0.1 m is `inf`, not see-through) |
+| `/head_camera/image_color` + `/camera_info` | Image bgra8 + CameraInfo | 5 Hz (`cameraRate`) **while subscribed**, 320×240, `camera_link_optical`; K of the unified camera model (fx = W / 2 tan(fov/2) = 233.87 px; principal point W/2 − 0.5, the ROS integer-pixel convention — webots_ros2 writes W/2) |
+| `/head_depth/image` + `/camera_info` | Image 32FC1 | **while subscribed**; depth along the optical axis (m), `+inf` outside [0.1, 5] m (geometry nearer than 0.1 m is `inf`, not see-through) |
 | `/murom/ground_truth_pose` | geometry_msgs/PoseStamped | every frame, `map`, same stamp as `/odom` |
 | `/murom/sim/tool_tips` | geometry_msgs/PoseArray | every frame, `map`, [left, right] forearm tips (forearm + 0.248 m = `l/r_tool_link`) |
 | `/murom/sim/objects` | murom_msgs/ProductArray | 2 Hz; sku, name, `location_id` (slot, `carried_*`, `basket_*`, `packing_*`), pose in `map` |
@@ -135,14 +136,45 @@ robot_state_publisher with `murom.urdf` (all robot TF frames, `laser_frame`, `im
 | `/murom/sim/attach`, `/murom/sim/detach` | murom_msgs/srv/AttachObject, DetachObject | SupervisorPlugin rules and messages: v2 grip point = palm surface centre within `MUROM_ATTACH_MAX_DIST` (0.18 m) of the top face; two hands: palm midpoint ≤ 0.15 m from the centre and the palm distance = box width ± 0.03 m; the product follows the palm (or the tips); detach with `place_pose` sets it upright with the yaw it had in the hand; `basket_*` items ride with the robot |
 | `/murom/sim/screenshot`, `/murom/sim/record` | std_srvs/srv/SetBool | answered `success: false` (use the studio window) unless the host provides a screenshot hook |
 
-Images: in the browser the WebGL buffers of the 3D view (when registered), in Node the software rasterizer of
-`src/vision/sensing.ts` (same camera model; flat shading). Transport (`src/ros/rosbridge_client.ts`, also used by
+Cameras on demand: the head camera and the range finder have no `<alwaysOn>` in `murom_webots.urdf`, so webots_ros2
+renders them only while a node subscribes; the studio does the same. The backend asks rosapi
+(`/rosapi/subscribers`, every second) whether the image or camera_info topics have subscribers; images start within
+about a second of the first subscription and stop when it goes. Until rosapi has answered the devices stay off; when
+rosapi is not running (three failed calls) they publish at `cameraRate` all the time (`cameraOnDemand: false` /
+`--camera-always` force that). Lidar, IMU and the rest are always on (`<alwaysOn>true</alwaysOn>`).
+Back pressure: rosbridge (Python) has to decode about 0.8 MB of JSON per bgra8 + 32FC1 frame pair. The backend
+subscribes to its own `/clock` through rosbridge (throttled to 10 Hz); the echo's lag over its smallest value of the
+last 30 s says whether rosbridge's queue keeps growing. Above 1 s camera frames are dropped until it is back below
+0.4 s; the clock, odometry, lidar and the rest are never dropped. `backendStats()` reports `rosLag` and
+`camera: {rendered, skipped (no subscriber), dropped}`.
+Images come from the software rasterizer of `src/vision/sensing.ts` (same camera model; flat shading); the
+page-thread fallback of the browser uses the WebGL buffers of the 3D view when registered. Transport (`src/ros/rosbridge_client.ts`, also used by
 `src/ros/rosbridge.ts`): rosbridge v2 with `advertise_service` (ROS service calls arrive as `call_service` ops and are
 answered with `service_response`), non-finite floats written as the `Infinity` / `NaN` tokens that rosbridge's
 JSON backends read (Python json, and ujson 5.9 of the Ubuntu 24.04 package — checked; JSON `null` is rejected for float
 fields), `uint8[]` as base64. QoS: rosbridge publishers are reliable / volatile (latched topics transient local), which matches
 the `SensorDataQoS().reliable()` of the webots_ros2 sensor plugins and serves best-effort subscribers (Nav2 costmaps).
 The interface also runs on a URDF import of `murom.urdf` (wrist chains as separate robots; no products).
+
+### In the browser (Connect › ROS 2 via rosbridge… › Simulator backend)
+
+1. File › Open folder `ros2_ws/src/murom_webots` (the Webots world; the folder is a ROS package, choose "Webots world"),
+   or `ros2_ws/src` (world and `murom_world/config` together).
+2. Connect › ROS 2 via rosbridge…: when the MUROM world has no products, the dialog offers **Load retail layout
+   (murom_world/config)…** — the supervisor's `$MUROM_CONFIG_DIR`; it spawns the 50 products of `products.yaml` in the
+   `locations.yaml` slots exactly as a folder import with the YAML files does (`src/ros/murka_layout.ts`; products as the
+   coloured boxes `RetailProduct.proto` is). Without it the backend warns and `/murom/sim/objects` is empty.
+3. Mode "Simulator backend", the rosbridge URL, OK.
+
+The backend then runs in a **Web Worker** (`src/ros/sim_worker.ts`) on a structured clone of the station (item tree +
+the meshes it references, `stationTransfer`): the same `sim_backend.ts` loop as the headless CLI, paced to the wall
+clock with catch-up frames, with its own rosbridge connection. The 3D view, the UI and the WebGL renders cannot stall
+it. What it moves — base state, joints, product poses — comes back to the page as state diffs by item id at up to
+30 Hz (`src/ros/sim_mirror.ts`), so the 3D view and the tree follow the backend. `app.ros.backendStats()` reports sim
+time, RTF, frames, messages and the time spent in frames. The station is copied at Connect: edits made in the
+studio while connected are not seen by the backend (reconnect); opening another station disconnects it. Without
+workers (Node, `?worker=off`, or a worker that fails to load) the same loop runs on the page thread (catch-up keeps
+the sim clock on the wall clock across a 400 ms stall; the former `setInterval` loop reached 0.43 of real time).
 
 Headless backend (`src/ros/sim_backend.ts`, CLI `src/ros/sim_cli.ts`):
 
@@ -165,11 +197,25 @@ with `pip --target`, no sudo) and a copy of the MURKA `ros2_ws`; `run_stack.sh` 
   the 50 products at their `locations.yaml` slots, tool tips and palms vs `murom.urdf` FK (< 1 mm), `/cmd_vel`
   kinematics + watchdog + saturation, trajectory interpolation + servo law, attach / detach / basket / two-hand
   messages; the same interface on the C1 station (`buildMurkaRetailStation`).
-- `ROS_WSL=1 npx vitest run tests/ros_murka_e2e.test.ts` — MURKA's own `scripts/smoke_test.py` (unmodified) prints
-  **SMOKE PASS** against the studio (all topics, 640 beams, 16 joints, 50 products, 0.75 m reverse drive,
-  |odom − gt| 0.000 m, RTF 1.0); and the real **MURKA FSM + Nav2 + navigate_server** (`murom_bringup` with `sim:=none`)
-  run `mission_test.py --mission undock` and `--mission dock`: both **MISSION PASS**, the studio robot ends 1.1 cm from
-  the dock pose.
+- `ROS_WSL=1 npx vitest run tests/ros_murka_e2e.test.ts` (headless backend) — MURKA's own `scripts/smoke_test.py`
+  (unmodified) prints **SMOKE PASS** against the studio (all topics, 640 beams, 16 joints, 50 products, 0.75 m reverse
+  drive, |odom − gt| 0.000 m, RTF 1.0); and the real **MURKA FSM + Nav2 + navigate_server** (`murom_bringup` with
+  `sim:=none`) run `mission_test.py --mission undock` and `--mission dock`: both **MISSION PASS**, the studio robot
+  ends 1.6 cm from the dock pose (last run, RTF 1.0).
+- `npm run build`, then `ROS_WSL=1 npm run test:e2e -- tests/e2e/ros_murka_browser.e2e.test.ts` (**the studio in the
+  browser**, system Chrome with the hardware GPU; `E2E_GL=swiftshader` for software GL) — the steps above done in the
+  UI (Open folder `murom_webots`, Load retail layout, Simulator backend), then `smoke_test.py`, then a camera
+  subscriber (`cam_rate.py`, 12 s). With the Intel GPU the smoke test passed in all 5 runs (50 products, 0.752 m,
+  backend RTF 1.00 in the worker); the last run, with the final back-pressure thresholds, passed whole: bgra8 / 32FC1
+  320×240 at 5.0 Hz in sim time, 0 frames dropped, `/clock` on the ROS side at 0.99 of real time. With SwiftShader
+  the smoke test passed in 3 of 4 runs; the software-rendered 3D view loads every core, and with other heavy jobs on
+  the machine the WSL VM fell behind (`/clock` seen at 0.2–0.3 of real time, once during the drive, once during the
+  camera check) — use a GPU. Before this round the same flow failed (0 products; with SwiftShader also
+  "робот не поехал", RTF 0.12).
+- `tests/ros_murka_browser_backend.test.ts` — the layout loader equals the folder import (50 products, poses
+  1e-6); the worker on a structured clone through a fake rosbridge (the mirrored base equals the published ground
+  truth to 1e-9, joints to 1e-6; no images until rosapi reports a subscriber, then 6- or 7-frame gaps); state diffs by
+  id; `SubscriberWatch` with and without rosapi; the page-thread loop across a stall.
 
 ## MoveIt 2 config and inertials (`src/io/urdf/moveit_export.ts`, `src/io/urdf/inertia.ts`)
 
@@ -192,4 +238,6 @@ with `pip --target`, no sudo) and a copy of the MURKA `ros2_ws`; `run_stack.sh` 
   (`config/appearance_<sim>.yaml` by its `calibrate.py`); a studio appearance file is not provided, so the `scan`
   stage of the mission was not run (the image / depth formats are verified).
 - `/murom/sim/record` (video) and `/murom/sim/viewpoint` are not implemented by the backend.
+- A studio tab in the background: the worker's timers are not subject to the page's timer throttling, but this was
+  not measured (headless Chrome pages stay "visible").
 - Native DDS from the browser is out of scope; everything goes through rosbridge.

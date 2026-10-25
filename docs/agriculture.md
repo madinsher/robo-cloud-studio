@@ -40,6 +40,14 @@ programs; foliage is soft.
 expansion, turning losses), omni (vx, vy, ω), legged (lateral speed limit), Ackermann bicycle (steering angle with
 angle and rate limits, reverse, yaw-rate limit), aerial (x, y, z, yaw, take-off to cruise altitude, hover / climb
 power). Pose paths carry a direction per point (forward / reverse / rotate in place); the tracker stops at cusps.
+An Ackermann base is referenced to its **rear axle** (`kin.rearAxle`, body x; default −wheelBase/2, i.e. axles
+symmetric about the item origin; the Webots importer takes the proto's rear wheels, −1.095 m on the UTP-G): the bicycle
+model, the turning-radius limit, the Hybrid A* arcs, Reeds–Shepp joins, headland turns and the path tracker hold at
+the rear axle, the item origin / footprint centre follows as a rigid body (it slips by atan(a/R) in a turn, about 14° on
+the orchard Sprayer at R = 3.6 m), and the 3-D view draws the wheels on those axles. Measured from consecutive poses the
+rear wheels have no side slip (< 0.5°; `mobile_ackermann_rear_axle`). The tracker previews curvature switches for the
+steering-rate lag (the transition is centred on the switch and at most 100 mm long, braking-distance aware), and steers
+at standstill at a cusp.
 
 **Planning** (`src/mobile/planner.ts`, `hybrid_astar.ts`, `reeds_shepp.ts`, `navigate.ts`): footprint-aware grid A*
 with oriented string pulling (turn-then-drive, no corner cutting at alley mouths) for differential / tracked /
@@ -154,7 +162,8 @@ picks every ripe fruit of rows 1–4 with the TCP on each fruit at its pick time
 the arm within 0.8 × reach of the row it harvests (`agri_orchard_demo`); arm motion, joint speed limits, collision-free
 pick configurations, the `incomplete` result of a fixed-mount arm and the opt-out (`agri_harvest_arm`); head-on robots in one alley /
 lane, allocators, save–load mid-mission (`mobile_traffic`); Ackermann alley-to-alley turns and wall detours
-(`mobile_kinematics`); docking and program motion (`mobile_navigate`); harvest / spray programs and the detect → pick
+(`mobile_kinematics`); Ackermann rear axle without side slip in the bicycle model, Hybrid A* / headland turns, Navigate
+docking, the orchard demo Sprayer and the S1 UTP-G platforms (`mobile_ackermann_rear_axle`); docking and program motion (`mobile_navigate`); harvest / spray programs and the detect → pick
 loop (`agri_programs`); process models and generators (`agri_processes`); equipment and depot reconfiguration
 (`agri_equipment`); group control on Ackermann robots (`mobile_group`); component ↔ program signals
 (`agri_vc_signals`); greenhouse rails (`agri_greenhouse`); palletizer cells (`agri_vc_palletizer`); navigation method →

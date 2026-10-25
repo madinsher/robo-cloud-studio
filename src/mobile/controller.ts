@@ -3,8 +3,12 @@
  *
  * Drive models (`integrate`): differential (wheel-speed saturation), tracked / skid steer (track slip and ICR
  * expansion), omni (vx, vy, ω), legged (holonomic with a lateral speed limit), Ackermann bicycle (steering angle state
- * with angle and rate limits, reverse) and aerial (x, y, z, yaw with climb / hover). The state point is the reference
- * point of the drive (rear axle for Ackermann); it has no lateral velocity for non-holonomic drives.
+ * with angle and rate limits, reverse) and aerial (x, y, z, yaw with climb / hover). The state point is the item origin
+ * (footprint centre). The reference point of the drive, the point without lateral velocity, is the origin for
+ * differential / tracked / legged drives and the rear axle (`rearAxleOffset`, body x = kin.rearAxle, default
+ * −wheelBase/2) for Ackermann: the bicycle model, the turning-radius limit, Reeds–Shepp joins, Hybrid A* arcs and the
+ * path tracker all hold at the rear axle, and the origin follows as a rigid body (V3 F4: referencing the bicycle
+ * model to the origin made the rear wheels slide sideways 8–19° in turns).
  *
  * Paths: plain [x, y] polylines or pose paths [x, y, headingDeg, dir] (dir 1 forward, -1 reverse, 0 rotate in place),
  * the format produced by the Hybrid-A* / Reeds–Shepp planners. `followPath` converts a polyline into a pose path the
@@ -16,6 +20,7 @@ import { MobileRobot, MobileKinematics } from './items';
 import { DEG, RAD } from '../core/math/pose';
 import { pathLength, regulatedMinRadius } from './planner';
 import { reedsSheppPath } from './reeds_shepp';
+import { shiftPose, shiftPosePath } from './footprint';
 
 export interface VelocityCommand {
   v: number; // mm/s, body x (signed)
@@ -38,6 +43,16 @@ export function minTurnRadius(k: MobileKinematics): number {
   return Math.max(k.minTurnRadius || 0, fromSteer);
 }
 
+/**
+ * Body x (mm) of the drive's reference point — the point without lateral velocity that the curvature limit and path
+ * tracking refer to: the rear axle of an Ackermann base (kin.rearAxle, default −wheelBase/2), 0 for the other drives.
+ */
+export function rearAxleOffset(k: MobileKinematics): number {
+  if (k.drive !== 'ackermann') return 0;
+  const a = k.rearAxle ?? -Math.max(0, k.wheelBase) / 2;
+  return Number.isFinite(a) ? a : 0;
+}
+
 export function isHolonomic(k: MobileKinematics): boolean { return k.drive === 'omni' || k.drive === 'aerial'; }
 
 /** Mechanical power draw (W) for the current state. */
@@ -57,6 +72,8 @@ export function integrate(robot: MobileRobot, cmd: VelocityCommand, dt: number):
   const accel = (cur: number, target: number, a: number) => cur + clamp(target - cur, -a * dt, a * dt);
   const maxYaw = k.maxYawRate;
   let vx = st.v, vy = st.vy ?? 0, omega: number;
+  /** Lateral body velocity of the origin when the reference point is not the origin (Ackermann rear axle). */
+  let vyOrigin: number | null = null;
   switch (k.drive) {
     case 'differential':
     case 'tracked': {
@@ -120,16 +137,20 @@ export function integrate(robot: MobileRobot, cmd: VelocityCommand, dt: number):
       omega = ((vx * Math.tan(st.steer * DEG)) / L) * RAD;
       if (Math.abs(omega) > maxYaw) omega = Math.sign(omega) * maxYaw; // yaw-rate limit (fast at low radius)
       vy = 0;
+      // the bicycle model holds at the rear axle (body x = a): the rigid body turns about the ICR on the rear axle line,
+      // so the origin moves with the lateral body velocity −a·ω (v is the rear-axle speed, the odometer counts it)
+      vyOrigin = -rearAxleOffset(k) * omega * DEG;
       break;
     }
   }
   st.v = vx; st.vy = vy; st.omega = omega;
-  moveBody(robot, vx, vy, omega, dt);
+  if (vyOrigin !== null) moveBody(robot, vx, vyOrigin, omega, dt, Math.abs(vx));
+  else moveBody(robot, vx, vy, omega, dt);
   finish(robot, dt);
 }
 
-/** Exact planar motion over dt with constant body velocities (arc integration). */
-function moveBody(robot: MobileRobot, vx: number, vy: number, omegaDeg: number, dt: number): void {
+/** Exact planar motion over dt with constant body velocities (arc integration); `odoSpeed` overrides the odometer rate. */
+function moveBody(robot: MobileRobot, vx: number, vy: number, omegaDeg: number, dt: number, odoSpeed?: number): void {
   const st = robot.state;
   const w = omegaDeg * DEG, th = st.theta * DEG;
   let dxb: number, dyb: number;
@@ -142,7 +163,7 @@ function moveBody(robot: MobileRobot, vx: number, vy: number, omegaDeg: number, 
   st.x += Math.cos(th) * dxb - Math.sin(th) * dyb;
   st.y += Math.sin(th) * dxb + Math.cos(th) * dyb;
   st.theta = wrap180(st.theta + omegaDeg * dt);
-  st.odometer += Math.hypot(vx, vy) * dt;
+  st.odometer += (odoSpeed ?? Math.hypot(vx, vy)) * dt;
 }
 
 function finish(robot: MobileRobot, dt: number): void {
@@ -265,6 +286,9 @@ export function toPosePath(robot: MobileRobot, path: number[][], opts: FollowOpt
     return out;
   }
   if (k.drive === 'ackermann') {
+    // Reeds–Shepp joins are paths of the rear axle (where the radius limit holds): planned between the rear-axle poses
+    // of the waypoint poses and returned as origin poses
+    const ax = rearAxleOffset(k);
     const R = minTurnRadius(k) * 1.15;
     const segDir = (i: number) => Math.atan2(dedup[i + 1][1] - dedup[i][1], dedup[i + 1][0] - dedup[i][0]) * RAD;
     const poses: Array<{ x: number; y: number; theta: number; free?: boolean }> = [{ x: st.x, y: st.y, theta: st.theta }];
@@ -281,10 +305,10 @@ export function toPosePath(robot: MobileRobot, path: number[][], opts: FollowOpt
       const cands = b.free ? [b.theta, wrap180(b.theta + 180)] : [b.theta];
       let best: number[][] | null = null, bestCost = Infinity;
       for (const th of cands) {
-        const rs = reedsSheppPath({ x: a.x, y: a.y, theta: a.theta }, { x: b.x, y: b.y, theta: th }, R, { allowReverse: opts.allowReverse ?? true, step: 150 });
+        const rs = reedsSheppPath(shiftPose({ x: a.x, y: a.y, theta: a.theta }, ax), shiftPose({ x: b.x, y: b.y, theta: th }, ax), R, { allowReverse: opts.allowReverse ?? true, step: 150 });
         if (rs && rs.cost < bestCost) { bestCost = rs.cost; best = rs.poses; }
       }
-      if (best) out.push(...best.slice(1));
+      if (best) out.push(...shiftPosePath(best.slice(1), -ax));
     }
     return out;
   }
@@ -338,6 +362,16 @@ export function followPath(robot: MobileRobot, path: number[][], opts: FollowOpt
 
 interface TrackState { leg: number }
 const trackStates = new WeakMap<MobileRobot, { path: number[][]; t: TrackState }>();
+/** Rear-axle pose paths of the origin pose paths followed by Ackermann bases (cached per path and offset). */
+const refPaths = new WeakMap<number[][], { a: number; p: number[][] }>();
+function refPathOf(path: number[][], a: number): number[][] {
+  if (!a) return path;
+  const c = refPaths.get(path);
+  if (c && c.a === a) return c.p;
+  const p = shiftPosePath(path, a);
+  refPaths.set(path, { a, p });
+  return p;
+}
 
 /**
  * Pose-path tracker. Non-holonomic legs use the kinematic law (s = distance travelled, e_y lateral error left of the
@@ -346,10 +380,14 @@ const trackStates = new WeakMap<MobileRobot, { path: number[][]; t: TrackState }
  * Holonomic drives track the path point-wise with a heading controller. Returns null when the path is complete.
  */
 export function trackPath(robot: MobileRobot, opts: PurePursuitOptions = {}): VelocityCommand | null {
-  const path = robot.state.path;
-  if (!path || !path.length) return null;
-  const pose = opts.pose ?? robot.state;
+  const statePath = robot.state.path;
+  if (!statePath || !statePath.length) return null;
   const k = robot.kin;
+  // the tracking law runs at the drive's reference point: the rear axle of an Ackermann base follows the rear-axle
+  // path of the (origin) pose path, so the curvature it is given is the one its bicycle model can drive
+  const ax = rearAxleOffset(k);
+  const path = refPathOf(statePath, ax);
+  const pose = shiftPose(opts.pose ?? robot.state, ax);
   let ts = trackStates.get(robot);
   if (!ts || ts.path !== path) {
     ts = { path, t: { leg: 0 } };
@@ -433,7 +471,28 @@ export function trackPath(robot: MobileRobot, opts: PurePursuitOptions = {}): Ve
       return { v: 0, omega: -Math.sign(eth) * k.maxYawRate * 0.6 };
     }
     const eyc = clamp(ey, -Ld, Ld);
-    const kappa = dir * kp - eyc / (Ld * Ld) - dir * (2 / Ld) * eth;
+    // feed-forward curvature (signed for the motion direction); an Ackermann base previews the next curvature change
+    // (Reeds–Shepp / Hybrid A* paths switch curvature instantly): its wheels need T = |Δδ|/rate to steer there, which
+    // the speed law below makes a transition of at most TR mm (v ≤ TR/T at the change); the feed-forward switches
+    // T/2 before the change, so the transition is centred on it
+    let kff = dir * kp, previewing = false;
+    const steerRate = Math.max(1, k.maxSteerRate ?? 60) * DEG;
+    const TR = 100;
+    if (k.drive === 'ackermann') {
+      const L = k.wheelBase, dNowFF = Math.atan(L * dir * kp), vNow = Math.abs(robot.state.v);
+      let s = segLen * (1 - bestT);
+      for (let i = bestI + 1; i < leg.b && s < TR; i++) {
+        const sl = Math.hypot(path[i + 1][0] - path[i][0], path[i + 1][1] - path[i][1]);
+        const ki = sl > 1 ? (dir * wrap180(path[i + 1][2] - path[i][2]) * DEG) / sl : 0;
+        if (Math.abs(Math.atan(L * ki) - dNowFF) > 2 * DEG) {
+          const T = Math.abs(Math.atan(L * ki) - robot.state.steer * DEG) / steerRate;
+          if (s <= 0.5 * T * Math.min(vNow, TR / Math.max(T, 1e-6))) { kff = ki; previewing = true; }
+          break;
+        }
+        s += sl;
+      }
+    }
+    const kappa = kff - eyc / (Ld * Ld) - dir * (2 / Ld) * eth;
     // speed: stop at the leg end (cusp / goal), slow in curvature, never below a creep speed
     const vlim = dir > 0 ? vcap : Math.min(vcap, k.maxReverseSpeed);
     let v = Math.min(vlim, Math.sqrt(2 * decel * Math.max(0, rem - legTol * 0.3)) + 20);
@@ -455,19 +514,27 @@ export function trackPath(robot: MobileRobot, opts: PurePursuitOptions = {}): Ve
     if (opts.slowdownDistance !== undefined && last && rem < opts.slowdownDistance) v = Math.min(v, Math.max(150, vlim * (rem / opts.slowdownDistance)));
     let creep = 25;
     if (k.drive === 'ackermann') {
-      // steering-rate-aware speed: the wheels must reach the steering angle needed further along the path in time
-      const rate = (k.maxSteerRate ?? 60) * DEG, L = k.wheelBase;
-      const dNow = Math.abs(Math.atan(L * kappa) - robot.state.steer * DEG);
-      if (dNow > 4 * DEG) creep = 0; // steer at standstill first
+      // steering-rate-aware speed: a curvature change ahead needing a steering change Δδ is crossed in a transition
+      // v·Δδ/rate long (centred on the change by the preview); it is kept ≤ TR (braking-distance aware:
+      // v ≤ sqrt(v_change² + 2·a·(s − TR/2))), which leaves a heading error of about Δκ·TR/4 for the feedback to remove
+      const rate = steerRate, L = k.wheelBase;
+      const steerMax = Math.min(k.maxSteer, Math.atan(L / Math.max(1, minTurnRadius(k))) * RAD) * DEG;
+      const dNow = Math.abs(clamp(Math.atan(L * kappa), -steerMax, steerMax) - robot.state.steer * DEG);
       let s = segLen * (1 - bestT);
-      for (let i = bestI + 1; i < leg.b && s < 4000; i++) {
+      for (let i = bestI + 1; i < leg.b && s < 6000; i++) {
         const sl = Math.hypot(path[i + 1][0] - path[i][0], path[i + 1][1] - path[i][1]);
         const ki = sl > 1 ? (dir * wrap180(path[i + 1][2] - path[i][2]) * DEG) / sl : 0;
-        const need = Math.abs(Math.atan(L * ki) - robot.state.steer * DEG) - 2 * DEG;
-        if (need > 0) v = Math.min(v, (s * rate) / need);
+        const need = Math.abs(clamp(Math.atan(L * ki), -steerMax, steerMax) - robot.state.steer * DEG);
+        if (need > 2 * DEG) v = Math.min(v, Math.sqrt(((TR * rate) / need) ** 2 + 2 * decel * Math.max(0, s - 0.5 * TR)));
         s += sl;
       }
-      if (dNow > 2 * DEG) v = Math.min(v, (300 * rate) / dNow);
+      if (!previewing && dNow > 2 * DEG) {
+        // the wheels lag the curvature needed now (leg start after a cusp, a disturbance): steer at standstill first
+        // when starting, else slow down so the lag lasts at most TR
+        creep = 0;
+        if (dNow > 4 * DEG && Math.abs(robot.state.v) < 50) v = 0;
+        else v = Math.min(v, (TR * rate) / dNow);
+      }
     }
     v = Math.max(v, creep);
     // do not start a reverse leg while still rolling forward (and vice versa)

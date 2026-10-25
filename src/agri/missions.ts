@@ -12,7 +12,7 @@ import { fruitWorldPositions } from './orchard';
 import { FleetManager, FleetTask, TaskType } from '../fleet/fleet';
 import { MobileRobot } from '../mobile/items';
 import { orderRowsNearest, headlandTurns } from '../mobile/planner';
-import { minTurnRadius } from '../mobile/controller';
+import { minTurnRadius, rearAxleOffset } from '../mobile/controller';
 import { transl, add, scale } from '../core/math/pose';
 import { armOf, armMount, armReach, armLift } from './harvest';
 import { planStops } from './process';
@@ -107,7 +107,7 @@ export function planMission(station: Station, mission: MissionItem, fleet: Fleet
     const e0 = toWorld(r0.travelLine(sideOffset).end), s1 = toWorld(r1.travelLine(sideOffset).end);
     const d = r0.direction();
     const th = Math.atan2(abs[1] * d[0] + abs[5] * d[1], abs[0] * d[0] + abs[4] * d[1]) * 180 / Math.PI;
-    const turns = headlandTurns({ x: e0[0], y: e0[1], theta: th }, { x: s1[0], y: s1[1], theta: th + 180 }, minTurnRadius(r.kin) * 1.15, [r.kin.footprint[0], r.kin.footprint[1]]);
+    const turns = headlandTurns({ x: e0[0], y: e0[1], theta: th }, { x: s1[0], y: s1[1], theta: th + 180 }, minTurnRadius(r.kin) * 1.15, [r.kin.footprint[0], r.kin.footprint[1]], rearAxleOffset(r.kin));
     const best = turns.reduce((p, q) => (q.depth < p.depth ? q : p), turns[0]);
     if (best && best.depth > field.crop.headland) warnings.push(`${r.name}: a ${best.kind} turn needs ${(best.depth / 1000).toFixed(1)} m of headland, the field has ${(field.crop.headland / 1000).toFixed(1)} m`);
   }

@@ -78,12 +78,23 @@ class Robolink(object):
     def setParam(self, n, v):
         self.params[n] = str(v)
 
-    def getParam(self, n):
+    def _params(self):
+        out = dict(self.params)
         for p, c in CFG['programs'].items():
             s = self.started.get(p)
-            if n in c.get('sets', {}) and s is not None and self.sim() >= s + c['duration'] - 1e-9:
-                return str(c['sets'][n])
-        return self.params.get(n)
+            if s is not None and self.sim() >= s + c['duration'] - 1e-9:
+                for k, v in c.get('sets', {}).items():
+                    out[k] = str(v)
+        return out
+
+    def getParam(self, n):
+        v = self._params().get(n)
+        if v is None:
+            print('WARNING: Invalid/unknown parameter to get: %s' % n)  # what RoboDK 5.9's robolink prints
+        return v
+
+    def getParams(self):
+        return [[k, v] for k, v in self._params().items()]
 `;
 const DRIVER = `import sys, runpy, time, atexit
 sys.path.insert(0, sys.argv[2])
@@ -122,6 +133,7 @@ function runScript(kind: 'petri' | 'bt', source: string, cfg: Record<string, unk
   fs.rmSync(dir, { recursive: true, force: true });
   const lines = r.stdout.split(/\r?\n/);
   return {
+    stdout: lines,
     stderr: r.stderr,
     trace: lines.filter((l) => l.startsWith('TRACE')).map((l) => { const [, t, k, label] = l.split('\t'); return { t: Number(t), kind: k, label }; }),
     result: lines.find((l) => l.startsWith('RESULT'))?.split('\t') ?? [],
@@ -187,6 +199,18 @@ describe.skipIf(!HAVE_PY)('RoboDK station script timing and signals (RoboDK-like
       // delays run on the simulation clock: tD ends at 2 s of simulation time, not after 40 slow steps
       const tD = py.trace.find((e) => e.kind === 'end' && e.label === 'tD')!;
       expect(tD.t).toBeGreaterThanOrEqual(2 - 1e-6); expect(tD.t).toBeLessThan(2.8);
+    }
+  });
+  it('stdout: no "Invalid/unknown parameter" warning per tick for a signal no program has set yet (one getParams() per read)', () => {
+    const GUARD = ['petri Guard on a robot output', 'place p0 tokens=1', 'place a1', 'place b1', 'place a2', 'place b2', 'place a3', 'place pE',
+      'transition tF', 'transition tA', 'transition tB', 'transition tC guard="Ready == 1"', 'transition tJ',
+      'arc p0 -> tF -> a1, b1', 'arc a1 -> tA -> a2', 'arc b1 -> tB -> b2', 'arc a2 -> tC -> a3', 'arc a3, b2 -> tJ -> pE',
+      'action tA program=A_Pick robot=R1', 'action tB program=B_Work robot=R2', 'action tC program=A_Place robot=R1'].join('\n');
+    for (const [kind, src] of [['petri', GUARD], ['bt', BT60]] as Array<['petri' | 'bt', string]>) {
+      const py = runScript(kind, src, { programs: PROGRAMS, speed: 5, latency: 0.12 }, ['60']);
+      expect(py.result[1], `${kind}: ${py.stdout.join('\n')}`).toBe('done');
+      expect(py.trace.filter((e) => e.kind === 'program').map((e) => e.label)).toEqual(['A_Pick', 'B_Work', 'A_Place']);
+      expect(py.stdout.filter((l) => /WARNING/.test(l)), kind).toEqual([]);
     }
   });
   it('sets the simulation speed to 1 by default (as the studio runs) and restores RoboDK\'s speed; 0 keeps it', () => {

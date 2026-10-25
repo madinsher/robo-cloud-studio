@@ -21,6 +21,12 @@ export interface MobileKinematics {
   minTurnRadius: number;
   /** Ackermann steering-rate limit (deg/s). */
   maxSteerRate?: number;
+  /**
+   * Ackermann: x (mm, body frame) of the rear axle, the reference point of the bicycle model (no lateral velocity
+   * there; the turning radius limit and path curvature hold there). Default −wheelBase/2: axles symmetric about the
+   * item origin (the Webots UTP-G proto origin is the wheelbase midpoint). The steered axle is at rearAxle + wheelBase.
+   */
+  rearAxle?: number;
   /** Tracked / skid steer: longitudinal track slip (0-1) and ICR expansion (effective track = track·(1+turnSlip)). */
   slip?: number;
   turnSlip?: number;

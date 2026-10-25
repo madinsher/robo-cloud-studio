@@ -44,6 +44,12 @@ describe('BT editor tree as a mission', () => {
     expect(run.done).toBe(true); expect(run.rt.status).toBe('success');
     expect(run.rt.time).toBeGreaterThan(longest); expect(run.rt.time).toBeLessThan(longest + duration(L) + 5);
     expect(toasts().some((t) => /Mission: success/.test(t))).toBe(true);
+    // the mission log of an arm-only tree: every program start and end with its time, then the tree result
+    const log = run.rt.log; const tOf = (re: RegExp) => Number(/^\[([\d.]+)\]/.exec(log.find((l) => re.test(l)) ?? '')?.[1] ?? NaN);
+    for (const p of [L, R]) { expect(log.some((l) => l.includes(`program ${p} started`)), log.join('\n')).toBe(true); expect(log.some((l) => l.includes(`program ${p} success`)), log.join('\n')).toBe(true); }
+    expect(log.filter((l) => l.includes(`program ${L} started`))).toHaveLength(2);
+    expect(tOf(new RegExp(`program ${R} success`))).toBeGreaterThan(tOf(new RegExp(`program ${R} started`)));
+    expect(log[log.length - 1]).toMatch(/tree success$/);
   });
   it('a timeout shorter than its program ends the mission with a logged failure (no silent endless restarts)', () => {
     app.setStation(demos.find((d) => d.id === 'welding')!.build()); clearToasts();

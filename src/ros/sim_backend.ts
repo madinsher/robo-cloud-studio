@@ -29,6 +29,86 @@ export interface SimBackendOptions {
   transport?: RosTransport;
   WebSocket?: WebSocketCtor;
   log?: (msg: string, level?: 'info' | 'warn' | 'error') => void;
+  /**
+   * Render the camera devices only while their topics have subscribers, like the webots_ros2 devices without
+   * <alwaysOn> (default true; needs rosapi_node, started by rosbridge_websocket_launch.xml — without it the cameras
+   * publish at their rate all the time).
+   */
+  cameraOnDemand?: boolean;
+  /** Called after every tick (one or more control frames), e.g. to mirror the state to the studio's 3D view. */
+  onFrame?: (h: SimBackendHandle) => void;
+}
+
+/**
+ * Subscriber counts of ROS topics through rosbridge: polls rosapi's /rosapi/subscribers (rosapi_msgs/srv/Subscribers)
+ * every `periodMs` for the topics asked about. `has(topics)` is false until the first answer (a device stays off until
+ * a subscription is seen, as in webots_ros2) and undefined for good when rosapi is not running (the calls fail three
+ * times in a row), so callers fall back to "always on".
+ */
+export class SubscriberWatch {
+  private known = new Map<string, number>();
+  private wanted = new Set<string>();
+  private failures = 0;
+  private timer: ReturnType<typeof setInterval> | null = null;
+  available: boolean | null = null;
+  constructor(readonly client: { callService(service: string, args?: any, type?: string, timeoutMs?: number): Promise<any> }, readonly periodMs = 1000) {}
+  has(topics: string[]): boolean | undefined {
+    for (const t of topics) if (!this.wanted.has(t)) { this.wanted.add(t); this.start(); }
+    if (this.available === false) return undefined;
+    return topics.some((t) => (this.known.get(t) ?? 0) > 0);
+  }
+  private start(): void {
+    if (this.timer || this.available === false) return;
+    void this.poll();
+    this.timer = setInterval(() => void this.poll(), this.periodMs);
+  }
+  private inFlight = false;
+  async poll(): Promise<void> {
+    if (this.inFlight || this.available === false) return;
+    this.inFlight = true;
+    try {
+      for (const t of this.wanted) {
+        const r = await this.client.callService('/rosapi/subscribers', { topic: t }, 'rosapi_msgs/srv/Subscribers', Math.max(2000, this.periodMs * 2));
+        this.known.set(t, Array.isArray(r?.subscribers) ? r.subscribers.length : 0);
+        this.available = true; this.failures = 0;
+      }
+    } catch {
+      // no rosapi (or a busy graph): after a few failures in a row, treat the demand as unknown for good
+      if (++this.failures >= 3 && this.available !== true) { this.available = false; this.stop(); }
+    } finally { this.inFlight = false; }
+  }
+  stop(): void { if (this.timer) clearInterval(this.timer); this.timer = null; }
+}
+
+/**
+ * How far the ROS side lags behind the backend: the backend's own /clock as rosbridge delivers it back (throttled to
+ * one message per 100 ms) went through rosbridge's whole queue. The round trip has a baseline (rosbridge, the WSL
+ * relay: 0.3-0.4 s measured; a 5 Hz bgra8 + 32FC1 pair adds transient spikes), so congestion is a lag `high` s above
+ * the smallest lag of the last `windowS` s of sim time — a queue that keeps growing — and ends below `low` s above it;
+ * an unknown lag (no echo yet, or none at all) is not congestion.
+ */
+export class ClockEcho {
+  private echoed = NaN;
+  private on = false;
+  private samples: Array<[number, number]> = [];
+  constructor(client: { subscribe(topic: string, type: string, cb: (m: any) => void, opts?: { throttleRate?: number }): void }, readonly now: () => number, readonly high = 1.0, readonly low = 0.4, readonly windowS = 30) {
+    client.subscribe('/clock', 'rosgraph_msgs/msg/Clock', (m) => {
+      const c = m?.clock; if (!c) return;
+      this.echoed = Number(c.sec) + Number(c.nanosec) * 1e-9;
+      const t = this.now();
+      this.samples.push([t, t - this.echoed]);
+      while (this.samples.length && this.samples[0][0] < t - this.windowS) this.samples.shift();
+    }, { throttleRate: 100 });
+  }
+  lag(): number | undefined { return Number.isFinite(this.echoed) ? this.now() - this.echoed : undefined; }
+  /** Smallest round-trip lag of the window (s). */
+  baseline(): number | undefined { let m = Infinity; for (const [, l] of this.samples) if (l < m) m = l; return Number.isFinite(m) ? m : undefined; }
+  congested(): boolean {
+    const l = this.lag(), b = this.baseline();
+    if (l === undefined || b === undefined) return (this.on = false);
+    if (this.on ? l < b + this.low : l > b + this.high) this.on = !this.on;
+    return this.on;
+  }
 }
 
 export interface SimBackendHandle {
@@ -40,6 +120,10 @@ export interface SimBackendHandle {
   /** Measured real-time factor since start. */
   rtf(): number;
   steps(): number;
+  /** Wall time spent inside the control frames (ms, cumulative) and the longest frame (ms). */
+  busy(): { ms: number; maxMs: number };
+  /** Sim seconds the ROS side lags behind (the /clock echo through rosbridge; MURKA backend over rosbridge only). */
+  rosLag(): number | undefined;
   stop(): void;
   /** Resolves when stopped. */
   done: Promise<void>;
@@ -69,12 +153,16 @@ export async function startSimBackend(opts: SimBackendOptions): Promise<SimBacke
     io = client;
   }
   if (opts.assets) setSensingAssets(opts.assets);
-  const { kind, sim } = createSimInterface(opts.station, io, { murom: opts.murom, twin: opts.twin, assets: opts.assets });
+  const watch = client && opts.cameraOnDemand !== false && !opts.murom?.sensorDemand ? new SubscriberWatch(client) : null;
+  let t = opts.station.simTime ?? 0;
+  // the MURKA interface drops camera frames while rosbridge falls behind (its /clock echo lags): the clock stays real time
+  const echo = client && findMurom(opts.station) && !opts.murom?.cameraBackpressure ? new ClockEcho(client, () => t) : null;
+  const murom: MuromSimOptions = { ...opts.murom, ...(watch ? { sensorDemand: (topics: string[]) => watch.has(topics) } : {}), ...(echo ? { cameraBackpressure: () => echo.congested() } : {}) };
+  const { kind, sim } = createSimInterface(opts.station, io, { murom, twin: opts.twin, assets: opts.assets });
   const dt = opts.step ?? stationStep(opts.station);
   const rtf = opts.rtf ?? 1;
-  let t = opts.station.simTime ?? 0;
   sim.start(t);
-  let steps = 0, stopped = false;
+  let steps = 0, stopped = false, busyMs = 0, maxMs = 0;
   const wall0 = Date.now(), sim0 = t;
   let wallRef = wall0, simRef = t;
   let resolveDone!: () => void;
@@ -86,7 +174,10 @@ export async function startSimBackend(opts: SimBackendOptions): Promise<SimBacke
       // a few frames per tick when behind (bounded), one when on time
       for (let k = 0; k < 4; k++) {
         t += dt;
+        const a = performance.now();
         sim.step(dt, t);
+        const d = performance.now() - a;
+        busyMs += d; if (d > maxMs) maxMs = d;
         opts.station.simTime = t;
         steps++;
         if (rtf <= 0) break;
@@ -96,6 +187,7 @@ export async function startSimBackend(opts: SimBackendOptions): Promise<SimBacke
     } catch (e) {
       log(`step failed: ${(e as Error).stack ?? e}`, 'error');
     }
+    if (opts.onFrame) { try { opts.onFrame(handle); } catch (e) { log(`frame hook failed: ${(e as Error).message}`, 'error'); } }
     if (client && !client.connected) { log('rosbridge connection lost — backend stopped', 'error'); handle.stop(); return; }
     const now = Date.now();
     let delay = 0;
@@ -111,7 +203,9 @@ export async function startSimBackend(opts: SimBackendOptions): Promise<SimBacke
     time: () => t,
     rtf: () => { const w = (Date.now() - wall0) / 1000; return w > 0 ? (t - sim0) / w : 0; },
     steps: () => steps,
-    stop: () => { if (stopped) return; stopped = true; client?.close(); resolveDone(); },
+    busy: () => ({ ms: busyMs, maxMs }),
+    rosLag: () => echo?.lag(),
+    stop: () => { if (stopped) return; stopped = true; watch?.stop(); client?.close(); resolveDone(); },
     done,
   };
   return handle;

@@ -10,4 +10,5 @@ import './more';
 import './vendors';
 import './staubli';
 import './urp';
+import './rdk_builtin';
 export * from './base';

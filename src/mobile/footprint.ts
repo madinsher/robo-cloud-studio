@@ -298,6 +298,23 @@ export class CollisionWorld {
   }
 }
 
+/**
+ * Pose of the body point at x = `a` (mm, body frame) for a body pose (same heading). A car-like base is planned and
+ * tracked at its rear axle (`shiftPose(origin, rearAxle)`), its footprint and item pose stay at the body origin
+ * (`shiftPose(rear, -rearAxle)`).
+ */
+export function shiftPose<T extends { x: number; y: number; theta: number }>(p: T, a: number): T {
+  if (!a) return p;
+  const th = (p.theta * Math.PI) / 180;
+  return { ...p, x: p.x + Math.cos(th) * a, y: p.y + Math.sin(th) * a };
+}
+
+/** Pose path ([x, y, headingDeg, dir, …] points) of the body point at x = `a` (see shiftPose). */
+export function shiftPosePath(path: number[][], a: number): number[][] {
+  if (!a) return path;
+  return path.map((p) => { const th = (p[2] * Math.PI) / 180; const q = p.slice(); q[0] = p[0] + Math.cos(th) * a; q[1] = p[1] + Math.sin(th) * a; return q; });
+}
+
 /** Footprint rectangle of a robot-like state. */
 export function footprintRect(st: { x: number; y: number; theta: number }, fp: number[]): Rect2 {
   return { x: st.x, y: st.y, theta: st.theta, L: fp[0], W: fp[1] };

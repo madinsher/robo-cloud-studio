@@ -66,7 +66,7 @@ def FeatureTest():
   
   # Subprogram SubPick
   def SubPick():
-    movel(pose_trans(ref_frame,p[-0.421760, 0.353029, 0.380392, 3.048456, 0.496359, 0.454616]),accel_mss,speed_ms,0,0.000)
+    movel(pose_trans(ref_frame,p[-0.421760, 0.353029, 0.380392, 3.048452, 0.496356, 0.454618]),accel_mss,speed_ms,0,0.000)
     set_standard_digital_out(7, True)
   end
   
@@ -82,14 +82,14 @@ def FeatureTest():
   accel_radss = 6.981
   blend_radius_m = 0.005
   movej([-0.523599, -1.745329, 1.570796, -1.396263, -1.570796, 0.349066],accel_radss,speed_rads,0,0.005)
-  movel(pose_trans(ref_frame,p[-0.421760, 0.353029, 0.380392, 3.048456, 0.496359, 0.454616]),accel_mss,speed_ms,0,0.005)
-  movec(pose_trans(ref_frame,p[-0.384494, 0.350433, 0.368074, 3.036811, 0.389568, 0.461664]),pose_trans(ref_frame,p[-0.346512, 0.428592, 0.387797, 3.069714, 0.117166, 0.434828]),accel_mss,speed_ms,0) # end trace
+  movel(pose_trans(ref_frame,p[-0.421760, 0.353029, 0.380392, 3.048452, 0.496356, 0.454618]),accel_mss,speed_ms,0,0.005)
+  movec(pose_trans(ref_frame,p[-0.384494, 0.350433, 0.368074, 3.036811, 0.389569, 0.461666]),pose_trans(ref_frame,p[-0.346512, 0.428592, 0.387797, 3.069709, 0.117165, 0.434828]),accel_mss,speed_ms,0) # end trace
   speed_ms    = 0.050
   blend_radius_m = 0.000
-  movel(pose_trans(ref_frame,p[-0.421760, 0.353029, 0.380392, 3.048456, 0.496359, 0.454616]),accel_mss,speed_ms,0,0.000)
+  movel(pose_trans(ref_frame,p[-0.421760, 0.353029, 0.380392, 3.048452, 0.496356, 0.454618]),accel_mss,speed_ms,0,0.000)
   blend_radius_m = 0.000
   speed_ms    = 0.300
-  movel(pose_trans(ref_frame,p[-0.384494, 0.350433, 0.368074, 3.036811, 0.389568, 0.461664]),accel_mss,speed_ms,0,0.000)
+  movel(pose_trans(ref_frame,p[-0.384494, 0.350433, 0.368074, 3.036811, 0.389569, 0.461666]),accel_mss,speed_ms,0,0.000)
   set_standard_digital_out(3, True)
   DO_GRIP = 0
   while (get_standard_digital_in(5) != True):

@@ -128,7 +128,8 @@ export class MotomanPost extends RoboPost {
   override setTool(pose: Mat4, id: number, name: string): void {
     const v = pose2Motoman(pose);
     if (this.cartesian && id <= 0) {
-      this.tool = 9;
+      // the ///TOOL number of the positions keeps the last numbered tool (RoboDK Motoman_Cartesian: 02.i Main_Program
+      // writes ///TOOL 45 in SQUARE.JBI after the tool 45 of an earlier program, the program alone ///TOOL 9)
       this.comment(`Setting Tool 9 (${name}):`);
       v.forEach((x, i) => this.addline(`SETE P00095 (${i + 1}) ${pyRound(x * (i < 3 ? 1000 : 100))}`));
       this.addline('SETTOOL TL#(9) P00095');

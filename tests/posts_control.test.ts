@@ -22,7 +22,7 @@ function cell() {
   main.waitSignal('5', 1, 500);
   main.addInstruction({ kind: 'signal', signal: '2', value: 1, wait: false });
   main.addInstruction({ kind: 'loop', count: 0, bodyProgramId: other.id });
-  return compileForPost(st, main);
+  return compileForPost(st, main, { nativeThreads: true });
 }
 const text = (id: string) => { const c = cell(); const files = getPost(id)!.generate(c, { date: new Date(2026, 9, 25, 12) }); return { c, all: files.map((f) => `#### ${f.name}\n${f.content}`).join('\n').replace(/\r/g, ''), files }; };
 

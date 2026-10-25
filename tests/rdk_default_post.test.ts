@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
 /**
  * F1 (V1 finding): a RoboDK robot whose file stores no post processor (Item.getParam('PostProcessor') == '' in the
- * ground truth) is exported with its brand's post, like RoboDK 5.9.4 did for the Library code ground truth
+ * ground truth) is exported like RoboDK 5.9.4 does it, with RoboDK's built-in generator of the brand (G4: the Library
+ * code ground truth was written by those generators, src/posts/rdk_builtin.ts)
  * (tests/fixtures/robodk_gt/code: .LS for the Fanuc of 06.d Pick and stamp, .mod for the ABB of 06.b, .src for the
  * KUKAs of 08.a, .pdl for the Comau of 05.d). The studio imported them with the Generic post, so the Export dialog
  * offered the CSV post and the user downloaded .csv files.
@@ -28,15 +29,17 @@ const CASES: Array<[string, string]> = [
 ];
 
 describe('default post processor of RoboDK robots without one', () => {
-  it('brand defaults (RoboDK): ABB IRC5, Fanuc R30i, KUKA KRC2, Motoman, Comau C5G, UR; mechanisms stay generic', () => {
-    expect(defaultPostOf('ABB IRB 1600-6/1.45', 1, 6)).toBe('ABB_RAPID_IRC5');
-    expect(defaultPostOf('Fanuc LR Mate 200iD/7L', 2, 6)).toBe('Fanuc_R30i');
-    expect(defaultPostOf('KUKA KR 6 R900', 5, 6)).toBe('KUKA_KRC2');
+  it("RoboDK's built-in generators for ABB, Fanuc, KUKA, Comau, UR (tests/posts_builtin.test.ts); the placeholder for mechanisms", () => {
+    expect(defaultPostOf('ABB IRB 1600-6/1.45', 1, 6)).toBe('RoboDK_Builtin_ABB');
+    expect(defaultPostOf('Fanuc LR Mate 200iD/7L', 2, 6)).toBe('RoboDK_Builtin_Fanuc');
+    expect(defaultPostOf('KUKA KR 6 R900', 5, 6)).toBe('RoboDK_Builtin_KUKA');
+    expect(defaultPostOf('Comau Smart5 NJ 165-3.0', 11, 6)).toBe('RoboDK_Builtin_Comau');
+    expect(defaultPostOf('UR10e', 0, 6)).toBe('RoboDK_Builtin_UR');
+    // no post-less Motoman station exists to check RoboDK's choice: the brand's post
     expect(defaultPostOf('Motoman GP180', 3, 6)).toBe('Motoman');
-    expect(defaultPostOf('Comau Smart5 NJ 165-3.0', 11, 6)).toBe('Comau_C5G');
-    expect(defaultPostOf('UR10e', 0, 6)).toBe('Universal_Robots');
-    expect(defaultPostOf('Turntable', 0, 1)).toBe('Generic');
-    expect(defaultPostOf('Gudel 3-axis gantry', 0, 3)).toBe('Generic');
+    expect(defaultPostOf('Turntable', 0, 1)).toBe('RoboDK_Builtin_Generic');
+    expect(defaultPostOf('Gudel 3-axis gantry', 0, 3)).toBe('RoboDK_Builtin_Generic');
+    for (const id of ['RoboDK_Builtin_ABB', 'RoboDK_Builtin_Fanuc', 'RoboDK_Builtin_KUKA', 'RoboDK_Builtin_Comau', 'RoboDK_Builtin_UR', 'RoboDK_Builtin_Generic']) expect(getPost(id), id).toBeTruthy();
   });
 
   for (const [file, brand] of CASES) {

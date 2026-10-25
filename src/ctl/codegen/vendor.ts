@@ -126,7 +126,7 @@ export function vendorPrograms(st: Station, kind: ControlKind, source: string, n
     files.push({ name: `${ident(name)}_robot_io.csv`, content: rows.join('\n') + '\n', mime: 'text/csv' });
     for (const s of h.servers) {
       const post = getPost(opts.post ?? s.robot.postProcessor) ?? getPost('RoboDK_Python')!;
-      const pp = compileForPost(st, s.program);
+      const pp = compileForPost(st, s.program, { nativeThreads: true });
       const out: PostFile[] = post.generate(pp, {});
       for (const f of out) files.push({ name: `${ident(s.robot.name)}/${f.name}`, content: f.content, mime: f.mime ?? (f.encoding === 'base64' ? 'application/octet-stream' : undefined), ...(f.encoding === 'base64' ? { encoding: 'base64' as const } : {}) });
       if (pp.problems.length) files.push({ name: `${ident(s.robot.name)}/PROBLEMS.txt`, content: pp.problems.join('\n') + '\n' });

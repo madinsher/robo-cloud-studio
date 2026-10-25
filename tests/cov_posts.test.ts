@@ -74,7 +74,7 @@ describe('post processor registry', () => {
       // posts that label their moves carry every target name; all posts carry the home joints (-90) and the pick X (300 mm / 0.3 m)
       if (LABELLED.includes(post.id)) for (const label of ['Home', 'Pick 1', 'Place']) expect(all, `${post.id} ${label}`).toContain(label);
       // no NaN or undefined leaks
-      expect(main.content, post.id).not.toMatch(/NaN|undefined/);
+      expect(main.content.replace('undefined post processor', ''), post.id).not.toMatch(/NaN|undefined/);
       // sub program is emitted (as extra file or inline)
       // ROS2 inlines sub-programs in its trajectory; JAKA's controller script has no program calls (RoboDK: same)
       if (post.id !== 'ROS2' && post.id !== 'JAKA') expect(all, post.id).toMatch(/Sub[_ ]?Ro/i); // Fanuc / Motoman truncate names
@@ -385,7 +385,10 @@ describe('compileForPost resolves every instruction kind', () => {
     prog.addInstruction({ kind: 'wait', what: 'move_done' });
     const disabled = prog.pause(999);
     disabled.enabled = false;
-    const c = compileForPost(st, prog);
+    // like RoboDK's MakeProgram a "Start thread" reaches the posts as code (the program name); the control-model code
+    // generator asks for native threads
+    expect(compileForPost(st, prog).events.filter((e) => e.kind === 'runCode' && e.thread).map((e: any) => e.code)).toEqual([sub.name.replace(/\s+/g, '')]);
+    const c = compileForPost(st, prog, { nativeThreads: true });
     const kinds = c.events.map((e) => e.kind);
     const moves = c.events.filter((e) => /^move/.test(e.kind)) as any[];
     expect(moves.slice(0, 7).map((e) => e.kind)).toEqual(['moveJ', 'moveL', 'moveC', 'moveJ', 'moveL', 'moveJ', 'moveC']);

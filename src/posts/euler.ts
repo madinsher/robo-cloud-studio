@@ -88,3 +88,16 @@ export function xyzrpw2pose(x: number, y: number, z: number, r: number, p: numbe
 export function staubli2pose(x: number, y: number, z: number, rx: number, ry: number, rz: number): Mat4 {
   return mul(transl(x, y, z), rotx(rx * DEG), roty(ry * DEG), rotz(rz * DEG));
 }
+
+/** robomath.PosePP(x,y,z,r,p,w) = transl(x,y,z)*rotz(r)*roty(p)*rotx(w) (KUKA ABC), column-major Mat4. */
+export function posePP(v: number[]): Mat4 {
+  const [x, y, z, a, b, c] = v;
+  const D = Math.PI / 180;
+  const ca = Math.cos(a * D), sa = Math.sin(a * D), cb = Math.cos(b * D), sb = Math.sin(b * D), cc = Math.cos(c * D), sc = Math.sin(c * D);
+  const m = new Float64Array(16);
+  m[0] = cb * ca; m[4] = ca * sc * sb - cc * sa; m[8] = sc * sa + cc * ca * sb; m[12] = x;
+  m[1] = cb * sa; m[5] = cc * ca + sc * sb * sa; m[9] = cc * sb * sa - ca * sc; m[13] = y;
+  m[2] = -sb; m[6] = cb * sc; m[10] = cc * cb; m[14] = z;
+  m[15] = 1;
+  return m as unknown as Mat4;
+}

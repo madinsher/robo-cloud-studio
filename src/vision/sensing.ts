@@ -452,7 +452,20 @@ export interface RenderRequest {
   fields?: boolean;
   /** Add the z = 0 floor (depth sensors). */
   ground?: boolean;
+  /**
+   * Sub-pixel sample position (px, image coordinates with v down, from the pixel centre). Default [0, 0]: centre
+   * sampling. RoboDK's Cam2D DEPTH images sample at ROBODK_DEPTH_SAMPLE_OFFSET. Rendered by the software rasterizer
+   * (exact); the returned K carries the shifted principal point, so back-projecting pixel centres with it is exact.
+   */
+  sampleOffset?: [number, number];
 }
+
+/**
+ * Where RoboDK 5.9.4 samples a Cam2D DEPTH pixel: (−0.125, −0.375) px from its centre — sample 0 of the standard 4x
+ * MSAA pattern — measured with tilted planes at 640x480 / FOV 32 and 320x240 / FOV 50
+ * (tests/fixtures/vision_gt/robodk_cam2d_depth). Its RGB snapshots are centre-sampled.
+ */
+export const ROBODK_DEPTH_SAMPLE_OFFSET: [number, number] = [-0.125, -0.375];
 export type CameraBufferRenderer = (station: Station, cam: CameraItem, req: RenderRequest) => CameraRender | null;
 let gpuRenderer: CameraBufferRenderer | null = null;
 let defaultAssets: AssetStore | null = null;
@@ -464,8 +477,11 @@ export function setSensingAssets(assets: AssetStore | null): void { defaultAsset
 
 /** Depth / ID / RGB buffers of what the camera sees, at the camera resolution unless width/height are given. */
 export function renderCamera(station: Station, cam: CameraItem, req: RenderRequest = {}): CameraRender {
-  if (gpuRenderer) { try { const r = gpuRenderer(station, cam, req); if (r) return r; } catch { /* fall back to software */ } }
-  const K = cameraIntrinsics(cam, req.width ?? cam.width, req.height ?? cam.height);
+  const off = req.sampleOffset && (req.sampleOffset[0] || req.sampleOffset[1]) ? req.sampleOffset : null;
+  if (gpuRenderer && !off) { try { const r = gpuRenderer(station, cam, req); if (r) return r; } catch { /* fall back to software */ } }
+  const K0 = cameraIntrinsics(cam, req.width ?? cam.width, req.height ?? cam.height);
+  // sampling pixel (i, j) at (i + 0.5 + du, j + 0.5 + dv) = centre sampling with the principal point moved by (−du, −dv)
+  const K = off ? { ...K0, cx: K0.cx - off[0], cy: K0.cy - off[1] } : K0;
   const meshes = sceneMeshes(station, { assets: req.assets ?? defaultAssets, fields: req.fields, ground: req.ground });
   const r = rasterize(meshes, K, cam.poseAbs(), cam.near, cam.far, { rgb: req.rgb });
   r.meshes = meshes;

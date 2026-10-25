@@ -15,7 +15,9 @@
  *                                                             negative increment), inf outside [0.15, 8] m, Webots
  *                                                             noise (std = noise x maxRange); ray cast on the scene
  *                                                             geometry except the robot itself (hall + products)
- *   /head_camera/image_color     sensor_msgs/Image bgra8      5 Hz (cameraRate), camera_link_optical
+ *   /head_camera/image_color     sensor_msgs/Image bgra8      5 Hz (cameraRate), camera_link_optical; like the webots_ros2
+ *                                                             devices without <alwaysOn> (murom_webots.urdf), rendered and
+ *                                                             published only while someone subscribes (sensorDemand)
  *   /head_camera/camera_info     sensor_msgs/CameraInfo       K of the unified camera model (fx = W / 2 tan(fov/2))
  *   /head_depth/image            sensor_msgs/Image 32FC1      depth along the optical axis (m), inf outside [0.1, 5] m
  *   /head_depth/camera_info
@@ -80,6 +82,17 @@ export interface MuromSimOptions {
   assets?: AssetStore | null;
   /** Camera buffer renderer (browser: WebGL); returns null to fall back to the software rasterizer. */
   render?: (station: Station, cam: CameraItem, req: { rgb: boolean; near: number; far: number }) => CameraRender | null;
+  /**
+   * Whether a sensor's topics have subscribers on the ROS side (webots_ros2: a device without <alwaysOn>true</alwaysOn>
+   * is enabled only while subscribed — the head camera and range finder of murom_webots.urdf; lidar and IMU are
+   * alwaysOn). undefined = unknown (always publish). The backend answers it from rosapi (./sim_backend.ts).
+   */
+  sensorDemand?: (topics: string[]) => boolean | undefined;
+  /**
+   * True while the ROS side cannot keep up (rosbridge's queue grows): camera frames are dropped then; the clock,
+   * odometry, lidar and the rest keep real time. The backend measures it with its own /clock echoed by rosbridge.
+   */
+  cameraBackpressure?: () => boolean;
   /** /murom/sim/screenshot handler (host-specific: writes a PNG); default answers success=false. */
   onScreenshot?: () => { success: boolean; message: string };
   log?: (msg: string, level?: 'info' | 'warn' | 'error') => void;
@@ -144,6 +157,8 @@ export class MuromSimInterface {
   private started = false;
   private links = new Map<string, { robot: Robot; index: number }>();
   readonly attachMaxDist: number;
+  /** Head camera frames rendered / skipped because nobody subscribed (sensorDemand) / dropped under back pressure. */
+  readonly cameraStats = { rendered: 0, skipped: 0, dropped: 0 };
 
   constructor(readonly station: Station, readonly io: RosTransport, readonly opts: MuromSimOptions = {}) {
     const m = findMurom(station);
@@ -518,10 +533,11 @@ export class MuromSimInterface {
   }
 
   /** Render the head camera (bgra8) and the range finder (32FC1, inf outside [minRange, maxRange]). */
-  renderHead(): { bgra?: Uint8Array; depth?: Float32Array; width: number; height: number; source: string } | null {
-    const cam = this.headCam ?? this.headDepth;
+  renderHead(want: { rgb?: boolean; depth?: boolean } = {}): { bgra?: Uint8Array; depth?: Float32Array; width: number; height: number; source: string } | null {
+    const headCam = want.rgb === false ? null : this.headCam;
+    const dcam = want.depth === false ? null : this.headDepth;
+    const cam = headCam ?? dcam;
     if (!cam) return null;
-    const dcam = this.headDepth;
     const near = Math.min(cam.near > 0 ? cam.near : 10, 10), far = Math.max(cam.far > 0 ? cam.far : 100000, (dcam?.far ?? 0) + 1);
     const samePose = !dcam || dcam === cam || (dist3(dcam.poseAbs().subarray(12, 15), cam.poseAbs().subarray(12, 15)) < 1e-3 && dcam.width === cam.width && dcam.height === cam.height && Math.abs(dcam.fov - cam.fov) < 1e-9);
     const render = (c: CameraItem, rgb: boolean): CameraRender => {
@@ -531,8 +547,8 @@ export class MuromSimInterface {
       return rasterize(meshes, cameraIntrinsics(c), c.poseAbs(), near, far, { rgb, background: [180, 186, 194] });
     };
     const out: { bgra?: Uint8Array; depth?: Float32Array; width: number; height: number; source: string } = { width: cam.width, height: cam.height, source: '' };
-    if (this.headCam) {
-      const r = render(this.headCam, true);
+    if (headCam) {
+      const r = render(headCam, true);
       out.source = r.source;
       if (r.rgba) {
         const n = r.width * r.height, bgra = new Uint8Array(n * 4);
@@ -546,8 +562,14 @@ export class MuromSimInterface {
   }
 
   private publishCamera(stamp: { sec: number; nanosec: number }): void {
-    const f = this.renderHead();
+    const demand = (topics: string[]) => this.opts.sensorDemand?.(topics) ?? true;
+    const rgb = !!this.headCam && demand(['/head_camera/image_color', '/head_camera/camera_info']);
+    const depth = !!this.headDepth && demand(['/head_depth/image', '/head_depth/camera_info']);
+    if (!rgb && !depth) { if (this.headCam || this.headDepth) this.cameraStats.skipped++; return; }
+    if (this.opts.cameraBackpressure?.()) { this.cameraStats.dropped++; return; }
+    const f = this.renderHead({ rgb, depth });
     if (!f) return;
+    this.cameraStats.rendered++;
     if (f.bgra && this.headCam) {
       this.pub('/head_camera/image_color', 'sensor_msgs/msg/Image', { header: { stamp, frame_id: 'camera_link_optical' }, height: f.height, width: f.width, encoding: 'bgra8', is_bigendian: 0, step: f.width * 4, data: base64(f.bgra) });
       this.pub('/head_camera/camera_info', 'sensor_msgs/msg/CameraInfo', this.cameraInfoMsg(this.headCam, stamp));

@@ -60,6 +60,7 @@ export class RosbridgeClient implements RosTransport {
   readonly log: (msg: string, level?: 'info' | 'warn' | 'error') => void;
   private subs = new Map<string, Array<(msg: any) => void>>();
   private subTypes = new Map<string, string>();
+  private subThrottle = new Map<string, number>();
   private advertised = new Map<string, { type: string; latch: boolean }>();
   private services = new Map<string, { type: string; handler: RosServiceHandler }>();
   private pending = new Map<string, { resolve: (v: any) => void; reject: (e: Error) => void }>();
@@ -81,7 +82,7 @@ export class RosbridgeClient implements RosTransport {
         this.connected = true;
         // re-announce everything (reconnect)
         for (const [topic, a] of this.advertised) this.raw(a.latch ? { op: 'advertise', topic, type: a.type, latch: true } : { op: 'advertise', topic, type: a.type });
-        for (const [topic, type] of this.subTypes) this.raw({ op: 'subscribe', topic, type });
+        for (const [topic, type] of this.subTypes) this.raw({ op: 'subscribe', topic, type, ...(this.subThrottle.get(topic) ? { throttle_rate: this.subThrottle.get(topic) } : {}) });
         for (const [service, s] of this.services) this.raw({ op: 'advertise_service', service, type: s.type });
         if (!settled) { settled = true; clearTimeout(timer); resolve(); }
       };
@@ -137,13 +138,15 @@ export class RosbridgeClient implements RosTransport {
     this.raw({ op: 'publish', topic, msg });
   }
 
-  subscribe(topic: string, type: string, cb: (msg: any) => void): void {
+  /** Subscribe through rosbridge; `throttleRate` (ms): rosbridge sends at most one message per period. */
+  subscribe(topic: string, type: string, cb: (msg: any) => void, opts: { throttleRate?: number } = {}): void {
     const list = this.subs.get(topic) ?? [];
     list.push(cb);
     this.subs.set(topic, list);
     if (this.subTypes.get(topic) === type) return;
     this.subTypes.set(topic, type);
-    this.raw({ op: 'subscribe', topic, type, queue_length: 10 });
+    if (opts.throttleRate) this.subThrottle.set(topic, opts.throttleRate);
+    this.raw({ op: 'subscribe', topic, type, queue_length: 10, ...(opts.throttleRate ? { throttle_rate: opts.throttleRate } : {}) });
   }
 
   advertiseService(service: string, type: string, handler: RosServiceHandler): void {

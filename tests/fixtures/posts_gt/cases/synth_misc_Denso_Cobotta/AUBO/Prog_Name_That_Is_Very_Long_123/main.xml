@@ -43,7 +43,7 @@
                 <Condition ConditionType="Waypoint" ConditionAlias="Waypoint" ConditionUuid="e443df789558467f9ba91faf7a024204">
                     <Attribute>
                         <WaypointConditionMode>FixedPoint</WaypointConditionMode>
-                        <FixedPoint>0.250703,0.015135,0.051473,0.181234,-0.611701,0.742706,-0.203381,0.174533,0.349066,1.570796,0.523599,0.785398,1.047198</FixedPoint>
+                        <FixedPoint>0.250703,0.015135,0.051473,0.181236,-0.611700,0.742706,-0.203384,0.174533,0.349066,1.570796,0.523599,0.785398,1.047198</FixedPoint>
                     </Attribute>
                 </Condition>
             </Condition>
@@ -75,7 +75,7 @@
                 <Condition ConditionType="Waypoint" ConditionAlias="Waypoint" ConditionUuid="259f4329e6f4490b9a164106cf6a659e">
                     <Attribute>
                         <WaypointConditionMode>FixedPoint</WaypointConditionMode>
-                        <FixedPoint>0.250374,0.061096,0.029401,0.175829,-0.666696,0.705838,-0.162462,0.314159,0.418879,1.570796,0.523599,0.785398,1.047198</FixedPoint>
+                        <FixedPoint>0.250374,0.061096,0.029401,0.175828,-0.666696,0.705838,-0.162462,0.314159,0.418879,1.570796,0.523599,0.785398,1.047198</FixedPoint>
                     </Attribute>
                 </Condition>
             </Condition>
@@ -107,7 +107,7 @@
                 <Condition ConditionType="Waypoint" ConditionAlias="Waypoint" ConditionUuid="8d723104f77343c1b458a748e9bb17bc">
                     <Attribute>
                         <WaypointConditionMode>FixedPoint</WaypointConditionMode>
-                        <FixedPoint>0.232348,0.043719,0.029487,0.165476,-0.642636,0.730479,-0.161358,0.244346,0.349066,1.658063,0.523599,0.785398,1.047198</FixedPoint>
+                        <FixedPoint>0.232348,0.043719,0.029487,0.165475,-0.642637,0.730480,-0.161356,0.244346,0.349066,1.658063,0.523599,0.785398,1.047198</FixedPoint>
                     </Attribute>
                 </Condition>
             </Condition>
@@ -186,7 +186,7 @@
                 <Condition ConditionType="Waypoint" ConditionAlias="Waypoint" ConditionUuid="4a84eb038d1f49b78d2b9deb1beb3711">
                     <Attribute>
                         <WaypointConditionMode>FixedPoint</WaypointConditionMode>
-                        <FixedPoint>0.250374,0.061096,0.029401,0.175829,-0.666696,0.705838,-0.162462,0.314159,0.418879,1.570796,0.523599,0.785398,1.047198</FixedPoint>
+                        <FixedPoint>0.250374,0.061096,0.029401,0.175828,-0.666696,0.705838,-0.162462,0.314159,0.418879,1.570796,0.523599,0.785398,1.047198</FixedPoint>
                     </Attribute>
                 </Condition>
             </Condition>
@@ -216,7 +216,7 @@
                 <Condition ConditionType="Waypoint" ConditionAlias="Waypoint" ConditionUuid="5129fb7c628841a58c45782198a6416d">
                     <Attribute>
                         <WaypointConditionMode>FixedPoint</WaypointConditionMode>
-                        <FixedPoint>0.250703,0.015135,0.051473,0.181234,-0.611701,0.742706,-0.203381,0.174533,0.349066,1.570796,0.523599,0.785398,1.047198</FixedPoint>
+                        <FixedPoint>0.250703,0.015135,0.051473,0.181236,-0.611700,0.742706,-0.203384,0.174533,0.349066,1.570796,0.523599,0.785398,1.047198</FixedPoint>
                     </Attribute>
                 </Condition>
             </Condition>

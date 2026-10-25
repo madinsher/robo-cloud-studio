@@ -175,6 +175,8 @@ export function fileMaterial(fm: MeshMaterial, fallback = '#9aa3ad', opacity = 1
   if (o < 1) { m.transparent = true; m.opacity = o; }
   if (fm.emissive) m.emissive = new THREE.Color(fm.emissive[0], fm.emissive[1], fm.emissive[2]);
   if (fm.map) { const t = textureFromBytes(fm.map); if (t) m.map = t; }
+  // environment reflections only for PBR materials (a Webots PBRAppearance: IBLStrength), not for file / studio ones
+  m.envMapIntensity = fm.ibl ?? 0;
   return m;
 }
 
@@ -203,9 +205,17 @@ export function primitiveGeometry(p: NonNullable<GeometryRef['primitive']> | Non
   return g;
 }
 
-export function materialFor(color: string | undefined, opacity = 1, fallback = '#9aa3ad'): THREE.MeshStandardMaterial {
-  const m = new THREE.MeshStandardMaterial({ color: new THREE.Color(color ?? fallback), metalness: 0.22, roughness: 0.42, flatShading: false });
+/**
+ * Material of a coloured geometry. Without `pbr`: the studio material (metalness 0.22, roughness 0.42, no environment
+ * reflection). With `pbr` (a Webots PBRAppearance): its metalness / roughness, emissive colour × intensity, and the
+ * scene environment (SceneRenderer: the world's Background as a uniform or gradient sky, like Webots' IBL without a
+ * cube map) scaled by IBLStrength.
+ */
+export function materialFor(color: string | undefined, opacity = 1, fallback = '#9aa3ad', pbr?: GeometryRef['pbr']): THREE.MeshStandardMaterial {
+  const m = new THREE.MeshStandardMaterial({ color: new THREE.Color(color ?? fallback), metalness: pbr?.metalness ?? 0.22, roughness: pbr?.roughness ?? 0.42, flatShading: false });
   if (opacity < 1) { m.transparent = true; m.opacity = opacity; }
+  m.envMapIntensity = pbr ? pbr.ibl ?? 1 : 0;
+  if (pbr?.emissive) { m.emissive = new THREE.Color(pbr.emissive); m.emissiveIntensity = pbr.emissiveIntensity ?? 1; }
   return m;
 }
 
@@ -232,7 +242,7 @@ export function buildGeometry(refs: GeometryRef[], assets: AssetStore, defaultCo
     if (!geometry) continue;
     // meshes without an explicit colour use the materials of their file (OBJ+MTL, COLLADA, textured Webots meshes)
     const fileMats = r.mesh && !r.color ? (assets.get(r.mesh) ?? findByBasename(assets, r.mesh))?.mesh?.materials : undefined;
-    const mesh = new THREE.Mesh(geometry, fileMats?.length ? (fileMats.length === 1 ? fileMaterial(fileMats[0], defaultColor, r.opacity ?? 1) : fileMats.map((fm) => fileMaterial(fm, defaultColor, r.opacity ?? 1))) : materialFor(r.color ?? defaultColor, r.opacity ?? 1));
+    const mesh = new THREE.Mesh(geometry, fileMats?.length ? (fileMats.length === 1 ? fileMaterial(fileMats[0], defaultColor, r.opacity ?? 1) : fileMats.map((fm) => fileMaterial(fm, defaultColor, r.opacity ?? 1))) : materialFor(r.color ?? defaultColor, r.opacity ?? 1, undefined, r.pbr));
     if (geometry.userData.doubleSided) for (const mt of Array.isArray(mesh.material) ? mesh.material : [mesh.material]) mt.side = THREE.DoubleSide;
     mesh.castShadow = true;
     mesh.receiveShadow = true;
@@ -246,7 +256,7 @@ export function buildGeometry(refs: GeometryRef[], assets: AssetStore, defaultCo
 }
 
 export function buildLinkVisuals(visuals: LinkVisual[], assets: AssetStore, defaultColor: string): THREE.Group {
-  return buildGeometry(visuals.map((v) => ({ mesh: v.mesh, primitive: v.primitive as any, origin: Array.from(v.origin), color: v.color, scale: v.scale, opacity: (v as LinkVisual & { opacity?: number }).opacity })), assets, defaultColor);
+  return buildGeometry(visuals.map((v) => ({ mesh: v.mesh, primitive: v.primitive as any, origin: Array.from(v.origin), color: v.color, scale: v.scale, opacity: (v as LinkVisual & { opacity?: number }).opacity, pbr: (v as LinkVisual & { pbr?: GeometryRef['pbr'] }).pbr })), assets, defaultColor);
 }
 
 export function findByBasename(assets: AssetStore, uri: string) {

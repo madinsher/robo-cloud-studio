@@ -4,10 +4,10 @@
  */
 export { buildMurkaRetailStation, muromHandles, configureMurom, retailStationOf, RETAIL_VARIANTS, DEFAULT_MURKA_ROOT } from './station';
 export type { RetailVariant, RetailStationOptions, RetailStationResult, MuromHandles, VariantInfo } from './station';
-export { runMurkaRetailMission, createRetailSession, retailSessionOf } from './mission';
-export type { RetailMissionResult, RetailMissionOptions, RetailStage, RetailChecks, RetailSession } from './mission';
-export { parseMission, missionFsmDsl, RetailOrchestrator, MISSION_DEFAULTS } from './orchestrator';
-export type { MissionTask, ProgressEvent } from './orchestrator';
+export { runMurkaRetailMission, runMurkaE2E, createRetailSession, retailSessionOf } from './mission';
+export type { RetailMissionResult, RetailMissionOptions, RetailStage, RetailChecks, RetailSession, RetailE2EResult } from './mission';
+export { parseMission, missionFsmDsl, RetailOrchestrator, MISSION_DEFAULTS, COPY_DEFAULTS } from './orchestrator';
+export type { MissionTask, ProgressEvent, FsmFlavor } from './orchestrator';
 export { parseRetailLayout } from './layout';
 export type { RetailLayout, RetailSlot } from './layout';
 export { ArmKinematics } from './kinematics';

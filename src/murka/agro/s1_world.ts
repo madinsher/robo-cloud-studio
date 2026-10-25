@@ -7,10 +7,12 @@
  *    corridor between the west and east blocks (heading west for x < 0 blocks, east for the others), one stop per
  *    tree (robot centre abreast of the trunk), left by reversing to the lane entrance;
  *  - planning: Hybrid A* with Reeds–Shepp shots (src/mobile/hybrid_astar.ts, the UTP-G turning radius 2.19 m / tan 0.3
- *    = 7.08 m, reverse allowed) on an occupancy map rasterised from the world's boundingObjects in the platform height
+ *    = 7.08 m at the rear axle — body x −1.095 m, the proto origin is the wheelbase midpoint —, reverse allowed) on an occupancy map rasterised from the world's boundingObjects in the platform height
  *    band + crown discs of the trees + footprints of objects without colliders (collection point pad, depot shelf and
  *    modules); in-lane motion is straight along the lane axis;
- *  - legs: constant-speed playback of a pose path by arc length (§9: constant speeds on route segments);
+ *  - legs: constant-speed playback of a pose path by the arc length of its reference point (the rear axle of a UTP-G;
+ *    §9: constant speeds on route segments), interpolated along circular arcs between the planner's samples, so the
+ *    rear wheels roll without side slip;
  *  - contacts: the studio collision module on the world's 3D colliders (trunks, fences, buildings, rocks, crates, CP2),
  *    the crowns' measured radial profile against the chassis collision boxes, robot–robot 3D colliders and the
  *    footprints of collider-less obstacles.
@@ -19,7 +21,7 @@ import { Station, Item, ItemType, SceneObject, GeometryRef } from '../../core/it
 import { Mat4, fromArray, identity, multiply, transformPoint } from '../../core/math/pose';
 import { MobileRobot } from '../../mobile/items';
 import { FieldItem, CropRow } from '../../agri/items';
-import { CollisionWorld, CircleObstacle, coveringCircles, rectIntersectsPolygon } from '../../mobile/footprint';
+import { CollisionWorld, CircleObstacle, coveringCircles, rectIntersectsPolygon, shiftPosePath } from '../../mobile/footprint';
 import { planHybridAStar } from '../../mobile/hybrid_astar';
 import { itemsCollide } from '../../core/collision/collision';
 import type { AssetStore } from '../../scene/assets';
@@ -44,13 +46,38 @@ export interface S1Row {
   stops: Pose[];
 }
 
-/** A leg: pose path (x, y, th, dir) driven at constant speed starting at t0. */
+/** Arc length between two poses of a constant-curvature sample (chord / sinc of half the heading change). */
+function arcLength(a: number[], b: number[]): number {
+  const c = Math.hypot(b[0] - a[0], b[1] - a[1]);
+  const h = (wrap180(b[2] - a[2]) * DEG) / 2;
+  return Math.abs(h) > 1e-9 && Math.abs(h) < Math.PI / 4 ? (c * h) / Math.sin(h) : c;
+}
+/** Pose at fraction f of the circular arc from a to b (through both points, heading a[2] → b[2]; a line when straight). */
+function arcPose(a: number[], b: number[], f: number): [number, number, number] {
+  const dth = wrap180(b[2] - a[2]) * DEG;
+  const dx = b[0] - a[0], dy = b[1] - a[1], c = Math.hypot(dx, dy);
+  const th = a[2] + (dth / DEG) * f;
+  if (Math.abs(dth) < 1e-9 || c < 1e-9 || Math.abs(dth) >= Math.PI / 2) return [a[0] + dx * f, a[1] + dy * f, th];
+  // sub-chord of the arc: length c·sin(f·Δθ/2)/sin(Δθ/2), direction (chord direction − Δθ/2 + f·Δθ/2)
+  const l = (c * Math.sin((f * dth) / 2)) / Math.sin(dth / 2);
+  const ang = Math.atan2(dy, dx) - dth / 2 + (f * dth) / 2;
+  return [a[0] + l * Math.cos(ang), a[1] + l * Math.sin(ang), th];
+}
+
+/**
+ * A leg: pose path (x, y, th, dir) of the robot origin driven at constant speed starting at t0. The speed, the length
+ * and the interpolation refer to the point at body x = `refX` (the rear axle of a car-like platform, 0 otherwise),
+ * which moves along circular arcs between the samples: it has no side slip.
+ */
 export class Leg {
   readonly s: number[] = [0];
   readonly length: number;
   readonly duration: number;
-  constructor(readonly robot: string, readonly points: number[][], readonly speed: number, readonly t0: number, readonly kind: string, readonly z0?: number, readonly z1?: number, readonly vz = 1000) {
-    for (let i = 1; i < points.length; i++) this.s.push(this.s[i - 1] + Math.hypot(points[i][0] - points[i - 1][0], points[i][1] - points[i - 1][1]));
+  /** Reference-point poses of `points`. */
+  private readonly ref: number[][];
+  constructor(readonly robot: string, readonly points: number[][], readonly speed: number, readonly t0: number, readonly kind: string, readonly z0?: number, readonly z1?: number, readonly vz = 1000, readonly refX = 0) {
+    this.ref = shiftPosePath(points, refX);
+    for (let i = 1; i < points.length; i++) this.s.push(this.s[i - 1] + arcLength(this.ref[i - 1], this.ref[i]));
     this.length = this.s[this.s.length - 1];
     const tz = z0 !== undefined && z1 !== undefined ? Math.abs(z1 - z0) / vz : 0;
     this.duration = this.length / speed + tz;
@@ -65,10 +92,12 @@ export class Leg {
     const d = Math.min(this.length, u * this.speed);
     let lo = 0, hi = this.s.length - 1;
     while (hi - lo > 1) { const m = (lo + hi) >> 1; if (this.s[m] <= d) lo = m; else hi = m; }
-    const a = this.points[lo], b = this.points[Math.min(hi, this.points.length - 1)];
+    const a = this.ref[lo], b = this.ref[Math.min(hi, this.points.length - 1)];
     const seg = this.s[hi] - this.s[lo];
     const f = seg > 1e-9 ? (d - this.s[lo]) / seg : 0;
-    return { x: a[0] + (b[0] - a[0]) * f, y: a[1] + (b[1] - a[1]) * f, th: wrap180(a[2] + wrap180(b[2] - a[2]) * f), z: this.z1 ?? this.z0 };
+    const [rx, ry, th] = arcPose(a, b, f);
+    const c = Math.cos(th * DEG), sn = Math.sin(th * DEG);
+    return { x: rx - this.refX * c, y: ry - this.refX * sn, th: wrap180(th), z: this.z1 ?? this.z0 };
   }
   /** Max curvature (1/mm) of a ground leg (heading change per arc length over 300 mm windows). */
   maxCurvature(window = 300): number {
@@ -244,14 +273,17 @@ export class S1World {
     return ![...this.blocked(), ...extraPolys].some((q) => rectIntersectsPolygon(rect, q));
   }
 
-  /** Hybrid A* pose path (x, y, th, dir) between two poses for a ground platform; cached; null when no path. */
-  plan(fp: [number, number, number], radius: number, from: Pose, to: Pose, extraPolys: number[][][] = []): number[][] | null {
+  /**
+   * Hybrid A* pose path (x, y, th, dir) of the origin between two poses for a ground platform whose arcs of `radius`
+   * are driven by the point at body x = `refX` (the rear axle); cached; null when no path.
+   */
+  plan(fp: [number, number, number], radius: number, from: Pose, to: Pose, extraPolys: number[][][] = [], refX = 0): number[][] | null {
     const parkedPolys = (this.o.parked ?? []).map((mr) => S1World.robotPoly({ x: mr.state.x, y: mr.state.y, th: mr.state.theta }, mr.kin.footprint as [number, number, number]));
-    const key = `${fp.join(',')}|${radius.toFixed(0)}|${[from.x, from.y, from.th, to.x, to.y, to.th].map((v) => Math.round(v)).join(',')}|${extraPolys.map((q) => q.map((v) => `${Math.round(v[0])},${Math.round(v[1])}`).join(' ')).join(';')}`;
+    const key = `${fp.join(',')}|${radius.toFixed(0)}|${refX.toFixed(0)}|${[from.x, from.y, from.th, to.x, to.y, to.th].map((v) => Math.round(v)).join(',')}|${extraPolys.map((q) => q.map((v) => `${Math.round(v[0])},${Math.round(v[1])}`).join(' ')).join(';')}`;
     if (this.cache.has(key)) return this.cache.get(key)!;
     const t0 = Date.now();
     const blocked = [...this.blocked(), ...parkedPolys, ...extraPolys];
-    const opt = { footprint: fp, radius, allowReverse: true, blocked };
+    const opt = { footprint: fp, radius, allowReverse: true, blocked, refX };
     // a re-plan around a standing robot gets one bounded attempt (the caller waits when it fails); otherwise forward,
     // then the time-reversed plan (goal → start, driven backwards: a car path reversed is a car path; it is found much
     // faster when the start is a confined pocket such as a parking bay), then forward with half the margin

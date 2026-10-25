@@ -21,6 +21,8 @@ export { buildWebotsWorld, buildWebotsProto, WebotsSceneBuilder } from './scene'
 export type { WebotsBuildOptions, WebotsBuildResult } from './scene';
 export { robotToKinTree, WEBOTS_DEVICE_TO_STUDIO_CAMERA } from './robot';
 export { rasterizeOccupancy } from './occupancy';
+export { restOnGround, groundTopAt } from './settle';
+export type { RestResult } from './settle';
 export type { OccupancyOptions } from './occupancy';
 export { loadRetailLayout } from './retail_layout';
 export { upgradeOrchard } from './semantic';

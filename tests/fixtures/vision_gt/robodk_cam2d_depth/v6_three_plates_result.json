@@ -1,0 +1,26 @@
+{
+ "mode": "robodk",
+ "errors": [],
+ "version": "5.9.4.25510",
+ "cam_valid": true,
+ "cam_type": 19,
+ "cam_name": "Camera 1",
+ "settings": "FOV=32.000 PixelSize=7.168635 Size=640x480 SHOW_LIMITS FOCAL_LENGTH=6.00 FAR_LENGTH=1000.00 BG_COLOR=#000000 Persp WindowResize",
+ "snapshot_ret": 1,
+ "snapshot_file": 1323,
+ "snapshot_bytes": {
+  "type": "bytes",
+  "len": 923643,
+  "head": "89504e470d0a1a0a"
+ },
+ "snapshot06c_ret": 1,
+ "depth_ret": 1,
+ "depth_file": 1228808,
+ "depth_bytes_len": 1228808,
+ "depth_settings": "FOV=32.000 PixelSize=5.973862 Size=640x480 SHOW_LIMITS FOCAL_LENGTH=5.00 FAR_LENGTH=1000.00 BG_COLOR=#ffffff DEPTH Persp WindowResize",
+ "cams_in_station": [
+  "Camera 1",
+  "Camera 2",
+  "Camera 3"
+ ]
+}

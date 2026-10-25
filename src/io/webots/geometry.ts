@@ -69,9 +69,28 @@ export function rigidOf(M: Mat4): Mat4 {
 const hex2 = (x: number) => Math.round(Math.max(0, Math.min(1, x)) * 255).toString(16).padStart(2, '0');
 export const rgbHex = (c: number[]) => `#${hex2(c[0])}${hex2(c[1])}${hex2(c[2])}`;
 
-interface Look { color?: string; rgb?: [number, number, number]; opacity?: number; texture?: { url: string; base: string }; hidden?: boolean }
+interface Look { color?: string; rgb?: [number, number, number]; opacity?: number; texture?: { url: string; base: string }; hidden?: boolean; pbr?: GeometryRef['pbr'] }
 
-/** Appearance (PBRAppearance, Appearance{Material}, appearance PROTO) -> colour / opacity / texture. */
+/**
+ * PBR parameters of a PBRAppearance with the Webots defaults (roughness 0, metalness 1, emissiveColor 0 0 0,
+ * emissiveIntensity 1, IBLStrength 1); a legacy Material is converted like Webots' WbMaterial (metalness 0,
+ * roughness 1 - shininess, emissiveColor).
+ */
+function pbrOf(a: WNode): NonNullable<GeometryRef['pbr']> {
+  const out: NonNullable<GeometryRef['pbr']> = {};
+  const em = (c: number[], k: number) => { if (k > 0 && c.length >= 3 && (c[0] > 0 || c[1] > 0 || c[2] > 0)) { out.emissive = rgbHex(c); if (k !== 1) out.emissiveIntensity = k; } };
+  if (a.type === 'PBRAppearance') {
+    out.metalness = fNum1(a, 'metalness', 1); out.roughness = fNum1(a, 'roughness', 0);
+    em(fNum(a, 'emissiveColor', [0, 0, 0]), fNum1(a, 'emissiveIntensity', 1));
+    const ibl = fNum1(a, 'IBLStrength', 1); if (ibl !== 1) out.ibl = ibl;
+  } else {
+    out.metalness = 0; out.roughness = 1 - Math.max(0, Math.min(1, fNum1(a, 'shininess', 0.2)));
+    em(fNum(a, 'emissiveColor', [0, 0, 0]), 1);
+  }
+  return out;
+}
+
+/** Appearance (PBRAppearance, Appearance{Material}, appearance PROTO) -> colour / opacity / texture / PBR parameters. */
 export function appearanceOf(app: WNode | null, ctx: BuildCtx): Look {
   if (!app) return { color: '#e6e6e6', rgb: [0.9, 0.9, 0.9] };
   const a = ctx.reg.resolve(app);
@@ -85,14 +104,14 @@ export function appearanceOf(app: WNode | null, ctx: BuildCtx): Look {
   if (a.type === 'PBRAppearance') {
     const c = fNum(a, 'baseColor', [1, 1, 1]);
     const tr = fNum1(a, 'transparency', 0);
-    return { color: rgbHex(c), rgb: [c[0], c[1], c[2]], ...(tr > 0 ? { opacity: 1 - tr } : {}), ...(tr >= 0.999 ? { hidden: true } : {}), texture: texOf(fNode(a, 'baseColorMap')) };
+    return { color: rgbHex(c), rgb: [c[0], c[1], c[2]], ...(tr > 0 ? { opacity: 1 - tr } : {}), ...(tr >= 0.999 ? { hidden: true } : {}), texture: texOf(fNode(a, 'baseColorMap')), pbr: pbrOf(a) };
   }
   if (a.type === 'Appearance') {
     const m = fNode(a, 'material');
     const mat = m ? ctx.reg.resolve(m) : null;
     const c = mat ? fNum(mat, 'diffuseColor', [0.8, 0.8, 0.8]) : [1, 1, 1];
     const tr = mat ? fNum1(mat, 'transparency', 0) : 0;
-    return { color: rgbHex(c), rgb: [c[0], c[1], c[2]], ...(tr > 0 ? { opacity: 1 - tr } : {}), ...(tr >= 0.999 ? { hidden: true } : {}), texture: texOf(fNode(a, 'texture')) };
+    return { color: rgbHex(c), rgb: [c[0], c[1], c[2]], ...(tr > 0 ? { opacity: 1 - tr } : {}), ...(tr >= 0.999 ? { hidden: true } : {}), texture: texOf(fNode(a, 'texture')), ...(mat ? { pbr: pbrOf(mat) } : {}) };
   }
   warnOnce(ctx, `appearance ${a.type} not supported, grey used`);
   return { color: '#9aa3ad' };
@@ -316,10 +335,17 @@ function texturedRef(ref: GeometryRef, id: string, meshIn: MeshData, look: Look,
   if (ctx.assets && !ctx.assets.has(tid)) {
     const mat: MeshMaterial = { name: f, color: look.rgb ?? [1, 1, 1], map: { data: img, mime: imageMime(f!), name: f } };
     if (look.opacity !== undefined) mat.opacity = look.opacity;
+    if (look.pbr) {
+      if (look.pbr.metalness !== undefined) mat.metalness = look.pbr.metalness;
+      if (look.pbr.roughness !== undefined) mat.roughness = look.pbr.roughness;
+      if (look.pbr.emissive) { const k = look.pbr.emissiveIntensity ?? 1; const e = parseInt(look.pbr.emissive.slice(1), 16); mat.emissive = [((e >> 16) & 255) / 255 * k, ((e >> 8) & 255) / 255 * k, (e & 255) / 255 * k]; }
+      mat.ibl = look.pbr.ibl ?? 1;
+    }
     ctx.assets.registerMesh(tid, { ...mesh, groups: [{ start: 0, count: mesh.positions.length / 3, material: 0 }], materials: [mat] }, `${f!.split('/').pop()}`, 'm');
   }
   const out: GeometryRef = { ...ref, mesh: tid };
   if (look.opacity !== undefined && look.opacity < 1) out.opacity = look.opacity;
+  if (look.pbr) out.pbr = look.pbr;
   return out;
 }
 
@@ -333,6 +359,7 @@ export function geometryRefs(geomNode: WNode | null, M: Mat4, look: Look | null,
   const style = (r: GeometryRef): GeometryRef => {
     if (look?.color && !useFileMaterials) r.color = look.color;
     if (look?.opacity !== undefined && look.opacity < 1) r.opacity = look.opacity;
+    if (look?.pbr && !useFileMaterials) r.pbr = look.pbr;
     // a textured primitive keeps its primitive (collision, comparisons) and is drawn as a textured mesh of the same
     // shape with Webots-like texture coordinates (the renderer uses `mesh` when present)
     if (look?.texture && !useFileMaterials && r.primitive && !r.mesh) {

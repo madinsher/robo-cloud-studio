@@ -5,11 +5,15 @@
  *  0. leave a tight parking first: reverse glide to the standoff of the parking the robot stands in (corridor test of
  *     parking.py — the mission starts on the charger), or only re-glide when the goal is the same parking;
  *  2. coarse navigation (the Nav2 stand-in): footprint-aware path on the occupancy map (planForRobot, I8 planner) tracked
- *     by the studio path follower at the Nav2 velocity limits, stopping within xy_goal_tolerance 0.30 m;
+ *     by a port of RPP at the Nav2 velocity limits, stopping within xy_goal_tolerance 0.30 m; RPP's collision detection
+ *     (Nav2 footprint polygon, 0.7 s ahead, on the lidar-plane obstacles of the local costmap) refuses a command, and the
+ *     next recovery of Nav2's tree runs (clear, spin, wait, back up — each collision-checked), then a new plan;
  *  3. fine alignment: the glide-docking controller of navigate_server (P-control on the ground-truth pose, 0.12 m/s,
  *     0.4 rad/s, entry angle ≤ 20°, retreat-and-retry, 2 cm / 0.03 rad), unless skip_fine_align.
  */
 import { planForRobot } from '../../mobile/planner';
+import type { MapItem } from '../../mobile/items';
+import { rasterizeOccupancy } from '../../io/webots/occupancy';
 import { stationWorld } from '../../mobile/world';
 import { toPosePath, isPosePath } from '../../mobile/controller';
 import type { Pose3, RetailLayout } from './layout';
@@ -66,6 +70,12 @@ export function undockStep(eLong: number, eLat: number): [boolean, number] {
 
 /** nav2 RegulatedPurePursuitController with the murom_navigation parameters (nav2_params.yaml FollowPath). */
 export const RPP = { desiredV: 0.4, lookaheadTime: 1.5, minLookahead: 0.45, maxLookahead: 0.9, approachDist: 0.6, minApproachV: 0.08, minRadius: 0.9, minRegulatedV: 0.25, rotateMinAngle: 1.0, rotateW: 0.7 };
+/** Nav2 footprint polygon of nav2_params.yaml (m, base frame; the basket at the stern included) and RPP's collision
+ *  look-ahead (use_collision_detection, max_allowed_time_to_collision_up_to_carrot). */
+export const NAV2_FOOTPRINT: Array<[number, number]> = [[0.48, 0.42], [0.48, -0.42], [-0.55, -0.42], [-0.55, 0.42]];
+export const RPP_COLLISION_TIME = 0.7;
+/** Recoveries of Nav2's navigate_to_pose_w_replanning_and_recovery tree (round robin) and its retry budget. */
+export const NAV2_RECOVERY = { retries: 6, spin: 1.57, spinW: 0.6, wait: 5.0, backup: 0.30, backupV: 0.05 };
 /** One RPP control step on a densified path (m): carrot at the velocity-scaled lookahead, rotate-to-heading above
  *  1 rad, curvature- and approach-regulated linear speed. Returns the command and the pruned path index. */
 export function rppCommand(pts: Array<[number, number]>, start: number, pose: P3, vNow: number): { v: number; w: number; index: number } {
@@ -102,7 +112,13 @@ export class Navigator {
   /** Phases of every goal (undock / coarse / glide) with their sim times and results. */
   readonly events: Array<{ t0: number; t1: number; kind: 'undock' | 'coarse' | 'glide'; ok: boolean; message: string }> = [];
   private *timed(kind: 'undock' | 'coarse' | 'glide', task: Task<[boolean, string]>): Task<[boolean, string]> { const t0 = this.sim.time; const r = yield* task; this.events.push({ t0, t1: this.sim.time, kind, ok: r[0], message: r[1] }); return r; }
-  constructor(readonly sim: MuromSim, readonly L: RetailLayout, readonly cancelled: () => boolean = () => false) { this.cands = parkings(L); }
+  /**
+   * 'murom': navigate_server.py + parking.py of robot-retailer-murka(-v2). 'murka': navigate_server.py of the
+   * MURKA_Simulation copy — the robot counts as parked within 0.35 m of the last SUCCESSFUL fine parking (no corridor
+   * test, no charger), and the reverse glide out of it stops 0.10 m before the standoff line (straight back while
+   * more than 0.25 m away, then a lateral correction).
+   */
+  constructor(readonly sim: MuromSim, readonly L: RetailLayout, readonly cancelled: () => boolean = () => false, readonly flavor: 'murom' | 'murka' = 'murom') { this.cands = parkings(L); }
 
   resolve(goal: NavGoal): [P3, P3 | null] | null {
     if (goal.pose) return [goal.pose, null];
@@ -126,7 +142,21 @@ export class Navigator {
     const [coarse, fine] = resolved;
     const out = (success: boolean, message: string): NavOutcome => { sim.stop(); const p = sim.pose(); const f = fine ?? coarse; const e = parkingErrors(p, f); return { success, message, time: sim.time - t0, coarse, fine, finalError: e }; };
     // phase 0: leave the tight parking
-    const parked = currentParking(sim.pose(), this.lastParked, this.cands);
+    if (this.flavor === 'murka') {
+      if (this.lastParked) {
+        const [lastFine, lastStandoff] = this.lastParked; const [x, y] = sim.pose();
+        if (Math.hypot(x - lastFine[0], y - lastFine[1]) < 0.35) {
+          if (fine && Math.hypot(fine[0] - lastFine[0], fine[1] - lastFine[1]) < 0.05) {
+            const [ok, msg] = yield* this.timed('glide', this.glideTo(fine));
+            return out(ok, ok ? 'OK (уже на месте)' : `fine_align: ${msg}`);
+          }
+          const [ok, msg] = yield* this.timed('undock', this.undockToCopy(lastStandoff));
+          if (!ok) return out(false, `undock: ${msg}`);
+        }
+        this.lastParked = null;
+      }
+    }
+    const parked = this.flavor === 'murka' ? null : currentParking(sim.pose(), this.lastParked, this.cands);
     if (parked) {
       const [lastFine, lastStandoff] = parked;
       if (fine && Math.hypot(fine[0] - lastFine[0], fine[1] - lastFine[1]) < 0.05) {
@@ -142,19 +172,19 @@ export class Navigator {
     let [ok, msg] = yield* this.timed('coarse', this.coarse(coarse));
     for (let a = 1; !ok && a < 3 && !this.cancelled(); a++) { yield 3.0; [ok, msg] = yield* this.timed('coarse', this.coarse(coarse)); }
     if (!ok) return out(false, msg);
-    // phase 2: fine alignment
+    // phase 2: fine alignment (the copy remembers the parking only after a successful glide)
     if (!goal.skipFineAlign) {
       const target = fine ?? coarse;
       const [gok, gmsg] = yield* this.timed('glide', this.glideTo(target));
       sim.stop();
-      if (fine) this.lastParked = [fine, coarse];
+      if (fine && (gok || this.flavor !== 'murka')) this.lastParked = [fine, coarse];
       if (!gok) return out(false, `fine_align: ${gmsg}`);
     }
     return out(true, 'OK');
   }
 
   /** Nav2 stand-in: plan on the occupancy map (footprint-aware), track at 0.4 m/s, stop within 0.30 m. */
-  *coarse(goal: P3): Task<[boolean, string]> {
+  *coarse(goal: P3, recoveries0 = 0): Task<[boolean, string]> {
     const sim = this.sim; const robot = sim.base;
     const [x, y] = sim.pose();
     if (Math.hypot(goal[0] - x, goal[1] - y) <= NAV_PARAMS.nav2Tol) return [true, 'OK'];
@@ -172,19 +202,75 @@ export class Navigator {
     const pts: Array<[number, number]> = [];
     for (const p of path) { const q: [number, number] = [p[0] / 1000, p[1] / 1000]; const last = pts[pts.length - 1]; if (last) { const d = Math.hypot(q[0] - last[0], q[1] - last[1]); const n = Math.ceil(d / 0.05); for (let k = 1; k < n; k++) pts.push([last[0] + ((q[0] - last[0]) * k) / n, last[1] + ((q[1] - last[1]) * k) / n]); if (d < 1e-6) continue; } pts.push(q); }
     const t1 = sim.time + NAV_PARAMS.navTimeout;
-    let idx = 0;
+    let idx = 0; let recoveries = recoveries0;
     for (;;) {
       if (this.cancelled()) { sim.stop(); return [false, 'Отменено']; }
       if (sim.time > t1) { sim.stop(); return [false, 'Nav2 timeout']; }
       const [rx, ry, th] = sim.pose();
       if (Math.hypot(goal[0] - rx, goal[1] - ry) <= NAV_PARAMS.nav2Tol) break; // SimpleGoalChecker (stateful, yaw free)
       const cmd = rppCommand(pts, idx, [rx, ry, th], Math.abs(sim.base.state.v) / 1000);
+      if (this.collisionImminent([rx, ry, th], cmd.v, cmd.w)) {
+        // RPP: "detected collision ahead!" -> FollowPath fails; the BT runs its next recovery (round robin), replans
+        sim.stop();
+        if (recoveries >= NAV2_RECOVERY.retries) return [false, 'Nav2: RegulatedPurePursuitController detected collision ahead (recoveries exhausted)'];
+        const kind = (['clear', 'spin', 'wait', 'backup'] as const)[recoveries % 4]; recoveries++;
+        this.recoveryLog.push({ t: sim.time, kind });
+        yield* this.recovery(kind);
+        return yield* this.coarse(goal, recoveries);
+      }
       idx = cmd.index;
       sim.cmdVel(cmd.v, cmd.w);
       yield;
     }
     sim.stop();
     return [true, 'OK'];
+  }
+
+  /** Recoveries (nav2_behaviors) run when RPP refuses a command: each checks its own motion for collisions first. */
+  readonly recoveryLog: Array<{ t: number; kind: 'clear' | 'spin' | 'wait' | 'backup' }> = [];
+  private *recovery(kind: 'clear' | 'spin' | 'wait' | 'backup'): Task<void> {
+    const sim = this.sim; const R = NAV2_RECOVERY;
+    if (kind === 'clear') { yield 0.5; return; }
+    if (kind === 'wait') { yield R.wait; return; }
+    const free = (v: number, w: number, T: number) => { let [x, y, th] = sim.pose(); for (let t = 0; t < T; t += 0.05) { x += v * Math.cos(th) * 0.05; y += v * Math.sin(th) * 0.05; th += w * 0.05; if (this.footprintHits([x, y, th])) return false; } return true; };
+    const run = function* (v: number, w: number, T: number): Task<void> { const tEnd = sim.time + T; while (sim.time < tEnd) { sim.cmdVel(v, w); yield; } sim.stop(); };
+    if (kind === 'spin') { const T = R.spin / R.spinW; if (free(0, R.spinW, T)) yield* run(0, R.spinW, T); return; }
+    const T = R.backup / R.backupV; if (free(-R.backupV, 0, T)) yield* run(-R.backupV, 0, T);
+  }
+  private occ: MapItem | null | undefined;
+  /**
+   * The obstacles of RPP's costmap: the local costmap of nav2_params.yaml has only the voxel layer of the 2D /scan
+   * (no static layer), so its lethal cells are where the lidar plane (the robot's lidar height) cuts the furniture
+   * colliders — 5 cm cells like the costmap.
+   */
+  localCostmap(): MapItem | null {
+    if (this.occ === undefined) {
+      const lz = this.sim.h.lidar?.poseAbs()[14] ?? 656;
+      try { this.occ = rasterizeOccupancy(this.sim.station, { zMin: lz - 10, zMax: lz + 10, resolution: 50, name: 'lidar plane' }); } catch { this.occ = null; }
+    }
+    return this.occ;
+  }
+  /** Nav2 footprint outline (nav2_costmap_2d footprintCost: the polygon's edges) on lethal cells of the local costmap. */
+  footprintHits(p: P3): boolean {
+    const m = this.localCostmap(); if (!m) return false;
+    const c = Math.cos(p[2]), s = Math.sin(p[2]); const step = m.resolution / 1000 / 2;
+    for (let k = 0; k < NAV2_FOOTPRINT.length; k++) {
+      const a = NAV2_FOOTPRINT[k], b = NAV2_FOOTPRINT[(k + 1) % NAV2_FOOTPRINT.length];
+      const n = Math.max(1, Math.ceil(Math.hypot(b[0] - a[0], b[1] - a[1]) / step));
+      for (let i = 0; i <= n; i++) {
+        const lx = a[0] + ((b[0] - a[0]) * i) / n, ly = a[1] + ((b[1] - a[1]) * i) / n;
+        const [cx, cy] = m.worldToCell((p[0] + c * lx - s * ly) * 1000, (p[1] + s * lx + c * ly) * 1000);
+        if (m.get(cx, cy) >= 100) return true;
+      }
+    }
+    return false;
+  }
+  /** RPP isCollisionImminent: the footprint at the current pose and along the command for up to 0.7 s. */
+  collisionImminent(pose: P3, v: number, w: number): boolean {
+    if (this.footprintHits(pose)) return true;
+    let [x, y, th] = pose; const dt = 0.05;
+    for (let t = dt; t <= RPP_COLLISION_TIME + 1e-9; t += dt) { x += v * Math.cos(th) * dt; y += v * Math.sin(th) * dt; th += w * dt; if (this.footprintHits([x, y, th])) return true; }
+    return false;
   }
 
   /** navigate_server._undock_to: reverse glide out of a tight parking onto the standoff line. */
@@ -211,6 +297,33 @@ export class Navigator {
       }
       const glideHeading = yawt + latCorr;
       sim.cmdVel(-Math.min(P.fineV, 0.4 * Math.max(eLong, 0) + 0.05), Math.max(-P.fineW, Math.min(P.fineW, 1.8 * norm(glideHeading - th))));
+      yield;
+    }
+  }
+
+  /** _undock_to of the MURKA_Simulation copy: reverse glide, done 0.10 m before the standoff line. */
+  *undockToCopy(standoff: P3): Task<[boolean, string]> {
+    const sim = this.sim; const P = NAV_PARAMS;
+    const [xt, yt, yawt] = standoff; const ux = Math.cos(yawt), uy = Math.sin(yawt);
+    const t0 = sim.time; let last: [number | null, number] = [null, t0]; let wiggles = 0;
+    for (;;) {
+      if (this.cancelled()) { sim.stop(); return [false, 'Отменено']; }
+      if (sim.time - t0 > 40) { sim.stop(); return [false, 'таймаут']; }
+      const [x, y, th] = sim.pose();
+      const dx = x - xt, dy = y - yt; const eLong = dx * ux + dy * uy, eLat = -dx * uy + dy * ux;
+      if (eLong <= 0.10) { sim.stop(); return [true, 'OK']; }
+      const [ref, tRef] = last;
+      if (ref === null || ref - eLong > 0.04) last = [eLong, sim.time];
+      else if (sim.time - tRef > 5) {
+        if (wiggles >= 3) { sim.stop(); return [false, 'заклинило (3 расклинивания не помогли)']; }
+        wiggles++;
+        const tEnd = sim.time + 1.5;
+        while (sim.time < tEnd && !this.cancelled()) { sim.cmdVel(P.fineV, 0); yield; }
+        sim.stop(); last = [null, sim.time];
+        continue;
+      }
+      const latCorr = eLong > 0.25 ? 0 : Math.max(-0.35, Math.min(0.35, 1.5 * eLat));
+      sim.cmdVel(-Math.min(P.fineV, 0.4 * eLong + 0.04), Math.max(-P.fineW, Math.min(P.fineW, 1.8 * norm(yawt + latCorr - th))));
       yield;
     }
   }

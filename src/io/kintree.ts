@@ -148,12 +148,13 @@ export function geometryBounds(refs: GeometryRef[], assets?: AssetStore): { min:
 }
 
 function toLinkVisual(g: GeometryRef): LinkVisual {
-  const v: LinkVisual & { opacity?: number } = { origin: geomOrigin(g) };
+  const v: LinkVisual & { opacity?: number; pbr?: GeometryRef['pbr'] } = { origin: geomOrigin(g) };
   if (g.mesh) v.mesh = g.mesh;
   if (g.primitive) v.primitive = g.primitive as LinkVisual['primitive'];
   if (g.color) v.color = g.color;
   if (g.scale) v.scale = [...g.scale] as Vec3;
   if (g.opacity !== undefined && g.opacity < 1) v.opacity = g.opacity;
+  if (g.pbr) v.pbr = { ...g.pbr };
   return v;
 }
 
@@ -544,6 +545,9 @@ export function buildStationItemsFromTree(tree: KinTree, opts: KinBuildOptions =
     if (steers.length) {
       kin.drive = 'ackermann';
       kin.wheelBase = Math.abs(mean(front.map((w) => along(w, fwd))) - (rear.length ? mean(rear.map((w) => along(w, fwd))) : 0));
+      // rear axle (reference point of the bicycle model, MobileKinematics.rearAxle) when the base drives along +X:
+      // the UTP-G proto origin is the wheelbase midpoint (−wheelBase/2), a Webots Car proto's is the rear axle (0)
+      if (rear.length && Math.abs(fwd[0] - 1) < 1e-6) kin.rearAxle = mean(rear.map((w) => along(w, fwd)));
       const axle = rear.length >= 2 ? rear : front;
       const ys = axle.map((w) => along(w, lat));
       kin.track = Math.max(...ys) - Math.min(...ys);

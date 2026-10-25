@@ -20,10 +20,10 @@
   mCurrentSpeed.reach = 10.000
   mCurrentSpeed.leave = 10.000
   call MoveJoint(10.00000,20.00000,90.00000,30.00000,45.00000,60.00000)
-  call MoveLine(1077.305,-56.172,837.243,-146.156,25.288,-102.118)
+  call MoveLine(1077.300,-56.172,837.243,-146.156,25.288,-102.118)
   mCurrentSpeed.reach = 0.500
   mCurrentSpeed.leave = 0.500
-  call MoveLine(1005.195,-118.362,847.372,-147.806,26.654,-97.799)
+  call MoveLine(1005.190,-118.362,847.372,-147.806,26.655,-97.799)
   delay(0.000)
   delay(1.500)
   popUpMsg("Say "hi" to the operator")
@@ -33,7 +33,7 @@
   watch(Input[4]==false,1000.0)
   watch(IN_B==true)
   //call prog:Program_With_A_Long_Name_ABCDEFGHIJ()
-  call MoveLine(1077.305,-56.172,837.243,-146.156,25.288,-102.118)
+  call MoveLine(1077.300,-56.172,837.243,-146.156,25.288,-102.118)
   mCurrentSpeed.reach = -1.000
   mCurrentSpeed.leave = -1.000
   call MoveJoint(10.00000,20.00000,90.00000,30.00000,45.00000,60.00000)

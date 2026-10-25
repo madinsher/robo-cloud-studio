@@ -53,7 +53,7 @@ P[2]{
    GP1:
     UF : 9, UT : 9,        CONFIG : 'F U T, 0, 0, 0',
 	X =     0.000  mm,	Y =     0.000  mm,	Z =     0.000  mm,
-	W =    90.000 deg,	P =    -0.000 deg,	R =   180.000 deg
+	W =    90.000 deg,	P =     0.000 deg,	R =   180.000 deg
 };
 P[3]{
    GP1:

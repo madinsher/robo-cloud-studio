@@ -95,14 +95,28 @@ IF VISION_FOUND > 0 THEN PickPart ELSE NoPart      # PickPart: MoveJ Pick approa
 `Cam2D_Snapshot(file, cam)` saves a PNG (or RoboDK's grey32 depth for `.grey32` / `DEPTH`) and returns 1;
 `Cam2D_Snapshot("", cam[, 'DEPTH'])` returns the bytes (PNG for `cv2.imdecode`, grey32 = big-endian u32 w, h, rows
 bottom-up, depth / FAR_LENGTH · (2³² − 1), as `Macros/Depth_Camera.py` and `Open3D_Depth_Camera.py` decode it).
-`Cam2D_Settings` returns `FOV= FAR_LENGTH= NEAR_LENGTH= SIZE= [DEPTH]`.
+`Cam2D_Settings` returns RoboDK's own string, e.g. `FOV=32.000 PixelSize=7.168635 Size=640x480 SHOW_LIMITS
+FOCAL_LENGTH=6.00 FAR_LENGTH=1000.00 BG_COLOR=#000000 Persp WindowResize` (`tests/vision_rdkcam.test.ts`).
+
+Pixel parity with RoboDK 5.9.4 (the same scripts run against RoboDK and the studio; ground truth written by RoboDK in
+`tests/fixtures/vision_gt/robodk_cam2d_depth`, checked by `tests/vision_cam2d_depth_parity.test.ts`):
+- RGB snapshots are centre-sampled in both: V6's three-plate scene gives the same 11 729 lit pixels (XOR 0).
+- DEPTH snapshots: RoboDK samples a depth pixel (−0.125, −0.375) px from its centre (v down) — sample 0 of the
+  standard 4× MSAA pattern. Measured on planes tilted 20° about the camera y / x axis: −0.122 / −0.373 px at 640×480
+  FOV 32 and −0.125 / −0.375 px at 320×240 FOV 50. The studio samples there too (`ROBODK_DEPTH_SAMPLE_OFFSET`, render
+  option `sampleOffset`; the returned K has the shifted principal point). V6's scene now has the same 11 878 depth
+  pixels as RoboDK (before: 149 missing, one column / row at the right and bottom edges); the top faces agree to
+  0.02 mm (RoboDK writes 900.0145 for 900 mm), the row that sees a plate's side face to 0.1 mm.
+- Depth snapshots are rendered by the software rasterizer in the browser too (exact sub-pixel sampling); RGB
+  snapshots use the WebGL buffers when the 3D view registered them.
 
 ## ROS 2
 
 - `publishCameraFrame(ros, cam, frame)`: `sensor_msgs/Image` (rgb8 / bgr8 / rgba8 / bgra8), `CameraInfo` with the render
   K (principal point W/2 − 0.5 in the ROS integer-pixel convention), 32FC1 depth in metres (NaN = no return) with its
   CameraInfo, and TF `map → <cam>_link → <cam>_optical_frame`. The Vision tab publishes them when "Publish to ROS 2" is on;
-  rosbridge mode `sim` publishes every rgb / depth camera at 5 Hz (generic twin) or the MURKA head camera / range finder.
+  rosbridge mode `sim` publishes every rgb / depth camera at 5 Hz (generic twin) or the MURKA head camera / range finder
+  (5 Hz while subscribed, like the webots_ros2 devices of `murom_webots.urdf`; docs/ros.md).
 - Generated parameter files are typed ROS 2 YAML (`toRosYaml`: doubles always with a decimal point, the integer
   parameters `imgsz_*`, `*_reliability`, `max_det`, `track_buffer`, `depth_image_units_divisor`, `min_points` as integers).
 - `detectFruit` skips harvested (`picked`) fruit, so a detect → pick loop never re-detects them.

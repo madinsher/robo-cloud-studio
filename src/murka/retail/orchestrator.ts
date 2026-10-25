@@ -1,9 +1,13 @@
 /**
- * The murom_fsm orchestrator (orchestrator.py + recovery.py) as a studio control model: the yasmin state machines are
- * an `fsm` DSL document (missionFsmDsl — same states, outcomes and transitions as _build_mission_sm /
- * _build_depal_sm / _build_order_sm and the single tasks), executed by the studio's FsmExecutor (src/ctl/fsm.ts); every
- * state is a skill `murom.<state>` of the action library bound here to the station simulation (navigation, pick /
- * place, perception, head and arms), with the same blackboard keys, retries, error continuation and cancel semantics.
+ * The retail orchestrators as studio control models: the yasmin state machines are an `fsm` DSL document
+ * (missionFsmDsl), executed by the studio's FsmExecutor (src/ctl/fsm.ts); every state is a skill of the action library
+ * bound here to the station simulation (navigation, pick / place, perception, head and arms), with the same blackboard
+ * keys, retries, error continuation and cancel semantics.
+ *  - flavor 'murom': murom_fsm/orchestrator.py + recovery.py of robot-retailer-murka(-v2) (_build_mission_sm /
+ *    _build_depal_sm / _build_order_sm and the single tasks; skills `murom.<state>`);
+ *  - flavor 'murka': murka_fsm/orchestrator.py of the MURKA_Simulation copy (only /murka/task/depalletize and
+ *    /murka/task/collect_order: no perception, VERIFY_ITEM, held-object recovery, scan, dock or mission; skills
+ *    `murka.<state>`; SKU instances chosen from the registry by name).
  */
 import { FsmExecutor, parseFsm, FsmDoc } from '../../ctl/fsm';
 import type { ExecutorWorld } from '../../ctl/exec';
@@ -20,6 +24,11 @@ import type { AssetStore } from '../../scene/assets';
 
 export const BASKET_CAPACITY = 2;
 export const MISSION_DEFAULTS = { scan: ['shelf_A1', 'shelf_A2', 'shelf_A3'], depal: ['pallet_2', 'box_blue', 'bulk_B3', 1] as [string, string, string, number], order: ['tea_box', 'juice_pack'] };
+/** Task arguments of the MURKA_Simulation copy when none are given: its README quick start and scripts/e2e_test.py. */
+export const COPY_DEFAULTS = { depal: ['pallet_1', 'box_red', 'bulk_B1', 1] as [string, string, string, number], order: ['tea_box', 'coffee_can'] };
+/** Orchestrator family: murom_fsm (robot-retailer-murka v1 / v2) or murka_fsm (the MURKA_Simulation copy). */
+export type FsmFlavor = 'murom' | 'murka';
+const COPY_TASKS_MSG = (name: string) => `задачи '${name}' нет в оркестраторе MURKA_Simulation (murka_fsm): есть depalletize, order`;
 export const PHASES: Record<string, [number, number]> = { SCAN: [0, 15], DEPAL: [15, 35], ORDER: [50, 40], DOCK: [90, 10] };
 export const HEAD_AXIS_X = -0.076, CAMERA_Z = 1.575, HEAD_PAN_LIMIT = 1.6;
 export const HEAD_TILT_LIMITS: [number, number] = [-0.9, 0.6];
@@ -40,9 +49,22 @@ export type MissionTask =
   | { type: 'scan'; shelves: string[] }
   | { type: 'goto' | 'dock' | 'undock' | 'home'; nav: NavSpec };
 
-/** _parse_mission: mission / task by name with its arguments (`full scan=shelf_A1 depal=pallet_1,box_red,bulk_B1,1 order=tea_box`). */
-export function parseMission(name0: string, args0: string[], L: RetailLayout): MissionTask {
+/**
+ * _parse_mission: mission / task by name with its arguments (`full scan=shelf_A1 depal=pallet_1,box_red,bulk_B1,1
+ * order=tea_box`). The MURKA_Simulation copy (flavor 'murka') has the services /murka/task/depalletize (pallet sku
+ * target_shelf count) and /murka/task/collect_order (SKUs) only.
+ */
+export function parseMission(name0: string, args0: string[], L: RetailLayout, flavor: FsmFlavor = 'murom'): MissionTask {
   const name = name0.trim().toLowerCase(); const args = args0.filter((a) => a !== '');
+  if (flavor === 'murka') {
+    if (name === 'depalletize' || name === 'depal') {
+      const p: Array<string | number> = [...COPY_DEFAULTS.depal];
+      args.slice(0, 4).forEach((a, i) => { p[i] = i === 3 ? parseInt(a, 10) : a; });
+      return { type: 'depalletize', pallet_id: String(p[0]), sku: String(p[1]), target_shelf: String(p[2]), count: Math.max(1, Number(p[3]) || 1) };
+    }
+    if (name === 'order' || name === 'collect_order') return { type: 'collect_order', skus: args.length ? args : [...COPY_DEFAULTS.order] };
+    throw new Error(COPY_TASKS_MSG(name));
+  }
   if (name === 'full' || name === 'mission' || name === '') {
     const p: { scan: string[]; depal: Array<string | number>; order: string[] } = { scan: [...MISSION_DEFAULTS.scan], depal: [...MISSION_DEFAULTS.depal], order: [...MISSION_DEFAULTS.order] };
     for (const a of args) {
@@ -78,6 +100,9 @@ export function parseMission(name0: string, args0: string[], L: RetailLayout): M
 // ------------------------------------------------------------------- FSM document (yasmin structure)
 const st = (name: string, skill: string, outcomes: string[], tr: Record<string, string>, extra = '', ind = '', initial = false): string[] => [
   `${ind}state ${name}${initial ? ' initial' : ''}`, `${ind}  do skill=murom.${skill}${extra ? ` ${extra}` : ''} outcomes=${outcomes.join(',')}`, ...Object.entries(tr).map(([o, t]) => `${ind}  ${o} -> ${t}`)];
+/** The same lines with the skills of the MURKA_Simulation copy (murka.<state>). */
+const copySkills = (lines: string[]) => lines.map((l) => l.replace('do skill=murom.', 'do skill=murka.'));
+/** _build_depal_sm (identical in murom_fsm and in the copy's murka_fsm; the planning skill differs). */
 function depalStates(goHome: boolean, ind: string): string[] {
   return [
     ...st('PLAN', 'plan_depal', ['found', 'none_left', 'error'], { found: 'NAV_PICK', none_left: goHome ? 'NAV_HOME' : 'done', error: 'error' }, '', ind),
@@ -87,6 +112,20 @@ function depalStates(goHome: boolean, ind: string): string[] {
     ...st('PLACE', 'place', ['ok', 'fail'], { ok: 'PLAN', fail: 'error' }, '', ind),
     ...(goHome ? st('NAV_HOME', 'nav', ['ok', 'fail'], { ok: 'done', fail: 'done' }, 'key=home_nav', ind) : []),
   ];
+}
+/** _build_order_sm of the MURKA_Simulation copy: PLAN_ITEM found -> NAV_SHELF (no NAV_VERIFY / VERIFY_ITEM). */
+function copyOrderStates(goHome: boolean, ind: string): string[] {
+  return copySkills([
+    ...st('PLAN_ITEM', 'plan_item', ['found', 'to_packing', 'finished', 'error'], { found: 'NAV_SHELF', to_packing: 'UNLOAD_PLAN', finished: goHome ? 'NAV_HOME' : 'done', error: 'error' }, '', ind),
+    ...st('NAV_SHELF', 'nav', ['ok', 'fail'], { ok: 'PICK_ITEM', fail: 'error' }, 'key=pick_nav', ind),
+    ...st('PICK_ITEM', 'pick', ['ok', 'fail', 'skip'], { ok: 'PLACE_BASKET', skip: 'PLAN_ITEM', fail: 'error' }, 'skip_on_fail=true', ind),
+    ...st('PLACE_BASKET', 'place', ['ok', 'fail'], { ok: 'PLAN_ITEM', fail: 'error' }, '', ind),
+    ...st('UNLOAD_PLAN', 'unload_plan', ['item', 'empty', 'error'], { item: 'NAV_UNLOAD', empty: 'PLAN_ITEM', error: 'error' }, '', ind),
+    ...st('NAV_UNLOAD', 'nav', ['ok', 'fail'], { ok: 'PICK_BASKET', fail: 'error' }, 'key=unload_nav', ind),
+    ...st('PICK_BASKET', 'pick', ['ok', 'fail'], { ok: 'PLACE_PACK', fail: 'error' }, '', ind),
+    ...st('PLACE_PACK', 'place', ['ok', 'fail'], { ok: 'UNLOAD_PLAN', fail: 'error' }, '', ind),
+    ...(goHome ? st('NAV_HOME', 'nav', ['ok', 'fail'], { ok: 'done', fail: 'done' }, 'key=home_nav', ind) : []),
+  ]);
 }
 function orderStates(goHome: boolean, ind: string): string[] {
   return [
@@ -103,9 +142,17 @@ function orderStates(goHome: boolean, ind: string): string[] {
     ...(goHome ? st('NAV_HOME', 'nav', ['ok', 'fail'], { ok: 'done', fail: 'done' }, 'key=home_nav', ind) : []),
   ];
 }
-/** The FSM DSL of a task: same states / outcomes / transitions as the yasmin machines of orchestrator.py. */
-export function missionFsmDsl(task: MissionTask): string {
-  const out: string[] = [`fsm MUROM ${task.type}`, 'outcomes done error'];
+/** The FSM DSL of a task: same states / outcomes / transitions as the yasmin machines of orchestrator.py (murom_fsm, or
+ *  murka_fsm of the MURKA_Simulation copy for flavor 'murka', header `fsm MURKA <task>`). */
+export function missionFsmDsl(task: MissionTask, flavor: FsmFlavor = 'murom'): string {
+  const out: string[] = [`fsm ${flavor === 'murka' ? 'MURKA' : 'MUROM'} ${task.type}`, 'outcomes done error'];
+  if (flavor === 'murka') {
+    const initial = (lines: string[]) => lines.map((l, i) => (i === 0 ? `${l} initial` : l));
+    if (task.type === 'depalletize') out.push(...initial(copySkills(depalStates(true, ''))));
+    else if (task.type === 'collect_order') out.push(...initial(copyOrderStates(true, '')));
+    else throw new Error(COPY_TASKS_MSG(task.type));
+    return out.join('\n');
+  }
   if (task.type === 'mission') {
     const stages: Array<[string, string[]]> = [];
     if (task.scan.length) stages.push(['SCAN', st('SCAN', 'scan', ['ok', 'fail'], { ok: 'done', fail: 'error' }, '', '    ')]);
@@ -165,7 +212,7 @@ export function busyMessage(held: Partial<Record<Hand, string>>, need: string[],
 // ------------------------------------------------------------------- orchestrator
 export interface ProgressEvent { t: number; taskType: string; state: string; phase: string; detail: string; percent: number }
 export interface Detection { slotId: string; sku: string; confidence: number; position: [number, number, number]; width: number; height: number }
-export interface OrchestratorOptions { verifyWithCamera?: boolean; assets?: AssetStore | null; onEvent?: (e: ProgressEvent) => void; dumpFrames?: boolean; catalog: Record<string, Prototype> }
+export interface OrchestratorOptions { verifyWithCamera?: boolean; assets?: AssetStore | null; onEvent?: (e: ProgressEvent) => void; dumpFrames?: boolean; catalog: Record<string, Prototype>; flavor?: FsmFlavor }
 type BB = Record<string, any>;
 
 export class RetailOrchestrator {
@@ -181,7 +228,9 @@ export class RetailOrchestrator {
   readonly verifyWithCamera: boolean;
   private cancelFlag = false;
   task: MissionTask | null = null;
-  constructor(readonly sim: MuromSim, readonly nav: Navigator, readonly manip: ManipServer, readonly L: RetailLayout, readonly opts: OrchestratorOptions) { this.verifyWithCamera = opts.verifyWithCamera ?? true; }
+  /** The project's orchestrator family (station variant): its tasks and defaults. */
+  readonly flavor: FsmFlavor;
+  constructor(readonly sim: MuromSim, readonly nav: Navigator, readonly manip: ManipServer, readonly L: RetailLayout, readonly opts: OrchestratorOptions) { this.verifyWithCamera = opts.verifyWithCamera ?? true; this.flavor = opts.flavor ?? 'murom'; }
   private say(m: string): void { this.log.push(`[${this.sim.time.toFixed(2)}] ${m}`); }
   cancel(): void { this.cancelFlag = true; }
   get cancelRequested(): boolean { return this.cancelFlag; }
@@ -399,6 +448,75 @@ export class RetailOrchestrator {
     bb.detail = `выгрузка ${objName} -> ${free[0]}`;
     return 'item';
   }
+  // ------------------------------------------------------------- states of the MURKA_Simulation copy (murka_fsm)
+  /** basket_contents of the copy: every product in a basket_* slot. */
+  basketAll(): string[] { return Object.entries(this.objects()).filter(([, o]) => o.location.startsWith('basket_')).map(([n]) => n); }
+  /** PlanDepalStep of murka_fsm: no held-object recovery; no box of the SKU left on the pallet ends the task (none_left). */
+  *stPlanDepalCopy(bb: BB): Task<string> {
+    if (bb.remaining_count <= 0) return 'none_left';
+    const pallet = bb.pallet_id, sku = bb.sku, shelf = bb.target_shelf;
+    const objs = this.objects();
+    const order = (loc: string): [number, number] => { const parts = loc.split('_'); if (parts.length < 3) return [0, 99]; const a = parseInt(parts[parts.length - 2].slice(1), 10), b = parseInt(parts[parts.length - 1].slice(1), 10); return Number.isFinite(a) && Number.isFinite(b) ? [-a, b] : [0, 99]; };
+    const cands = Object.entries(objs).filter(([, o]) => o.sku === sku && o.location.startsWith(`${pallet}_L`));
+    if (!cands.length) { this.say(`На ${pallet} не осталось ${sku}`); return 'none_left'; }
+    cands.sort((a, b) => { const x = order(a[1].location), y = order(b[1].location); return x[0] - y[0] || x[1] - y[1]; });
+    const [objName, obj] = cands[0];
+    const pickSlot = this.L.slots[obj.location];
+    if (!pickSlot) { bb.errors = [...bb.errors, `Слот ${obj.location} не описан`]; return 'error'; }
+    const occupied = new Set(Object.values(objs).map((o) => o.location));
+    const free = slotsByPrefix(this.L, `${shelf}_L`).filter((s) => !occupied.has(s));
+    if (!free.length) { bb.errors = [...bb.errors, `На ${shelf} нет свободных слотов`]; return 'error'; }
+    let placeId: string | null = null;
+    for (const sid of free) {
+      const [ok, why] = this.manip.checkPlace(objName, sid, 'both');
+      if (ok) { placeId = sid; break; }
+      this.say(`${sid}: ${why} — слот пропущен`);
+    }
+    if (!placeId) { bb.errors = [...bb.errors, `На ${shelf} нет свободных слотов, достижимых двуручной укладкой`]; return 'error'; }
+    const place = this.L.slots[placeId]; const arm = pickSlot.arm ?? '';
+    if (place.arm !== arm && place.armAlt !== arm) { bb.errors = [...bb.errors, `${placeId}: нет подхода для руки ${arm}`]; return 'error'; }
+    bb.pick_object = objName; bb.pick_arm = arm; bb.pick_nav = ['slot', obj.location, arm]; bb.place_location = placeId; bb.place_nav = ['slot', placeId, arm];
+    bb.remaining_count = bb.remaining_count - 1; bb.detail = `${objName}: ${obj.location} -> ${placeId}`;
+    this.say(`План: ${bb.detail} (рука ${arm})`);
+    return 'found';
+  }
+  /** PlanOrderItem of murka_fsm: the first instance of the SKU on a gondola by name (registry, no camera inventory). */
+  *stPlanItemCopy(bb: BB): Task<string> {
+    const basket = this.basketAll();
+    if (basket.length >= BASKET_CAPACITY) return 'to_packing';
+    if (!bb.remaining_skus.length) return basket.length ? 'to_packing' : 'finished';
+    const objs = Object.entries(this.objects()).sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+    const remaining: string[] = [...bb.remaining_skus];
+    let cands: typeof objs = [];
+    while (remaining.length) {
+      cands = objs.filter(([, o]) => o.sku === remaining[0] && o.location.startsWith('shelf_'));
+      if (cands.length) break;
+      this.say(`SKU ${remaining[0]} не найден на гондолах — пропуск`);
+      bb.failed_items = [...bb.failed_items, [remaining[0], 'нет на полках']];
+      remaining.shift();
+    }
+    if (!remaining.length) { bb.remaining_skus = remaining; return basket.length ? 'to_packing' : 'finished'; }
+    const sku = remaining.shift()!; bb.remaining_skus = remaining;
+    const [objName, obj] = cands[0];
+    const slot = this.L.slots[obj.location];
+    if (!slot) { bb.errors = [...bb.errors, `Слот ${obj.location} не описан`]; return 'error'; }
+    bb.pick_object = objName; bb.pick_arm = slot.arm; bb.pick_nav = ['slot', obj.location, slot.arm]; bb.place_location = 'basket';
+    bb.detail = `${sku} (${objName}) из ${obj.location}`;
+    this.say(`Заказ: беру ${bb.detail}`);
+    return 'found';
+  }
+  /** UnloadPlan of murka_fsm: the first basket product by name -> the first free packing slot. */
+  *stUnloadPlanCopy(bb: BB): Task<string> {
+    const basket = this.basketAll(); if (!basket.length) return 'empty';
+    const occupied = new Set(Object.values(this.objects()).map((o) => o.location));
+    const free = slotsByPrefix(this.L, 'packing_S').filter((s) => !occupied.has(s));
+    if (!free.length) { bb.errors = [...bb.errors, 'Нет свободных слотов упаковки']; return 'error'; }
+    const objName = [...basket].sort()[0];
+    bb.pick_object = objName; bb.pick_arm = 'left'; bb.place_location = free[0]; bb.unload_nav = ['slot', free[0], 'left'];
+    bb.detail = `выгрузка ${objName} -> ${free[0]}`;
+    return 'item';
+  }
+
   *stScan(bb: BB): Task<string> {
     const views: Array<[string, P3]> = []; for (const shelf of bb.scan_shelves as string[]) for (const p of this.scanViews(shelf)) views.push([shelf, p]);
     if (!views.length) { bb.errors = [...bb.errors, `нет гондол для осмотра: ${bb.scan_shelves}`]; return 'fail'; }
@@ -511,6 +629,13 @@ export class RetailOrchestrator {
       'murom.unload_plan': skill('error', (bb) => this.stUnloadPlan(bb)),
       'murom.scan': skill('fail', (bb) => this.stScan(bb)),
       'murom.verify': skill('fail', (bb) => this.stVerify(bb)),
+      // murka_fsm of the MURKA_Simulation copy: NavState / PickState / PlaceState as above, its own planning states
+      'murka.nav': skill('fail', (bb, a, s) => this.stNav(s, bb, String(a.key))),
+      'murka.pick': skill('fail', (bb, a, s) => this.stPick(s, bb, a.skip_on_fail === true || a.skip_on_fail === 'true')),
+      'murka.place': skill('fail', (bb, _a, s) => this.stPlace(s, bb)),
+      'murka.plan_depal': skill('error', (bb) => this.stPlanDepalCopy(bb)),
+      'murka.plan_item': skill('error', (bb) => this.stPlanItemCopy(bb)),
+      'murka.unload_plan': skill('error', (bb) => this.stUnloadPlanCopy(bb)),
     };
     const sim = this.sim;
     return { sense: () => ({ battery: sim.battery.pct, docked: sim.battery.docked, x: sim.pose()[0], y: sim.pose()[1] }), actions, halt: {} };
@@ -520,17 +645,18 @@ export class RetailOrchestrator {
   /** The executor of a task: its FSM document (or `dsl`, an edited document) + the action library on the simulation. */
   executor(task: MissionTask, dsl0?: string, log?: (m: string) => void): { exec: FsmExecutor; doc: FsmDoc; dsl: string } {
     this.task = task; this.cancelFlag = false;
-    const dsl = dsl0 ?? missionFsmDsl(task); const doc = parseFsm(dsl);
+    const dsl = dsl0 ?? missionFsmDsl(task, this.flavor); const doc = parseFsm(dsl);
     const host = this.bindings(); const sim = this.sim;
     const world: ExecutorWorld = { host, forRobot: () => null, step: (dt) => sim.step(dt) };
     const exec = new FsmExecutor({ doc, world, maxPerTick: 50, log });
     Object.assign(exec.bb, this.newBlackboard(task), doc.blackboard); // values declared in the document win
     return { exec, doc, dsl };
   }
-  /** The task a document was made for (`fsm MUROM <type>` header; defaults of that task). */
+  /** The task a document was made for (`fsm MUROM <type>` / `fsm MURKA <type>` header; defaults of that task). */
   static taskOfDsl(dsl: string, L: RetailLayout): MissionTask {
-    const m = /^\s*fsm\s+MUROM\s+(\w+)/m.exec(dsl); const type = m?.[1] ?? 'mission';
+    const m = /^\s*fsm\s+(MUROM|MURKA)\s+(\w+)/m.exec(dsl); const type = m?.[2] ?? 'mission';
+    const flavor: FsmFlavor = m?.[1] === 'MURKA' || (!m && /skill=murka\./.test(dsl)) ? 'murka' : 'murom';
     const name = type === 'mission' ? 'full' : type === 'collect_order' ? 'order' : type;
-    try { return parseMission(name, [], L); } catch { return parseMission('full', [], L); }
+    try { return parseMission(name, [], L, flavor); } catch { return flavor === 'murka' ? parseMission('order', [], L, flavor) : parseMission('full', [], L); }
   }
 }

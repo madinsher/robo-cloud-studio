@@ -150,10 +150,29 @@ def _make_post(module, job):
     return RobotPost()
 
 
-def _replay(post, prog, Mat):
+def _g(v):
+    # RoboDK writes the numbers of its intermediate post script with '%g' (6 significant digits): the posts see those
+    return float('%g' % v)
+
+
+def _rdk_pose(Mat, rows):
+    # RoboDK hands a pose to its posts as p(x,y,z,a,b,c) (robomath.PosePP, KUKA xyzabc) with 6 significant digits
+    try:
+        from robodk.robomath import Pose_2_KUKA, PosePP
+    except Exception:
+        from robomath import Pose_2_KUKA, PosePP  # type: ignore
+    return PosePP(*[0.0 if abs(x) < 1e-9 else _g(x) for x in Pose_2_KUKA(Mat(rows))])
+
+
+def _replay(post, prog, Mat, precision=True):
     def mat(v):
         r = _rows(v)
-        return Mat(r) if r is not None else None
+        if r is None:
+            return None
+        return _rdk_pose(Mat, r) if precision else Mat(r)
+
+    def jl(v):
+        return [_g(x) for x in v] if precision and v else (v or [])
 
     def conf(ev, key='conf'):
         c = ev.get(key)
@@ -189,11 +208,11 @@ def _replay(post, prog, Mat):
     for ev in prog['events']:
         k = ev.get('kind')
         if k == 'moveJ':
-            post.MoveJ(mat(ev.get('pose')), ev.get('joints') or [], conf(ev))
+            post.MoveJ(mat(ev.get('pose')), jl(ev.get('joints')), conf(ev))
         elif k == 'moveL':
-            post.MoveL(mat(ev.get('pose')), ev.get('joints') or [], conf(ev))
+            post.MoveL(mat(ev.get('pose')), jl(ev.get('joints')), conf(ev))
         elif k == 'moveC':
-            post.MoveC(mat(ev.get('via')), ev.get('viaJoints') or ev.get('joints') or [], mat(ev.get('pose')), ev.get('joints') or [], conf(ev, 'viaConf') if ev.get('viaConf') else conf(ev), conf(ev))
+            post.MoveC(mat(ev.get('via')), jl(ev.get('viaJoints') or ev.get('joints')), mat(ev.get('pose')), jl(ev.get('joints')), conf(ev, 'viaConf') if ev.get('viaConf') else conf(ev), conf(ev))
         elif k == 'setFrame':
             fid = ev.get('frameId')
             post.setFrame(mat(ev.get('pose')), -1 if fid is None else fid, ev.get('name', 'Frame'))
@@ -285,7 +304,8 @@ def _run_group(module, job, group, folder, Mat, logs):
     for k, v in (job.get('post_attrs') or {}).items():
         setattr(post, k, v)
     for p in group:
-        _replay(post, p, Mat)
+        # job['rdk_precision'] False: full-precision numbers (default: what RoboDK's intermediate script passes)
+        _replay(post, p, Mat, job.get('rdk_precision', True) is not False)
     try:
         try:
             post.ProgSave(folder, group[0]['name'], False, False)

@@ -9,13 +9,13 @@ function JointTargets()
 	MoveJ({joint={10.000000, 20.000000, 90.000000, 30.000000, 45.000000, 60.000000}})
 	-- Linear movement using joint targets is not supported. Change the target type to cartesian or use a joint movement.
 	MoveJ({joint={18.000000, 24.000000, 90.000000, 30.000000, 45.000000, 60.000000}})
-	Move({coordinate={250.7030,15.1349,51.4733,-148.4034,1.1683,-100.7189}},'User=9 Tool=9')
+	Move({coordinate={250.7030,15.1349,51.4733,-148.4030,1.1683,-100.7190}},'User=9 Tool=9')
 	-- Linear movement using joint targets is not supported. Change the target type to cartesian or use a joint movement.
 	CP(5)
 	MoveJ({joint={10.000000, 20.000000, 90.000000, 30.000000, 45.000000, 60.000000}})
 	-- Linear movement using joint targets is not supported. Change the target type to cartesian or use a joint movement.
 	MoveJ({joint={18.000000, 24.000000, 90.000000, 30.000000, 45.000000, 60.000000}})
-	Move({coordinate={250.7030,15.1349,51.4733,-148.4034,1.1683,-100.7189}},'User=9 Tool=9')
+	Move({coordinate={250.7030,15.1349,51.4733,-148.4030,1.1683,-100.7190}},'User=9 Tool=9')
 	-- Linear movement using joint targets is not supported. Change the target type to cartesian or use a joint movement.
 	CP(0)
 	MoveJ({joint={10.000000, 20.000000, 90.000000, 30.000000, 45.000000, 60.000000}})

@@ -229,10 +229,10 @@ export function orderRowsNearest(rows: Array<{ start: number[]; end: number[] }>
 // Footprint- and drive-aware planning (pose paths)
 // ---------------------------------------------------------------------------------------------------------------
 import type { MobileRobot } from './items';
-import { CollisionWorld, CircleObstacle, Pose2 } from './footprint';
+import { CollisionWorld, CircleObstacle, Pose2, shiftPose, shiftPosePath } from './footprint';
 import { planGridFootprint, planHybridAStar, PosePathResult, footprintChecker } from './hybrid_astar';
 import { railRoute, RailNetwork, locateOnRails } from './rails';
-import { minTurnRadius } from './controller';
+import { minTurnRadius, rearAxleOffset } from './controller';
 
 export interface RobotPlanOptions {
   world: CollisionWorld;
@@ -292,7 +292,8 @@ export function planForRobot(robot: MobileRobot, start: Pose2, goal: { x: number
   if (k.drive === 'ackermann' || method === 'nav2_smac_hybrid_rpp') {
     // Smac Hybrid-A*: curvature-limited arcs for every drive (no rotation in place)
     const radius = k.drive === 'ackermann' ? minTurnRadius(k) * 1.15 : Math.max(800, k.footprint[1]);
-    return planHybridAStar(o.world, start, { x: goal.x, y: goal.y, theta: o.goalHeading }, { ...base, radius, allowReverse: o.allowReverse ?? true });
+    // a car's arcs are rear-axle arcs (rearAxleOffset); a differential base turns about its origin
+    return planHybridAStar(o.world, start, { x: goal.x, y: goal.y, theta: o.goalHeading }, { ...base, radius, allowReverse: o.allowReverse ?? true, refX: rearAxleOffset(k) });
   }
   const g = planGridFootprint(o.world, start, goal, base);
   if (method === 'nav2_navfn_dwb' || method === 'nav2_smac2d_mppi') return g; // 2-D planners: no hybrid fallback
@@ -306,9 +307,11 @@ export interface HeadlandTurn { kind: 'U' | 'omega' | 'fishtail'; path: number[]
 /**
  * Headland turns from a row exit pose to the next row's entry pose for a car-like robot with turning radius R:
  * forward-only (U turn when the row spacing ≥ 2R, else an Ω / bulb turn) and with reverse (fish-tail / 3-point turn).
- * `depth` is how far the footprint reaches beyond the exit line — compare it with the headland width.
+ * `depth` is how far the footprint reaches beyond the exit line — compare it with the headland width. Poses are the robot
+ * origin (footprint centre); the turns are Reeds–Shepp paths of the point at body x = `refX` (a car's rear axle,
+ * controller.rearAxleOffset), where the radius R holds.
  */
-export function headlandTurns(exit: { x: number; y: number; theta: number }, entry: { x: number; y: number; theta: number }, R: number, footprint: [number, number]): HeadlandTurn[] {
+export function headlandTurns(exit: { x: number; y: number; theta: number }, entry: { x: number; y: number; theta: number }, R: number, footprint: [number, number], refX = 0): HeadlandTurn[] {
   const out: HeadlandTurn[] = [];
   const u = [Math.cos((exit.theta * Math.PI) / 180), Math.sin((exit.theta * Math.PI) / 180)];
   const spacing = Math.abs(-(entry.x - exit.x) * u[1] + (entry.y - exit.y) * u[0]);
@@ -321,10 +324,11 @@ export function headlandTurns(exit: { x: number; y: number; theta: number }, ent
     }
     return d;
   };
-  const fwd = reedsSheppPath(exit, entry, R, { allowReverse: false, step: 100 });
-  if (fwd) out.push({ kind: spacing >= 2 * R - 1 ? 'U' : 'omega', path: fwd.poses, length: fwd.length, depth: depthOf(fwd.poses) });
-  const rs = reedsSheppPath(exit, entry, R, { allowReverse: true, step: 100, reverseCost: 1.2 });
-  if (rs && rs.poses.some((p) => p[3] < 0)) out.push({ kind: 'fishtail', path: rs.poses, length: rs.length, depth: depthOf(rs.poses) });
+  const ex = shiftPose(exit, refX), en = shiftPose(entry, refX);
+  const fwd = reedsSheppPath(ex, en, R, { allowReverse: false, step: 100 });
+  if (fwd) { const path = shiftPosePath(fwd.poses, -refX); out.push({ kind: spacing >= 2 * R - 1 ? 'U' : 'omega', path, length: fwd.length, depth: depthOf(path) }); }
+  const rs = reedsSheppPath(ex, en, R, { allowReverse: true, step: 100, reverseCost: 1.2 });
+  if (rs && rs.poses.some((p) => p[3] < 0)) { const path = shiftPosePath(rs.poses, -refX); out.push({ kind: 'fishtail', path, length: rs.length, depth: depthOf(path) }); }
   return out;
 }
 import { reedsSheppPath } from './reeds_shepp';

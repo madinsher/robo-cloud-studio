@@ -330,6 +330,12 @@ export interface GeometryRef {
   color?: string;
   scale?: [number, number, number];
   opacity?: number;
+  /**
+   * Physically based material (Webots PBRAppearance; a legacy Appearance{Material} converted like Webots does):
+   * metalness / roughness 0..1, emissive colour '#rrggbb' × emissiveIntensity, ibl = IBLStrength (environment
+   * reflection scale). Absent: the studio's default material.
+   */
+  pbr?: { metalness?: number; roughness?: number; emissive?: string; emissiveIntensity?: number; ibl?: number };
 }
 
 /** 3D object (workpiece, fixture, tree, crate...). */

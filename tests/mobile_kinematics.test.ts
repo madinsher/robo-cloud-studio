@@ -2,7 +2,7 @@
 import { describe, it, expect } from 'vitest';
 import { Station } from '../src/core/items/item';
 import { MobileRobot, MapItem } from '../src/mobile/items';
-import { followPath, stepMobile, integrate, minTurnRadius } from '../src/mobile/controller';
+import { followPath, stepMobile, integrate, minTurnRadius, rearAxleOffset } from '../src/mobile/controller';
 import { reedsSheppPath, reedsSheppCandidates, dubinsCandidates, integrateWord } from '../src/mobile/reeds_shepp';
 
 function mk(drive: MobileRobot['kin']['drive'], extra: Partial<MobileRobot['kin']> = {}) {
@@ -13,21 +13,25 @@ function mk(drive: MobileRobot['kin']['drive'], extra: Partial<MobileRobot['kin'
   return { st, r };
 }
 
-/** Run until the path is done; record body-frame lateral velocity, yaw rate, steering and the trajectory. */
+/** Run until the path is done; record body-frame lateral velocity (of the drive's reference point: the rear axle of an
+ *  Ackermann base, the origin otherwise), yaw rate, steering and the trajectory. */
 function run(r: MobileRobot, maxT = 600, dt = 0.05) {
   let t = 0, maxLat = 0, maxYaw = 0, maxSteer = 0;
-  let px = r.state.x, py = r.state.y, pth = r.state.theta;
+  const ax = rearAxleOffset(r.kin);
+  const ref = () => [r.state.x + Math.cos(r.state.theta * Math.PI / 180) * ax, r.state.y + Math.sin(r.state.theta * Math.PI / 180) * ax];
+  let [px, py] = ref(), pth = r.state.theta;
   const trail: number[][] = [];
   while (t < maxT && stepMobile(r, dt)) {
     t += dt;
-    const vx = (r.state.x - px) / dt, vy = (r.state.y - py) / dt;
+    const [rx, ry] = ref();
+    const vx = (rx - px) / dt, vy = (ry - py) / dt;
     const th = ((pth + r.state.theta) / 2) * Math.PI / 180;
     // lateral velocity of the reference point (mid-step heading)
     const dth = ((r.state.theta - pth + 540) % 360) - 180;
     if (Math.abs(dth) < 90) maxLat = Math.max(maxLat, Math.abs(-Math.sin(th) * vx + Math.cos(th) * vy));
     maxYaw = Math.max(maxYaw, Math.abs(dth) / dt);
     maxSteer = Math.max(maxSteer, Math.abs(r.state.steer));
-    px = r.state.x; py = r.state.y; pth = r.state.theta;
+    px = rx; py = ry; pth = r.state.theta;
     trail.push([r.state.x, r.state.y, r.state.theta]);
   }
   return { t, maxLat, maxYaw, maxSteer, trail, done: r.state.path === null };

@@ -44,10 +44,14 @@ interface Entry {
 
 export type SelectCallback = (item: Item | null, additive: boolean) => void;
 
+/** Zenith and horizon colours of the daylight sky standing in for a textured Webots background (by its name). */
+function skyColors(name: string): [string, string] {
+  const n = name.toLowerCase();
+  return /night|dark|space/.test(n) ? ['#05070d', '#1b2233'] : /dusk|sunset|dawn|evening|morning/.test(n) ? ['#4a6fa5', '#f2b880'] : /cloud|overcast|fog|mist/.test(n) ? ['#8fa3b8', '#dfe5ea'] : ['#5d8fd0', '#cfe1f2'];
+}
 /** Daylight sky for Webots' textured backgrounds (noon_cloudy_countryside, ...): a vertical gradient (zenith -> horizon). */
 function skyGradient(name: string): THREE.Texture | THREE.Color {
-  const n = name.toLowerCase();
-  const [top, horizon] = /night|dark|space/.test(n) ? ['#05070d', '#1b2233'] : /dusk|sunset|dawn|evening|morning/.test(n) ? ['#4a6fa5', '#f2b880'] : /cloud|overcast|fog|mist/.test(n) ? ['#8fa3b8', '#dfe5ea'] : ['#5d8fd0', '#cfe1f2'];
+  const [top, horizon] = skyColors(name);
   if (typeof document === 'undefined') return new THREE.Color(horizon);
   const c = document.createElement('canvas'); c.width = 4; c.height = 256;
   const g = c.getContext('2d');
@@ -115,6 +119,8 @@ export class SceneRenderer {
     this.renderer.shadowMap.enabled = opts.showShadows ?? true;
     this.renderer.shadowMap.type = THREE.PCFShadowMap;
     canvasHost.appendChild(this.renderer.domElement);
+    // a lost and restored WebGL context empties the PBR environment map: render it again at the next frame
+    this.renderer.domElement.addEventListener('webglcontextrestored', () => { this.pmremTarget = null; this.scene.environment = null; this.pbrEnvRequest = { bg: this.pbrEnvBg }; });
     this.scene.background = new THREE.Color(opts.background ?? 0x1e2229);
     this.scene.fog = new THREE.Fog(opts.background ?? 0x1e2229, 60000, 250000);
     this.camera = new THREE.PerspectiveCamera(45, 1, 5, 1e6);
@@ -679,7 +685,11 @@ export class SceneRenderer {
       root.add(body);
       const wheelR = m.kin.wheelRadius, wheelW = Math.max(60, W * 0.12);
       const wheelMat = materialFor('#22262b');
-      const positions = m.kin.drive === 'ackermann' || m.kin.drive === 'tracked' ? [[L * 0.35, W / 2 + wheelW / 2], [L * 0.35, -W / 2 - wheelW / 2], [-L * 0.35, W / 2 + wheelW / 2], [-L * 0.35, -W / 2 - wheelW / 2]] : [[0, W / 2 + wheelW / 2], [0, -W / 2 - wheelW / 2], [L * 0.4, 0], [-L * 0.4, 0]];
+      // Ackermann wheels on the kinematic axles: rear axle at kin.rearAxle (controller.rearAxleOffset, default
+      // −wheelBase/2), steered axle one wheel base ahead — the rear wheels then roll without side slip (V3 F4)
+      const rearX = m.kin.rearAxle ?? -m.kin.wheelBase / 2, frontX = rearX + m.kin.wheelBase;
+      const positions = m.kin.drive === 'ackermann' ? [[frontX, W / 2 + wheelW / 2], [frontX, -W / 2 - wheelW / 2], [rearX, W / 2 + wheelW / 2], [rearX, -W / 2 - wheelW / 2]]
+        : m.kin.drive === 'tracked' ? [[L * 0.35, W / 2 + wheelW / 2], [L * 0.35, -W / 2 - wheelW / 2], [-L * 0.35, W / 2 + wheelW / 2], [-L * 0.35, -W / 2 - wheelW / 2]] : [[0, W / 2 + wheelW / 2], [0, -W / 2 - wheelW / 2], [L * 0.4, 0], [-L * 0.4, 0]];
       positions.forEach(([x, y], i) => {
         const r = i < 2 || m.kin.drive !== 'differential' ? wheelR : wheelR * 0.5;
         const w = new THREE.Mesh(new THREE.CylinderGeometry(r, r, wheelW, 20), wheelMat);
@@ -728,7 +738,49 @@ export class SceneRenderer {
       if (dl.color) this.sun.color.setRGB(dl.color[0], dl.color[1], dl.color[2]);
     } else { this.sun.position.set(20000, -15000, 30000); this.sun.intensity = 1.6; this.sun.color.set(0xffffff); }
     if (this.hemi) this.hemi.intensity = 0.9 * (bg?.luminosity !== undefined ? Math.max(0.2, Number(bg.luminosity)) : 1);
+    this.pbrEnvRequest = { bg }; this.pbrEnvBg = bg; // PBR environment light, built at the next frame
     this.dirty = true;
+  }
+
+  private pmremTarget: THREE.WebGLRenderTarget | null = null;
+  private pbrEnvRequest: { bg: { skyColor?: number[]; luminosity?: number; texture?: string } | undefined } | null = null;
+  /**
+   * Image-based lighting of the PBR materials (materialFor / fileMaterial with Webots PBR parameters; the studio's own
+   * materials have envMapIntensity 0): like Webots' pbr.frag without a Background cube map, a uniform environment of
+   * the sky colour × luminosity; a textured Webots background gets the daylight gradient of the 3D view's sky.
+   * Stations without a Webots background have no environment. applyEnvironment requests it; the environment map is
+   * rendered at the next frame (made while a station is being set up, the PMREM render targets came out black), and
+   * again after a lost and restored WebGL context (which empties every render target; listener in the constructor).
+   */
+  private pbrEnvBg: { skyColor?: number[]; luminosity?: number; texture?: string } | undefined;
+  private buildPbrEnvironment(): void {
+    const req = this.pbrEnvRequest; this.pbrEnvRequest = null;
+    if (!req) return;
+    const bg = req.bg;
+    this.pmremTarget?.dispose(); this.pmremTarget = null; this.scene.environment = null;
+    if (!bg) return;
+    try {
+      const pmrem = new THREE.PMREMGenerator(this.renderer);
+      const lum = bg.luminosity !== undefined ? Math.max(0, Number(bg.luminosity)) : 1;
+      const s = new THREE.Scene();
+      if (bg.texture) {
+        // a textured Webots background: the daylight gradient of the view's sky above, its horizon colour darkened below
+        const [top, horizon] = skyColors(String(bg.texture)).map((h) => new THREE.Color(h).multiplyScalar(lum));
+        const geo = new THREE.SphereGeometry(1, 32, 16); const pos = geo.attributes.position; const col = new Float32Array(pos.count * 3);
+        for (let i = 0; i < pos.count; i++) { const z = pos.getY(i); const c = z >= 0 ? horizon.clone().lerp(top, z) : horizon.clone().multiplyScalar(0.55); col.set([c.r, c.g, c.b], i * 3); }
+        geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+        const dome = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.BackSide })); dome.rotation.x = Math.PI / 2; // sphere Y up -> world Z up
+        s.add(dome);
+        this.pmremTarget = pmrem.fromScene(s, 0, 0.1, 10);
+        geo.dispose(); (dome.material as THREE.Material).dispose();
+      } else {
+        const c = bg.skyColor && bg.skyColor.length >= 3 ? new THREE.Color(bg.skyColor[0], bg.skyColor[1], bg.skyColor[2]) : new THREE.Color(1, 1, 1);
+        s.background = c.multiplyScalar(lum);
+        this.pmremTarget = pmrem.fromScene(s, 0);
+      }
+      pmrem.dispose();
+      this.scene.environment = this.pmremTarget.texture;
+    } catch { this.pmremTarget = null; this.scene.environment = null; /* no WebGL (headless): materials keep the direct lights */ }
   }
 
   /** Follow an item with the camera (null stops): the view keeps its orbit around the item while the item moves. */
@@ -873,6 +925,7 @@ export class SceneRenderer {
       this.structural.clear();
     }
     this.syncTransforms();
+    if (this.pbrEnvRequest) this.buildPbrEnvironment();
     this.renderer.render(this.scene, this.camera);
   }
 
@@ -1097,6 +1150,7 @@ export class SceneRenderer {
   }
 
   screenshot(): string {
+    if (this.pbrEnvRequest) this.buildPbrEnvironment();
     this.renderer.render(this.scene, this.camera);
     return this.renderer.domElement.toDataURL('image/png');
   }

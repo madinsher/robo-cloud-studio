@@ -6,7 +6,8 @@
  *   node dist/ros-sim/sim_cli.js --murka "<MURKA_Simulation>" [--variant v2|v1] [--url ws://127.0.0.1:9090]
  *   node dist/ros-sim/sim_cli.js --world <dir>/worlds/x.wbt [--layout <dir with products.yaml, locations.yaml>]
  *   node dist/ros-sim/sim_cli.js --station my_cell.vbs
- *   options: --rtf 1 (0 = as fast as possible), --camera-rate 5 (Hz, 0 = no images), --no-lidar-noise, --seed N
+ *   options: --rtf 1 (0 = as fast as possible), --camera-rate 5 (Hz, 0 = no images), --camera-always (render the
+ *   cameras without subscribers too; default: only while subscribed, asked from rosapi), --no-lidar-noise, --seed N
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -61,7 +62,7 @@ async function main(argv: string[]): Promise<void> {
     station = loadStation(JSON.parse(fs.readFileSync(arg('--station')!, 'utf8')), assets);
   } else { console.log('usage: sim_cli --murka <MURKA_Simulation> | --world <x.wbt> [--layout <dir>] | --station <x.vbs> [--url ws://127.0.0.1:9090] [--rtf 1] [--camera-rate 5]'); process.exit(2); }
   const h = await startSimBackend({
-    url: arg('--url') ?? 'ws://127.0.0.1:9090', station, assets, rtf: Number(arg('--rtf') ?? 1),
+    url: arg('--url') ?? 'ws://127.0.0.1:9090', station, assets, rtf: Number(arg('--rtf') ?? 1), cameraOnDemand: !argv.includes('--camera-always'),
     murom: { cameraRate: Number(arg('--camera-rate') ?? 5), lidarNoise: !argv.includes('--no-lidar-noise'), seed: arg('--seed') ? Number(arg('--seed')) : undefined },
   });
   const timer = setInterval(() => console.log(`[sim-cli] sim ${h.time().toFixed(1)} s, RTF ${h.rtf().toFixed(2)}, ${h.client?.stats.sent ?? 0} messages`), 30000);

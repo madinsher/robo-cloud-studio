@@ -147,16 +147,18 @@ function brandOf(name: string, convention: number): RobotBrand {
 }
 
 /**
- * Post processor RoboDK uses for a robot whose file stores none (Item.getParam('PostProcessor') == ''): the brand's
- * default post, recognised from the robot name / joint convention. Library GT: RoboDK 5.9.4 wrote .LS (Fanuc 06.d),
- * .mod (ABB 06.b), .src (KUKA 08.a), .pdl (Comau 05.d) for robots without a stored post. Mechanisms (turntables,
- * rails, grippers: no brand) keep the generic one, like RoboDK (which writes a license placeholder for them).
+ * Post processor RoboDK uses for a robot whose file stores none (Item.getParam('PostProcessor') == ''), recognised
+ * from the robot name / joint convention. RoboDK 5.9.4 then generates with its BUILT-IN generators (compiled into
+ * RoboDK.exe, src/posts/rdk_builtin.ts): Library GT .LS of the Fanuc of 06.d / 02.d, .mod of the ABBs of 03.e / 05.c /
+ * 06.b / 10.a, .src of the KUKAs of 08.a, .pdl of the Comau of 05.d, .script of the UR of 07.e
+ * (tests/posts_library_code.test.ts). Mechanisms (turntables, rails, grippers) get RoboDK's "undefined post processor"
+ * placeholder. Brands without a built-in generator verified against RoboDK keep their brand's post.
  */
 export function defaultPostOf(name: string, convention: number, dof: number): string {
   const n = name.toLowerCase();
   const brand = brandOf(name, convention);
   const byBrand: Partial<Record<RobotBrand, string>> = {
-    ABB: 'ABB_RAPID_IRC5', Fanuc: 'Fanuc_R30i', Yaskawa: 'Motoman', KUKA: 'KUKA_KRC2', Comau: 'Comau_C5G', UR: 'Universal_Robots',
+    ABB: 'RoboDK_Builtin_ABB', Fanuc: 'RoboDK_Builtin_Fanuc', Yaskawa: 'Motoman', KUKA: 'RoboDK_Builtin_KUKA', Comau: 'RoboDK_Builtin_Comau', UR: 'RoboDK_Builtin_UR',
     Staubli: 'Staubli_VAL3', Doosan: 'Doosan_Robotics', Kawasaki: 'Kawasaki', Denso: 'Denso_RC8', Mecademic: 'Mecademic',
   };
   if (byBrand[brand] && dof >= 4) return byBrand[brand]!;
@@ -165,7 +167,7 @@ export function defaultPostOf(name: string, convention: number, dof: number): st
     [/\bdobot\b/, 'Dobot_CR'], [/hanwha|\bhcr-/, 'Hanwha_HCR'], [/\bjaka\b/, 'JAKA'], [/\baubo\b/, 'AUBO'], [/\belite\b/, 'Elite_EC'], [/kinova/, 'Kinova_Kortex'],
   ];
   if (dof >= 4) for (const [re, id] of byName) if (re.test(n)) return id;
-  return 'Generic';
+  return 'RoboDK_Builtin_Generic';
 }
 
 export interface RdkRobotDecode {
@@ -264,6 +266,8 @@ export function decodeRobotTable(r: RdkBytes, at: number, end: number, fallbackN
   // the file's post, else RoboDK's choice for a robot without one (the brand's default post)
   robot.postProcessor = post || defaultPostOf(name, conv, dof);
   robot.params.rdkPostProcessor = post;
+  // payload (kg): RoboDK's built-in ABB generator declares rdkTool with 0.8 x this mass
+  if (Number.isFinite(t(100)) && t(100) > 0) robot.params.rdkPayload = t(100);
   const reach = t(101);
   if (reach > 50 && reach < 20000) robot.reach = reach;
   const cur: number[] = [];
@@ -284,7 +288,9 @@ export function decodeRobotTable(r: RdkBytes, at: number, end: number, fallbackN
   if (conv === 3) {
     const pulses: number[] = [];
     for (let i = 0; i < dof; i++) pulses.push(t(980 + i));
-    if (pulses.some((v) => v > 1)) robot.params.motomanPulses = pulses;
+    // RoboDK's Motoman posts multiply the joints by these ratios as stored, zeros included (Library 05.e: the ES200D has
+    // none and RoboDK writes C00000=0,0,0,0,0,0)
+    if (pulses.every((v) => Number.isFinite(v) && v >= 0)) robot.params.motomanPulses = pulses;
   }
   return { robot, meshEnd, notes };
 }

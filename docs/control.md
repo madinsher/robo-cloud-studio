@@ -12,6 +12,10 @@ Petri inspector edits transition guards (`guard=`) and input events (`on=`), and
 (`xA d2; xB a2`) and sensors (`event "expr"; …`); the automaton inspector edits a guard per controllable event of an edge,
 the sensors and `terminate marked`. Renaming an automaton or a state updates the bindings and the `check` atoms that
 use the name. New behavior-tree actions carry no default timeout (set one for the bound program in the inspector).
+Edges between the same two nodes fan out symmetrically: two opposite edges (`I ⇄ W`) are two arcs bowed to either side,
+leaving the node circles apart, with their labels outside, so each one (line or label) is selected by a click
+(`tests/ui_graph_edges.test.ts`: the 12 px hit strokes never overlap, at the template layout, after Auto layout and
+after a drag; checked in Chrome: every click at the label and at 25 / 50 / 75 % of either arc selects that arc).
 
 ## Run on station
 
@@ -22,7 +26,13 @@ All executors use the same world (`src/ctl/world.ts`, `src/ctl/runtime.ts` `host
   concurrently, a second program for a busy robot waits (FIFO). Headless code can use `perRobotBackend` (one
   ProgramSimulator per robot) or `simulatedBackend` (durations by name).
 - A program that does not compile or stops at an error **fails** the action (the message is logged).
-- One action per robot at a time (`RobotLocks`); halting an action stops only its own program / move.
+- One action per robot at a time (`RobotLocks`); halting an action stops only its own program / move. The log tells
+  when a contested robot really starts: the transition / state that fired is logged at once (`tC started: program
+  A_Place on R1`), then `program A_Place waits for R1 (busy)` and `program A_Place starts on R1 after waiting 2.30 s`
+  (`tests/ctl_exec_lock_log.test.ts`).
+- Behavior-tree missions write the Mission log as the other executors do: every action that runs over several ticks
+  when it starts and ends (`pickA: program A_Pick on R1 started` / `… success`), every failure, and the tree result
+  (`tree success`) — an arm-only tree of programs used to leave it empty (`tests/ctl_bt_editor_mission.test.ts`).
 - `move target=` moves the target's own robot (explicit `robot=`, the target's robot link, its robot parent, the frame
   used by exactly one robot, or the only robot); `linear=true` plays the planned MoveL (straight TCP path).
 - The blackboard holds the merged signal table (runtime signals: robot DI/DO, program signals; process-component
@@ -57,7 +67,7 @@ the course Petri net (deadlocks at {a1 b1}) and the same net with its GMEC monit
 
 | Export | Files | Validation (tests) |
 |---|---|---|
-| RoboDK station script | `<model>_robodk.py`: the model as JSON + a Python port of the executors over robolink (RunProgram / Busy, MoveJ / MoveL, setParam / getParams signals). `python script.py [seconds] [speed]`: the run sets RoboDK's simulation speed (default 1, as the studio runs; 0 keeps RoboDK's, which starts at 5) and restores it; delays / waits / timeouts run on the station's simulation clock (`RDK.SimulationTime()`), and a timer that ends while a program is still seen running is applied first, so a race does not depend on the speed or on the robolink round trips (`Busy()` costs 0.1–0.2 s while a program runs); guards / conditions / decisions read the signals again after a program ended (its `SetDO` outputs) | `tests/ctl_codegen_robodk.test.ts`: py_compile and run under RoboDK's Python 3.7 against a virtual-clock robolink stand-in — same firing / outcome trace and times as the studio executors; `tests/ctl_codegen_robodk_timing.test.ts`: a RoboDK-like stand-in (speed 5, slow Busy(), program outputs) — the BT condition after a parallel and the timer / program race end as in the studio. Checked against RoboDK 5.9.4 (two-robot station): BT success 9.7 s, race → B_Work on R2 at 2.0 s at speed 1 and 5, guard / FSM / DES as in the studio |
+| RoboDK station script | `<model>_robodk.py`: the model as JSON + a Python port of the executors over robolink (RunProgram / Busy, MoveJ / MoveL, setParam / getParams signals). `python script.py [seconds] [speed]`: the run sets RoboDK's simulation speed (default 1, as the studio runs; 0 keeps RoboDK's, which starts at 5) and restores it; delays / waits / timeouts run on the station's simulation clock (`RDK.SimulationTime()`), and a timer that ends while a program is still seen running is applied first, so a race does not depend on the speed or on the robolink round trips (`Busy()` costs 0.1–0.2 s while a program runs); guards / conditions / decisions read the signals again after a program ended (its `SetDO` outputs); signals are read with one `getParams()` per read, so a signal no program has set yet prints no `WARNING: Invalid/unknown parameter` line per tick (RoboDK 5.9.4, verifier station: 0 warning lines for the guard net and the BT; `ctl_codegen_robodk_timing.test.ts` with a stand-in that prints RoboDK's warning) | `tests/ctl_codegen_robodk.test.ts`: py_compile and run under RoboDK's Python 3.7 against a virtual-clock robolink stand-in — same firing / outcome trace and times as the studio executors; `tests/ctl_codegen_robodk_timing.test.ts`: a RoboDK-like stand-in (speed 5, slow Busy(), program outputs) — the BT condition after a parallel and the timer / program race end as in the studio. Checked against RoboDK 5.9.4 (two-robot station): BT success 9.7 s, race → B_Work on R2 at 2.0 s at speed 1 and 5, guard / FSM / DES as in the studio |
 | Robot programs with IO handshake | per robot (its own post, `Robot.postProcessor`): server = reset DONE, endless loop over `IF DI[START_k]` (one operation: `WAIT DI`), operation wrapper = call the bound program / move, `DO[DONE_k]`, wait START low, DONE low; robot I/O map CSV. In the studio the same programs (named START_x / DONE_x signals) plus `Main <model>` (Start thread per server) run on the station runtime | `tests/ctl_deploy.test.ts`: the executor as cell controller (`handshakeBackend`) drives the generated programs on the station runtime — same cycle as direct execution, START once per operation, robots concurrent; ABB RAPID / Fanuc LS structure |
 | IEC 61131-3 ST | automata: CASE state machines + supervisor table, one event per scan with the DONE / sensor edges latched until their event is taken (two robots finishing in the same scan are both seen); Petri nets: marking logic, TON timers, START / DONE handshakes; `io_map.csv`. Addresses (all ST exports): bits from %IX0.0 / %QX0.0, INT words after the bit bytes, REAL (numeric signals) double words after the words - no overlap in the CODESYS (word / dword index) or the Siemens (byte offset) address model | `tests/ctl_codegen_formats.test.ts`: block / declaration checker; `tests/ctl_fsm_st.test.ts`: address overlaps in both models, same-scan DONE edges |
 | PLCopen XML (TC6 2.01) SFC | 1-safe Petri nets as Grafcet | XML parse, steps = places, initial steps, connection references |

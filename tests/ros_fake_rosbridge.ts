@@ -2,7 +2,8 @@
  * A fake rosbridge_server (v2 protocol subset) for contract tests: records every op a client sends (advertise,
  * publish, subscribe, advertise_service, service_response), parses the raw text with the Python json dialect
  * (bare Infinity / NaN accepted, like rosbridge), can publish to the client's subscriptions and call the services the
- * client advertised (call_service with an id, awaiting the matching service_response).
+ * client advertised (call_service with an id, awaiting the matching service_response), and answer the client's own
+ * service calls for services registered in `answers` (rosapi: /rosapi/subscribers); other calls get no answer.
  */
 import { WebSocketServer, WebSocket as WsClient } from 'ws';
 import { rosJsonParse } from '../src/ros/rosbridge_client';
@@ -15,6 +16,8 @@ export class FakeRosbridge {
   private sock: WsClient | null = null;
   private pending = new Map<string, (op: FakeOp) => void>();
   private nextId = 1;
+  /** Services this fake answers when the client calls them (handler result = response values; undefined = result false). */
+  readonly answers = new Map<string, (args: any) => any>();
   private constructor(private wss: WebSocketServer, port: number) { this.url = `ws://127.0.0.1:${port}`; }
 
   static async start(): Promise<FakeRosbridge> {
@@ -29,6 +32,10 @@ export class FakeRosbridge {
         const op: FakeOp = { ...m, raw, t: Date.now() };
         fake.ops.push(op);
         if (m.op === 'service_response') { const cb = fake.pending.get(m.id); if (cb) { fake.pending.delete(m.id); cb(op); } }
+        if (m.op === 'call_service' && fake.answers.has(m.service)) {
+          const values = fake.answers.get(m.service)!(m.args ?? {});
+          s.send(JSON.stringify(values === undefined ? { op: 'service_response', service: m.service, id: m.id, values: `Service ${m.service} does not exist`, result: false } : { op: 'service_response', service: m.service, id: m.id, values, result: true }));
+        }
       });
     });
     return fake;

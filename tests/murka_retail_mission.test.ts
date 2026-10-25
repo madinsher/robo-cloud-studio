@@ -79,18 +79,13 @@ describe.skipIf(!HAS_MURKA)('MURKA retail v2: full mission headless', () => {
     expect(session.sim.battery.pct - p0).toBeCloseTo(Math.min(2.0, 100 - p0), 6);
   });
 
-  it('collisions: no arm link, carried load or robot body ever enters the furniture colliders (mesh hand model, 5 mm); the only hand contact is the MURKA BOTH_CARRY fingertip at the bulk L1 board', () => {
+  it('collisions: no arm link, hand, carried load or robot body ever enters the furniture colliders (mesh hand model, 5 mm)', () => {
     expect(session.sim.armGeom.left.source).toBe('mesh');
-    expect(res.checks.collisions.armLinks).toBe(0);
-    expect(res.checks.collisions.loads).toBe(0);
-    expect(res.checks.collisions.base).toBe(0);
-    // reproduced defect of the original (documented in docs/murka-retail.md): two-hand carry at z = 1.50 m, the
-    // fingertips of the inward palms touch the underside of the bulk_B3 L1 board (1.62 m) at the end of the glide
-    for (const c of res.collisions) {
-      expect(c.part).toMatch(/_hand$/); expect(c.item).toBe('bulk_B3'); expect(c.depth).toBeLessThan(0.02);
-      const st = session.orch.states.filter((s) => s.t <= c.t).pop()!.state;
-      expect(st).toBe('NAV_PLACE');
-    }
+    expect(res.checks.collisions).toEqual({ armLinks: 0, hands: 0, loads: 0, base: 0, ok: true });
+    // the two-hand carry at BOTH_CARRY z = 1.50 m passes under the bulk_B3 L1 board (1.62 m): with the robot standing
+    // on its wheels (base_link -4 mm) the palms stay outside it; 14 mm higher (the world translation) they touched it
+    expect(res.collisions).toEqual([]);
+    expect(session.sim.maxArmPen).toBeLessThan(0.005);
   });
 
   it('mission time: simulated time reported per stage and compared with the MURKA reference (Webots 1069 s wall at RTF 0.84, MuJoCo 990 s)', () => {

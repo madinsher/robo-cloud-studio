@@ -337,6 +337,26 @@ export class MuromSim {
   bodySamples(): V3[] {
     if (this.bodyCache) return this.bodyCache;
     const out: V3[] = [];
+    // the robot body = the Webots boundingObjects of the base (chassis box, torso box, basket plate, wheels, caster):
+    // surface points every <= 4 cm, in base_link (m)
+    const cols = this.base.colliders ?? [];
+    for (const g of cols) {
+      const P = g.origin ? fromArray(g.origin) : identity(); const pr = g.primitive;
+      const put = (lx: number, ly: number, lz: number) => { out.push([(P[0] * lx + P[4] * ly + P[8] * lz + P[12]) / 1000, (P[1] * lx + P[5] * ly + P[9] * lz + P[13]) / 1000, (P[2] * lx + P[6] * ly + P[10] * lz + P[14]) / 1000]); };
+      if (pr?.kind === 'box') {
+        const h = pr.size.map((v) => v / 2); const n = h.map((v) => Math.max(1, Math.ceil((2 * v) / 40)));
+        for (let i = 0; i <= n[0]; i++) for (let j = 0; j <= n[1]; j++) for (let k = 0; k <= n[2]; k++) {
+          if (i > 0 && i < n[0] && j > 0 && j < n[1] && k > 0 && k < n[2]) continue;
+          put(-h[0] + (2 * h[0] * i) / n[0], -h[1] + (2 * h[1] * j) / n[1], -h[2] + (2 * h[2] * k) / n[2]);
+        }
+      } else if (pr?.kind === 'cylinder') {
+        const m = Math.max(8, Math.ceil((2 * Math.PI * pr.radius) / 40));
+        for (let a = 0; a < m; a++) for (const z of [-pr.length / 2, pr.length / 2]) put(pr.radius * Math.cos((2 * Math.PI * a) / m), pr.radius * Math.sin((2 * Math.PI * a) / m), z);
+      } else if (pr?.kind === 'sphere') {
+        for (const [a, b, c] of [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]]) put(a * pr.radius, b * pr.radius, c * pr.radius);
+      }
+    }
+    if (out.length) return (this.bodyCache = out);
     const [lo, hi] = [[-0.17, -0.19, 0.612], [0.06, 0.19, 1.492]];
     for (let i = 0; i <= 4; i++) for (let j = 0; j <= 4; j++) for (let k = 0; k <= 6; k++) {
       if (i > 0 && i < 4 && j > 0 && j < 4 && k > 0 && k < 6) continue;
@@ -382,8 +402,8 @@ export class MuromSim {
     const armPts = [...this.armSamples('left'), ...this.armSamples('right')];
     for (const n of [this.attached.left, this.attached.right, this.attached.both]) if (n) { const o = this.objects.get(n)!; for (const p of this.loadSamples(o)) armPts.push({ p, r: 0, part: `load ${n}` }); }
     check(armPts, this.collisions, false);
-    // robot body against the same colliders: the Webots boundingObjects of MUROM (torso box, wheel cylinders r 0.177 m);
-    // the capsule shell has no collider in Webots either
+    // robot body against the same colliders: the Webots boundingObjects of the base (chassis, torso, basket plate, wheels,
+    // caster); the capsule shell has no collider in Webots either
     const c = Math.cos(th), s = Math.sin(th), z0 = this.z0;
     check(this.bodySamples().map(([lx, ly, z]) => ({ p: [x + c * lx - s * ly, y + s * lx + c * ly, z0 + z] as V3, r: 0, part: 'base' })), this.baseContacts, true, 0.06);
     for (const k of [...this.activeContacts.keys()]) if (!seen.has(k)) this.activeContacts.delete(k);

@@ -66,28 +66,28 @@ def StartSimulation():
   
   # Subprogram FeedConveyor
   def FeedConveyor():
-    ref_frame = p[-1.052125, 0.561703, 0.068352, 0.000000, 0.000000, 1.570796]
+    ref_frame = p[-1.052120, 0.561703, 0.068352, 0.000000, 0.000000, 1.570796]
     set_tcp(p[0.000000, -0.020000, 0.130000, 0.000000, 0.000000, 0.000000])
-    movej([-1.414501, -1.531892, 2.172742, -0.640850, 0.156295, 0.000000],accel_radss,speed_rads,0,0.001)
+    movej([-1.414502, -1.531893, 2.172743, -0.640850, 0.156295, 0.000000],accel_radss,speed_rads,0,0.001)
     movel(pose_trans(ref_frame,p[-0.107464, -0.311695, 0.040000, 0.000000, 2.221441, 2.221441]),accel_mss,speed_ms,0,0.001)
     # Attach to GripperA Opened
     sleep(0.500)
     movel(pose_trans(ref_frame,p[-0.111072, -0.592992, 0.184438, -0.000000, -2.221441, -2.221441]),accel_mss,speed_ms,0,0.001)
-    movej([2.282488, -0.754381, 0.716211, 0.038171, -0.885442, -0.000000],accel_radss,speed_rads,0,0.001)
+    movej([2.282489, -0.754382, 0.716212, 0.038171, -0.885442, -0.000000],accel_radss,speed_rads,0,0.001)
     ref_frame = p[0.597228, -0.467251, 0.119180, 0.000000, 0.000000, 0.000000]
-    movel(pose_trans(ref_frame,p[0.200000, 0.100000, 0.020000, 0.000000, 2.221441, 2.221441]),accel_mss,speed_ms,0,0.001)
+    movel(pose_trans(ref_frame,p[0.200000, 0.100000, 0.020000, -0.000000, 2.221441, 2.221441]),accel_mss,speed_ms,0,0.001)
     # Detach from GripperA Opened
     sleep(0.500)
     movel(pose_trans(ref_frame,p[0.185681, 0.025792, 0.304534, 0.029080, -2.208177, -2.208177]),accel_mss,speed_ms,0,0.001)
-    movej([-1.414501, -1.531892, 2.172742, -0.640850, 0.156295, 0.000000],accel_radss,speed_rads,0,0.001)
-    ref_frame = p[-1.052125, 0.561703, 0.068352, 0.000000, 0.000000, 1.570796]
+    movej([-1.414502, -1.531893, 2.172743, -0.640850, 0.156295, 0.000000],accel_radss,speed_rads,0,0.001)
+    ref_frame = p[-1.052120, 0.561703, 0.068352, 0.000000, 0.000000, 1.570796]
     movel(pose_trans(ref_frame,p[0.092552, -0.301726, 0.040000, 0.000000, 2.221441, 2.221441]),accel_mss,speed_ms,0,0.001)
     # Attach to GripperA Opened
     sleep(0.500)
     movel(pose_trans(ref_frame,p[-0.111072, -0.592992, 0.184438, -0.000000, -2.221441, -2.221441]),accel_mss,speed_ms,0,0.001)
-    movej([2.282488, -0.754381, 0.716211, 0.038171, -0.885442, -0.000000],accel_radss,speed_rads,0,0.001)
+    movej([2.282489, -0.754382, 0.716212, 0.038171, -0.885442, -0.000000],accel_radss,speed_rads,0,0.001)
     ref_frame = p[0.597228, -0.467251, 0.119180, 0.000000, 0.000000, 0.000000]
-    movel(pose_trans(ref_frame,p[0.200000, 0.100000, 0.020000, 0.000000, 2.221441, 2.221441]),accel_mss,speed_ms,0,0.001)
+    movel(pose_trans(ref_frame,p[0.200000, 0.100000, 0.020000, -0.000000, 2.221441, 2.221441]),accel_mss,speed_ms,0,0.001)
     # Detach from GripperA Opened
     sleep(0.500)
     movel(pose_trans(ref_frame,p[0.185681, 0.025792, 0.304534, 0.029080, -2.208177, -2.208177]),accel_mss,speed_ms,0,0.001)
@@ -95,40 +95,40 @@ def StartSimulation():
   
   # Subprogram TakeConveyor
   def TakeConveyor():
-    ref_frame = p[0.597228, -1.679822, 0.119180, 0.000000, 0.000000, 0.000000]
+    ref_frame = p[0.597228, -1.679820, 0.119180, 0.000000, 0.000000, 0.000000]
     set_tcp(p[0.000000, -0.020000, 0.130000, 0.000000, 0.000000, 0.000000])
-    movej([0.834100, -2.232052, -0.976459, 3.208511, 0.801048, -0.000000],accel_radss,speed_rads,0,0.001)
+    movej([0.834100, -2.232049, -0.976459, 3.208509, 0.801049, -0.000000],accel_radss,speed_rads,0,0.001)
     movel(pose_trans(ref_frame,p[0.200000, 1.900000, 0.020000, 1.570796, 0.000000, 0.000000]),accel_mss,speed_ms,0,0) # end trace
     WaitForPart()
     # Attach to GripperB Opened
     sleep(0.500)
-    movel(pose_trans(ref_frame,p[0.167472, 2.048755, 0.308455, 1.570641, 0.025958, 0.025958]),accel_mss,speed_ms,0,0.001)
-    movej([0.899064, -1.434813, 2.046893, -0.612080, 2.469860, -0.000000],accel_radss,speed_rads,0,0.001)
-    ref_frame = p[-1.052125, -0.650868, 0.068352, 0.000000, 0.000000, 1.570796]
+    movel(pose_trans(ref_frame,p[0.167472, 2.048760, 0.308455, 1.570640, 0.025958, 0.025958]),accel_mss,speed_ms,0,0.001)
+    movej([0.899064, -1.434812, 2.046887, -0.612080, 2.469868, -0.000000],accel_radss,speed_rads,0,0.001)
+    ref_frame = p[-1.052120, -0.650868, 0.068352, 0.000000, 0.000000, 1.570796]
     movel(pose_trans(ref_frame,p[-0.107464, -0.311695, 0.040000, 0.000000, 2.221441, 2.221441]),accel_mss,speed_ms,0,0.001)
     # Detach from GripperB Opened
     sleep(0.500)
-    movel(pose_trans(ref_frame,p[0.117660, -0.615375, 0.192567, 0.000000, 2.221441, 2.221442]),accel_mss,speed_ms,0,0.001)
-    movej([0.834100, -2.232052, -0.976459, 3.208511, 0.801048, -0.000000],accel_radss,speed_rads,0,0.001)
-    ref_frame = p[0.597228, -1.679822, 0.119180, 0.000000, 0.000000, 0.000000]
+    movel(pose_trans(ref_frame,p[0.117660, -0.615375, 0.192567, -0.000000, 2.221441, 2.221441]),accel_mss,speed_ms,0,0.001)
+    movej([0.834100, -2.232049, -0.976459, 3.208509, 0.801049, -0.000000],accel_radss,speed_rads,0,0.001)
+    ref_frame = p[0.597228, -1.679820, 0.119180, 0.000000, 0.000000, 0.000000]
     movel(pose_trans(ref_frame,p[0.200000, 1.900000, 0.020000, 1.570796, 0.000000, 0.000000]),accel_mss,speed_ms,0,0) # end trace
     WaitForPart()
     # Attach to GripperB Opened
     sleep(0.500)
-    movel(pose_trans(ref_frame,p[0.167472, 2.048755, 0.308455, 1.570641, 0.025958, 0.025958]),accel_mss,speed_ms,0,0.001)
-    movej([0.899064, -1.434813, 2.046893, -0.612080, 2.469860, -0.000000],accel_radss,speed_rads,0,0.001)
-    ref_frame = p[-1.052125, -0.650868, 0.068352, 0.000000, 0.000000, 1.570796]
+    movel(pose_trans(ref_frame,p[0.167472, 2.048760, 0.308455, 1.570640, 0.025958, 0.025958]),accel_mss,speed_ms,0,0.001)
+    movej([0.899064, -1.434812, 2.046887, -0.612080, 2.469868, -0.000000],accel_radss,speed_rads,0,0.001)
+    ref_frame = p[-1.052120, -0.650868, 0.068352, 0.000000, 0.000000, 1.570796]
     movel(pose_trans(ref_frame,p[0.092552, -0.301726, 0.040000, 0.000000, 2.221441, 2.221441]),accel_mss,speed_ms,0,0.001)
     # Detach from GripperB Opened
     sleep(0.500)
-    movel(pose_trans(ref_frame,p[0.117660, -0.615375, 0.192567, 0.000000, 2.221441, 2.221442]),accel_mss,speed_ms,0,0.001)
+    movel(pose_trans(ref_frame,p[0.117660, -0.615375, 0.192567, -0.000000, 2.221441, 2.221441]),accel_mss,speed_ms,0,0.001)
   end
   
   
   # Main program:
   # Program generated by VerticalBot Studio for UR10 A on 25/10/2026 12:00:00
   # Using nominal kinematics.
-  ref_frame = p[-1.052125, 0.561703, 0.068352, 0.000000, 0.000000, 1.570796]
+  ref_frame = p[-1.052120, 0.561703, 0.068352, 0.000000, 0.000000, 1.570796]
   set_tcp(p[0.000000, -0.020000, 0.130000, 0.000000, 0.000000, 0.000000])
   # Replace objects Replace objects
   FeedConveyor()

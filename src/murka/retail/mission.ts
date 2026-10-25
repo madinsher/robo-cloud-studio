@@ -44,6 +44,8 @@ export interface RetailMissionResult {
   detail: string;
   /** FSM trace (state path, outcome, target) and the progress telemetry (/murom/fsm/progress). */
   trace: Array<{ t: number; path: string; outcome: string; to: string }>;
+  /** The states this task published on /murom/fsm/state (/murka/fsm/state), in order. */
+  states: string[];
   progress: ProgressEvent[];
   registry: Record<string, { sku: string; location: string; pos: [number, number, number]; yaw: number }>;
   report: string[];
@@ -51,7 +53,7 @@ export interface RetailMissionResult {
   wallMs: number;
 }
 export interface RetailMissionOptions {
-  /** full (default), depalletize, order, scan, goto, dock, undock, home */
+  /** full (default), depalletize, order, scan, goto, dock, undock, home; the MURKA_Simulation copy: depalletize, order (default) */
   mission?: string;
   /** full: scan= / depal= / order= values; other tasks: args= (comma separated). */
   params?: Record<string, string>;
@@ -91,10 +93,12 @@ export interface RetailSession { sim: MuromSim; nav: Navigator; manip: ManipServ
 export function createRetailSession(built: RetailStationResult, opts: { assets?: AssetStore | null; appearance?: Appearance | null; verifyWithCamera?: boolean; dumpFrames?: boolean; onEvent?: (e: ProgressEvent) => void } = {}): RetailSession {
   const sim = new MuromSim(built, { assets: opts.assets ?? null });
   const orch0: { o?: RetailOrchestrator } = {};
-  const nav = new Navigator(sim, built.layout, () => orch0.o?.cancelRequested ?? false);
-  const manip = new ManipServer(sim, built.layout);
+  // the servers and the orchestrator of the station's own project (murom_* of robot-retailer-murka, murka_* of the copy)
+  const flavor = built.info.fsm ?? 'murom';
+  const nav = new Navigator(sim, built.layout, () => orch0.o?.cancelRequested ?? false, flavor);
+  const manip = new ManipServer(sim, built.layout, flavor);
   const appearance = opts.appearance === undefined ? STUDIO_APPEARANCE[built.variant] ?? null : opts.appearance;
-  const orch = new RetailOrchestrator(sim, nav, manip, built.layout, { catalog: loadCatalog(built.layout, appearance), assets: opts.assets ?? null, verifyWithCamera: opts.verifyWithCamera, dumpFrames: opts.dumpFrames, onEvent: opts.onEvent });
+  const orch = new RetailOrchestrator(sim, nav, manip, built.layout, { catalog: loadCatalog(built.layout, appearance), assets: opts.assets ?? null, verifyWithCamera: opts.verifyWithCamera, dumpFrames: opts.dumpFrames, onEvent: opts.onEvent, flavor });
   orch0.o = orch;
   return { sim, nav, manip, orch, built };
 }
@@ -110,7 +114,7 @@ export function retailSessionOf(built: RetailStationResult): RetailSession {
 // Control tab: an fsm document with murom.* skills on a MURKA retail station runs on the station's session
 registerStationFsmProvider((station, source, log) => {
   const built = retailStationOf(station);
-  if (!built || !/skill=murom\./.test(source)) return null;
+  if (!built || !/skill=mur(om|ka)\./.test(source)) return null;
   const s = retailSessionOf(built);
   const { exec } = s.orch.executor(RetailOrchestrator.taskOfDsl(source, built.layout), source, log);
   return { exec, stop: () => s.orch.cancel() };
@@ -127,10 +131,11 @@ export function runMurkaRetailMission(station: Station | RetailStationResult, op
   if (opts.onEvent && opts.session) session.orch.opts.onEvent = opts.onEvent;
   const { sim, orch } = session;
   if (opts.fixes?.bothCarryZ !== undefined) session.manip.bothCarry = [session.manip.bothCarry[0], opts.fixes.bothCarryZ];
-  const name = opts.mission ?? 'full';
+  const name = opts.mission ?? (orch.flavor === 'murka' ? 'order' : 'full');
   const args = opts.args ?? (opts.params ? (['full', 'mission', ''].includes(name) ? Object.entries(opts.params).map(([k, v]) => `${k}=${v}`) : (opts.params.args ?? '').split(',').filter(Boolean)) : []);
-  const task = opts.dsl && !opts.mission ? RetailOrchestrator.taskOfDsl(opts.dsl, built.layout) : parseMission(name, args, built.layout);
+  const task = opts.dsl && !opts.mission ? RetailOrchestrator.taskOfDsl(opts.dsl, built.layout) : parseMission(name, args, built.layout, orch.flavor);
   const { exec, dsl } = orch.executor(task, opts.dsl);
+  const states0 = orch.states.length;
   const dt = opts.dt ?? 0.05, maxTime = opts.maxTime ?? 3600;
   const t0 = sim.time; const wall0 = Date.now();
   const initial = sim.registry();
@@ -158,12 +163,12 @@ export function runMurkaRetailMission(station: Station | RetailStationResult, op
       while (!tr.done && n++ < 400) { tr.tick(); sim.step(dt); }
       const held = describeHeld(orch.heldNow()); if (held) parts.push(`в руках остался товар: ${held}`);
     }
-    return summarize(session, task, outcome, exec.trace, parts.join('; '), t0, initial, dsl, Date.now() - wall0);
+    return summarize(session, task, outcome, exec.trace, parts.join('; '), t0, initial, dsl, Date.now() - wall0, orch.states.slice(states0).map((x) => x.state));
   })();
   return { done, cancel: () => { cancelled = true; orch.cancel(); }, session };
 }
 
-function summarize(s: RetailSession, task: MissionTask, outcome: RetailMissionResult['outcome'], trace: RetailMissionResult['trace'], detail: string, t0: number, initial: Record<string, { sku: string; location: string }>, dsl: string, wallMs: number): RetailMissionResult {
+function summarize(s: RetailSession, task: MissionTask, outcome: RetailMissionResult['outcome'], trace: RetailMissionResult['trace'], detail: string, t0: number, initial: Record<string, { sku: string; location: string }>, dsl: string, wallMs: number, states: string[]): RetailMissionResult {
   const { sim, orch, built } = s;
   const L = built.layout;
   // stages from the FSM trace: PH_<STAGE> -> <STAGE> machine outcome
@@ -216,5 +221,55 @@ function summarize(s: RetailSession, task: MissionTask, outcome: RetailMissionRe
     `  collisions: arm links ${armLinks}, hands ${hands}, loads ${loads}, base ${base} (monitor: ${sim.armGeom.left.source} hand model, tolerance 5 mm)`,
     ...(detail ? [`  detail: ${detail}`] : []),
   ];
-  return { outcome, stages, inventory, simTime, collisions: coll, baseContacts: sim.baseContacts.filter((c) => c.t >= t0), checks, reference: { webotsWall: wallRef, webotsRtf: rtf, webotsSim: ref, mujoco: full ? built.info.mujocoTime : null, ratio: ref ? simTime / ref : null }, battery: { pct: sim.battery.pct, docked: sim.battery.docked }, detail, trace, progress: orch.progress, registry: reg, report, dsl, wallMs };
+  return { outcome, stages, inventory, simTime, collisions: coll, baseContacts: sim.baseContacts.filter((c) => c.t >= t0), checks, reference: { webotsWall: wallRef, webotsRtf: rtf, webotsSim: ref, mujoco: full ? built.info.mujocoTime : null, ratio: ref ? simTime / ref : null }, battery: { pct: sim.battery.pct, docked: sim.battery.docked }, detail, trace, states, progress: orch.progress, registry: reg, report, dsl, wallMs };
+}
+
+// ------------------------------------------------------------------- scripts/e2e_test.py of the MURKA_Simulation copy
+export interface RetailE2EResult {
+  /** E2E PASS (both scenarios done with the products where e2e_test.py looks for them). */
+  pass: boolean;
+  /** e2e_test.py failure lines (empty on PASS). */
+  failures: string[];
+  /** What e2e_test.py prints: the two tests, their results and the verdict. */
+  lines: string[];
+  /** depalletize pallet_1/box_red -> bulk_B1 (count 1), order [tea_box, coffee_can]. */
+  tasks: RetailMissionResult[];
+}
+
+/**
+ * scripts/e2e_test.py of the MURKA_Simulation copy on the studio simulator: on the station's session (the store state
+ * carries over like the running ROS nodes), depalletize pallet_1 / box_red -> bulk_B1 (count 1), then collect the order
+ * [tea_box, coffee_can]; PASS when both tasks end `done`, a box_red is in a bulk_B1_* slot and a tea_box and a coffee_can
+ * are in packing_S* slots (the registry, /murka/sim/objects). Works on any retail station whose orchestrator has those
+ * tasks (all variants). `skipDepal` / `skipOrder` = the script's --skip-depal / --skip-order.
+ */
+export function runMurkaE2E(station: Station | RetailStationResult, opts: Omit<RetailMissionOptions, 'mission' | 'args' | 'params' | 'dsl'> & { skipDepal?: boolean; skipOrder?: boolean } = {}): { done: Promise<RetailE2EResult>; cancel(): void } {
+  const built = 'robot' in station && 'layout' in station ? station : retailStationOf(station as Station);
+  if (!built) throw new Error('not a MURKA retail station (build it with buildMurkaRetailStation)');
+  let current: { cancel(): void } | null = null; let cancelled = false;
+  const done = (async (): Promise<RetailE2EResult> => {
+    const lines: string[] = [], failures: string[] = [], tasks: RetailMissionResult[] = [];
+    const where = (r: RetailMissionResult, sku: string, prefix: string) => Object.values(r.registry).filter((o) => o.sku === sku && o.location.startsWith(prefix)).map((o) => o.location).sort();
+    const list = (a: string[]) => `[${a.map((x) => `'${x}'`).join(', ')}]`;
+    const run = async (mission: string, args: string[]) => { const h = runMurkaRetailMission(built, { ...opts, mission, args }); current = h; const r = await h.done; current = null; tasks.push(r); return r; };
+    if (!opts.skipDepal && !cancelled) {
+      lines.push('=== ТЕСТ 1: депалетирование pallet_1/box_red -> bulk_B1 ===');
+      const r = await run('depalletize', ['pallet_1', 'box_red', 'bulk_B1', '1']);
+      const onBulk = where(r, 'box_red', 'bulk_B1');
+      lines.push(`Итог: ${r.outcome}; box_red на bulk_B1: ${list(onBulk)}`);
+      if (r.outcome !== 'done' || !onBulk.length) failures.push(`depal: state=${r.outcome}, on_bulk=${list(onBulk)}`);
+    }
+    if (!opts.skipOrder && !cancelled) {
+      lines.push('=== ТЕСТ 2: заказ [tea_box, coffee_can] -> упаковка ===');
+      const r = await run('order', ['tea_box', 'coffee_can']);
+      const tea = where(r, 'tea_box', 'packing'), cof = where(r, 'coffee_can', 'packing');
+      lines.push(`Итог: ${r.outcome}; tea на упаковке: ${list(tea)}; coffee: ${list(cof)}`);
+      if (r.outcome !== 'done' || !tea.length || !cof.length) failures.push(`order: state=${r.outcome}, tea=${list(tea)}, coffee=${list(cof)}`);
+    }
+    if (cancelled) failures.push('остановлено');
+    if (failures.length) lines.push('E2E FAIL:', ...failures.map((f) => `  - ${f}`));
+    else lines.push('E2E PASS: оба сценария выполнены');
+    return { pass: !failures.length, failures, lines, tasks };
+  })();
+  return { done, cancel: () => { cancelled = true; current?.cancel(); } };
 }

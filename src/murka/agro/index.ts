@@ -6,8 +6,10 @@
  */
 export { buildMurkaOrchardStation, runMissionB, configureOrchardRobots, treeProfile, crownRadiusIn, ORCHARD_WORLDS, AGRO_WS_REL, MISSION_B_ROLES } from './orchard';
 export type { OrchardWorld, OrchardStationOptions, OrchardStationResult, TreeProfile, MissionBOptions } from './orchard';
-export { runS1Benchmark, s1World, S1_DEFAULTS } from './s1';
-export type { S1Options, S1Result, S1Metrics, S1Event, S1Level, S1Controller, S1Params, S1Timeline } from './s1';
+export { runS1Benchmark, s1World, s1Timeline, S1_DEFAULTS } from './s1';
+export type { S1Options, S1Result, S1Metrics, S1Event, S1Level, S1Controller, S1Params, S1Timeline, S1TimelineData, S1LegData } from './s1';
+export { runS1InWorker, s1WorkerAvailable, cancelS1Worker, s1Payload, runS1OnPayload, s1ResultFromData, s1DownloadJson } from './s1_remote';
+export type { S1Payload, S1ResultData, S1RemoteOptions } from './s1_remote';
 export { S1_FSMS } from './s1_fsm';
 export { murkaKpiFromFleet, murkaKpiFromS1, murkaKpiArtifact } from './kpi';
 export type { MurkaKpiRecord } from './kpi';

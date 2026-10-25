@@ -4,6 +4,7 @@ import { describe, it, expect } from 'vitest';
 import { Station } from '../src/core/items/item';
 import { MobileRobot } from '../src/mobile/items';
 import { FleetRuntime } from '../src/mrs/runtime';
+import { rearAxleOffset } from '../src/mobile/controller';
 
 describe('group control on Ackermann robots (acceptance 14)', () => {
   it('a consensus formation run on the fleet respects yaw-rate, steering and no-slip constraints', () => {
@@ -30,7 +31,9 @@ formation circle r=3 gain=0.5 steps=1200 dt=0.05`;
         const dth = ((r.state.theta - p.th + 540) % 360) - 180;
         maxYaw = Math.max(maxYaw, Math.abs(dth) / dt);
         const thm = ((p.th + dth / 2) * Math.PI) / 180;
-        const vx = (r.state.x - p.x) / dt, vy = (r.state.y - p.y) / dt;
+        // the rear axle (body x = −wheelBase/2, the bicycle model's reference point) of each car
+        const ax = rearAxleOffset(r.kin), c0 = Math.cos(p.th * Math.PI / 180), s0 = Math.sin(p.th * Math.PI / 180), c1 = Math.cos(r.state.theta * Math.PI / 180), s1 = Math.sin(r.state.theta * Math.PI / 180);
+        const vx = (r.state.x + c1 * ax - p.x - c0 * ax) / dt, vy = (r.state.y + s1 * ax - p.y - s0 * ax) / dt;
         maxLat = Math.max(maxLat, Math.abs(-Math.sin(thm) * vx + Math.cos(thm) * vy));
         maxSteer = Math.max(maxSteer, Math.abs(r.state.steer));
         prev[i] = { x: r.state.x, y: r.state.y, th: r.state.theta };

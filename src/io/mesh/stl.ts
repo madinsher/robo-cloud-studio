@@ -24,6 +24,8 @@ export interface MeshMaterial {
   emissive?: [number, number, number];
   roughness?: number;
   metalness?: number;
+  /** Environment (image-based) lighting scale of a PBR material (Webots IBLStrength); absent: no environment reflection. */
+  ibl?: number;
   /** Base colour texture, embedded so station files keep it. */
   map?: { data: Uint8Array; mime: string; name?: string };
 }

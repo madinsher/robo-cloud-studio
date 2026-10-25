@@ -36,9 +36,8 @@ export function tokens(line: string): Array<string | number> {
 }
 /**
  * Deliberate deviations from RoboDK, applied to RoboDK's file before comparing (each one is a RoboDK defect):
- * Fanuc RJ3 / R30i truncate program FILE names to 6 / 10 characters but write calls to those programs with up to 8 / 12
- * characters ("CALL SubPick" for SubPic.LS) - the studio calls the program by its real (truncated) name.
- * Programs started on a thread: RoboDK writes the bare program name; the studio UR post uses a URScript thread.
+ * Programs started on a thread in a studio control program (CompileOptions.nativeThreads; the frozen cases were compiled
+ * that way): RoboDK writes the bare program name; the studio UR post uses a URScript thread.
  * Comau split parts: RoboDK closes every part with the first part's names (END R_SplitTest in SplitTest1.pdl).
  * Doosan: RoboDK writes "wait_digital_input(...):" (trailing colon, invalid DRL). Epson: a stop as "Wait -0.001".
  * Circular moves on controllers without circles (Mecademic, ...): RoboDK drops them, the studio writes the arc as linear
@@ -46,8 +45,6 @@ export function tokens(line: string): Array<string | number> {
  */
 export function fixGt(post: string, job: PostJob, text: string, file = ''): string {
   const progs = [job.program, ...(job.subprograms ?? []).map((s) => s.name)];
-  const fanucLen = post === 'Fanuc_RJ3' ? 6 : post === 'Fanuc_R30i' ? 10 : 0;
-  if (fanucLen) for (const n of progs) { const safe = n.replace(/[^A-Za-z0-9_]/g, ''); if (safe.length > fanucLen) text = text.split(`CALL ${safe.slice(0, fanucLen + 2)} ;`).join(`CALL ${safe.slice(0, fanucLen)} ;`); }
   // RoboDK writes a program started on a thread as a plain line (the fixture generator replays it as a call): the studio
   // UR post runs it in a real URScript thread declared before the main program
   if (post.startsWith('Universal_Robots')) {
@@ -129,7 +126,9 @@ export function diffPrograms(expected: string, actual: string, tol = 1e-3): stri
   for (let i = 0; i < n; i++) {
     if (a[i] === undefined || b[i] === undefined) return `line ${i + 1}: expected "${a[i] ?? '<end>'}" got "${b[i] ?? '<end>'}"`;
     const ta = tokens(a[i]), tb = tokens(b[i]);
-    const same = ta.length === tb.length && ta.every((t, k) => (typeof t === 'number' && typeof tb[k] === 'number' ? Math.abs(t - (tb[k] as number)) <= tol : t === tb[k]));
+    // within tol inclusive (1e-9 absorbs the binary noise of a difference of exactly one unit in the 3rd decimal: a value
+    // at a decimal tie prints either way depending on the last bit of the platform's cos / sin)
+    const same = ta.length === tb.length && ta.every((t, k) => (typeof t === 'number' && typeof tb[k] === 'number' ? Math.abs(t - (tb[k] as number)) <= tol + 1e-9 : t === tb[k]));
     if (!same) return `line ${i + 1}: expected "${a[i]}" got "${b[i]}"`;
   }
   return null;

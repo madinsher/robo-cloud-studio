@@ -18,13 +18,14 @@ const FILE = 'Example-02.i-Wood engraving - Remote TCP - Motoman.rdk';
 const posSection = (s: string) => { const L = s.replace(/\r/g, '').split('\n'); return L.slice(L.indexOf('//POS') + 1, L.indexOf('//INST')); };
 
 describe('RoboDK tool / frame numbers from item names', () => {
-  it('the last number written as a word, else trailing digits (RoboDK 02.i: 45, 30; none for "10MM")', () => {
+  it('the last number written as a word (RoboDK 02.i: 45, 30; none for "10MM"; RoboDK passes -1 for "Gripper1" / "Section1", 06.f / 07.c intermediate files)', () => {
     expect(nameIndex('USER - CONE - 10MM  X  45 DEG')).toBe(45);
     expect(nameIndex('USER - ENGRAVE - 30 DEG POINT END')).toBe(30);
     expect(nameIndex('BALL END - 10MM')).toBe(-1);
     expect(nameIndex('Wood_Holder')).toBe(-1);
     expect(nameIndex('Frame 3')).toBe(3);
-    expect(nameIndex('Tool2')).toBe(2);
+    expect(nameIndex('Tool2')).toBe(-1);
+    expect(nameIndex('Spindle tool 3')).toBe(3);
   });
 });
 

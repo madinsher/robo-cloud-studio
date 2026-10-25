@@ -33,7 +33,7 @@ CONTROL_CODE	= 00000000 00000000;
   12:  PR[9,1]=-2.000 ;
   13:  PR[9,2]=0.000 ;
   14:  PR[9,3]=402.000 ;
-  15:  PR[9,4]=-0.000 ;
+  15:  PR[9,4]=0.000 ;
   16:  PR[9,5]=45.000 ;
   17:  PR[9,6]=180.000 ;
   18:  UTOOL[9]=PR[9] ;
@@ -113,7 +113,7 @@ P[2]{
    GP1:
     UF : 9, UT : 9,        CONFIG : 'F U T, 0, 0, 0',
 	X =   204.293  mm,	Y =  -150.000  mm,	Z =   123.889  mm,
-	W =   180.000 deg,	P =   -44.997 deg,	R =    -0.000 deg
+	W =   180.000 deg,	P =   -44.997 deg,	R =     0.000 deg
 };
 P[3]{
    GP1:
@@ -137,25 +137,25 @@ P[6]{
    GP1:
     UF : 9, UT : 9,        CONFIG : 'F U T, 0, 0, 0',
 	X =   275.000  mm,	Y =  -350.000  mm,	Z =     3.175  mm,
-	W =  -180.000 deg,	P =   -44.997 deg,	R =    -0.000 deg
+	W =  -180.000 deg,	P =   -44.997 deg,	R =     0.000 deg
 };
 P[7]{
    GP1:
     UF : 9, UT : 9,        CONFIG : 'F U T, 0, 0, 0',
 	X =   275.000  mm,	Y =  -350.000  mm,	Z =     3.175  mm,
-	W =  -180.000 deg,	P =   -44.997 deg,	R =    -0.000 deg
+	W =  -180.000 deg,	P =   -44.997 deg,	R =     0.000 deg
 };
 P[8]{
    GP1:
     UF : 9, UT : 9,        CONFIG : 'F U T, 0, 0, 0',
 	X =   204.293  mm,	Y =  -350.000  mm,	Z =    73.889  mm,
-	W =  -180.000 deg,	P =   -44.997 deg,	R =    -0.000 deg
+	W =  -180.000 deg,	P =   -44.997 deg,	R =     0.000 deg
 };
 P[9]{
    GP1:
     UF : 9, UT : 9,        CONFIG : 'F U T, 0, 0, 0',
 	X =   204.293  mm,	Y =  -350.000  mm,	Z =   123.889  mm,
-	W =  -180.000 deg,	P =   -44.997 deg,	R =    -0.000 deg
+	W =  -180.000 deg,	P =   -44.997 deg,	R =     0.000 deg
 };
 P[10]{
    GP1:
@@ -215,19 +215,19 @@ P[19]{
    GP1:
     UF : 9, UT : 9,        CONFIG : 'F U T, 0, 0, 1',
 	X =   366.289  mm,	Y =  -150.000  mm,	Z =    73.886  mm,
-	W =  -180.000 deg,	P =   -45.000 deg,	R =    -0.000 deg
+	W =  -180.000 deg,	P =   -45.000 deg,	R =     0.000 deg
 };
 P[20]{
    GP1:
     UF : 9, UT : 9,        CONFIG : 'F U T, 0, 0, 1',
 	X =   437.000  mm,	Y =  -150.000  mm,	Z =     3.175  mm,
-	W =   180.000 deg,	P =   -45.000 deg,	R =    -0.000 deg
+	W =   180.000 deg,	P =   -45.000 deg,	R =     0.000 deg
 };
 P[21]{
    GP1:
     UF : 9, UT : 9,        CONFIG : 'F U T, 0, 0, 1',
 	X =   437.000  mm,	Y =  -150.000  mm,	Z =     3.175  mm,
-	W =  -180.000 deg,	P =   -45.000 deg,	R =    -0.000 deg
+	W =  -180.000 deg,	P =   -45.000 deg,	R =     0.000 deg
 };
 P[22]{
    GP1:
@@ -365,43 +365,43 @@ P[44]{
    GP1:
     UF : 9, UT : 9,        CONFIG : 'F U T, 0, 0, 1',
 	X =   603.489  mm,	Y =  -150.000  mm,	Z =    74.061  mm,
-	W =  -180.000 deg,	P =   -45.000 deg,	R =    -0.000 deg
+	W =  -180.000 deg,	P =   -45.000 deg,	R =     0.000 deg
 };
 P[45]{
    GP1:
     UF : 9, UT : 9,        CONFIG : 'F U T, 0, 0, 1',
 	X =   674.200  mm,	Y =  -150.000  mm,	Z =     3.350  mm,
-	W =  -180.000 deg,	P =   -45.000 deg,	R =    -0.000 deg
+	W =  -180.000 deg,	P =   -45.000 deg,	R =     0.000 deg
 };
 P[46]{
    GP1:
     UF : 9, UT : 9,        CONFIG : 'F U T, 0, 0, 1',
 	X =   674.200  mm,	Y =  -150.000  mm,	Z =     3.350  mm,
-	W =  -180.000 deg,	P =   -45.000 deg,	R =    -0.000 deg
+	W =  -180.000 deg,	P =   -45.000 deg,	R =     0.000 deg
 };
 P[47]{
    GP1:
     UF : 9, UT : 9,        CONFIG : 'F U T, 0, 0, 1',
 	X =   674.200  mm,	Y =  -350.000  mm,	Z =     3.350  mm,
-	W =  -180.000 deg,	P =   -45.000 deg,	R =    -0.000 deg
+	W =  -180.000 deg,	P =   -45.000 deg,	R =     0.000 deg
 };
 P[48]{
    GP1:
     UF : 9, UT : 9,        CONFIG : 'F U T, 0, 0, 1',
 	X =   674.200  mm,	Y =  -350.000  mm,	Z =     3.350  mm,
-	W =  -180.000 deg,	P =   -45.000 deg,	R =    -0.000 deg
+	W =  -180.000 deg,	P =   -45.000 deg,	R =     0.000 deg
 };
 P[49]{
    GP1:
     UF : 9, UT : 9,        CONFIG : 'F U T, 0, 0, 1',
 	X =   603.489  mm,	Y =  -350.000  mm,	Z =    74.061  mm,
-	W =  -180.000 deg,	P =   -45.000 deg,	R =    -0.000 deg
+	W =  -180.000 deg,	P =   -45.000 deg,	R =     0.000 deg
 };
 P[50]{
    GP1:
     UF : 9, UT : 9,        CONFIG : 'F U T, 0, 0, 1',
 	X =   603.489  mm,	Y =  -350.000  mm,	Z =   124.061  mm,
-	W =  -180.000 deg,	P =   -45.000 deg,	R =    -0.000 deg
+	W =  -180.000 deg,	P =   -45.000 deg,	R =     0.000 deg
 };
 P[51]{
    GP1:

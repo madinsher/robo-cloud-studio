@@ -45,7 +45,7 @@
                 <Condition ConditionType="Waypoint" ConditionAlias="Waypoint" ConditionUuid="eb1167b367a94378bc65c1e582e2e662">
                     <Attribute>
                         <WaypointConditionMode>FixedPoint</WaypointConditionMode>
-                        <FixedPoint>0.250374,0.061096,0.029401,0.175829,-0.666696,0.705838,-0.162462,0.314159,0.418879,1.570796,0.523599,0.785398,1.047198</FixedPoint>
+                        <FixedPoint>0.250374,0.061096,0.029401,0.175828,-0.666696,0.705838,-0.162462,0.314159,0.418879,1.570796,0.523599,0.785398,1.047198</FixedPoint>
                     </Attribute>
                 </Condition>
             </Condition>

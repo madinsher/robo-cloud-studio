@@ -53,7 +53,12 @@ export class ManipServer {
   /** Two-hand carry grip points (x, z) in base_link — BOTH_CARRY of the original unless a fix lowers it. */
   bothCarry: [number, number] = [...BOTH_CARRY];
 
-  constructor(readonly sim: MuromSim, readonly L: RetailLayout) { this.kin = sim.kin; }
+  /**
+   * 'murom': pick_place_server.py of robot-retailer-murka(-v2). 'murka': the MURKA_Simulation copy's server — no
+   * under-board scheme for the classic robot (pre straight above the target), a failed pick goes straight to HOME and
+   * a failed place does not move, a retried pick starts from where the arm stopped (no retreat along the approach).
+   */
+  constructor(readonly sim: MuromSim, readonly L: RetailLayout, readonly flavor: 'murom' | 'murka' = 'murom') { this.kin = sim.kin; }
   private say(m: string): void { this.log.push(`[${this.sim.time.toFixed(2)}] ${m}`); }
   get hasWrist(): boolean { return this.sim.h.hasWrist; }
   /** z of base_link in the map (v2); 0 for the classic robot like the original. */
@@ -169,7 +174,7 @@ export class ManipServer {
   }
   approachGeom(arm: Arm, lx: number, ly: number, z: number, location: string, place = false): Geo {
     const legacy = this.legacyGeom(z, location, place);
-    if (!this.hasWrist) return this.classicGeom(arm, lx, ly, z, location, legacy);
+    if (!this.hasWrist) return this.flavor === 'murka' ? legacy : this.classicGeom(arm, lx, ly, z, location, legacy);
     const m = Math.sign(ly) || 1;
     const keep: Box = [[-1.0, Math.min(m * FACE_Y, m * 1.5), 0.0], [1.0, Math.max(m * FACE_Y, m * 1.5), 2.0]];
     const where = location.split('_').find((p) => p[0] === 'L' && /^\d+$/.test(p.slice(1))) ?? location;
@@ -278,7 +283,7 @@ export class ManipServer {
     let qLift: Q | null = null, qStage: Q | null = null, geo: Geo | null = null;
     try {
       for (let attempt = 0; attempt < 2; attempt++) {
-        if (reached.length) { yield* this.retreat(arm!, reached.slice(0, -1).reverse()); reached.length = 0; }
+        if (reached.length) { if (this.flavor !== 'murka') yield* this.retreat(arm!, reached.slice(0, -1).reverse()); reached.length = 0; }
         if (attempt && cancel()) throw new Cancelled();
         let [lx, ly, graspZ] = this.pickTargets(objName, size);
         if (!arm) arm = ly > 0 ? 'left' : 'right';
@@ -343,7 +348,8 @@ export class ManipServer {
   }
   private *failPick(cancel: () => boolean, arm: Arm | 'both', msg: string, reached: Array<Q | Pair>): Task<PickResult> {
     this.say(`PICK ${cancel() ? 'отменён' : 'fail'}: ${msg}`);
-    yield* this.retreat(arm, reached.slice(0, -1).reverse(), this.home(arm));
+    if (this.flavor === 'murka') yield* this.go(arm, this.home(arm), this.tLong, 0.0); // _fail_pick of the copy: straight HOME
+    else yield* this.retreat(arm, reached.slice(0, -1).reverse(), this.home(arm));
     return { status: cancel() ? 'canceled' : 'aborted', success: false, message: cancel() && !msg.startsWith('отменено') ? `отменено (${msg})` : msg, objectName: '', arm: '' };
   }
   private *pickBoth(objName: string, size: V3, cancel: () => boolean): Task<PickResult> {
@@ -351,7 +357,7 @@ export class ManipServer {
     let pre: Pair | null = null; let dims: [number, number] = [size[0], size[1]]; let dyaw = 0;
     try {
       for (let attempt = 0; attempt < 2; attempt++) {
-        if (reached.length) { yield* this.retreat('both', reached.slice(0, -1).reverse()); reached.length = 0; }
+        if (reached.length) { if (this.flavor !== 'murka') yield* this.retreat('both', reached.slice(0, -1).reverse()); reached.length = 0; }
         if (attempt && cancel()) throw new Cancelled();
         const obj = sim.objects.get(objName)!;
         dyaw = obj.yaw - sim.pose()[2];
@@ -455,7 +461,7 @@ export class ManipServer {
   private *failPlace(cancel: () => boolean, arm: Arm | 'both', msg0: string, reached: Array<Q | Pair>, start: Q | Pair | null, held = ''): Task<PlaceResult> {
     const msg = held ? `${msg0}; ${held} остаётся в ${arm === 'both' ? 'обеих руках' : `руке ${arm}`}` : msg0;
     this.say(`PLACE ${cancel() ? 'отменена' : 'fail'}: ${msg}`);
-    if (reached.length) {
+    if (reached.length && this.flavor !== 'murka') { // _fail_place of the copy: abort without a motion
       const back = reached.slice(0, -1).reverse();
       if (held) yield* this.retreat(arm, back, start);
       else yield* this.retreat(arm, [...back, ...(start ? [start] : [])], this.home(arm));

@@ -75,7 +75,8 @@ export class FanucPost extends RoboPost {
       const j = (i: number) => `J${i + 1}=    ${fx(joints[i] ?? 0)} deg`;
       P.push(`\t${j(0)},\t${j(1)},\t${j(2)},`, `\t${j(3)},\t${j(4)},\t${j(5)}`);
     } else {
-      const turn = (i: number) => Math.floor(((joints[i] ?? 0) + 180) / 360);
+      // turn 0 for (-180, 180]: a joint at exactly -180 deg is turn -1 (RoboDK 5.9.4, 03.j Laser P[77] J4 -180)
+      const turn = (i: number) => Math.ceil(((joints[i] ?? 0) - 180) / 360) || 0;
       const cfg = `'${conf[2] ? 'F' : 'N'} ${conf[1] ? 'D' : 'U'} ${conf[0] ? 'B' : 'T'}, ${turn(0)}, ${turn(3)}, ${turn(5)}'`;
       const [x, y, z, w, p, r] = pose2Fanuc(pose);
       const c = (v: number) => fx(v).padStart(9);
@@ -134,9 +135,12 @@ export class FanucPost extends RoboPost {
   }
   protected callName(code: string) {
     const m = code.trim().match(/^([^(]*)(\(.*\))?$/)!;
-    const base = m[1].trim().replace(/ /g, '_');
-    // a program generated in this run is called by its (shorter) file name
-    if (!m[2] && this.ctx.programs.includes(base)) return this.safe(base).slice(0, this.nameLen);
+    // RoboDK hands program names with their blanks (RunCode("Pick EarCup 1", True)); its Fanuc posts drop them
+    const base = m[1].trim().replace(/\s+/g, '');
+    // like RoboDK's Fanuc posts: a call keeps up to 8 (RJ3) / 12 (R30i) characters, also for a program generated in
+    // this run whose file name is cut to 6 / 10 (03.j MainProgram: CALL PickEarC for PickEa.LS); the program must be
+    // renamed for the controller (reported)
+    if (!m[2] && this.ctx.programs.includes(base) && this.safe(base).length > this.nameLen) this.addlog(`Program ${base} is written to ${this.safe(base).slice(0, this.nameLen)}.LS but called as ${base.slice(0, this.callLen)} (RoboDK's Fanuc name limits): rename it to ${this.nameLen} characters or less`);
     return `${base.slice(0, this.callLen)}${m[2] ?? ''}`;
   }
   /** Last motion line (RoboDK's arc-welding calls modify it). */

@@ -8,7 +8,7 @@
  *    logical time (or the time of the event it waits for) and ends exactly at start + duration, so event times do not
  *    depend on the executor step (§9 «дискретно-событийно»).
  *  - Motion: the drone flies the boustrophedon at 5 m / 5 m/s (aerial drive); the UTP-G platforms drive Ackermann
- *    paths (Hybrid A* + Reeds–Shepp, R_min = 7.08 m, cusps allowed, no turning in place) between lane entrances and
+ *    paths (Hybrid A* + Reeds–Shepp, R_min = 7.08 m at the rear axle, cusps allowed, no turning in place) between lane entrances and
  *    straight lanes at 0.4 m/s (harvesters 0.6 m/s off the rows, the logist 1.0 m/s), with constant speeds per segment;
  *    a robot starts a leg only when it does not meet another robot's committed motion (it waits or plans around
  *    a standing robot). Contacts are replayed afterwards with the studio collision module (s1_world.ts).
@@ -24,6 +24,7 @@ import { Station, ItemType, Item } from '../../core/items/item';
 import { invert, multiply, mul as mulM, transl as translM, rotz as rotzM } from '../../core/math/pose';
 import { MobileRobot } from '../../mobile/items';
 import { rectsOverlap } from '../../mobile/footprint';
+import { rearAxleOffset } from '../../mobile/controller';
 import { parseFsm, FsmExecutor, checkFsm } from '../../ctl/fsm';
 import type { ExecutorWorld } from '../../ctl/exec';
 import type { WorldBindings } from '../../ctl/runtime';
@@ -84,6 +85,8 @@ export interface S1Options {
   /** Reuse a world (plans are cached per world). */
   world?: S1World;
   log?: (m: string) => void;
+  /** Progress of the computation: logical mission time while the automata run, replay time while contacts are checked. */
+  progress?: (p: { phase: 'mission' | 'contacts'; t: number; end: number }) => void;
 }
 
 export interface S1Event { t: number; type: string; robot?: string; data?: Record<string, unknown> }
@@ -116,6 +119,36 @@ export interface S1Timeline {
   apply(t: number): void;
 }
 
+/** A leg as plain data (see s1_world Leg). */
+export interface S1LegData { points: number[][]; speed: number; t0: number; kind: string; z0?: number; z1?: number; vz: number; refX: number }
+/** The motion of a run as plain data (structured-clone / JSON safe): rebuilt into an S1Timeline on any station holding
+ *  the same robots (a Web Worker computes the run on a copy, the app plays it on its own station). */
+export interface S1TimelineData { end: number; agents: Array<{ name: string; aerial: boolean; start: Pose; legs: S1LegData[] }> }
+
+/** Timeline of a run on `station`: poses of the named robots at time t, `apply` moves them there. */
+export function s1Timeline(station: Station, data: S1TimelineData): S1Timeline {
+  const robots = new Map(station.itemsOfType<MobileRobot>(ItemType.MOBILE_ROBOT).map((r) => [r.name, r]));
+  const agents = data.agents.map((a) => ({ ...a, robot: robots.get(a.name) ?? null, legs: a.legs.map((l) => new Leg(a.name, l.points, l.speed, l.t0, l.kind, l.z0, l.z1, l.vz, l.refX)) }));
+  const poseAt = (a: (typeof agents)[number], t: number): Pose => {
+    let p = a.start;
+    for (const l of a.legs) { if (t < l.t0) break; p = t <= l.t1 ? l.poseAt(t) : l.end; }
+    return p;
+  };
+  return {
+    end: data.end,
+    agents: agents.map((a) => a.name),
+    poseAt: (name, t) => { const a = agents.find((x) => x.name === name); if (!a) throw new Error(`S1 timeline: no robot ${name}`); return poseAt(a, t); },
+    apply: (t) => {
+      for (const a of agents) {
+        const r = a.robot; if (!r) continue;
+        const p = poseAt(a, t);
+        if (a.aerial) { r.setPose(mulM(translM(p.x, p.y, p.z ?? r.pose()[14]), rotzM(p.th * DEG))); if (r.kin.drive === 'aerial') r.state.z = p.z ?? r.state.z; }
+        else r.setPose2D(p.x, p.y, p.th);
+      }
+    },
+  };
+}
+
 export interface S1Result {
   level: S1Level; controller: S1Controller; seed: number;
   rows: Array<{ id: string; sector: string; laneY: number; heading: number; trees: Array<{ x: number; y: number }>; yields: number[]; estimate: number }>;
@@ -127,6 +160,8 @@ export interface S1Result {
   metrics: S1Metrics;
   contacts: S1Contact[];
   timeline: S1Timeline;
+  /** The timeline as plain data. */
+  timelineData: S1TimelineData;
   /** events.jsonl text. */
   eventsJsonl(): string;
 }
@@ -137,6 +172,8 @@ interface RowTask { id: string; row: S1Row; lane: Lane; /** indices into row.tre
 interface SwapReq { id: string; h: Agent; t: number; pose: Pose; lane: Lane; kg: number; partial: boolean; logist: Agent | null; assignedAt?: number; done?: number; delivered?: number }
 interface Agent {
   name: string; role: Role; robot: MobileRobot; fp: [number, number, number]; radius: number;
+  /** Body x of the point the platform's arcs are driven by (rear axle of a UTP-G, controller.rearAxleOffset). */
+  refX: number;
   lt: number; home: Pose; start: Pose; legs: Leg[]; dist: number; kg: number; fill: number; failed: boolean;
   exec: FsmExecutor | null; runs: Map<string, { end: number; onEnd?: () => void; fail?: boolean }>;
   states: Array<{ t: number; state: string }>;
@@ -207,7 +244,7 @@ export function runS1Benchmark(station: Station, opts: S1Options = {}): S1Result
     const r = need(name);
     const z = role === 'drone' ? (r.state.z ?? r.pose()[14]) : undefined;
     const start: Pose = { x: r.state.x, y: r.state.y, th: wrap180(r.state.theta), ...(z !== undefined ? { z } : {}) };
-    return { name, role, robot: r, fp: [...r.kin.footprint] as [number, number, number], radius: r.kin.minTurnRadius ?? 7000, lt: 0, home: { ...start }, start, legs: [], dist: 0, kg: 0, fill: 0, failed: false, exec: null, runs: new Map(), states: [], task: null, queue: [], stopIdx: 0, rowsStarted: 0, rowsDone: [], lane: null, pickS: 0, req: null, reqs: [], contracts: 0, waitSince: null, trafficWait: 0, homeAt: null, requested: false, swapAt: null, failAt: null, reconfigAt: null, reconfigured: false };
+    return { name, role, robot: r, fp: [...r.kin.footprint] as [number, number, number], radius: r.kin.minTurnRadius ?? 7000, refX: role === 'drone' ? 0 : rearAxleOffset(r.kin), lt: 0, home: { ...start }, start, legs: [], dist: 0, kg: 0, fill: 0, failed: false, exec: null, runs: new Map(), states: [], task: null, queue: [], stopIdx: 0, rowsStarted: 0, rowsDone: [], lane: null, pickS: 0, req: null, reqs: [], contracts: 0, waitSince: null, trafficWait: 0, homeAt: null, requested: false, swapAt: null, failAt: null, reconfigAt: null, reconfigured: false };
   };
   const drone = mk(dName, 'drone');
   const H = hNames.map((n) => mk(n, 'harvester'));
@@ -255,13 +292,13 @@ export function runS1Benchmark(station: Station, opts: S1Options = {}): S1Result
         const dx = s.to.x - p.x, dy = s.to.y - p.y;
         const dir = s.dir ?? (Math.cos(p.th * DEG) * dx + Math.sin(p.th * DEG) * dy >= 0 ? 1 : -1);
         if (Math.hypot(dx, dy) < 1) continue;
-        leg = new Leg(a.name, [[p.x, p.y, p.th, dir], [s.to.x, s.to.y, p.th, dir]], s.speed, t, dir > 0 ? 'straight' : 'reverse');
+        leg = new Leg(a.name, [[p.x, p.y, p.th, dir], [s.to.x, s.to.y, p.th, dir]], s.speed, t, dir > 0 ? 'straight' : 'reverse', undefined, undefined, undefined, a.refX);
       } else if (s.kind === 'transit') {
         if (Math.hypot(s.to.x - p.x, s.to.y - p.y) < 1 && Math.abs(wrap180(s.to.th - p.th)) < 0.5) continue;
-        const path = world.plan(a.fp, a.radius, p, s.to, extraPolys);
+        const path = world.plan(a.fp, a.radius, p, s.to, extraPolys, a.refX);
         if (!path) return null;
         path[path.length - 1] = [s.to.x, s.to.y, s.to.th, path[path.length - 1][3]];
-        leg = new Leg(a.name, path, s.speed, t, 'transit');
+        leg = new Leg(a.name, path, s.speed, t, 'transit', undefined, undefined, undefined, a.refX);
       } else if (s.kind === 'fly') {
         if (Math.hypot(s.to.x - p.x, s.to.y - p.y) < 1) continue;
         const th = Math.atan2(s.to.y - p.y, s.to.x - p.x) / DEG;
@@ -480,7 +517,7 @@ export function runS1Benchmark(station: Station, opts: S1Options = {}): S1Result
       const from = lastPose(h);
       const slots = station.children.filter((c) => /^depot_slot_/i.test(c.name)).map((c) => ({ name: c.name, x: c.poseAbs()[12], y: c.poseAbs()[13] })).sort((a, b) => Math.hypot(a.x - from.x, a.y - from.y) - Math.hypot(b.x - from.x, b.y - from.y));
       let goal: Pose | null = null, slotName = '';
-      for (const s of slots) { for (const th of [180, 0, 90, -90]) { const g = { x: s.x, y: s.y, th }; if (world.free(h.fp, g) && world.plan(h.fp, h.radius, h.lane ? h.lane.entrance : from, g)) { goal = g; slotName = s.name; break; } } if (goal) break; }
+      for (const s of slots) { for (const th of [180, 0, 90, -90]) { const g = { x: s.x, y: s.y, th }; if (world.free(h.fp, g) && world.plan(h.fp, h.radius, h.lane ? h.lane.entrance : from, g, [], h.refX)) { goal = g; slotName = s.name; break; } } if (goal) break; }
       if (!goal) return 'fail';
       const end = commit(h, [...outOfLane(h, P.vHRow), { kind: 'transit', to: goal, speed: P.vH }], `to ${slotName}`);
       if (end === 'wait') return end;
@@ -644,7 +681,9 @@ export function runS1Benchmark(station: Station, opts: S1Options = {}): S1Result
 
   const dt = P.dt;
   const tStop = P.tMax + 1200;
+  let tick = 0;
   for (; T <= tStop; T += dt) {
+    if (opts.progress && ++tick % 100 === 0) opts.progress({ phase: 'mission', t: T, end: P.tMax });
     if (reannounceAt <= T + 1e-9) { const t = reannounceAt; reannounceAt = Infinity; if (planned && pool.length) contractRows(liveH(), t); dispatchSwaps(t); }
     mExec.tick(dt);
     drone.exec!.tick(dt);
@@ -692,20 +731,22 @@ export function runS1Benchmark(station: Station, opts: S1Options = {}): S1Result
   const boxesExpected = level === 'C' ? NaN : actual.reduce((a, ys) => a + boxesOf(ys), 0);
 
   // timeline & kinematics
-  const timeline: S1Timeline = {
+  const timelineData: S1TimelineData = {
     end: Math.max(mission.lt, ...agents.map(lastEnd)),
-    agents: agents.map((a) => a.name),
-    poseAt: (name, t) => { const a = agents.find((x) => x.name === name); if (!a) throw new Error(`S1 timeline: no robot ${name}`); return poseAt(a, t); },
-    apply: (t) => { for (const a of agents) { const p = poseAt(a, t); if (a.role === 'drone') { a.robot.setPose(mulM(translM(p.x, p.y, p.z ?? a.robot.pose()[14]), rotzM(p.th * DEG))); if (a.robot.kin.drive === 'aerial') a.robot.state.z = p.z ?? a.robot.state.z; } else a.robot.setPose2D(p.x, p.y, p.th); } },
+    agents: agents.map((a) => ({ name: a.name, aerial: a === drone, start: { ...a.start }, legs: a.legs.map((l) => ({ points: l.points, speed: l.speed, t0: l.t0, kind: l.kind, ...(l.z0 !== undefined ? { z0: l.z0 } : {}), ...(l.z1 !== undefined ? { z1: l.z1 } : {}), vz: l.vz, refX: l.refX })) })),
   };
+  const timeline = s1Timeline(station, timelineData);
   const maxSpeed: Record<string, number> = {}, minR: Record<string, number> = {}, maxStep: Record<string, number> = {};
   let inPlace = 0;
   for (const a of agents) {
     maxSpeed[a.name] = Math.max(0, ...a.legs.filter((l) => l.length > 0).map((l) => l.speed));
     if (a.role !== 'drone') { const k = Math.max(0, ...a.legs.filter((l) => l.kind === 'transit').map((l) => l.maxCurvature())); minR[a.name] = k > 0 ? r4(1 / k) : Infinity; }
     for (const l of a.legs) for (let i = 1; i < l.points.length; i++) { const p = l.points[i], q = l.points[i - 1]; if (Math.hypot(p[0] - q[0], p[1] - q[1]) < 1 && Math.abs(wrap180(p[2] - q[2])) > 0.5 && a.role !== 'drone') inPlace++; }
-    let prev = poseAt(a, 0); maxStep[a.name] = 0;
-    for (let t = 0.1; t <= timeline.end; t += 0.1) { const p = poseAt(a, t); maxStep[a.name] = Math.max(maxStep[a.name], Math.hypot(p.x - prev.x, p.y - prev.y, (p.z ?? 0) - (prev.z ?? 0))); prev = p; }
+    // displacement per 0.1 s of the reference point (the rear axle of a UTP-G: the platform speed; its origin, the
+    // wheelbase midpoint, moves up to sqrt(1 + (1.095/7.08)²) = 1.2 % faster in the turns)
+    const refAt = (t: number) => { const p = poseAt(a, t); return { x: p.x + a.refX * Math.cos(p.th * DEG), y: p.y + a.refX * Math.sin(p.th * DEG), z: p.z }; };
+    let prev = refAt(0); maxStep[a.name] = 0;
+    for (let t = 0.1; t <= timeline.end; t += 0.1) { const p = refAt(t); maxStep[a.name] = Math.max(maxStep[a.name], Math.hypot(p.x - prev.x, p.y - prev.y, (p.z ?? 0) - (prev.z ?? 0))); prev = p; }
   }
 
   // contacts: replay the whole run on the station items
@@ -727,7 +768,9 @@ export function runS1Benchmark(station: Station, opts: S1Options = {}): S1Result
     const chk = new S1ContactChecker(world, all, opts.assets);
     const step = opts.contactStep ?? 0.5;
     try {
+      let k = 0;
       for (let t = 0; t <= timeline.end + 1e-9; t += step) {
+        if (opts.progress && ++k % 200 === 0) opts.progress({ phase: 'contacts', t, end: timeline.end });
         timeline.apply(t);
         const moving = new Set(agents.filter((a) => movingAt(a, t)).map((a) => a.name));
         if (moving.size) { chk.check(t, moving); samples++; }
@@ -763,7 +806,7 @@ export function runS1Benchmark(station: Station, opts: S1Options = {}): S1Result
   return {
     level, controller, seed,
     rows: world.rows.map((r, i) => ({ id: r.id, sector: r.sector, laneY: r.laneY, heading: r.heading, trees: r.trees, yields: actual[i].map(r4), estimate: r4(estimate[i]) })),
-    events, states, fsmTraces, fsmDocs, metrics, contacts, timeline,
+    events, states, fsmTraces, fsmDocs, metrics, contacts, timeline, timelineData,
     eventsJsonl: () => events.map((e) => JSON.stringify(e)).join('\n') + '\n',
   };
 }

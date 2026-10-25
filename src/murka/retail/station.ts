@@ -7,18 +7,20 @@
  * MUROM height band (0.06–0.62 m, 5 cm cells; lower steps are driven over) and the MURKA joint limits / start pose / drive limits.
  *
  * Variants: 'v2' (robot-retailer-murka-v2, "capsule" robot, 6-DOF arms with wrists), 'v1' (robot-retailer-murka,
- * classic STL robot, 4-DOF arms), 'murka' / 'murka_classic' (simulation_ws/src/MURKA_Simulation renamed copies).
+ * classic STL robot, 4-DOF arms), 'murka' / 'murka_classic' (simulation_ws/src/MURKA_Simulation renamed copies, run
+ * with that project's own murka_fsm / servers: VariantInfo.fsm). The robot is put onto its wheels like Webots does
+ * (restOnGround: base_link -4 mm instead of the world's +10 mm translation).
  */
 import { Station, Item, Camera, ItemType, Tool } from '../../core/items/item';
 import { Robot } from '../../core/items/robot';
 import { MobileRobot, MapItem } from '../../mobile/items';
 import { transl } from '../../core/math/pose';
 import type { AssetStore } from '../../scene/assets';
-import { importWebotsWorld, mapSource, rasterizeOccupancy, loadRetailLayout } from '../../io/webots';
+import { importWebotsWorld, mapSource, rasterizeOccupancy, loadRetailLayout, restOnGround } from '../../io/webots';
 import type { WebotsSource } from '../../io/webots';
 import { parseRetailLayout, RetailLayout } from './layout';
 import { ControlModelItem } from '../../ctl/model';
-import { missionFsmDsl, parseMission } from './orchestrator';
+import { missionFsmDsl, parseMission, FsmFlavor } from './orchestrator';
 
 export type RetailVariant = 'v2' | 'v1' | 'murka' | 'murka_classic';
 export interface VariantInfo {
@@ -34,12 +36,20 @@ export interface VariantInfo {
   referenceRtf: number | null;
   /** MuJoCo reference time (s), when published. */
   mujocoTime: number | null;
+  /**
+   * The project's own orchestrator / servers: 'murom' = murom_fsm of robot-retailer-murka(-v2) (full mission, scan,
+   * verify, dock, cancel), 'murka' = murka_fsm of the MURKA_Simulation copy (depalletize and collect_order only).
+   */
+  fsm: FsmFlavor;
+  /** Tasks of that orchestrator (runMurkaRetailMission `mission`; 'e2e' = the copy's scripts/e2e_test.py). */
+  tasks: string[];
 }
+const MUROM_TASKS = ['full', 'scan', 'depalletize', 'order', 'goto', 'dock', 'undock', 'home'];
 export const RETAIL_VARIANTS: Record<RetailVariant, VariantInfo> = {
-  v2: { base: 'robot-retailer-murka-v2/ros2_ws/src', webots: 'murom_webots', world: 'worlds/retail_store.wbt', products: 'murom_world/config/products.yaml', locations: 'murom_world/config/locations.yaml', referenceTime: 1069, referenceRtf: 0.84, mujocoTime: 990 },
-  v1: { base: 'robot-retailer-murka/ros2_ws/src', webots: 'murom_webots', world: 'worlds/retail_store.wbt', products: 'murom_world/config/products.yaml', locations: 'murom_world/config/locations.yaml', referenceTime: 706, referenceRtf: 0.73, mujocoTime: 499 },
-  murka: { base: 'simulation_ws/src/MURKA_Simulation/ros2_ws/src', webots: 'murka_simulation', world: 'worlds/retail_store.wbt', products: 'murka_simulation/config/products.yaml', locations: 'murka_simulation/config/locations.yaml', referenceTime: null, referenceRtf: null, mujocoTime: null },
-  murka_classic: { base: 'simulation_ws/src/MURKA_Simulation/ros2_ws/src', webots: 'murka_simulation', world: 'worlds/retail_store_classic.wbt', products: 'murka_simulation/config/products.yaml', locations: 'murka_simulation/config/locations.yaml', referenceTime: null, referenceRtf: null, mujocoTime: null },
+  v2: { base: 'robot-retailer-murka-v2/ros2_ws/src', webots: 'murom_webots', world: 'worlds/retail_store.wbt', products: 'murom_world/config/products.yaml', locations: 'murom_world/config/locations.yaml', referenceTime: 1069, referenceRtf: 0.84, mujocoTime: 990, fsm: 'murom', tasks: MUROM_TASKS },
+  v1: { base: 'robot-retailer-murka/ros2_ws/src', webots: 'murom_webots', world: 'worlds/retail_store.wbt', products: 'murom_world/config/products.yaml', locations: 'murom_world/config/locations.yaml', referenceTime: 706, referenceRtf: 0.73, mujocoTime: 499, fsm: 'murom', tasks: MUROM_TASKS },
+  murka: { base: 'simulation_ws/src/MURKA_Simulation/ros2_ws/src', webots: 'murka_simulation', world: 'worlds/retail_store.wbt', products: 'murka_simulation/config/products.yaml', locations: 'murka_simulation/config/locations.yaml', referenceTime: null, referenceRtf: null, mujocoTime: null, fsm: 'murka', tasks: ['e2e', 'depalletize', 'order'] },
+  murka_classic: { base: 'simulation_ws/src/MURKA_Simulation/ros2_ws/src', webots: 'murka_simulation', world: 'worlds/retail_store_classic.wbt', products: 'murka_simulation/config/products.yaml', locations: 'murka_simulation/config/locations.yaml', referenceTime: null, referenceRtf: null, mujocoTime: null, fsm: 'murka', tasks: ['e2e', 'depalletize', 'order'] },
 };
 
 /** Default MURKA_Simulation folder of the owner's machine (Node only; overridable with MURKA_DIR). */
@@ -195,6 +205,11 @@ export async function buildMurkaRetailStation(opts: RetailStationOptions = {}): 
   const layout = parseRetailLayout(productsYaml, locationsYaml);
   const robot = muromHandles(station);
   configureMurom(robot);
+  // Webots drops the robot from its world translation (z 0.01) onto the wheels: base_link at the wheel bottom (and
+  // ≈ 3 mm lower from the soft contact). The IK targets are in base_link: from 1 cm up the palm pre-grasp under the
+  // gondola L0 board of the MURKA_Simulation store has no solution in arm_kinematics.py.
+  const rest = restOnGround(robot.base, station, { assets: opts.assets });
+  if (rest) report.push(`${robot.base.name} rests on its wheels: base_link z ${rest.from.toFixed(1)} -> ${rest.to.toFixed(1)} mm (lowest boundingObject point ${rest.lowest.toFixed(1)} mm in the base frame, floor top ${rest.ground.toFixed(1)} mm; Webots: ≈ 3 mm lower from the soft contact)`);
   // band from 6 cm (steps below a third of the 0.177 m wheel radius are driven over in Webots: the 5 cm charging pad of
   // the MURKA_Simulation worlds) to 0.62 m (lidar / torso height of MUROM)
   const map = rasterizeOccupancy(station, { zMin: TRAVERSABLE_STEP * 1000, zMax: 620, resolution: 50, assets: opts.assets, name: 'occupancy (0.06–0.62 m)' });
@@ -202,10 +217,16 @@ export async function buildMurkaRetailStation(opts: RetailStationOptions = {}): 
   station.addChild(map);
   station.params.murkaRetail = variant;
   report.push(`MURKA retail ${variant}: ${lr.products.length} products, ${Object.keys(layout.slots).length} slots, robot ${robot.base.name} (${robot.hasWrist ? '6' : '4'}-DOF arms), map ${map.width}x${map.height} @ ${map.resolution} mm`);
-  // the mission FSM as a control model of the station (Control tab: view, diagram, exports, Run on station)
-  const cm = new ControlModelItem('MUROM mission (full)');
-  cm.kind = 'fsm'; cm.source = missionFsmDsl(parseMission('full', [], layout)); cm.robotIds = [robot.base.id];
-  station.addChild(cm);
+  // the project's task FSMs as control models of the station (Control tab: view, diagram, exports, Run on station):
+  // the murom_fsm mission, or the two machines of the MURKA_Simulation copy's murka_fsm
+  const models: Array<[string, string]> = info.fsm === 'murka'
+    ? [['MURKA depalletize', missionFsmDsl(parseMission('depalletize', [], layout, 'murka'), 'murka')], ['MURKA collect_order', missionFsmDsl(parseMission('order', [], layout, 'murka'), 'murka')]]
+    : [['MUROM mission (full)', missionFsmDsl(parseMission('full', [], layout))]];
+  for (const [name, src0] of models) {
+    const cm = new ControlModelItem(name);
+    cm.kind = 'fsm'; cm.source = src0; cm.robotIds = [robot.base.id];
+    station.addChild(cm);
+  }
   const result: RetailStationResult = { station, robot, layout, variant, info, map, report, assets: opts.assets ?? null };
   built.set(station, result);
   return result;

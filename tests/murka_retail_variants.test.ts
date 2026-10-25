@@ -1,8 +1,7 @@
 /**
  * MURKA retail — the other robot / world variants: robot-retailer-murka (v1-classic: STL robot, 4-DOF arms, no wrist,
- * tip grasp, head turned 90° for the scan) runs the whole `full` mission; the renamed copies of
- * simulation_ws/src/MURKA_Simulation (Murka / MurkaClassic, gondola levels 0.9/1.2/1.5, robot starting at home, charging
- * pad as a plain 5 cm Solid) load and run the scan + dock stages.
+ * tip grasp, head turned 90° for the scan) runs the whole `full` mission. The renamed copies of
+ * simulation_ws/src/MURKA_Simulation (Murka / MurkaClassic) run their own orchestrator: tests/murka_retail_copy.test.ts.
  */
 import { describe, it, expect } from 'vitest';
 import { buildMurkaRetailStation, runMurkaRetailMission } from '../src/murka/retail';
@@ -38,25 +37,6 @@ describe.skipIf(!HAS_MURKA)('MURKA retail variants', () => {
     for (const v of views) expect(Math.abs(v.outcome.finalError![2])).toBeLessThan(0.031);
     expect(JSON.parse(views[0].goal)[2]).toBe(0);
   }, 900000);
-
-  for (const variant of ['murka', 'murka_classic'] as const) {
-    it(`${variant} (MURKA_Simulation copy): scan + dock stages done, every visible slot correct, docked at the dock target`, async () => {
-      const b = await buildMurkaRetailStation({ variant, assets: new AssetStore(), loadMeshes: false });
-      expect(b.robot.base.name).toMatch(/^murka/i);
-      expect(b.robot.hasWrist).toBe(variant === 'murka');
-      expect(b.layout.dock).toBeNull(); // the renamed worlds have a dock target, no charger slot
-      const [x0, y0] = [b.robot.base.state.x, b.robot.base.state.y];
-      expect([x0, y0]).toEqual([-5500, 3000]);
-      const r = await runMurkaRetailMission(b, { params: { depal: '', order: '' } }).done;
-      expect(r.outcome, r.report.join('\n')).toBe('done');
-      expect(r.stages.map((s) => [s.name, s.outcome])).toEqual([['SCAN', 'done'], ['DOCK', 'done']]);
-      expect(r.checks.scan!.wrong).toEqual([]);
-      expect(r.checks.scan!.visible).toBe(36); // levels 0.9 / 1.2 / 1.5: the top level is in frame too
-      expect(r.checks.scan!.correct).toBe(36);
-      expect(r.checks.docked!.distance).toBeLessThan(0.03);
-      expect(r.checks.collisions.ok).toBe(true);
-    }, 900000);
-  }
 
   it('browser path: a picked MURKA_Simulation folder (files map with v1 and v2 projects) builds the requested variant', async () => {
     const files = new Map<string, Uint8Array>();

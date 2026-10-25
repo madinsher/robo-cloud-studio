@@ -18,7 +18,7 @@ import { compileForPost, getPost, generateProgram } from '../posts/index';
 import { robotSolveFK } from '../core/kinematics/combined';
 import { MobileRobot } from '../mobile/items';
 import { Camera as CameraItem } from '../core/items/item';
-import { renderCamera } from '../vision/sensing';
+import { renderCamera, ROBODK_DEPTH_SAMPLE_OFFSET } from '../vision/sensing';
 import { encodePNG, encodeGrey32 } from '../vision/png';
 import { setFocalLengthPx, cameraFovs } from '../vision/camera_model';
 import { runVisionCall } from '../vision/program_vision';
@@ -1365,7 +1365,8 @@ export class Robolink {
     const depth = /(?:^|\s)DEPTH(?:\s|$)/i.test(params) || /\.grey32$/i.test(file_save_img);
     const snap = String(it.params.cam2dSnapshot ?? '').split('x').map(Number);
     const w = snap[0] > 0 ? snap[0] : it.width, h = snap[1] > 0 ? snap[1] : it.height;
-    const r = renderCamera(this.station, it, { width: w, height: h, rgb: !depth, ground: false, ...(this.assets ? { assets: this.assets } : {}) });
+    // RoboDK samples its depth images (−0.125, −0.375) px off the pixel centre (its RGB at the centre)
+    const r = renderCamera(this.station, it, { width: w, height: h, rgb: !depth, ground: false, ...(depth ? { sampleOffset: ROBODK_DEPTH_SAMPLE_OFFSET } : {}), ...(this.assets ? { assets: this.assets } : {}) });
     let bytes: Uint8Array;
     if (depth) bytes = encodeGrey32(r.depth, r.width, r.height, it.far);
     else {

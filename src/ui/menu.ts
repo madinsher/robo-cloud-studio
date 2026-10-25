@@ -1,6 +1,6 @@
 import { App } from '../app';
 import { MobileRobot } from '../mobile/items';
-import { h, contextMenu, MenuEntry, downloadText, toast, dialog } from './dom';
+import { h, contextMenu, MenuEntry, downloadText, toast, dialog, pickFolder } from './dom';
 import { robotLibraryDialog, onlineLibraryDialog, mobileRobotDialog, orchardDialog, fleetDialog, missionDialog, mapDialog, zoneDialog, componentDialog, exportDialog, importDialog, harvestArmDialog, curveFollowDialog, machiningDialog, railIKDialog, vdaDialog, importFolderDialog } from './dialogs';
 import { ItemType, Folder } from '../core/items/item';
 import { demos } from '../demos';
@@ -9,6 +9,7 @@ import { collisionMapDialog, measureDialog, cameraDialog, VideoRecorder, exportH
 import { Camera as CameraItem } from '../core/items/item';
 import { Robot } from '../core/items/robot';
 import { murkaMenu } from './murka_ui';
+import { needsRetailLayout, loadRetailLayoutFiles } from '../ros/murka_layout';
 
 export class MenuBar {
   el: HTMLElement;
@@ -187,13 +188,30 @@ export class MenuBar {
   }
 
   async rosDialog(): Promise<void> {
+    // a MURKA world opened without murom_world/config (the Webots supervisor reads products.yaml + locations.yaml from
+    // $MUROM_CONFIG_DIR): offer to load the layout, otherwise /murom/sim/objects would be empty
+    let layoutBox: HTMLElement | null = null;
+    if (needsRetailLayout(this.app.station)) {
+      const status = h('p', { class: 'hint' }, 'This MURKA world has no products: the Webots supervisor spawns them from murom_world/config (products.yaml + locations.yaml), which was not in the opened folder. Load that folder before connecting as the simulator backend, or /murom/sim/objects stays empty.');
+      const btn = h('button', { class: 'btn', onClick: async () => {
+        const files = (await pickFolder()).filter((f) => /^(products|locations)\.ya?ml$/i.test(f.name));
+        const map = new Map<string, string>();
+        for (const f of files) map.set(((f as any).webkitRelativePath || f.name) as string, await f.text());
+        const res = await loadRetailLayoutFiles(this.app.station, map);
+        this.app.log(`Retail layout ${res.pair ? `(${res.pair.products}, ${res.pair.locations})` : ''}: ${res.report.join('; ')}`, res.products ? 'info' : 'warn');
+        status.textContent = res.products ? `Retail layout loaded: ${res.products} products (${res.pair!.products.replace(/\/[^/]*$/, '')}).` : `No layout loaded: ${res.report.join('; ')}`;
+        if (res.products) btn.setAttribute('disabled', '');
+      } }, 'Load retail layout (murom_world/config)…') as HTMLButtonElement;
+      layoutBox = h('div', null, status, btn);
+    }
     const r = await dialog<{ url: string; mode: any; rate: number }>('Connect to ROS 2 (rosbridge_server)', [
       { key: 'url', label: 'rosbridge websocket URL', type: 'text', value: 'ws://localhost:9090' },
       { key: 'mode', label: 'Mode', type: 'select', value: 'both', options: [{ value: 'both', label: 'Publish sim state + follow /joint_states' }, { value: 'publish', label: 'Publish only (drive real robots)' }, { value: 'follow', label: 'Follow only (digital twin of real robots)' }, { value: 'sim', label: 'Simulator backend (the studio replaces Webots / Gazebo: /clock, /odom, /scan, cameras, /cmd_vel)' }] },
       { key: 'rate', label: 'Publish rate (Hz)', type: 'number', value: 10 },
     ], { body: h('div', null,
       h('p', { class: 'hint' }, 'Publishes /cmd_joint_state, /cmd_point, /tcp_pose per arm and /cmd_vel, /robot_pose, /battery_state per mobile robot (namespaced). Subscribes to /joint_states and /odom. Run: ros2 launch rosbridge_server rosbridge_websocket_launch.xml'),
-      h('p', { class: 'hint' }, 'Simulator backend: the studio plays the role of the robot simulator for ROS 2 nodes (MURKA Webots interface) — /clock, /odom + TF, /joint_states, /scan, /imu, camera images + camera_info, depth; it follows /cmd_vel and joint trajectories.')) });
+      h('p', { class: 'hint' }, 'Simulator backend: the studio plays the role of the robot simulator for ROS 2 nodes (MURKA Webots interface) — /clock, /odom + TF, /joint_states, /scan, /imu, camera images + camera_info, depth; it follows /cmd_vel and joint trajectories. On a MURKA station it runs in a background worker at real time (software-rendered camera images), independent of the 3D view.'),
+      layoutBox) });
     if (!r) return;
     const { RosBridge } = await import('../ros/rosbridge');
     try {

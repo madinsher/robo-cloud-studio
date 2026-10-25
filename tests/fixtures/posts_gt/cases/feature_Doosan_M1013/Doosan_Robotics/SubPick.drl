@@ -22,7 +22,7 @@ def SubPick():
   
   
   # Main program:
-  movel(posx(787.952,-25.969,269.993,49.6928,138.6743,135.3837))
+  movel(posx(787.952,-25.969,269.993,49.6927,138.6744,135.3838))
   set_digital_output(7, 1)
   # End of main program
   

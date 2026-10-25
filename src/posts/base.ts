@@ -4,6 +4,7 @@ import { Program, Instruction, describeInstruction } from '../core/items/program
 import { Mat4, multiply, invert, fromArray, identity, poseToXyzrpw } from '../core/math/pose';
 import { actuatedIndices } from '../core/kinematics/chain';
 import { configFlags } from '../core/kinematics/ik_analytic';
+import { motionGroupFor } from '../core/motion/planner';
 
 /** Flat, resolved representation of a program that post processors consume. */
 export type PostEvent =
@@ -15,7 +16,8 @@ export type PostEvent =
   | { kind: 'moveJ'; joints: number[]; pose: Mat4 | null; name: string; speed?: number; rounding?: number; conf?: number[]; jointTarget?: boolean }
   | { kind: 'moveL'; joints: number[] | null; pose: Mat4; name: string; speed?: number; rounding?: number; conf?: number[]; jointTarget?: boolean }
   | { kind: 'moveC'; joints: number[] | null; via: Mat4; pose: Mat4; name: string; viaName: string; viaJoints?: number[] | null; viaConf?: number[]; conf?: number[]; speed?: number; rounding?: number }
-  | { kind: 'setFrame'; pose: Mat4; name: string; frameId?: number }
+  /** positioner: the frame rides on a synchronised positioner and `pose` is w.r.t. its flange (RoboDK, 02.f turntable). */
+  | { kind: 'setFrame'; pose: Mat4; name: string; frameId?: number; positioner?: boolean; basePose?: Mat4 }
   | { kind: 'setTool'; pose: Mat4; name: string; toolId: string | null; toolNum?: number }
   | { kind: 'setSpeed'; speedLinear?: number; speedJoints?: number; accelLinear?: number; accelJoints?: number }
   | { kind: 'setRounding'; radius: number }
@@ -23,7 +25,8 @@ export type PostEvent =
   | { kind: 'setDO'; io: string; value: number | boolean }
   | { kind: 'setAO'; io: string; value: number | string }
   | { kind: 'waitDI'; io: string; value: number | boolean; timeoutMs: number }
-  | { kind: 'runCode'; code: string; isCall: boolean }
+  /** thread: a RoboDK "Start thread" handed to the posts as code (RunCode(name, False)), see CompileOptions.nativeThreads. */
+  | { kind: 'runCode'; code: string; isCall: boolean; thread?: boolean }
   | { kind: 'comment'; text: string }
   | { kind: 'message'; text: string }
   | { kind: 'callProgram'; name: string }
@@ -50,6 +53,16 @@ export interface PostProgram {
   /** Initial frame & tool. */
   frame: { pose: Mat4; name: string };
   tool: { pose: Mat4; name: string };
+  /**
+   * The robot's active reference frame (w.r.t. the robot base) and tool when the program is generated (RoboDK's built-in
+   * KUKA generator states them first: $BASE / $TOOL).
+   */
+  robotFrame?: { pose: Mat4; name: string };
+  robotTool?: { pose: Mat4; name: string };
+  /** Linear moves to the position the robot is already at, skipped like RoboDK (dropZeroLengthMoves). */
+  skippedMoves?: number;
+  /** Base of the synchronised positioner w.r.t. the robot's base (RoboDK RobotPost pose_turntable). */
+  poseTurntable?: Mat4;
   problems: string[];
 }
 
@@ -156,14 +169,13 @@ export function confRLF(robot: Robot | null, q: number[] | null): number[] {
 
 /**
  * RoboDK frame/tool index from the item name: the last number standing as a word of its own ("Frame 3" -> 3,
- * "USER - CONE - 10MM  X  45 DEG" -> 45, "USER - ENGRAVE - 30 DEG POINT END" -> 30; "BALL END - 10MM" and "Spindle"
- * -> -1, RoboDK 5.9.4 Motoman output of Library 02.i), else trailing digits ("Tool2" -> 2).
+ * "USER - CONE - 10MM  X  45 DEG" -> 45, "USER - ENGRAVE - 30 DEG POINT END" -> 30, "Spindle tool 3" -> 3); a number
+ * glued to a word does not count ("Gripper1", "Section1", "BALL END - 10MM", "Spindle" -> -1): RoboDK 5.9.4
+ * intermediate files of the Library (06.f, 07.c) and its Motoman output of 02.i.
  */
 export function nameIndex(name: string): number {
   const words = name.split(/[\s\-_,;:()]+/).filter((w) => /^\d+$/.test(w));
-  if (words.length) return Number(words[words.length - 1]);
-  const m = name.match(/(\d+)\s*$/);
-  return m ? Number(m[1]) : -1;
+  return words.length ? Number(words[words.length - 1]) : -1;
 }
 
 export interface CompileOptions {
@@ -175,6 +187,20 @@ export interface CompileOptions {
   initialFrameTool?: boolean;
   /** Subsample recorded joint paths to at most this many rows (default: keep all). */
   maxJointPathRows?: number;
+  /**
+   * Joints of the moves as a simulation of the program reached them (instruction id -> joints at the move's target),
+   * for Cartesian targets: RoboDK's MakeProgram after Item.Update() hands its posts the simulated branch instead of the
+   * joints stored with the targets (tests/fixtures/robodk_gt/code was generated that way). Joint targets keep theirs.
+   */
+  moveJoints?: Map<string, number[]>;
+  /** Called when moveJoints replaced the joints of a move (target id, or null for an inline target). */
+  onSimulatedJoints?: (targetId: string | null, instructionId: string, joints: number[]) => void;
+  /**
+   * "Start thread" instructions as studio thread events (posts with threads write native threads: URScript thread,
+   * Fanuc RUN, ...). Default false, like RoboDK's MakeProgram: the thread program's name is handed to the post as
+   * code (RunCode(name, False)), e.g. UR "OpenGripper1" and ABB "RunConveyor" lines (Library 06.c-06.f).
+   */
+  nativeThreads?: boolean;
 }
 interface CompileState { frame: Item | null; tool: Item | null; q: number[] }
 
@@ -186,10 +212,11 @@ const poseClose = (a: Mat4, b: Mat4, mm: number, rot: number) => {
 
 /**
  * Resolve a Program into PostEvents the way RoboDK feeds its posts: Cartesian targets are written relative to their
- * reference frame (target.Pose(), so a program can be reused in another frame), joints come from the target's stored
- * joints when they match (else IK seeded with them), RoboDK conf_RLF flags are attached, MoveC carries the via joints,
- * per-move speed / rounding overrides become explicit setSpeed / setRounding events, no move is ever dropped
- * (unreachable ones are kept and reported in `problems`).
+ * reference frame (target.Pose(), so a program can be reused in another frame), joints are the target's stored joints
+ * as they are (IK seeded with the current joints only without stored joints), RoboDK conf_RLF flags are attached,
+ * MoveC carries the via joints, per-move speed / rounding overrides become explicit setSpeed / setRounding events;
+ * only linear moves to the point the robot is already at are dropped, like RoboDK (dropZeroLengthMoves); unreachable
+ * moves are kept and reported in `problems`.
  */
 export function compileForPost(station: Station, program: Program, options: CompileOptions = {}, inherited?: CompileState, compiled: Map<string, PostProgram> = new Map()): PostProgram {
   const robotItem = program.robot();
@@ -206,32 +233,58 @@ export function compileForPost(station: Station, program: Program, options: Comp
   };
   let frameItem: Item | null = inherited ? inherited.frame : program.frameId ? station.findById(program.frameId) : null;
   if (!inherited && !frameItem) { const t = firstCartTarget(); frameItem = t?.parent && t.parent.type === ItemType.FRAME ? t.parent : robot?.activeFrame() ?? null; }
+  const initialFrameItem = frameItem;
   let toolItem: Item | null = inherited ? inherited.tool : program.toolId ? station.findById(program.toolId) : robot?.activeTool() ?? null;
   // frame w.r.t. the robot base (without a robot: w.r.t. the station, poses stay relative to their frame)
-  const framePoseInBase = (): Mat4 => (frameItem ? (robot ? multiply(invert(robot.poseAbs()), frameItem.poseAbs()) : frameItem.poseAbs()) : identity());
+  // a robot on a rail / gantry (synchronised external axes): RoboDK states frames w.r.t. the base of the axes that carry
+  // it, not the moving arm base (Library 05.d: Comau on the Gudel gantry, $UFRAME of Part1 reference w.r.t. the Gudel
+  // base; a frame at that base is the identity and is not written)
+  const group = robot && robot.dof >= 5 ? motionGroupFor(robot) : null;
+  const carrier = group?.carrier ?? null;
+  const baseAbs = (): Mat4 => (carrier ? carrier.poseAbs() : robot!.poseAbs());
+  /** Arm base w.r.t. the program's base for the external-axis values of a joint vector (identity without a carrier). */
+  const armInBase = (q: number[] | null | undefined): Mat4 => (carrier && group ? multiply(invert(baseAbs()), group.baseAbs(group.full(q ?? [], group.current()).slice(robot!.dof))) : identity());
+  const fkInBase = (q: number[], tool: Mat4): Mat4 => multiply(armInBase(q), robot!.solveFK(q.slice(0, dof), tool));
+  const framePoseInBase = (): Mat4 => (frameItem ? (robot ? multiply(invert(baseAbs()), frameItem.poseAbs()) : frameItem.poseAbs()) : identity());
+  /** The synchronised positioner (external axis other than the carrier) that carries an item, if any. */
+  const positionerOf = (it: Item | null): Robot | null => {
+    for (let p = it?.parent ?? null; p; p = p.parent) if (p instanceof Robot) return p !== carrier && group?.ext.includes(p) ? p : null;
+    return null;
+  };
   const toolPose = (): Mat4 => (toolItem instanceof Tool ? toolItem.poseTool() : identity());
   const initialFrame = { pose: framePoseInBase(), name: frameItem?.name ?? 'World' };
   const initialTool = { pose: toolPose(), name: toolItem?.name ?? 'Flange' };
   let q = inherited?.q ?? robot?.joints() ?? [];
   const conf = (j: number[] | null) => (robot && j ? confRLF(robot, j) : [0, 0, 0]);
+  // RoboDK frame_id: 0 for the robot's own base frame ("KUKA KR 10 R900 sixx Base": RoboDK 5.9.4 intermediate file of
+  // 01.c GoHome), else the number in the frame name
+  const frameIndex = (f: Item | null) => (f && robot && robot.parent === f ? 0 : nameIndex(f?.name ?? ''));
 
   /** Pose of a target in the frame the robot program uses (RoboDK: target pose w.r.t. its reference). */
   const targetPose = (t: Target): Mat4 => {
     if (t.parent && t.parent.type === ItemType.FRAME) return t.pose();
-    const ref = frameItem ? frameItem.poseAbs() : robot ? robot.poseAbs() : identity();
+    const ref = frameItem ? frameItem.poseAbs() : robot ? baseAbs() : identity();
     return multiply(invert(ref), t.poseAbs());
   };
+  /** Whether the last solve() kept stored joints that reach the pose (false: none stored, or stored but stale). */
+  let storedMatch = false;
   const solve = (poseInFrame: Mat4, seed: number[] | null, label: string): number[] | null => {
+    storedMatch = false;
     if (!robot) return seed;
     // mechanisms (grippers, turntables, rails) move by their stored joints
     if (robot.dof < 6 && seed && seed.length >= dof) return seed.slice();
     const tool = toolPose();
     const inBase = multiply(framePoseInBase(), poseInFrame);
     if (seed && seed.length >= dof) {
+      // RoboDK's MakeProgram hands its posts the joints stored with the target, as they are: the intermediate files of
+      // the Library (01.c Home, 01.d InspectA 2, ...) carry them even where they no longer reach the target's pose
+      // exactly (taught with another tool / frame position); the configuration then follows those joints
       const s = seed.slice(0, dof);
-      if (poseClose(robot.solveFK(s, tool), inBase, 1, 1e-3)) return seed.length > dof ? seed.slice() : s;
+      storedMatch = poseClose(fkInBase(seed, tool), inBase, 1, 1e-3);
+      if (!storedMatch) problems.push(`${label}: the joints stored with the target do not reach its pose with the current tool / frame; they are written as stored, like RoboDK (re-teach the target to update them)`);
+      return seed.length > dof ? seed.slice() : s;
     }
-    const r = robot.solveIK(inBase, { seed: seed && seed.length >= dof ? seed.slice(0, dof) : q }, tool);
+    const r = robot.solveIK(multiply(invert(armInBase(seed ?? q)), inBase), { seed: seed && seed.length >= dof ? seed.slice(0, dof) : q }, tool);
     if (r.ok) return r.joints;
     problems.push(`${label}: unreachable (${r.posError.toFixed(1)} mm), joints kept from the target`);
     return seed && seed.length >= dof ? seed.slice(0, Math.max(dof, seed.length)) : r.joints?.length ? r.joints : q;
@@ -240,7 +293,7 @@ export function compileForPost(station: Station, program: Program, options: Comp
     const tool = toolPose();
     if (target) {
       if (target.isJointTarget && target.joints) {
-        const pose = robot ? multiply(invert(framePoseInBase()), robot.solveFK(target.joints.slice(0, dof), tool)) : null;
+        const pose = robot ? multiply(invert(framePoseInBase()), fkInBase(target.joints, tool)) : null;
         return { pose, joints: target.joints.slice(), jointTarget: true };
       }
       const pose = targetPose(target);
@@ -250,7 +303,7 @@ export function compileForPost(station: Station, program: Program, options: Comp
     const pp = viaPart ? d.viaPose : d.pose;
     // an inline target with a pose is Cartesian (its joints only pick the configuration); joints alone: a joint target
     if (pp) { const pose = fromArray(pp); return { pose, joints: solve(pose, jj ? jj.slice() : null, 'inline pose') }; }
-    if (jj) return { pose: robot ? multiply(invert(framePoseInBase()), robot.solveFK(jj.slice(0, dof), tool)) : null, joints: jj.slice(), jointTarget: true };
+    if (jj) return { pose: robot ? multiply(invert(framePoseInBase()), fkInBase(jj, tool)) : null, joints: jj.slice(), jointTarget: true };
     return { pose: null, joints: null };
   };
 
@@ -292,7 +345,13 @@ export function compileForPost(station: Station, program: Program, options: Comp
     switch (d.kind) {
       case 'move': {
         const target = d.targetId ? (station.findById(d.targetId) as Target | null) : null;
-        const { pose, joints, jointTarget } = resolveTarget(target, d, false);
+        const r0 = resolveTarget(target, d, false);
+        // simulated branch (RoboDK after Item.Update): replaces stored joints that do not reach the pose, and solves
+        // targets without stored joints; stored joints that reach the pose stay (02.h PickIn1 [78.02, ...])
+        const simJ = storedMatch ? undefined : options.moveJoints?.get(insn.id);
+        const { pose, jointTarget } = r0;
+        const joints = simJ && !jointTarget ? simJ.slice() : r0.joints;
+        if (simJ && !jointTarget) options.onSimulatedJoints?.(target?.id ?? null, insn.id, simJ.slice());
         const jt = jointTarget ? { jointTarget: true } : {};
         const name = target?.name ?? insn.name;
         if (d.moveType === 'MoveJ') {
@@ -326,15 +385,20 @@ export function compileForPost(station: Station, program: Program, options: Comp
           if (i % stride && i !== d.joints.length - 1) return;
           const joints = robot ? row.slice(0, robot.dof) : row;
           q = joints;
-          const pose = robot ? multiply(invert(framePoseInBase()), robot.solveFK(joints, toolPose())) : identity();
+          const pose = robot ? multiply(invert(framePoseInBase()), fkInBase(joints, toolPose())) : identity();
           events.push({ kind: 'moveJ', joints, pose, name: `${insn.name} ${i + 1}`, conf: conf(joints) });
         });
         break;
       }
-      case 'frame':
+      case 'frame': {
         frameItem = d.frameId ? station.findById(d.frameId) : null;
-        events.push({ kind: 'setFrame', pose: framePoseInBase(), name: frameItem?.name ?? 'World', frameId: nameIndex(frameItem?.name ?? '') });
+        // a frame on a synchronised positioner (turntable) reaches RoboDK's posts w.r.t. the positioner flange, the
+        // positioner base being given to the post as pose_turntable (02.f MillingEarth: setFrame(p(0,0,402.467,0,0,0)))
+        const pos = positionerOf(frameItem);
+        if (pos && frameItem) events.push({ kind: 'setFrame', pose: multiply(invert(multiply(pos.poseAbs(), pos.solveFKFlange())), frameItem.poseAbs()), name: frameItem.name, frameId: frameIndex(frameItem), positioner: true, basePose: framePoseInBase() });
+        else events.push({ kind: 'setFrame', pose: framePoseInBase(), name: frameItem?.name ?? 'World', frameId: frameIndex(frameItem) });
         break;
+      }
       case 'tool':
         toolItem = d.toolId ? station.findById(d.toolId) : null;
         // a "Set Tool" whose tool item was deleted in RoboDK keeps only its TCP: RoboDK names that tool after the
@@ -411,7 +475,11 @@ export function compileForPost(station: Station, program: Program, options: Comp
       }
       case 'thread': {
         const tp = findProgram(d.programId, d.programName);
-        if (tp) events.push({ kind: 'thread', name: compileSub(tp) });
+        if (!options.nativeThreads) {
+          // RoboDK: the bare program name as code (a robot program of this robot is still generated with the run)
+          const nm = tp ? compileSub(tp) : d.programName ?? (d.programId ? station.findById(d.programId)?.name : null) ?? String(d.programId ?? '');
+          events.push({ kind: 'runCode', code: nm.replace(/\s+/g, ''), isCall: false, thread: true });
+        } else if (tp) events.push({ kind: 'thread', name: compileSub(tp) });
         else {
           // a station script (RoboDK Python program) started in parallel only drives the simulation: RoboDK writes its bare
           // name, which is not valid robot code; the studio keeps a comment
@@ -434,7 +502,7 @@ export function compileForPost(station: Station, program: Program, options: Comp
     const firstMove = events.findIndex((e) => e.kind === 'moveJ' || e.kind === 'moveL' || e.kind === 'moveC' || e.kind === 'callProgram' || e.kind === 'loop' || e.kind === 'if');
     const before = firstMove < 0 ? events : events.slice(0, firstMove);
     const pre: PostEvent[] = [];
-    if (wantFrame && firstMove >= 0 && !before.some((e) => e.kind === 'setFrame')) pre.push({ kind: 'setFrame', pose: initialFrame.pose, name: initialFrame.name, frameId: nameIndex(initialFrame.name) });
+    if (wantFrame && firstMove >= 0 && !before.some((e) => e.kind === 'setFrame')) pre.push({ kind: 'setFrame', pose: initialFrame.pose, name: initialFrame.name, frameId: frameIndex(initialFrameItem) });
     if (wantTool && firstMove >= 0 && !before.some((e) => e.kind === 'setTool')) pre.push({ kind: 'setTool', pose: initialTool.pose, name: initialTool.name, toolId: toolItem?.id ?? null, toolNum: nameIndex(initialTool.name) });
     events.unshift(...pre);
   }
@@ -442,8 +510,9 @@ export function compileForPost(station: Station, program: Program, options: Comp
     name: program.name,
     robot,
     robotName: robot?.name ?? '',
-    dof,
-    axesType: robot ? actuatedIndices(robot.chain).map((i) => (robot.chain.joints[i].type === 'prismatic' ? 'T' : 'R')) : undefined,
+    // synchronised external axes (rail, gantry, positioner) count as axes of the robot, like RoboDK's posts receive them
+    dof: dof + (group?.ext.reduce((a, m) => a + m.dof, 0) ?? 0),
+    axesType: robot ? [...actuatedIndices(robot.chain).map((i) => (robot.chain.joints[i].type === 'prismatic' ? 'T' : 'R')), ...(group?.ext ?? []).flatMap((m) => actuatedIndices(m.chain).map((i) => (m.chain.joints[i].type === 'prismatic' ? 'L' : 'J')))] : undefined,
     jointNames: robot?.jointNames() ?? [],
     events,
     subprograms,
@@ -451,6 +520,13 @@ export function compileForPost(station: Station, program: Program, options: Comp
     tool: initialTool,
     problems,
   };
+  const positioner = group?.ext.find((m) => m !== carrier);
+  if (robot && positioner) out.poseTurntable = multiply(invert(baseAbs()), positioner.poseAbs());
+  if (robot) {
+    const af = robot.activeFrame(), at = robot.activeTool();
+    out.robotFrame = { pose: af ? multiply(invert(baseAbs()), af.poseAbs()) : identity(), name: af?.name ?? robot.name };
+    out.robotTool = { pose: at instanceof Tool ? at.poseTool() : identity(), name: at?.name ?? 'Flange' };
+  }
   if (!isSub) {
     // flatten nested sub-programs into the exported program's list (each generated once)
     const all: PostProgram[] = [];
@@ -458,8 +534,38 @@ export function compileForPost(station: Station, program: Program, options: Comp
     walk(out);
     out.subprograms = all;
     dropRepeatedFrameTool([out, ...all]);
+    dropZeroLengthMoves([out, ...all], robot);
   }
   return out;
+}
+
+/**
+ * RoboDK's generator skips a linear move to the position the previous move ended at ("Skipped move (mm)"): a MoveL
+ * right after a MoveJ to the same point, consecutive duplicate points of a path (10.a Weld1 MoveL 2 / MoveL 4,
+ * 03.i WeldPair1). The position runs through the generation like the frame / tool state (the program, then its
+ * sub-programs); it is unknown at the start of the run, so a program's first move is always written.
+ */
+export function dropZeroLengthMoves(programs: PostProgram[], robot: Robot | null, tolMm = 1e-3): void {
+  if (!robot) return;
+  let frame: Mat4 | null = null, last: Mat4 | null = null, lastJ: number[] | null = null;
+  for (const p of programs) {
+    if (!frame) frame = p.frame.pose;
+    p.events = p.events.filter((e) => {
+      if (e.kind === 'setFrame') { frame = e.basePose ?? e.pose; return true; }
+      if (e.kind !== 'moveJ' && e.kind !== 'moveL' && e.kind !== 'moveC') return true;
+      const j = e.joints && e.joints.length ? e.joints : null;
+      // the same joints (external axes included: a frame on a positioner moves with it, 05.c) is the same point
+      const sameJ = !!j && !!lastJ && j.length === lastJ.length && j.every((v, i) => Math.abs(v - lastJ![i]) < 1e-6);
+      lastJ = j;
+      if (!e.pose) { last = null; return true; }
+      const m = multiply(frame ?? identity(), e.pose);
+      // same position AND orientation: a linear move that only turns the tool is kept (08.a Prog1: C -90 -> C -40)
+      const same = sameJ || (!!last && Math.hypot(m[12] - last[12], m[13] - last[13], m[14] - last[14]) < tolMm && [0, 1, 2, 4, 5, 6, 8, 9, 10].every((i) => Math.abs(m[i] - last![i]) < 1e-6));
+      last = m;
+      if (e.kind === 'moveL' && same) { p.skippedMoves = (p.skippedMoves ?? 0) + 1; return false; }
+      return true;
+    });
+  }
 }
 
 /**
@@ -469,7 +575,9 @@ export function compileForPost(station: Station, program: Program, options: Comp
  * and 01.a MainProg: tests/posts_library_code.test.ts).
  */
 export function dropRepeatedFrameTool(programs: PostProgram[]): void {
-  const key = (e: { pose: Mat4; name: string }) => `${e.name}|${Array.from(e.pose, (v) => v.toFixed(6)).join(',')}`;
+  // by pose only: two tools with the same TCP are the same tool for the generator (02.i Main Program: "BALL END - 10MM"
+  // after "USER - CONE - 10MM  X  45 DEG", both 85 mm, is not sent: the JBI keeps ///TOOL 45)
+  const key = (e: { pose: Mat4; name: string }) => Array.from(e.pose, (v) => v.toFixed(6)).join(',');
   let frame: string | null = null, tool: string | null = null;
   for (const p of programs) {
     p.events = p.events.filter((e) => {

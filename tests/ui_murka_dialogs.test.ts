@@ -37,9 +37,11 @@ describe('MURKA folder reading', () => {
 });
 
 describe('MURKA retail dialog', () => {
-  it('task lists per variant (the MURKA_Simulation copy: depalletize / order only) and murka_classic is offered', () => {
-    expect(RETAIL_TASKS.murka).toEqual(['depalletize', 'order']);
-    expect(RETAIL_TASKS.murka_classic).toEqual(['depalletize', 'order']);
+  it('task lists per variant (the MURKA_Simulation copy: its e2e_test.py, depalletize / order only) and murka_classic is offered', () => {
+    expect(RETAIL_TASKS.murka).toEqual(['e2e', 'depalletize', 'order']);
+    expect(RETAIL_TASKS.murka_classic).toEqual(['e2e', 'depalletize', 'order']);
+    // the dialog offers exactly the tasks of each project's orchestrator (+ the copy's acceptance test)
+    for (const v of Object.keys(RETAIL_VARIANTS)) expect(RETAIL_TASKS[v], v).toEqual(RETAIL_VARIANTS[v as keyof typeof RETAIL_VARIANTS].tasks);
     expect(RETAIL_TASKS.v2).toEqual(expect.arrayContaining(['full', 'scan', 'depalletize', 'order', 'goto', 'dock', 'undock', 'home']));
     expect(Object.keys(RETAIL_TASKS).sort()).toEqual(Object.keys(RETAIL_VARIANTS).sort());
   });

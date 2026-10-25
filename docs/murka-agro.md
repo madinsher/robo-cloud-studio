@@ -131,10 +131,14 @@ executor step (§9 «дискретно-событийно»).
   clearance); the south lane of sector 3 touches the collection-point pad, so that row uses the inner aisle; one stop
   per tree (platform abreast of the trunk); lanes entered from the open corridor between the blocks, left by reversing;
 - UTP-G legs: Hybrid A* + Reeds–Shepp with the platform's turning radius 2.19 m / tan 0.3 = 7.08 m (cusps, no turning
-  in place), exact outlines of the static colliders, crown discs, collider-less obstacles (collection-point pad, depot
-  shelf / modules) as forbidden polygons; parking bays reached by planning the time-reversed path; constant speeds
-  (harvester 0.6 m/s, 0.4 m/s along rows; logist 1.0 m/s); a robot starts a leg only when it meets no committed motion
-  of another robot (otherwise it waits, or plans around a standing robot);
+  in place) **at the rear axle** — body x −1.095 m, the proto's rear wheels; the platform origin is the wheelbase
+  midpoint and swings on 7.16 m —, exact outlines of the static colliders, crown discs, collider-less obstacles
+  (collection-point pad, depot shelf / modules) as forbidden polygons against the footprint at the origin; parking
+  bays reached by planning the time-reversed path; constant rear-axle speeds (harvester 0.6 m/s, 0.4 m/s along rows;
+  logist 1.0 m/s), the poses interpolated along circular arcs between the planner's samples, so the rear wheels roll
+  without side slip (< 0.5° between 0.1 s samples, cusps excepted; `tests/mobile_ackermann_rear_axle.test.ts`); a robot
+  starts a leg only when it meets no committed motion of another robot (otherwise it waits, or plans around a standing
+  robot);
 - drone: boustrophedon over the trees' bounding box (+ crown radius) at 5 m and 5 m/s, swath 10 m; takeoff / landing at
   1 m/s;
 - deviations from the scenario text (the world was re-laid out on 2026-10-01, after the scenario was written): the
@@ -160,27 +164,28 @@ harvest capacity for logistics capacity); the studio reproduces the mechanism, n
 
 **Checks** (`tests/murka_agro_s1.test.ts`, seed 0; documented tolerance: event times exact to 1e-9 s, kg to 1e-3):
 zero robot–trunk / robot–crown / robot–static / robot–robot / robot–pad contacts (3-D colliders of the world, crown
-radial profile against the chassis collision boxes, replay every 0.25 s); curvature radius ≥ 7.08 m and no rotation in
-place; speeds of §2; survey time = takeoff + boustrophedon length / 5 m/s; boxes = the §4.2 fill rule over the seeded
+radial profile against the chassis collision boxes, replay every 0.25 s); curvature radius ≥ 7.08 m at the rear axle and
+no rotation in place; speeds of §2 (displacement of the rear axle per 0.1 s); survey time = takeoff + boustrophedon length / 5 m/s; boxes = the §4.2 fill rule over the seeded
 yields; kg delivered = kg on the trees (A, B); swap 45 s and unload 30 s exactly; WaitSwap of the event log = time in the
 WaitSwap state of the logical FSM trace, ≥ 45 s per box; makespan ≥ the single-logist bound
 `t(first box_full) + Σ (45 + 30 + 2·d_min/v_L)`; the Hungarian first assignment is the brute-force optimum of cost (1);
 ≤ 2 contracts per harvester; B has more boxes than A; C: lost kg = the crate at the failure, contract-net reaction ≤
 Hungarian reaction. Event log: `result.eventsJsonl()` (events.jsonl lines).
 
-**Results** (10 seeds per level and controller, median [IQR], all runs completed, zero contacts of any kind in all 90):
+**Results** (10 seeds per level and controller, median [IQR], all runs completed, zero contacts of any kind in all 90
+at the default 0.5 s replay step; smallest chassis–crown clearance 21 mm; re-run 2026-10-25 after the rear-axle fix):
 
 | Level / controller | makespan s | WaitSwap s (% of makespan) | boxes | completeness % | logist path m | decision messages / matrix cells | reaction to the failure s |
 |---|---|---|---|---|---|---|---|
-| A Hungarian | 1847 [1733–1943] | 1267 [1079–1384] (69) | 12 [11–13] | 100 | 550 [495–591] | 49 cells · 20 messages | — |
-| A contract net | 1891 [1817–1994] | 1295 [1062–1469] (69) | 12 [11–13] | 100 | 572 [520–623] | 64 [62–66] messages | — |
-| A hybrid | 1873 [1764–1913] | 1215 [1091–1368] (65) | 12 [11–13] | 100 | 554 [499–590] | 58 [56–60] messages + 16 cells | — |
-| B Hungarian | 2298 [2275–2327] | 1598 [1460–1657] (68) | 15 [14–16] | 100 | 667 [638–706] | 52 cells · 23 messages | — |
-| B contract net | 2271 [2163–2345] | 1616 [1493–1765] (72) | 15 [14–16] | 100 | 689 [662–732] | 73 [71–75] messages | — |
-| B hybrid | 2221 [2091–2274] | 1552 [1418–1737] (71) | 15 [14–16] | 100 | 671 [646–711] | 67 [65–69] messages + 16 cells | — |
-| C Hungarian | 2497 [2439–2629] | 967 [784–1050] (37) | 12 [10–12] | 94 | 534 [481–579] | 53 cells · 20.5 messages | 1515 [1446–1617] |
-| C contract net | 2697 [2577–2804] | 947 [849–1138] (36) | 12 [11–13] | 94 | 545 [505–588] | 68.5 [67–72] messages | 309 [133–318] |
-| C hybrid | 2564 [2508–2632] | 924 [792–1067] (36) | 12 [11–12] | 94 | 545 [488–561] | 62.5 [61–64] messages + 16 cells | 67 [58–249] |
+| A Hungarian | 1818 [1715–1924] | 1287 [1096–1386] (71) | 12 [11–13] | 100 | 559 [514–611] | 49 cells · 20 messages | — |
+| A contract net | 1880 [1805–1990] | 1240 [1026–1486] (67) | 12 [11–13] | 100 | 571 [526–620] | 64 [62–66] messages | — |
+| A hybrid | 1883 [1756–1956] | 1284 [1110–1498] (68) | 12 [11–13] | 100 | 559 [515–612] | 58 [56–60] messages + 16 cells | — |
+| B Hungarian | 2304 [2271–2330] | 1559 [1537–1640] (68) | 15 [14–16] | 100 | 699 [671–731] | 52 cells · 23 messages | — |
+| B contract net | 2274 [2235–2344] | 1681 [1631–1807] (74) | 15 [14–16] | 100 | 710 [683–751] | 73 [71–75] messages | — |
+| B hybrid | 2195 [2089–2301] | 1558 [1466–1730] (71) | 15 [14–16] | 100 | 701 [672–740] | 67 [65–69] messages + 16 cells | — |
+| C Hungarian | 2486 [2440–2631] | 963 [791–1035] (38) | 11.5 [10–12] | 94 | 540 [495–596] | 53 cells · 20.5 messages | 1543 [1476–1651] |
+| C contract net | 2687 [2559–2809] | 948 [842–1150] (36) | 11.5 [11–13] | 94 | 544 [510–589] | 68.5 [67–72] messages | 291 [108–300] |
+| C hybrid | 2573 [2508–2633] | 952 [790–1050] (36) | 11.5 [11–12] | 94 | 550 [507–568] | 62.5 [61–64] messages + 16 cells | 42 [34–229] |
 
 Decision messages = `metrics.comm.messages`: every message of the decision protocol — an announcement to each eligible
 bidder (a harvester that is failed or at its 2-contract limit is not addressed), each bid, each award / assignment (the
@@ -188,13 +193,38 @@ Hungarian assignments too) and every retransmission (none here: `msgLoss` = 0); 
 Σ free robots × open tasks over the Hungarian decisions. `tests/murka_agro_s1_table.test.ts` re-runs the 90 runs and
 checks the makespan and this column against the table.
 
+Why the table changed on 2026-10-25: the earlier runs referenced the UTP-G bicycle model to the platform origin (the
+wheelbase midpoint), so the rear wheels slid sideways 8–9° in every turn (V3 F4). With the radius limit and the leg speed
+at the rear axle the transit paths are different curves (the origin swings wider, the rear axle cuts inside) and the
+legs are timed by the rear-axle arc length; distances in the table are rear-axle (odometry) distances. Individual runs
+move by a few tens of seconds (A / Hungarian / seed 0: makespan 2116.9 → 2091.0 s), medians by ≤ 1.6 % (makespan) and
+≤ 5 % (logist path, B); the decision column is unchanged, the conclusions below hold.
+
 Reading: with one logist the logistics dominate (two thirds of the makespan are harvester idle time in WaitSwap, the
 logist cycle ≈ travel + 45 s + travel + 30 s per box); the decision mechanism changes the makespan by a few percent; the
 contract net re-awards the failed harvester's work far sooner (reaction 0.3 k s vs 1.5 k s) but in this layout finishes
 later. Battery (§2: 100 u, 0.2 u/m + 0.5 u/kg) is reported, not enforced: a harvester picking ~125 kg and the logist
 driving ~600 m exceed 100 u — the scenario's battery model is not consistent with its yields (no charging in S1).
 
-Run time ≈ 8 s per run (Node, contacts included). The app (C4) animates a run with `result.timeline.apply(t)`.
+Run time ≈ 1–15 s per run (Node, contacts included; plans are cached per station, the 90 runs on one station take
+5.5 min).
+
+**In the app** (File › MURKA examples › Orchard: benchmark S1…, levels A–D): the run is computed in a module Web Worker
+(`src/murka/agro/s1_worker.ts`, `s1_remote.ts`) on a copy of the open station — its serialized item tree and the meshes
+it references (the crown mesh the tree profile is measured on); the progress pill shows the mission time, then the
+contact replay, and the event log streams into the Log while it computes; the result comes back as plain data (the
+legs of the timeline, metrics, events, traces), the JSON is downloaded and the run plays on the world clock
+(`result.timeline.apply(t)` each world step). The worker's run equals the in-page run (metrics, events, FSM traces,
+contacts, timeline poses; `tests/murka_agro_s1_worker.test.ts`, which also drives the worker's message protocol).
+Without module workers (Node, jsdom, `?worker=off`) the run is computed on the page thread as before.
+Chrome check (2026-10-25, production build, Intel Iris Xe through ANGLE D3D11, `murca_garden_ws` picked, level A,
+Hungarian): a second run on the open station (seed 1) took 9.8–13.2 s with **no long task** (PerformanceObserver
+`longtask`, > 50 ms) and page round-trips ≤ 19 ms; with `?worker=off` the same run is one 8.0 s long task. The first
+run after picking the folder still has two 0.7–2.1 s long tasks in its first 2.2 s — the first 3-D frames of the
+just-imported orchard (`renderer.frame` measured at the same times), present with and without the worker — and the
+import before it blocks 2–3.5 s; after those frames the page answers in ~10 ms and the camera orbits with the mouse
+while the worker computes. In SwiftShader (software WebGL) every frame of the orchard view is a ~1 s long task, so the check
+needs a GPU.
 
 **Message model** (S1 params `msgLatency`, `msgLoss`, `msgTimeout`): every decision message takes the latency; a lost
 announcement or bid drops that bidder from the round (re-announced after the timeout), lost assignments are

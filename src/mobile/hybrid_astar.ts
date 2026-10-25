@@ -8,8 +8,10 @@
  * - `planHybridAStar`: Hybrid A* (Dolgov et al.) over (x, y, θ) with arc primitives limited by the turning radius,
  *   optional reverse and rotate-in-place primitives, a 2-D obstacle-aware Dijkstra heuristic and Reeds–Shepp analytic
  *   expansions to hit the goal pose exactly. Output: a pose path with direction per point (cusps for 3-point turns).
+ *   Poses are the robot origin (footprint centre); the arcs and Reeds–Shepp curves are paths of the reference point
+ *   at body x = `refX` (the rear axle of a car-like base), so the radius limit holds where the bicycle model has it.
  */
-import { CollisionWorld, CircleObstacle, Pose2, rectIntersectsPolygon, pointRectDistance } from './footprint';
+import { CollisionWorld, CircleObstacle, Pose2, rectIntersectsPolygon, pointRectDistance, shiftPose, shiftPosePath } from './footprint';
 import { reedsSheppPath } from './reeds_shepp';
 
 export interface FootprintPlanOptions {
@@ -328,6 +330,11 @@ export interface HybridOptions extends FootprintPlanOptions {
   reverseCost?: number;
   /** Heading tolerance at the goal when it is reached by a primitive (deg). */
   headingTolerance?: number;
+  /**
+   * Body x (mm) of the point the arcs / Reeds–Shepp curves (radius `radius`) are driven by: the rear axle of a car-like
+   * base (controller.rearAxleOffset). Start, goal and output poses stay the origin's (footprint centre). Default 0.
+   */
+  refX?: number;
 }
 
 interface HNode { x: number; y: number; th: number; g: number; parent: number; dir: number; kappa: number; len: number; rot: number }
@@ -337,6 +344,7 @@ export function planHybridAStar(world: CollisionWorld, start: Pose2, goal: Pose2
   const [L, W] = o.footprint;
   const free = footprintChecker(world, o);
   const R = Math.max(o.radius, 1);
+  const ax = o.refX ?? 0;
   const allowRev = o.allowReverse ?? true;
   const rc = o.reverseCost ?? 2;
   const goalFree = goal.theta === undefined;
@@ -377,11 +385,12 @@ export function planHybridAStar(world: CollisionWorld, start: Pose2, goal: Pose2
     const n = nodes[ni];
     let bestPoses: number[][] | null = null, bestCost = Infinity;
     for (const gt of goalThetas) {
-      const rs = reedsSheppPath({ x: n.x, y: n.y, theta: n.th }, { x: goal.x, y: goal.y, theta: gt }, R, { allowReverse: allowRev, step: sample, reverseCost: rc });
+      const rs = reedsSheppPath(shiftPose({ x: n.x, y: n.y, theta: n.th }, ax), shiftPose({ x: goal.x, y: goal.y, theta: gt }, ax), R, { allowReverse: allowRev, step: sample, reverseCost: rc });
       if (!rs || rs.cost >= bestCost) continue;
+      const poses = shiftPosePath(rs.poses, -ax);
       let okP = true;
-      for (const p of rs.poses) if (!free(p[0], p[1], p[2])) { okP = false; break; }
-      if (okP) { bestCost = rs.cost; bestPoses = rs.poses; }
+      for (const p of poses) if (!free(p[0], p[1], p[2])) { okP = false; break; }
+      if (okP) { bestCost = rs.cost; bestPoses = poses; }
     }
     return bestPoses;
   };
@@ -404,11 +413,14 @@ export function planHybridAStar(world: CollisionWorld, start: Pose2, goal: Pose2
         if (!rotationFree(free, x, y, c.th, th1)) continue;
         th = th1 * DEG;
       } else {
+        // the arc is driven by the reference point (rear axle): integrate it, check the footprint at the origin
         const n = Math.max(1, Math.ceil(step / sample));
         const ds = (pr.dir * step) / n;
+        let rx = x + ax * Math.cos(th), ry = y + ax * Math.sin(th);
         for (let s = 1; s <= n; s++) {
-          if (Math.abs(pr.kappa) < 1e-12) { x += ds * Math.cos(th); y += ds * Math.sin(th); }
-          else { const dth = ds * pr.kappa; x += (Math.sin(th + dth) - Math.sin(th)) / pr.kappa; y += (-Math.cos(th + dth) + Math.cos(th)) / pr.kappa; th += dth; }
+          if (Math.abs(pr.kappa) < 1e-12) { rx += ds * Math.cos(th); ry += ds * Math.sin(th); }
+          else { const dth = ds * pr.kappa; rx += (Math.sin(th + dth) - Math.sin(th)) / pr.kappa; ry += (-Math.cos(th + dth) + Math.cos(th)) / pr.kappa; th += dth; }
+          x = rx - ax * Math.cos(th); y = ry - ax * Math.sin(th);
           if (!free(x, y, th * RAD)) { okP = false; break; }
         }
         if (!okP) continue;
@@ -435,13 +447,14 @@ export function planHybridAStar(world: CollisionWorld, start: Pose2, goal: Pose2
   for (let q = 1; q < chain.length; q++) {
     const p = nodes[chain[q - 1]], n = nodes[chain[q]];
     if (n.dir === 0) { out.push([p.x, p.y, n.th, 0]); continue; }
-    let x = p.x, y = p.y, th = p.th * DEG;
+    let th = p.th * DEG;
+    let rx = p.x + ax * Math.cos(th), ry = p.y + ax * Math.sin(th);
     const cnt = Math.max(1, Math.ceil(step / sample));
     const ds = (n.dir * step) / cnt;
     for (let s = 1; s <= cnt; s++) {
-      if (Math.abs(n.kappa) < 1e-12) { x += ds * Math.cos(th); y += ds * Math.sin(th); }
-      else { const dth = ds * n.kappa; x += (Math.sin(th + dth) - Math.sin(th)) / n.kappa; y += (-Math.cos(th + dth) + Math.cos(th)) / n.kappa; th += dth; }
-      out.push([x, y, wrap180(th * RAD), n.dir]);
+      if (Math.abs(n.kappa) < 1e-12) { rx += ds * Math.cos(th); ry += ds * Math.sin(th); }
+      else { const dth = ds * n.kappa; rx += (Math.sin(th + dth) - Math.sin(th)) / n.kappa; ry += (-Math.cos(th + dth) + Math.cos(th)) / n.kappa; th += dth; }
+      out.push([rx - ax * Math.cos(th), ry - ax * Math.sin(th), wrap180(th * RAD), n.dir]);
     }
   }
   out.push(...shot.poses.slice(1));

@@ -2,6 +2,8 @@
 source "$(dirname "$0")/env.sh"
 MODE="${1:-loc}"
 ros2 run rosbridge_server rosbridge_websocket --ros-args -p port:=$R5_PORT -p address:=127.0.0.1 -p use_sim_time:=true &
+# rosapi (what rosbridge_websocket_launch.xml starts with rosbridge): the studio asks it which camera topics are subscribed
+ros2 run rosapi rosapi_node --ros-args -p use_sim_time:=true &
 ros2 launch murom_description description.launch.py use_sim_time:=true &
 case "$MODE" in
   loc) ros2 run murom_navigation localization_node --ros-args -p use_sim_time:=true & ;;

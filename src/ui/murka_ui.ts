@@ -76,12 +76,15 @@ async function pickProjectFiles(app: App, hint: string, base?: string): Promise<
   return (await readProjectFiles(app, files, base)).map;
 }
 
-/** Retail tasks of each store variant: the MURKA_Simulation copy (murka / murka_classic) has only depalletize / collect_order. */
+/**
+ * Retail tasks of each store variant: the MURKA_Simulation copy (murka / murka_classic) has only depalletize /
+ * collect_order in its orchestrator, plus its acceptance test scripts/e2e_test.py ('e2e': both tasks and the checks).
+ */
 export const RETAIL_TASKS: Record<string, string[]> = {
   v2: ['full', 'scan', 'depalletize', 'order', 'goto', 'dock', 'undock', 'home'],
   v1: ['full', 'scan', 'depalletize', 'order', 'goto', 'dock', 'undock', 'home'],
-  murka: ['depalletize', 'order'],
-  murka_classic: ['depalletize', 'order'],
+  murka: ['e2e', 'depalletize', 'order'],
+  murka_classic: ['e2e', 'depalletize', 'order'],
 };
 /** Task arguments of the dialog -> runMurkaRetailMission options (full: scan= / depal= / order=; others: positional). */
 export function retailTaskOptions(mission: string, text: string): { params?: Record<string, string>; args?: string[] } {
@@ -106,7 +109,7 @@ export async function retailMissionDialog(app: App): Promise<void> {
   const current = typeof retailStationOf === 'function' ? retailStationOf(app.station) : null;
   const variants = [{ value: 'v2', label: 'robot-retailer-murka-v2 (MURKA v2)' }, { value: 'v1', label: 'robot-retailer-murka (v1)' }, { value: 'murka', label: 'murka (MURKA_Simulation copy, v2 robot)' }, { value: 'murka_classic', label: 'murka_classic (MURKA_Simulation copy, classic robot)' }];
   const variant0 = current?.variant ?? 'v2';
-  const hintFor = (m: string) => ({ full: 'full: scan=S1,S2 depal=pallet_1,box_red,bulk_B1,1 order=tea_box,coffee_can (empty: the MURKA defaults)', scan: 'scan: shelf ids (S0 S1 …)', depalletize: 'depalletize: pallet sku target_shelf count (e.g. pallet_1 box_red bulk_B1 1)', order: 'order: SKUs (e.g. tea_box coffee_can)', goto: 'goto: location name, or x y yaw' } as Record<string, string>)[m] ?? '';
+  const hintFor = (m: string) => ({ e2e: 'e2e: scripts/e2e_test.py of the MURKA_Simulation copy — depalletize pallet_1 box_red bulk_B1 1, then order tea_box coffee_can (no arguments)', full: 'full: scan=S1,S2 depal=pallet_1,box_red,bulk_B1,1 order=tea_box,coffee_can (empty: the MURKA defaults)', scan: 'scan: shelf ids (S0 S1 …)', depalletize: 'depalletize: pallet sku target_shelf count (e.g. pallet_1 box_red bulk_B1 1)', order: 'order: SKUs (e.g. tea_box coffee_can)', goto: 'goto: location name, or x y yaw' } as Record<string, string>)[m] ?? '';
   const argsHint = h('p', { class: 'hint' }, hintFor(RETAIL_TASKS[variant0][0]));
   const r = await dialog<{ variant: string; mission: string; args: string; reuse: boolean; speed: number }>('MURKA retail store mission', [
     { key: 'variant', label: 'Store variant', type: 'select', value: variant0, options: variants },
@@ -140,8 +143,13 @@ export async function retailMissionDialog(app: App): Promise<void> {
   const label = `[MURKA ${r.mission}]`;
   const fmtEv = (e: any) => `${label} ${typeof e === 'string' ? e : `${Number(e?.t ?? 0).toFixed(1)} s ${e?.state ?? ''} ${e?.phase ?? ''} ${e?.detail ?? ''} ${e?.percent !== undefined ? `${Math.round(e.percent)} %` : ''}`.replace(/\s+/g, ' ').trim()}`;
   let handle: any;
-  try { handle = run(res, { mission: r.mission, ...retailTaskOptions(r.mission, r.args), runtime: 'realtime', speed: Number(r.speed) || 1, onEvent: (e: any) => app.log(fmtEv(e)) }); }
-  catch (e) { toast(`MURKA ${r.mission}: ${(e as Error).message}`, 'error', 8000); return; }
+  const e2e = r.mission === 'e2e';
+  const m = await loadMurka();
+  try {
+    const rt = { runtime: 'realtime', speed: Number(r.speed) || 1, onEvent: (e: any) => app.log(fmtEv(e)) };
+    if (e2e) { if (typeof m.runMurkaE2E !== 'function') { toast('runMurkaE2E is not available in this build', 'warn', 6000); return; } handle = m.runMurkaE2E(res, rt); handle.session = m.retailSessionOf?.(res); }
+    else handle = run(res, { mission: r.mission, ...retailTaskOptions(r.mission, r.args), ...rt });
+  } catch (e) { toast(`MURKA ${r.mission}: ${(e as Error).message}`, 'error', 8000); return; }
   // the default session of runMurkaRetailMission ignores opts.onEvent: hook the orchestrator's progress for this task
   // and give the previous hook back afterwards (a later task from the Control tab is not labelled with this one)
   const orchOpts = handle.session?.orch?.opts;
@@ -149,9 +157,12 @@ export async function retailMissionDialog(app: App): Promise<void> {
   if (orchOpts) orchOpts.onEvent = (e: any) => app.log(fmtEv(e));
   retailRun = handle;
   toast(`MURKA ${r.mission} started (${r.variant}${res === current ? ', open store' : ''})`, 'ok');
-  const out = await handle.done.catch((e: Error) => ({ outcome: 'error', stages: [], error: e.message }));
+  const out0 = await handle.done.catch((e: Error) => ({ outcome: 'error', stages: [], error: e.message }));
   if (orchOpts) orchOpts.onEvent = prevHook;
   if (retailRun === handle) retailRun = null;
+  // e2e: what scripts/e2e_test.py prints, and its verdict as the outcome
+  if (e2e && Array.isArray(out0.lines)) for (const line of out0.lines) app.log(`${label} ${line}`, out0.pass ? 'info' : 'warn');
+  const out = e2e && 'pass' in out0 ? { outcome: out0.pass ? 'done' : 'error', stages: (out0.tasks ?? []).map((t: any) => ({ name: t.stages?.[0]?.name ?? '', outcome: t.outcome })), simTime: (out0.tasks ?? []).reduce((a: number, t: any) => a + (t.simTime ?? 0), 0), error: out0.failures?.join('; ') || undefined } : out0;
   const stages = (out.stages ?? []).map((s: any) => `${s.name}: ${s.outcome}`).join(', ');
   app.log(`MURKA ${r.mission}: ${out.outcome}${out.simTime !== undefined ? ` in ${Number(out.simTime).toFixed(0)} s` : ''}${stages ? ` — ${stages}` : ''}${out.error ? ` (${out.error})` : ''}`, out.outcome === 'done' ? 'info' : 'warn');
   toast(`MURKA ${r.mission}: ${out.outcome}`, out.outcome === 'done' ? 'ok' : 'warn', 8000);
@@ -194,16 +205,31 @@ export async function s1BenchmarkDialog(app: App): Promise<void> {
   if (!r) return;
   const st = await orchardStation(app);
   if (!st) return;
-  // the benchmark computes the whole run first (planning, allocation, contact replay): say so before the page is busy
+  // the benchmark computes the whole run first (planning, allocation, contact replay): in a module worker on a copy of
+  // the station (the page stays responsive, progress and the event log arrive meanwhile), then the run plays here
   const label = 'S1 benchmark';
+  const opts = { level: r.level, controller: r.controller, seed: Number(r.seed) || 0 };
   app.events.emit('progress', { label, detail: `level ${r.level}, ${r.controller}: planning the run` });
-  toast('S1: computing the run (planning and allocation take a while), then it plays on the world clock', 'info', 6000);
-  await new Promise((res) => setTimeout(res, 60));
+  const m = await loadMurka();
+  const inWorker = typeof m.s1WorkerAvailable === 'function' && m.s1WorkerAvailable() && typeof m.runS1InWorker === 'function';
+  toast(inWorker ? 'S1: computing the run in the background (the app stays usable), then it plays on the world clock' : 'S1: computing the run (planning and allocation take a while), then it plays on the world clock', 'info', 6000);
   try {
-    const res = run(st, { level: r.level, controller: r.controller, seed: Number(r.seed) || 0, assets: app.assets, log: (m: string) => app.log(`[S1] ${m}`) });
+    let res: any, json: string;
+    if (inWorker) {
+      const out = await m.runS1InWorker(st, app.assets, opts, {
+        onProgress: (p: { phase: string; t: number; end: number }) => app.events.emit('progress', { label, detail: p.phase === 'mission' ? `level ${r.level}, ${r.controller}: mission time ${p.t.toFixed(0)} s` : p.phase === 'contacts' ? `contact check ${Math.round((100 * p.t) / Math.max(1, p.end))} %` : p.phase === 'world' ? 'building the S1 world' : 'finishing' }),
+        onLines: (lines: string[]) => { for (const l of lines) app.log(`[S1] ${l}`); },
+      });
+      res = out.result; json = out.json;
+    } else {
+      await new Promise((ok) => setTimeout(ok, 60));
+      res = run(st, { ...opts, assets: app.assets, log: (s: string) => app.log(`[S1] ${s}`) });
+      json = typeof m.s1DownloadJson === 'function' && res.timelineData ? m.s1DownloadJson(res) : JSON.stringify(res, (_k, v) => (typeof v === 'function' ? undefined : v), 1);
+    }
+    if (app.station !== st) { toast('S1: the station was closed while the run was computed', 'warn', 6000); return; }
     const metrics = res.metrics ?? res;
     app.log(`S1 ${r.level}/${r.controller}: ${JSON.stringify(metrics).slice(0, 600)}`);
-    downloadText(`s1_${r.level}_${r.controller}_seed${r.seed}.json`, JSON.stringify(res, (k, v) => (typeof v === 'function' ? undefined : v), 1), 'application/json');
+    downloadText(`s1_${r.level}_${r.controller}_seed${r.seed}.json`, json, 'application/json');
     if (res.timeline) playS1Timeline(app, st, res.timeline);
     toast(`S1 benchmark computed (metrics downloaded): playing ${Number(res.timeline?.end ?? 0).toFixed(0)} s on the world clock`, 'ok', 7000);
   } catch (e) { toast(`S1: ${(e as Error).message}`, 'error', 8000); }
