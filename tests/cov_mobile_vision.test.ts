@@ -87,8 +87,9 @@ describe('mobile items', () => {
     expect([r2.payloadKg, r2.rosNamespace, r2.fleetId]).toEqual([400, '/tractor', 'fleet-1']);
     expect(r2.home).toEqual({ x: 1, y: 2, theta: 3 });
     expect(r2.state.odometer).toBe(777);
-    expect(r2.state.path).toBeNull(); // transient path progress is not restored
-    expect(r2.state.pathIndex).toBe(0);
+    // a station saved mid-mission resumes the path being followed (agri_mobile B10)
+    expect(r2.state.path).toEqual([[0, 0], [1, 1]]);
+    expect(r2.state.pathIndex).toBe(1);
     expect(r2.state.x).toBeCloseTo(1000);
     expect(r2.state.theta).toBeCloseTo(90, 6);
     const m2 = copy.itemsOfType<MapItem>(ItemType.MAP)[0];
@@ -143,7 +144,9 @@ describe('camera model helpers', () => {
     const lidar = VISION_SENSORS.find((s) => !s.resolution[0])!;
     const KL = intrinsicsFromSensor(lidar);
     expect([KL.width, KL.height]).toEqual([1024, 768]);
-    const K2 = intrinsicsFromCamera({ fov: 90, width: 640, height: 480 });
+    // fov spans fovAxis (default vertical = RoboDK Cam2D / three.js): 90 deg over 480 px rows -> f = 240 px
+    expect(intrinsicsFromCamera({ fov: 90, width: 640, height: 480 }).fy).toBeCloseTo(240);
+    const K2 = intrinsicsFromCamera({ fov: 90, width: 640, height: 480, fovAxis: 'horizontal' });
     expect(K2.fx).toBeCloseTo(320);
     const ray = pixelRay(K2, 320, 240);
     expect(ray).toEqual([0, 0, 1]);
@@ -178,7 +181,7 @@ describe('camera model helpers', () => {
     expect(he[12]).toBeCloseTo(0, 6);
     expect(he[13]).toBeCloseTo(50, 6);
     expect(he[14]).toBeCloseTo(100, 6);
-    const K = intrinsicsFromCamera({ fov: 90, width: 640, height: 480 });
+    const K = intrinsicsFromCamera({ fov: 90, width: 640, height: 480, fovAxis: 'horizontal' });
     const p = pixelDepthToWorld(K, transl(0, 0, 1000), 320, 240, 500);
     expect(p[0]).toBeCloseTo(0);
     expect(p[2]).toBeCloseTo(1500);

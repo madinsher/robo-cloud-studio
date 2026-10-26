@@ -83,7 +83,8 @@ describe('control panel', () => {
     // export menu for a DES model
     const des = newControlModel(app, 'des'); buttonByText(panel.el, 'Analyse').click(); expect(panel.el.querySelector('.ctl-report-wrap svg.ctl-graph')).not.toBeNull();
     const d0 = downloads.length;
-    buttonByText(panel.el, 'Export ▾').click(); expect(ctxItems().map((e) => e.textContent)).toEqual(['Report (Markdown)', 'Document (.ctl.txt)', 'Graph view (SVG)', 'Supervisor table (JSON)', 'Supervisor runtime (Python)']);
+    // the document / supervisor exports come first; the control-program generators (T7: RoboDK script, vendor posts, ROS 2, IEC 61131-3, …) follow
+    buttonByText(panel.el, 'Export ▾').click(); expect(ctxItems().map((e) => e.textContent).slice(0, 5)).toEqual(['Report (Markdown)', 'Document (.ctl.txt)', 'Graph view (SVG)', 'Supervisor table (JSON)', 'Supervisor runtime (Python)']);
     ctxItem('Report (Markdown)').click(); expect(downloads.at(-1)!.name).toBe(`${des.name}.md`);
     buttonByText(panel.el, 'Export ▾').click(); ctxItem('Document (.ctl.txt)').click(); expect(downloads.at(-1)!.name).toBe(`${des.name}.ctl.txt`);
     buttonByText(panel.el, 'Export ▾').click(); ctxItem('Graph view (SVG)').click(); expect(downloads.at(-1)!.name).toBe(`${des.name}.svg`);
@@ -179,8 +180,9 @@ describe('graph editor (automata and Petri nets)', () => {
     const dI = inspector(); expect(dI.textContent).toContain('Document'); change(fieldIn(dI, 'Uncontrollable'), 'b2, b1'); expect(editor().state().des!.uncontrollable).toEqual(['b2', 'b1']); expect(m.source).toContain('uncontrollable');
     change(fieldIn(inspector(), 'Unobservable'), 'x'); expect(editor().state().des!.unobservable).toEqual(['x']); change(fieldIn(inspector(), 'Faults'), 'f'); expect(editor().state().des!.faults).toEqual(['f']);
     change(fieldIn(inspector(), 'Alphabet'), 'extra'); expect(editor().state().des!.plant[0].events).toContain('extra');
-    change(inspector().querySelectorAll<HTMLInputElement>('input.ge-text')[4], 'M1x'); expect(editor().state().des!.plant[0].name).toBe('M1x');
-    change(inspector().querySelectorAll<HTMLInputElement>('input.ge-text')[4], 'has space'); expect(lastToast()).toBe('a name without spaces');
+    // inputs: document Name, Uncontrollable, Unobservable, Faults, Sensors, then the automaton Name
+    change(inspector().querySelectorAll<HTMLInputElement>('input.ge-text')[5], 'M1x'); expect(editor().state().des!.plant[0].name).toBe('M1x');
+    change(inspector().querySelectorAll<HTMLInputElement>('input.ge-text')[5], 'has space'); expect(lastToast()).toBe('a name without spaces');
     change(inspector().querySelectorAll<HTMLInputElement>('input.ge-text')[0], 'Renamed doc'); expect(editor().state().des!.name).toBe('Renamed doc'); expect(m.source.split('\n')[0]).toBe('des Renamed doc');
     // add a state programmatically and interactively
     const id = editor().addNodeAt(300, 200)!; expect(id).toBeTruthy(); expect(editor().state().selection).toEqual({ type: 'node', id }); expect(editor().state().des!.layout![editor().state().des!.plant[0].name][id]).toEqual([300, 200]);
@@ -301,7 +303,7 @@ describe('behavior-tree editor', () => {
     expect(inspector().textContent).toContain('Node'); change(fieldIn(inspector(), 'Expression or blackboard key'), 'battery < 0.3'); expect(cond.fn).toBe('battery < 0.3'); change(fieldIn(inspector(), 'Name'), 'low battery'); expect(cond.name).toBe('low battery');
     bt().select(act); const a = act.args!;
     change(fieldIn(inspector(), 'Binding'), 'goto'); expect(act.fn).toBe('goto'); change(fieldIn(inspector(), 'Zone'), 'home'); expect(a.zone).toBe('home');
-    change(fieldIn(inspector(), 'Binding'), 'program'); change(fieldIn(inspector(), 'Program'), 'PickPlace'); expect(a.name).toBe('PickPlace'); change(fieldIn(inspector(), 'Robot'), 'UR10e'); expect(a.robot).toBe('UR10e');
+    change(fieldIn(inspector(), 'Binding'), 'program'); change(fieldIn(inspector(), 'Program'), 'PickPlace'); expect(a.program).toBe('PickPlace'); // args.program (name= is the node label in the DSL: B9) change(fieldIn(inspector(), 'Robot'), 'UR10e'); expect(a.robot).toBe('UR10e');
     change(fieldIn(inspector(), 'Binding'), 'move'); change(fieldIn(inspector(), 'Target'), 'Home'); expect(a.target).toBe('Home');
     change(fieldIn(inspector(), 'Binding'), 'signal'); change(fieldIn(inspector(), 'Signal'), 'start'); change(fieldIn(inspector(), 'Value'), '12'); expect(a.value).toBe(12); change(fieldIn(inspector(), 'Value'), 'false'); expect(a.value).toBe(false);
     change(fieldIn(inspector(), 'Binding'), 'wait'); change(fieldIn(inspector(), 'Seconds'), '4'); expect(a.seconds).toBe(4);

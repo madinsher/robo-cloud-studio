@@ -1,0 +1,4 @@
+<?xml version="1.0"?>
+<robot name="r" xmlns:xacro="http://www.ros.org/wiki/xacro">
+<xacro:property name="lz" value="${lb*2}"/><xacro:property name="lb" value="3"/><v l="${lz}"/><xacro:macro name="m" params="k"><xacro:property name="pp" value="${k}" scope="parent"/><xacro:property name="gg" value="${k*10}" scope="global"/><xacro:property name="loc" value="${k+1}"/></xacro:macro><xacro:m k="2"/><v pp="${pp}" gg="${gg}"/>
+</robot>

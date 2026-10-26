@@ -1,0 +1,4 @@
+<?xml version="1.0"?>
+<robot name="r" xmlns:xacro="http://www.ros.org/wiki/xacro">
+<xacro:arg name="q" default="z"/><v b="$(find xc_cal)" c="${python.abs(-2)}" d="${xacro.arg('q')}"/>
+</robot>

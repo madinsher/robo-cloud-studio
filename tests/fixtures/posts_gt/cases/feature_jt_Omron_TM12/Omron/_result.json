@@ -1,0 +1,6 @@
+{
+ "ok": false,
+ "error": "RuntimeError: robodk.robolink.Robolink is not available while generating code from VerticalBot Studio",
+ "log": "",
+ "files": []
+}

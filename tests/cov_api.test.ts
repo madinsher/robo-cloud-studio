@@ -116,7 +116,7 @@ describe('RobolinkItem: tree, poses, frames, tools', () => {
     const r = RDK.AddRobot('UR5e');
     const robot = r.item as Robot;
     expect(r.DOF()).toBe(6);
-    expect(r.Connect('10.0.0.1')).toBe(true);
+    expect(r.Connect('10.0.0.1')).toBe(RL.ROBOTCOM_READY);
     expect(r.ConnectedState()).toBe(RL.ROBOTCOM_READY);
     expect(r.ConnectSafe('192.168.0.5')).toBe(RL.ROBOTCOM_READY);
     expect(r.ConnectionParams()[0]).toBe('192.168.0.5');
@@ -170,8 +170,8 @@ describe('RobolinkItem: tree, poses, frames, tools', () => {
     expect(r.FilterProgram()[0]).toBe(0);
     expect(r.SolveIK(robomath.transl(10000, 0, 0))).toEqual([]);
     expect(() => r.setPose(robomath.transl(10000, 0, 0))).toThrow(/not reachable/);
-    expect(() => r.MoveJ(robomath.transl(10000, 0, 0))).toThrow(/MoveJ/);
-    expect(() => r.MoveL(robomath.transl(10000, 0, 0))).toThrow(/MoveL/);
+    expect(() => r.MoveJ(robomath.transl(10000, 0, 0))).toThrow(/TargetReachError/);
+    expect(() => r.MoveL(robomath.transl(10000, 0, 0))).toThrow(/TargetReachError/);
     const p = r.Pose();
     r.setPose(robomath.transl(0, 0, -20).mul(p));
     expect(r.Pose().Pos()[2]).toBeCloseTo(p.Pos()[2] - 20, 1);
@@ -199,7 +199,7 @@ describe('RobolinkItem: tree, poses, frames, tools', () => {
     r.setDO('gripper', '1');
     r.setDO('lamp', 0);
     r.setAO('speed', 0.5);
-    expect(r.getDI('gripper')).toBe(true);
+    expect(r.getDI('gripper')).toBe(1);
     expect(r.getDI('lamp')).toBe(0);
     expect(r.getDI('missing')).toBe(0);
     expect(r.getAI('speed')).toBe(0.5);
@@ -211,9 +211,9 @@ describe('RobolinkItem: tree, poses, frames, tools', () => {
     r.Stop();
     expect(stopped).toBe(true);
     expect(r.setLink(tool)).toBe(r);
-    expect(r.AccuracyActive()).toBe(false);
+    expect(r.AccuracyActive()).toBe(0);
     r.setAccuracyActive(true);
-    expect(r.AccuracyActive()).toBe(true);
+    expect(r.AccuracyActive()).toBe(1);
     // DH parameters round trip
     const dhm = r.RobotParams();
     expect(dhm.length).toBe(6);
@@ -293,22 +293,27 @@ describe('RobolinkItem: programs and targets', () => {
     expect(prog.ShowTargets(false)).toBe(prog);
     const n = prog.InstructionCount();
     expect(n).toBeGreaterThan(20);
-    const list = prog.InstructionList();
-    expect(list.length).toBe(n);
+    // RoboDK InstructionList: (rows [j1..j6, MOVE_TYPE] per move, errors); Instruction(i) gives each instruction
+    const [seq, seqErrors] = prog.InstructionList();
+    const list = Array.from({ length: n }, (_, i) => prog.Instruction(i));
+    expect(seq.length + seqErrors).toBe(list.filter((i) => i.type === RL.INS_TYPE_MOVE).length);
+    expect(seq.every((row) => row.length === 7 && [1, 2, 3].includes(row[6]))).toBe(true);
     const moveIdx = list.findIndex((i) => i.moveType === RL.MOVE_TYPE_JOINT);
     const ins0 = prog.Instruction(moveIdx);
     expect(ins0.pose).not.toBeNull();
     expect(ins0.joints?.length).toBe(6);
     expect(list.some((i) => i.moveType === RL.MOVE_TYPE_LINEAR)).toBe(true);
     expect(list.some((i) => i.moveType === RL.MOVE_TYPE_CIRCULAR)).toBe(true);
-    expect(list.filter((i) => i.moveType === 0).length).toBeGreaterThan(5);
-    const jointMoveIdx = list.findIndex((i) => i.moveType === RL.MOVE_TYPE_JOINT && i.pose === null);
+    expect(list.filter((i) => i.moveType === null).length).toBeGreaterThan(5);
+    // inline joint moves report the pose computed from the joints (RoboDK always returns a pose for moves)
+    const jointMoveIdx = (prog.item as Program).instructions().findIndex((i) => i.data.kind === 'move' && !i.data.targetId && !!i.data.joints);
+    expect(list[jointMoveIdx].pose).not.toBeNull();
     expect(jointMoveIdx).toBeGreaterThan(0);
     // setInstruction on a target-based and an inline move
     prog.setInstruction(moveIdx, 'Renamed move', RL.INS_TYPE_MOVE, RL.MOVE_TYPE_LINEAR, true, t1.Pose(), [2, -90, 90, -90, -90, 0]);
     expect(prog.Instruction(moveIdx).name).toBe('Renamed move');
     expect(prog.Instruction(moveIdx).moveType).toBe(RL.MOVE_TYPE_LINEAR);
-    expect(prog.Instruction(moveIdx).isJointTarget).toBe(true);
+    expect(prog.Instruction(moveIdx).isJointTarget).toBe(1);
     expect(t1.Joints()[0]).toBe(2);
     prog.setInstruction(jointMoveIdx, 'Inline', RL.INS_TYPE_MOVE, RL.MOVE_TYPE_JOINT, false, robomath.transl(1, 2, 3), [3, -90, 90, -90, -90, 0]);
     expect(prog.Instruction(jointMoveIdx).joints?.[0]).toBe(3);
@@ -323,7 +328,7 @@ describe('RobolinkItem: programs and targets', () => {
     expect(prog.RunType()).toBe(RL.PROGRAM_RUN_ON_SIMULATOR);
     prog.setRunType(RL.PROGRAM_RUN_ON_ROBOT);
     expect(prog.RunType()).toBe(RL.PROGRAM_RUN_ON_ROBOT);
-    expect(prog.WaitFinished()).toBe(prog);
+    expect(prog.WaitFinished()).toBeUndefined(); // nothing running
     const ran: string[] = [];
     RDK.onRunProgram = (p) => ran.push(p.name);
     expect(prog.RunProgram()).toBe(0);
@@ -333,38 +338,47 @@ describe('RobolinkItem: programs and targets', () => {
     p2.setRobot(r);
     p2.setLink(r);
     expect(p2.getLink(RL.ITEM_TYPE_ROBOT).item).toBe(r.item);
-    expect(prog.ProgramStart('P3')).toBe(1);
-    expect(RDK.Item('P3', RL.ITEM_TYPE_PROGRAM).Valid()).toBe(true);
-    const [ok, code, file] = prog.MakeProgram('/tmp/', 'Universal_Robots');
+    // RoboDK ProgramStart opens an offline program (not a tree item) and returns 0 errors
+    expect(prog.ProgramStart('P3')).toBe(0);
+    expect(RDK.Item('P3', RL.ITEM_TYPE_PROGRAM).Valid()).toBe(false);
+    RDK.setRunMode(RL.RUNMODE_SIMULATE);
+    const written: string[] = [];
+    RDK.onGeneratedFiles = (files, folder) => written.push(...files.map((f) => `${folder}${f.name}`));
+    const [ok, log, transferred] = prog.MakeProgram('/tmp/', 'Universal_Robots') as [boolean, string, boolean];
     expect(ok).toBe(true);
-    expect(code.length).toBeGreaterThan(10);
-    expect(file.startsWith('/tmp/')).toBe(true);
+    expect(log).toMatch(/Program P generated/);
+    expect(transferred).toBe(false);
+    expect(written.some((f) => f.startsWith('/tmp/'))).toBe(true);
     const [valid, time] = prog.Update();
     expect(valid).toBeGreaterThan(0);
     expect(time).toBeGreaterThan(0);
     const [badMsg, , badStatus] = prog.InstructionListJoints();
-    expect(badStatus).toBe(-1); // calls a program that does not exist
-    expect(badMsg).not.toBe('Success');
+    // a call to a routine that does not exist is a code call (no motion): the path itself is valid, like RoboDK
+    expect(badStatus).toBe(prog.InstructionCount());
+    expect(badMsg).toBe('Success');
     p2.MoveJ(t1);
     const t4 = r.AddTarget('T4');
     t4.setPose(robomath.transl(0, 0, -10).mul(t1.Pose()));
     p2.MoveL(t4);
     const [msg, rows, status] = p2.InstructionListJoints(1, 1, '', 0, 0, 0.1);
     expect(msg).toBe('Success');
-    expect(status).toBe(0);
+    expect(status).toBe(2);
     expect(rows.length).toBeGreaterThan(0);
-    expect(rows[0].length).toBe(8);
-    expect(prog.Save().length).toBeGreaterThan(50);
-    expect(RDK.Item('', RL.ITEM_TYPE_STATION).Save().length).toBeGreaterThan(100);
+    expect(rows[0].length).toBe(10);
+    expect(String(prog.Save()).length).toBeGreaterThan(50);
+    expect(JSON.parse(String(RDK.Item('', RL.ITEM_TYPE_STATION).Save())).station.name).toBe(st.name);
     // moving the robot with different target types
     r.MoveJ(t1);
     expect(r.Joints()[0]).toBeCloseTo(2, 3);
-    r.MoveL(t2);
-    expect(r.Pose().Pos()[2]).toBeCloseTo(t2.Pose().Pos()[2], 0);
+    // robot moves are timed, path-checked motions (virtual clock): MoveL ends exactly on the target
+    r.MoveL(t4);
+    expect((r.item as Robot).poseTCPAbs()[14]).toBeCloseTo((t4.item as Target).poseAbs()[14], 3);
     r.MoveJ([0, -90, 90, -90, -90, 0]);
     expect(r.Joints()).toEqual([0, -90, 90, -90, -90, 0]);
-    r.MoveC(t2, t3);
-    expect(r.Pose().Pos()[1]).toBeCloseTo(t3.Pose().Pos()[1], 0);
+    const p0 = r.Pose();
+    r.MoveC(robomath.transl(20, 20, 0).mul(p0), robomath.transl(40, 0, 0).mul(p0));
+    expect(r.Pose().Pos()[0]).toBeCloseTo(p0.Pos()[0] + 40, 1);
+    expect(r.Busy()).toBe(false);
   });
 });
 
@@ -446,24 +460,25 @@ describe('RobolinkItem: objects, attach/detach, collisions and colours', () => {
     expect(robot.MoveL_Test(q0, pose.mul(robomath.transl(0, 0, -20)))).toBe(0);
     expect(robot.MoveJ_Test(q0, q0.map((v, i) => (i === 5 ? v + 20 : v)))).toBe(0);
     expect(robot.MoveL_Test(q0, robomath.transl(20000, 0, 0))).toBe(-2);
-    const contact = robot.SearchL(pose.mul(robomath.transl(0, 0, 5)));
+    const contact = robot.SearchL(pose.mul(robomath.transl(0, 0, 5))) as number[];
     expect(contact.length).toBe(6);
     robot.setJoints(q0);
     const t = RDK.Item('Above 1');
-    const near = robot.SearchL(t);
+    const near = robot.SearchL(t) as number[];
     expect(near.length).toBe(6);
     robot.setJoints(q0);
     // machining params on a plain item
     const mp = RDK.AddMillingProject('Mill');
-    const [, pts] = mp.setMachiningParameters('part.nc', box, 'Step=5');
-    expect(pts).toBe(0);
+    const [mprog, mstatus] = mp.setMachiningParameters('part.nc', box, 'Step=5');
+    expect(mprog.Valid()).toBe(false); // a box without curves gives no path
+    expect(mstatus).toBe(-1);
     expect(mp.MachiningParameters()).toMatchObject({ ncfile: 'part.nc', params: 'Step=5', part: box.item!.id });
     void prog; void st;
   });
 });
 
 describe('Robolink: station-level API', () => {
-  it('items, selection, stations, flags, hooks and misc commands', () => {
+  it('items, selection, stations, flags, hooks and misc commands', async () => {
     const { st, RDK, robot, prog } = demoCell();
     let rendered = 0;
     RDK.onRender = () => { rendered++; };
@@ -475,7 +490,8 @@ describe('Robolink: station-level API', () => {
     expect(RDK.Item('nothing-here').Valid()).toBe(false);
     expect(RDK.ItemList(RL.ITEM_TYPE_TARGET).length).toBeGreaterThan(5);
     expect(RDK.ItemUserPick('pick', RL.ITEM_TYPE_ROBOT).item).toBe(robot.item);
-    expect(RDK.ItemUserPick().Valid()).toBe(false);
+    // no dialog: the headless pick for ITEM_TYPE_ANY is the first object (Library macros pick objects this way)
+    expect(RDK.ItemUserPick().item).toBe(st.itemsOfType(RL.ITEM_TYPE_OBJECT as any)[0]);
     RDK.setSelection([prog, new RobolinkItem(RDK, null)]);
     expect(RDK.Selection().map((s) => s.Name())).toEqual(['PickPlace']);
     expect(RDK.ItemUserPick('', RL.ITEM_TYPE_PROGRAM).item).toBe(prog.item);
@@ -485,13 +501,13 @@ describe('Robolink: station-level API', () => {
     expect(amr.Type()).toBe(ItemType.MOBILE_ROBOT);
     const msgs: Array<[string, boolean]> = [];
     RDK.onMessage = (m, p) => msgs.push([m, p]);
-    expect(RDK.AddFile('/tmp/x.step').Valid()).toBe(false);
+    await expect(RDK.AddFile('/tmp/x.step')).rejects.toThrow(/no file access/);
     RDK.ShowMessage('hello', false);
     RDK.RunMessage('comment', true);
     RDK.RunMessage('display');
     expect(RDK.RunCode('PickPlace', true)).toBe(0);
     expect(RDK.RunCode('free text')).toBe(0);
-    expect(msgs.map((m) => m[0])).toEqual(['AddFile: drop the file onto the viewport or use File > Import', 'hello', 'display', 'free text']);
+    expect(msgs.map((m) => m[0])).toEqual(['hello', 'display', 'free text']);
     const ran: string[] = [];
     RDK.onRunProgram = (p) => ran.push(p.name);
     expect(RDK.RunProgram('PickPlace()')).toBe(0);
@@ -499,16 +515,16 @@ describe('Robolink: station-level API', () => {
     expect(ran).toEqual(['PickPlace']);
     const pts = RDK.AddPoints([[0, 0, 0], [1, 1, 1]]);
     expect((pts.item as SceneObject).points.length).toBe(2);
-    RDK.AddPoints([[2, 2, 2]], pts);
+    RDK.AddPoints([[2, 2, 2]], pts, true); // add_to_ref
     expect((pts.item as SceneObject).points.length).toBe(3);
     const holder = RDK.AddFolder('Curves');
     const curve = RDK.AddCurve([[0, 0, 0], [10, 0, 0]], holder);
     expect(curve.Parent().item).toBe(holder.item);
-    RDK.AddCurve([[0, 0, 0], [0, 10, 0]], curve);
+    RDK.AddCurve([[0, 0, 0], [0, 10, 0]], curve, true); // add_to_ref
     expect((curve.item as SceneObject).curves.length).toBe(2);
     const registered: string[] = [];
     RDK.assetsRegister = (id) => registered.push(id);
-    const shape = RDK.AddShape([[0, 0, 0, 10, 0, 0, 0, 10, 0]], holder, 'Tri');
+    const shape = RDK.AddShape([[0, 0, 0, 10, 0, 0, 0, 10, 0]], holder, false, 'Tri');
     expect(registered.length).toBe(1);
     expect(shape.Name()).toBe('Tri');
     // merge objects with curves; empty merge is invalid
@@ -534,7 +550,7 @@ describe('Robolink: station-level API', () => {
     RDK.setPoses([f], [robomath.transl(1, 2, 3)]);
     expect(f.Pose().Pos()).toEqual([1, 2, 3]);
     RDK.ShowSequence([[0, -100, 110, -100, -90, 10]]);
-    expect(robot.Joints()[5]).toBe(10);
+    expect(robot.Joints()[5]).toBe(5); // ShowSequence displays ghosts; the robot does not move (RoboDK)
     let shown: number[][] = [];
     RDK.onShowSequence = (_r, rows) => { shown = rows; };
     RDK.ShowSequence([[1, 2, 3, 4, 5, 6]]);
@@ -551,12 +567,17 @@ describe('Robolink: station-level API', () => {
     expect(st.getParam('cmd:Trace')).toBe('On');
     expect(RDK.Version()).toMatch(/RoboDK API compatible/);
     expect(RDK.License()[1]).toBe('MIT');
-    expect(RDK.Save('x.rdk').length).toBeGreaterThan(100);
-    expect(RDK.Save('x.rdk', f)).toContain('Bulk');
+    expect((RDK.Save() as string).length).toBeGreaterThan(100);
+    expect(RDK.Save('', f)).toContain('Bulk');
+    const saved: Array<{ name: string; content: any }> = [];
+    RDK.onGeneratedFiles = (files) => saved.push(...files);
+    RDK.Save('dir/x.rdk');
+    expect(saved[0].name).toBe('x.rdk');
+    expect(JSON.parse(saved[0].content).station.name).toBe(st.name);
     RDK.setRunMode(RL.RUNMODE_RUN_ROBOT);
     expect(RDK.RunMode()).toBe(RL.RUNMODE_RUN_ROBOT);
     RDK.setSimulationSpeed(5);
-    expect(RDK.SimulationSpeed()).toBe(1);
+    expect(RDK.SimulationSpeed()).toBe(5);
     RDK.setSimulationTime(12);
     expect(RDK.SimulationTime()).toBe(12);
     expect(st.simTime).toBe(12);
@@ -566,7 +587,7 @@ describe('Robolink: station-level API', () => {
     expect(RDK.SimulationTime()).toBe(4);
     RDK.Finish();
     RDK.Disconnect();
-    expect(RDK.Connect()).toBe(true);
+    expect(RDK.Connect()).toBe(1);
     // flags / window / view / stations hooks
     expect(RDK.getFlagsRoboDK()).toBe(RL.FLAG_ROBODK_ALL);
     const win: Array<[string, any]> = [];
@@ -616,14 +637,13 @@ describe('Robolink: station-level API', () => {
     expect([c.fov, c.far, c.near]).toEqual([30, 4000, 1]);
     expect(RDK.Cam2D_SetParams('FOV=20', cam)).toBe(true);
     expect(c.fov).toBe(20);
-    expect(RDK.Cam2D_Snapshot()).toBe('');
-    RDK.onSnapshot = (item, w, h) => `png:${item.name}:${w}x${h}`;
-    expect(RDK.Cam2D_Snapshot('', cam)).toBe('png:Camera:320x240');
-    expect(RDK.Cam2D_Snapshot()).toBe('png:Camera:320x240');
+    // Cam2D_Snapshot('') returns the encoded image bytes (RoboDK); details are covered by the vision tests (T9)
+    const png = RDK.Cam2D_Snapshot('', cam) as Uint8Array;
+    expect(Array.from(png.slice(1, 4))).toEqual([80, 78, 71]); // "PNG"
     expect(RDK.Cam2D_Close(cam)).toBe(true);
     expect(cam.Valid()).toBe(false);
     expect(RDK.Cam2D_SetParams('FOV=10')).toBe(false);
-    expect(RDK.Cam2D_Snapshot()).toBe('');
+    expect((RDK.Cam2D_Snapshot() as Uint8Array).length).toBe(0);
     const cam2 = RDK.Cam2D_Add(new RobolinkItem(RDK, null));
     expect(cam2.Parent().item).toBe(st);
     expect(RDK.Cam2D_Close()).toBe(true);
@@ -631,12 +651,16 @@ describe('Robolink: station-level API', () => {
     // measurement helpers
     const xyz = RDK.LaserTracker_Measure();
     expect(xyz.length).toBe(3);
-    const tcp = robot.PoseAbs().Pos();
+    const tcp = Array.from((robot.item as Robot).poseTCPAbs().slice(12, 15)); // PoseAbs of a robot is its base (RoboDK)
+    expect(robot.PoseAbs().Pos()).toEqual(Array.from((robot.item as Robot).poseAbs().slice(12, 15)));
     expect(Math.hypot(xyz[0] - tcp[0], xyz[1] - tcp[1], xyz[2] - tcp[2])).toBeLessThan(5);
     const [mp, ok] = RDK.MeasurePose();
-    expect(ok).toBe(1);
+    expect(ok).toEqual([1]);
     expect(Math.abs(mp.Pos()[2] - tcp[2])).toBeLessThan(5);
-    expect(RDK.StereoCamera_Measure()[1]).toBe(1);
+    const stereo = RDK.StereoCamera_Measure();   // [Href, Htcp, n ref, n tcp, time ms, status]
+    expect(stereo.length).toBe(6);
+    expect(stereo[5]).toBe(0);
+    expect(Math.abs(stereo[1].Pos()[2] - tcp[2])).toBeLessThan(5);
     const q = robot.Joints();
     const ref = RDK.Calibrate_Reference([q, q.map((v, i) => (i === 0 ? v + 10 : v)), q.map((v, i) => (i === 1 ? v + 10 : v))], RL.CALIBRATE_FRAME_3P_P1_ORIGIN, true, robot);
     expect(ref.Pos().every((v) => Number.isFinite(v))).toBe(true);
@@ -651,7 +675,7 @@ describe('Robolink: station-level API', () => {
     expect(empty.Popup_ISO9283_CubeProgram().Valid()).toBe(false);
     expect(() => empty.Calibrate_Robot([[0, 0, 0, 0, 0, 0, 1, 2, 3]])).toThrow(/No robot/);
     expect(empty.LaserTracker_Measure([1, 2, 3])).toEqual([1, 2, 3]);
-    expect(empty.MeasurePose()[1]).toBe(-1);
+    expect(empty.MeasurePose()[1]).toEqual([-1]);
     expect(empty.Joints()).toEqual([]);
     empty.ShowSequence([[1, 2, 3]]);
     // collisions
@@ -694,7 +718,8 @@ describe('Robolink: station-level API', () => {
     expect(gid).toBeGreaterThan(0);
     expect(RDK.Spray_Add(new RobolinkItem(RDK, null), new RobolinkItem(RDK, null))).toBeGreaterThan(0);
     expect(RDK.Spray_SetState(1, -1)).toBe(1);
-    expect(RDK.Spray_GetStats(-1)[1].length).toBe(6);
+    expect(RDK.Spray_GetStats(-1)[1].length).toBe(2); // one row per spray gun
+    expect(RDK.Spray_GetStats(-1)[1][0].length).toBe(5);
     expect(RDK.Spray_Clear(-1)).toBe(1);
     expect(empty.Spray_Add()).toBe(-1);
     // events & plugins
@@ -734,9 +759,9 @@ describe('Robolink: station-level API', () => {
     (part.item as SceneObject).curves = [{ name: 'rapid', points: [[0, 0, 20], [0, 0, 0]], kind: 'rapid' } as any, { name: 'cut', points: [[0, 0, 0], [40, 0, 0], [40, 40, 0]], kind: 'cut' } as any];
     part.setPose(robomath.transl(400, 0, 250).mul(robomath.rotx(180 * DEG)));
     const proj = RDK.AddMachiningProject('Mill', r);
-    const [, points, unreachable] = proj.setMachiningParameters('part.nc', part, 'Approach=20 Speed=15 SpindleIO=Spindle RotZ=0 Rounding=2');
-    expect(points).toBeGreaterThan(0);
-    expect(unreachable).toBe(0);
+    const [mprog, mstatus] = proj.setMachiningParameters('part.nc', part, 'Approach=20 Speed=15 SpindleIO=Spindle RotZ=0 Rounding=2');
+    expect(mprog.InstructionCount()).toBeGreaterThan(0);
+    expect(mstatus).toBe(0);                     // RoboDK: 0 = path fully reachable
     expect(proj.getParam('machiningStats')).toMatchObject({ cutLength: expect.any(Number) });
     const pid = String(proj.getParam('programId'));
     expect(st.findById(pid)).toBeInstanceOf(Program);
@@ -761,11 +786,11 @@ describe('JSON-RPC layer', () => {
     const r4 = executeRpc(RDK, { id: 4, method: 'setPoseFrame', target: id, params: [{ $item: null }] });
     expect(r4.error).toBeUndefined();
     const r5 = executeRpc(RDK, { id: 5, method: 'Name', target: 'does-not-exist' });
-    expect(r5.result).toBe('');
+    expect(r5.error).toMatch(/Invalid item/); // RoboDK raises for calls on invalid items
     const r6 = executeRpc(RDK, { id: 6, method: 'setName', target: 'does-not-exist', params: ['x'] });
     expect(r6.error).toMatch(/Invalid item/);
     const r7 = executeRpc(RDK, { id: 7, method: 'JointLimits', target: id });
-    expect(r7.result.length).toBe(2);
+    expect(r7.result.length).toBe(3); // [lower, upper, joints type]
     const r8 = executeRpc(RDK, { id: 8, method: 'MachiningParameters', target: id });
     expect(r8.result).toMatchObject({ ncfile: undefined });
     const r9 = executeRpc(RDK, { id: 9, method: 'Calibrate_Reference', params: [[[0, 0, 0], [1, 0, 0], [0, 1, 0]]] });
@@ -792,7 +817,7 @@ describe('JSON-RPC layer', () => {
     expect(executeRpc(RDK, { id: 18, method: '__app__', params: ['ctl.pose'] }, { app }).result.$pose.length).toBe(4);
     const a4 = await executeRpcAsync(RDK, { id: 19, method: '__app__', params: ['ctl.fail'] }, { app });
     expect(a4.error).toBe('boom');
-    expect(executeRpc(RDK, { id: 20, method: '__app__', params: ['ctl.value'] }).error).toMatch(/Unknown method/);
+    expect(executeRpc(RDK, { id: 20, method: '__app__', params: ['ctl.value'] }).error).toMatch(/needs the browser/);
   });
 });
 
@@ -831,7 +856,8 @@ describe('studio server WebSocket bridge (browser side)', () => {
     expect(received[2]).toMatchObject({ id: 2 });
     expect(robot.Joints()[5]).toBe(33);
     await until(() => app.snapshot.mock.calls.length >= 1);
-    expect(app.previewProgram).toHaveBeenCalled();
+    // C3: recompiling the preview after API calls cancelled RunProgram playback; the bridge must not do it
+    expect(app.previewProgram).not.toHaveBeenCalled();
     s.send(JSON.stringify({ id: 3, method: 'WaitForEvent', params: [0.01] }));
     await until(() => received.length >= 4);
     expect(received[3]).toEqual({ id: 3, result: null });

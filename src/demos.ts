@@ -8,7 +8,12 @@ import { FleetItem, FleetManager } from './fleet/fleet';
 import { FieldItem, MissionItem, cropParams } from './agri/items';
 import { generateOrchard, buildFieldMap, rectPolygon, makeHeadlandZones, makeCanopyZones } from './agri/orchard';
 import { planMission } from './agri/missions';
-import { makeConveyor, makeFeeder, makeProcess, makeSink, makeBuffer } from './vc/component';
+import { buildGreenhouse, useRails } from './agri/greenhouse';
+import { mountArmOnLift, addLiftColumn, generateHarvestProgram } from './agri/harvest';
+import { Robot } from './core/items/robot';
+import { CropRow } from './agri/items';
+import { makeConveyor, makeFeeder, makeProcess, makeSink, makeBuffer, Component } from './vc/component';
+import { multiply, invert } from './core/math/pose';
 
 export interface Demo { id: string; name: string; description: string; build: () => Station }
 
@@ -89,17 +94,63 @@ function packingLine(): Station {
   (feeder.behaviour as any).next = c1.id;
   (c1.behaviour as any).next = grader.id;
   (grader.behaviour as any).next = c2.id;
-  (c2.behaviour as any).next = buffer.id;
   (buffer.behaviour as any).next = sink.id;
-  // palletizing robot next to the pallet
+  (buffer.behaviour as any).releaseWhenFull = true; // the pallet goes to the truck when complete
+  // palletizing robot between the conveyor end and the pallet: it picks every crate at the conveyor end and stacks it
+  // on the pallet slot of the buffer grid (robot-driven transfer, the crate rides on the gripper)
   const robot = st.addChild(createRobotFromLibrary('KUKA_KR16_R2010', 'Palletizer'));
-  robot.setPose(transl(3000, 900, 0));
+  robot.setPose(transl(3300, 300, 0));
   const tool = robot.addChild(new Tool('Crate gripper'));
   tool.setPoseTool(transl(0, 0, 250));
   robot.setTool(tool);
+  palletizerCell(st, robot, c2, buffer);
   const floor = st.addChild(new SceneObject('Floor marking'));
   floor.geometry = [{ primitive: { kind: 'box', size: [16000, 6000, 10] }, origin: Array.from(transl(0, 0, -5)), color: '#343a40' }];
   return st;
+}
+
+/**
+ * Palletizer cell bound to the process flow: joint targets by IK for the pick at the conveyor end and the 12 pallet
+ * slots (gripper on the crate top, approach 300 mm above), a robot-driven transfer component between the conveyor and
+ * the pallet buffer, an end-of-conveyor sensor (part_at_pick) and the equivalent robot program "Palletize" (MoveJ /
+ * MoveL / SetDO, exportable with the robot's post).
+ */
+function palletizerCell(st: Station, robot: ReturnType<typeof createRobotFromLibrary>, conveyor: Component, pallet: Component): Component {
+  const g = (pallet.behaviour as any).grid as { cols: number; rows: number; layers: number; pitch: [number, number, number] };
+  const crateH = 250;
+  const tcpAt = (base: Float64Array, up: number) => multiply(base, mul(transl(0, 0, crateH + up), rotx(180 * DEG)));
+  const home = robot.jointsHome();
+  const ik = (pose: Float64Array, seed: number[] = home) => { const r = robot.solveIK(multiply(invert(robot.poseAbs()), pose), { restarts: 4, seed }); if (!r.ok) throw new Error('palletizer cell: unreachable target'); return r.joints; };
+  const end = conveyor.conveyorPoseAt(conveyor.conveyorLength());
+  const pickAbove = ik(tcpAt(end, 300)), pick = ik(tcpAt(end, 0), pickAbove);
+  const n = (pallet.behaviour as any).capacity as number;
+  const slots = Array.from({ length: n }, (_, i) => multiply(pallet.poseAbs(), transl((i % g.cols) * g.pitch[0], (Math.floor(i / g.cols) % g.rows) * g.pitch[1], Math.floor(i / (g.cols * g.rows)) * g.pitch[2])));
+  const placeAbove = slots.map((s) => ik(tcpAt(s, 300))), place = slots.map((s, i) => ik(tcpAt(s, 0), placeAbove[i]));
+  const cell = st.addChild(new Component('Palletizer cell', { type: 'transfer', enabled: true, robotId: robot.id, from: null, next: pallet.id, cycleTime: 8, motion: { home: pickAbove, pickAbove, pick, placeAbove, place } } as any));
+  (conveyor.behaviour as any).next = cell.id;
+  robot.setJoints(pickAbove);
+  const sensor = st.addChild(new Component('Pick sensor', { type: 'sensor', enabled: true, signal: 'part_at_pick', range: 150 } as any));
+  sensor.setPoseAbs(end);
+  // the same cycle as a robot program
+  const frame = st.addChild(new Frame('Palletizer targets'));
+  const jt = (name: string, q: number[]) => { const t = frame.addChild(new Target(name)); t.setJoints(q); t.setAsJointTarget(); return t; };
+  const prog = st.addChild(new Program('Palletize'));
+  prog.setRobot(robot);
+  prog.setSpeed(1500, 150);
+  const tA = jt('Pick above', pickAbove), tP = jt('Pick', pick);
+  prog.addMoveJ(tA);
+  for (let i = 0; i < n; i++) {
+    prog.comment(`crate ${i + 1}: the cell waits for part_at_pick (process flow), gripper = signal "Palletizer cell.gripper"`);
+    prog.addMoveL(tP);
+    prog.setDO('gripper', 1);
+    prog.addMoveL(tA);
+    prog.addMoveJ(jt(`Slot ${i + 1} above`, placeAbove[i]));
+    prog.addMoveL(jt(`Slot ${i + 1}`, place[i]));
+    prog.setDO('gripper', 0);
+    prog.addMoveL(jt(`Slot ${i + 1} retract`, placeAbove[i]));
+    prog.addMoveJ(tA);
+  }
+  return cell;
 }
 
 function orchard(): Station {
@@ -126,9 +177,12 @@ function orchard(): Station {
     m.setPose2D(-6000, 14000 + i * 4000, 0);
     m.home = { x: -6000, y: 14000 + i * 4000, theta: 0 };
     fm.addRobot(m);
-    // a picking arm on each platform
+    // a picking arm on each platform, on a telescopic lift column at the row-side edge (arm base 1.4–3.5 m above the
+    // ground: with the UR10e's 1.3 m reach it covers the 0.6–4.3 m tall spindle canopy from the alley)
     const arm = m.addChild(createRobotFromLibrary('UR10e', `Arm ${i + 1}`));
     arm.setPose(mul(transl(0, -900, 1400), rotz(-90 * DEG)));
+    mountArmOnLift(arm, 2100);
+    addLiftColumn(arm, 4, 85);
     const g = arm.addChild(new Tool('Soft gripper'));
     g.toolKind = 'gripper';
     g.setPoseTool(transl(0, 0, 180));
@@ -147,15 +201,58 @@ function orchard(): Station {
   mission.fieldId = field.id;
   mission.fleetId = fleet.id;
   mission.rowIds = field.rows().slice(0, 4).map((r) => r.id);
-  mission.settings = { workSpeed: 400, bothSides: true, sideOffset: field.crop.rowSpacing / 2, secondsPerFruit: 4 };
+  // the arms move to every fruit they pick (IK per fruit, lift + joint motion; src/agri/process.ts)
+  mission.settings = { workSpeed: 400, bothSides: true, sideOffset: field.crop.rowSpacing / 2, secondsPerFruit: 4, animateArm: true };
   try { planMission(st, mission, fm); } catch { /* fleet may be empty */ }
-  const scoutMission = st.addChild(new MissionItem('Spray rows 5-8'));
-  scoutMission.missionType = 'spray';
-  scoutMission.fieldId = field.id;
-  scoutMission.fleetId = fleet.id;
-  scoutMission.rowIds = field.rows().slice(4, 8).map((r) => r.id);
-  scoutMission.settings = { workSpeed: 1500, bothSides: false, sideOffset: field.crop.rowSpacing / 2 };
+  const sprayMission = st.addChild(new MissionItem('Spray rows 5-8'));
+  sprayMission.missionType = 'spray';
+  sprayMission.fieldId = field.id;
+  sprayMission.fleetId = fleet.id;
+  sprayMission.rowIds = field.rows().slice(4, 8).map((r) => r.id);
+  sprayMission.settings = { workSpeed: 1500, bothSides: false, sideOffset: field.crop.rowSpacing / 2, tankL: 400 };
+  try { planMission(st, sprayMission, fm); } catch { /* fleet may be empty */ }
+  addHarvestStopProgram(st, fleet);
   return st;
+}
+
+/**
+ * A program to run with ▶ next to the fleet missions: the first picking platform drives into the row of the first
+ * harvest task, stops, its arm picks the fruit within reach (the called arm program; a fruit leaves the plant when the
+ * gripper closes on it) and the platform drives home. The stop along the row is the one with the most reachable fruit.
+ */
+function addHarvestStopProgram(st: Station, fleet: FleetItem): void {
+  const task = fleet.tasks.find((t) => t.type === 'harvest' && t.workPath && t.workPath.length >= 2);
+  const mob = [...st.walk()].find((i) => i instanceof MobileRobot && i.children.some((c) => c instanceof Robot)) as MobileRobot | undefined;
+  const arm = mob?.children.find((c) => c instanceof Robot) as Robot | undefined;
+  const row = task ? (st.findById(String(task.meta?.rowId ?? '')) as CropRow | null) : null;
+  if (!task || !mob || !arm || !row) return;
+  const [a, b] = task.workPath!;
+  const L = Math.hypot(b[0] - a[0], b[1] - a[1]);
+  const heading = task.goalHeading ?? (Math.atan2(b[1] - a[1], b[0] - a[0]) * 180) / Math.PI;
+  const home = { x: mob.home?.x ?? mob.state.x, y: mob.home?.y ?? mob.state.y, theta: mob.home?.theta ?? 0 };
+  const q0 = arm.joints();
+  let best: { stop: [number, number]; picked: number } | null = null;
+  for (const d of [3000, 6000, 9000, 12000]) {
+    if (d > L - 1000) break;
+    const stop: [number, number] = [a[0] + ((b[0] - a[0]) * d) / L, a[1] + ((b[1] - a[1]) * d) / L];
+    mob.setPose2D(stop[0], stop[1], heading);
+    arm.setJoints(q0);
+    const r = generateHarvestProgram(st, arm, [row], { limit: 8 });
+    if (!best || r.picked > best.picked) best = { stop, picked: r.picked };
+  }
+  if (!best || !best.picked) { mob.setPose2D(home.x, home.y, home.theta); arm.setJoints(q0); return; }
+  // regenerate at the chosen stop (the program and its target frame are reused by name)
+  mob.setPose2D(best.stop[0], best.stop[1], heading);
+  arm.setJoints(q0);
+  const pick = generateHarvestProgram(st, arm, [row], { limit: 8 }).program;
+  mob.setPose2D(home.x, home.y, home.theta);
+  arm.setJoints(q0);
+  const prog = st.addChild(new Program(`Harvest stop ${mob.name}`));
+  prog.setRobot(mob);
+  prog.comment(`Drive into the row, pick the fruit within reach with ${arm.name}, drive home`);
+  prog.navigateTo(best.stop[0], best.stop[1], heading);
+  prog.callProgram(pick);
+  prog.navigateTo(home.x, home.y, home.theta);
 }
 
 function greenhouse(): Station {
@@ -166,18 +263,28 @@ function greenhouse(): Station {
   field.crop = cropParams('tomato', { rowHeading: 0, headland: 4000, ripeFraction: 0.35 });
   generateOrchard(field, 5);
   st.addChild(buildFieldMap(field, 200));
+  // gutters, heating-pipe rails in every path, concrete corridor across the row heads; trolleys run on the rails only
+  const house = buildGreenhouse(st, field);
+  const [cA, cB] = house.network.corridor;
   const fleet = st.addChild(new FleetItem('Pipe-rail trolleys'));
   const fm = new FleetManager(st, fleet);
   for (let i = 0; i < 2; i++) {
     const m = st.addChild(new MobileRobot(`Rail trolley ${i + 1}`));
-    Object.assign(m.kin, { drive: 'differential', wheelBase: 900, track: 550, wheelRadius: 120, maxSpeed: 800, footprint: [1400, 700, 900] });
+    Object.assign(m.kin, { drive: 'differential', wheelBase: 900, track: 550, wheelRadius: 120, maxSpeed: 800, footprint: [1400, 700, 500] });
     m.capabilities = ['harvest', 'prune', 'scout'];
     m.color = '#f08c00';
-    m.setPose2D(-3000, 3000 + i * 3000, 0);
-    m.home = { x: -3000, y: 3000 + i * 3000, theta: 0 };
+    // parked on the corridor axis beyond its south end, facing the corridor
+    const hy = Math.min(cA[1], cB[1]) - 1200 - i * 1800;
+    m.setPose2D(cA[0], hy, 90);
+    m.home = { x: cA[0], y: hy, theta: 90 };
+    useRails(m, house.network);
     fm.addRobot(m);
+    // turret arm on a telescopic lift column on the trolley deck (arm base 0.5–3.0 m: the UR5e reaches the 0.3–3.2 m
+    // crop of both rows of the path)
     const arm = m.addChild(createRobotFromLibrary('UR5e', `Picker ${i + 1}`));
-    arm.setPose(mul(transl(0, 0, 900), rotz(-90 * DEG)));
+    arm.setPose(mul(transl(0, 0, 500), rotz(-90 * DEG)));
+    mountArmOnLift(arm, 2500);
+    addLiftColumn(arm, 6, 70);
     const g = arm.addChild(new Tool('Cutter gripper'));
     g.toolKind = 'shears';
     g.setPoseTool(transl(0, 0, 150));
@@ -190,8 +297,9 @@ function greenhouse(): Station {
   mission.missionType = 'harvest';
   mission.fieldId = field.id;
   mission.fleetId = fleet.id;
-  mission.settings = { workSpeed: 300, bothSides: true, sideOffset: field.crop.rowSpacing / 2, secondsPerFruit: 5 };
+  mission.settings = { workSpeed: 300, bothSides: true, sideOffset: field.crop.rowSpacing / 2, secondsPerFruit: 5, animateArm: true };
   try { planMission(st, mission, fm); } catch { /* ignore */ }
+  addHarvestStopProgram(st, fleet);
   return st;
 }
 
@@ -257,13 +365,35 @@ function verticalBot(): Station {
   const home = pallet.addChild(new Target('Home'));
   home.setJoints(arm.jointsHome());
   home.setAsJointTarget();
+  // 4 cartons on the pick table opposite the pallet: picked by the suction cup and stacked on the pallet
+  const table = st.addChild(new Frame('Pick table'));
+  table.setPose(transl(0, -1500, 150));
+  const tableObj = table.addChild(new SceneObject('Table top'));
+  tableObj.geometry = [{ primitive: { kind: 'box', size: [1200, 800, 150] }, origin: Array.from(transl(0, 0, -75)), color: '#868e96' }];
+  const boxH = 200;
+  const slot = (i: number) => [-450 + (i % 2) * 400 + 200, -250 + Math.floor(i / 2) * 400 + 50];
   prog.addMoveJ(home);
   for (let i = 0; i < 4; i++) {
-    const t = pallet.addChild(new Target(`Place ${i + 1}`));
-    t.setPose(mul(transl(-450 + (i % 2) * 400, -250 + Math.floor(i / 2) * 400, 350), rotx(180 * DEG)));
+    const [sx, sy] = slot(i);
+    const box = table.addChild(new SceneObject(`Box ${i + 1}`));
+    box.geometry = [{ primitive: { kind: 'box', size: [300, 300, boxH] }, origin: Array.from(transl(0, 0, boxH / 2)), color: ['#e8590c', '#2f9e44', '#1971c2', '#f08c00'][i] }];
+    box.setPose(transl(sy, sx, 0));
+    const pa = table.addChild(new Target(`Pick ${i + 1} above`)); pa.setPose(mul(transl(sy, sx, boxH + 250), rotx(180 * DEG)));
+    const pk = table.addChild(new Target(`Pick ${i + 1}`)); pk.setPose(mul(transl(sy, sx, boxH), rotx(180 * DEG)));
+    const ta = pallet.addChild(new Target(`Place ${i + 1} above`)); ta.setPose(mul(transl(sx, sy, boxH + 250), rotx(180 * DEG)));
+    const t = pallet.addChild(new Target(`Place ${i + 1}`)); t.setPose(mul(transl(sx, sy, boxH), rotx(180 * DEG)));
+    // joint moves (a 4-axis palletizer keeps the cup vertical; the approach is a short vertical joint move)
+    prog.addMoveJ(pa);
+    prog.addMoveJ(pk);
+    prog.event('attach', box.id);
+    prog.pause(300);
+    prog.addMoveJ(pa);
+    prog.addMoveJ(ta);
     prog.addMoveJ(t);
+    prog.event('detach', box.id);
     prog.event('gripper_open');
     prog.pause(300);
+    prog.addMoveJ(ta);
   }
   prog.addMoveJ(home);
   st.addChild(new SceneObject('Note: import vertical_robot_model/urdf + meshes via File > Open to replace the placeholder kinematics'));
@@ -331,7 +461,7 @@ export const demos: Demo[] = [
   { id: 'tutorial', name: 'Tutorial — first station (UR5e)', description: 'The station built in the documentation tutorial: UR5e on a pedestal, table frame, part and bin, gripper, pick-and-place program. Follow docs › Getting started › Your first station.', build: tutorialCell },
   { id: 'welding', name: 'Multi-robot welding cell', description: 'Two robots with torches following a seam on a fixture; positioner as external axis.', build: weldingCell },
   { id: 'packing', name: 'Packing line (process flow)', description: 'Visual-Components-style feeder → conveyor → grader (with failures) → conveyor → pallet buffer → truck. Start the world clock.', build: packingLine },
-  { id: 'orchard', name: 'Apple orchard with harvesting fleet', description: 'Field with rows/trees/fruit, occupancy map, 3 tracked platforms with UR10e arms and a sprayer; harvest + spray missions. Start the world clock and watch the fleet.', build: orchard },
-  { id: 'greenhouse', name: 'Greenhouse tomato gutters', description: 'Indoor gutters with pipe-rail trolleys carrying UR5e pickers.', build: greenhouse },
+  { id: 'orchard', name: 'Apple orchard with harvesting fleet', description: 'Field with rows/trees/fruit, occupancy map, 3 tracked platforms with UR10e arms on lift columns and a sprayer; harvest + spray missions (the arms move to every fruit they pick). Start the world clock and watch the fleet.', build: orchard },
+  { id: 'greenhouse', name: 'Greenhouse tomato gutters', description: 'Indoor gutters with pipe-rail trolleys carrying UR5e pickers on lift columns (the arms move to every fruit they pick).', build: greenhouse },
   { id: 'verticalbot', name: 'VerticalBot palletizer (this repo)', description: 'Placeholder for the vertical_bot_ros palletizer on an omni base. Import the URDF + meshes for exact geometry; export with the ROS 2 post.', build: verticalBot },
 ];

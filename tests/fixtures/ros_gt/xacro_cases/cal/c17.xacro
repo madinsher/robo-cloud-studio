@@ -1,0 +1,4 @@
+<?xml version="1.0"?>
+<robot name="r" xmlns:xacro="http://www.ros.org/wiki/xacro">
+<xacro:macro name="outer" params="a"><xacro:macro name="inner" params="b"><i b="${b}" a="${a}"/></xacro:macro><xacro:inner b="${a*2}"/></xacro:macro><xacro:outer a="3"/><xacro:inner b="1"/>
+</robot>

@@ -1,0 +1,3 @@
+error: Undefined substitution argument name
+when processing file: /home/madin/t5gt/prefix/share/webots_ros2_universal_robot/resource/Universal_Robots_ROS2_Driver/ur_description/urdf/ur.urdf.xacro
+included from: resource/ur5e_with_gripper.urdf.xacro

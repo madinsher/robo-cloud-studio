@@ -1,0 +1,1 @@
+<robot name="t" xmlns:xacro="http://www.ros.org/wiki/xacro"><xacro:macro name="m" params="parent xyz:='0 -2.5 0.95' rpy:='0 0 -1.57'"><link name="c"/><joint name="j" type="fixed"><parent link="${parent}"/><child link="c"/><origin xyz="${xyz}" rpy="${rpy}"/></joint></xacro:macro><link name="b"/><xacro:m parent="b"/></robot>

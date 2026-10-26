@@ -1,0 +1,4 @@
+<?xml version="1.0"?>
+<robot name="r" xmlns:xacro="http://www.ros.org/wiki/xacro">
+<xacro:macro name="m" params="parent xyz:='0 -2.5 0.95' rpy:=&quot;0 0 1&quot; n:=5 s:=abc b:=true f:=1.50 e:=^|7 *blk **mb"><o xyz="${xyz}" rpy="${rpy}" n="${n}" s="${s}" b="${b}" f="${f}" e="${e}" t="${b == 'true'}"><xacro:insert_block name="blk"/><xacro:insert_block name="mb"/></o></xacro:macro><xacro:property name="e" value="9"/><xacro:m parent="p"><first k="${e}"/><mb><c1/><c2/></mb></xacro:m>
+</robot>

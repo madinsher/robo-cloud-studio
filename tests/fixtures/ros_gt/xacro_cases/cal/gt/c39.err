@@ -1,0 +1,6 @@
+error: circular variable definition: a -> b -> a
+Consider disabling lazy evaluation via lazy_eval="false" 
+when evaluating expression 'a' 
+when evaluating expression 'b' 
+when evaluating expression 'a'
+when processing file: c39.xacro

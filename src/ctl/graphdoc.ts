@@ -6,17 +6,19 @@
  */
 import type { AutomatonSpec, Transition } from './des';
 import type { PetriNetSpec, PlaceKind } from './petri';
-import type { DesDoc, ActionBinding } from './dsl';
+import type { DesDoc, ActionBinding, SensorSpec } from './dsl';
 
 export type XY = [number, number];
 export type Layout = Record<string, XY>;
-export interface PetriDoc { spec: PetriNetSpec; checks: DesDoc['checks']; horizon: number; layout: Layout; actions: ActionBinding[] }
+export interface PetriDoc { spec: PetriNetSpec; checks: DesDoc['checks']; horizon: number; layout: Layout; actions: ActionBinding[]; finals?: Array<Record<string, number>>; sensors?: SensorSpec[]; blackboard?: Record<string, string | number | boolean> }
 
 const fmtNum = (v: number) => Number(v.toFixed(1)).toString();
 const q = (s: string) => (/\s/.test(s) ? `"${s}"` : s);
 const checkLine = (c: { kind: 'ltl' | 'ctl'; formula: string; name?: string }) => `check ${c.kind}${c.name ? ` "${c.name}"` : ''} ${c.formula}`;
 const qv = (v: string | number | boolean) => (typeof v === 'string' && /\s/.test(v) ? `"${v}"` : String(v));
-export const actionLine = (a: ActionBinding) => `action ${a.target} ${a.kind}=${qv(a.value)}${a.robot ? ` robot=${qv(a.robot)}` : ''}${a.component ? ` component=${qv(a.component)}` : ''}${a.done ? ` done=${a.done}` : ''}${Object.entries(a.args).map(([k, v]) => ` ${k}=${qv(v)}`).join('')}`;
+export const bindingText = (a: Omit<ActionBinding, 'target'>) => `${a.kind}=${qv(a.value)}${a.robot ? ` robot=${qv(a.robot)}` : ''}${a.component ? ` component=${qv(a.component)}` : ''}${a.done ? ` done=${a.done}` : ''}${a.fail ? ` fail=${a.fail}` : ''}${a.timeout !== undefined ? ` timeout=${a.timeout}` : ''}${Object.entries(a.args).map(([k, v]) => ` ${k}=${qv(v)}`).join('')}`;
+export const actionLine = (a: ActionBinding) => `action ${a.target} ${bindingText(a)}`;
+const qe = (e: string) => `"${e.replace(/"/g, "'")}"`;
 /** Set (or remove with null) the action bound to a state / transition. */
 export function setAction(list: ActionBinding[], target: string, binding: Omit<ActionBinding, 'target'> | null): void {
   const i = list.findIndex((a) => a.target === target);
@@ -74,8 +76,48 @@ export function desToDsl(doc: DesDoc): string {
   if (doc.faults.length) out.push(`faults ${doc.faults.join(' ')}`);
   for (const c of doc.checks) out.push(checkLine(c));
   for (const a of doc.actions ?? []) out.push(actionLine(a));
+  for (const [ev, g] of Object.entries(doc.guards ?? {})) out.push(`guard ${ev} ${qe(g)}`);
+  for (const s of doc.sensors ?? []) out.push(`sensor ${s.event} ${qe(s.expr)}`);
+  if (doc.blackboard && Object.keys(doc.blackboard).length) out.push(`blackboard ${Object.entries(doc.blackboard).map(([k, v]) => `${k}=${qv(v)}`).join(' ')}`);
+  if (doc.terminate) out.push(`terminate ${doc.terminate}`);
   for (const [auto, L] of Object.entries(doc.layout ?? {})) { const entries = Object.entries(L); if (entries.length) out.push(`layout ${q(auto)} ${entries.map(([s, p]) => `${s}=${fmtNum(p[0])},${fmtNum(p[1])}`).join(' ')}`); }
   return out.join('\n');
+}
+
+/** Sensor lines as editable text: `event "expression"; …` (diagram inspector). */
+export function sensorsText(list: SensorSpec[] | undefined): string { return (list ?? []).map((s) => `${s.event} "${s.expr.replace(/"/g, "'")}"`).join('; '); }
+export function parseSensorsText(text: string): SensorSpec[] {
+  const out: SensorSpec[] = [];
+  for (const part of text.split(';').map((x) => x.trim()).filter(Boolean)) {
+    const m = /^(\S+)\s+"([^"]*)"$/.exec(part) ?? /^(\S+)\s+(.+)$/.exec(part);
+    if (!m) throw new Error(`sensor "${part}": event "expression"`);
+    out.push({ event: m[1], expr: m[2].trim() });
+  }
+  return out;
+}
+/** Final markings as editable text: `xA d2; xB a2` (a place, or place=n tokens). */
+export function finalsText(finals: Array<Record<string, number>> | undefined): string { return (finals ?? []).map((f) => Object.entries(f).map(([p, n]) => (n === 1 ? p : `${p}=${n}`)).join(' ')).join('; '); }
+export function parseFinalsText(text: string, places: string[]): Array<Record<string, number>> {
+  return text.split(';').map((x) => x.trim()).filter(Boolean).map((part) => Object.fromEntries(part.split(/\s+/).map((w) => {
+    const [p, n] = w.split('='); if (!places.includes(p)) throw new Error(`final marking: no place ${p}`);
+    const k = n === undefined ? 1 : Number(n); if (!Number.isInteger(k) || k < 0) throw new Error(`final marking: ${w}`);
+    return [p, k];
+  })));
+}
+
+/** Rename an automaton where the document refers to it by name: bindings `A.state` and check atoms `A=state`. */
+export function renameAutomatonRefs(doc: DesDoc, from: string, to: string): void {
+  if (from === to) return;
+  for (const a of doc.actions ?? []) if (a.target.startsWith(`${from}.`)) a.target = `${to}.${a.target.slice(from.length + 1)}`;
+  const re = new RegExp(`(^|[^\\w.:'"])${from.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?=\\s*(?:==|!=|=))`, 'g');
+  for (const c of doc.checks ?? []) c.formula = c.formula.replace(re, `$1${to}`);
+}
+/** Rename a state of automaton `automaton` in check atoms `automaton=state` (bindings are retargeted by the editor). */
+export function renameStateRefs(doc: DesDoc, automaton: string, from: string, to: string): void {
+  if (from === to) return;
+  const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const re = new RegExp(`(^|[^\\w.:'"])(${esc(automaton)}\\s*(?:==|!=|=)\\s*['"]?)${esc(from)}(?![\\w.:])`, 'g');
+  for (const c of doc.checks ?? []) c.formula = c.formula.replace(re, `$1$2${to}`);
 }
 
 export function newAutomaton(name: string): AutomatonSpec { return { name, events: [], initial: 'q0', marked: ['q0'], transitions: [], states: ['q0'] }; }
@@ -118,7 +160,7 @@ export function petriToDsl(doc: PetriDoc): string {
   const { spec } = doc;
   const out = [`petri ${spec.name}${doc.horizon && doc.horizon !== 300 ? ` horizon=${doc.horizon}` : ''}`];
   for (const p of spec.places) out.push(`place ${p.id}${p.tokens ? ` tokens=${p.tokens}` : ''}${p.kind ? ` kind=${p.kind}` : ''}${p.capacity !== undefined ? ` capacity=${p.capacity}` : ''}${p.label ? ` "${p.label}"` : ''}`);
-  for (const t of spec.transitions) out.push(`transition ${t.id}${t.delay !== undefined ? ` delay=${t.delay}` : ''}${t.rate !== undefined ? ` rate=${t.rate}` : ''}${t.immediate ? ' immediate' : ''}${t.weight !== undefined ? ` weight=${t.weight}` : ''}${t.priority !== undefined ? ` priority=${t.priority}` : ''}${t.label ? ` "${t.label}"` : ''}`);
+  for (const t of spec.transitions) out.push(`transition ${t.id}${t.delay !== undefined ? ` delay=${t.delay}` : ''}${t.rate !== undefined ? ` rate=${t.rate}` : ''}${t.immediate ? ' immediate' : ''}${t.weight !== undefined ? ` weight=${t.weight}` : ''}${t.priority !== undefined ? ` priority=${t.priority}` : ''}${t.servers !== undefined ? ` servers=${t.servers}` : ''}${t.on ? ` on=${t.on}` : ''}${t.guard ? ` guard=${qe(t.guard)}` : ''}${t.label ? ` "${t.label}"` : ''}`);
   const isT = new Set(spec.transitions.map((t) => t.id));
   const plain = (a: { weight?: number; inhibitor?: boolean }) => !a.inhibitor && (a.weight === undefined || a.weight === 1);
   for (const t of spec.transitions) {
@@ -130,6 +172,9 @@ export function petriToDsl(doc: PetriDoc): string {
   for (const a of spec.arcs) if (!plain(a) || (!isT.has(a.from) && !isT.has(a.to))) out.push(`arc ${a.from} ${a.inhibitor ? '-o' : '->'} ${a.to}${a.weight !== undefined && a.weight !== 1 ? ` weight=${a.weight}` : ''}`);
   for (const c of doc.checks) out.push(checkLine(c));
   for (const a of doc.actions ?? []) out.push(actionLine(a));
+  for (const f of doc.finals ?? []) out.push(`final ${Object.entries(f).map(([p, n]) => (n === 1 ? p : `${p}=${n}`)).join(' ')}`);
+  for (const s of doc.sensors ?? []) out.push(`sensor ${s.event} ${qe(s.expr)}`);
+  if (doc.blackboard && Object.keys(doc.blackboard).length) out.push(`blackboard ${Object.entries(doc.blackboard).map(([k, v]) => `${k}=${qv(v)}`).join(' ')}`);
   const entries = Object.entries(doc.layout ?? {}); if (entries.length) out.push(`layout ${entries.map(([s, p]) => `${s}=${fmtNum(p[0])},${fmtNum(p[1])}`).join(' ')}`);
   return out.join('\n');
 }
@@ -168,14 +213,14 @@ export const BT_GLYPH: Record<BTNodeType, string> = { sequence: '→', fallback:
 export const isBtLeaf = (n: BTNodeSpec): boolean => n.type === 'action' || n.type === 'condition';
 export const isBtDecorator = (n: BTNodeSpec): boolean => BT_DECORATORS.includes(n.type);
 /** Bindings the mission runtime and the host offer to `action` leaves. */
-export const BT_ACTION_BINDINGS = ['goto', 'halt', 'wait', 'dock', 'undock', 'reach', 'stow', 'grasp', 'place', 'set', 'event', 'report', 'select_target', 'refine_pose', 'program', 'move', 'signal'];
+export const BT_ACTION_BINDINGS = ['goto', 'halt', 'wait', 'dock', 'undock', 'reach', 'stow', 'grasp', 'place', 'set', 'event', 'report', 'select_target', 'refine_pose', 'program', 'move', 'signal', 'await', 'log'];
 
 const btLine = (n: BTNodeSpec, depth: number): string => {
   const ind = '  '.repeat(depth);
   if (isBtLeaf(n)) {
     const fn = n.fn ?? ''; const parts = [n.type, /\s/.test(fn) || fn === '' ? `"${fn}"` : fn];
     if (n.name && n.name !== fn && n.name !== n.type) parts.push(`name=${qv(n.name)}`);
-    for (const [k, v] of Object.entries(n.args ?? {})) if (v !== undefined && v !== null) parts.push(`${k}=${qv(v as string | number | boolean)}`);
+    for (const [k, v] of Object.entries(n.args ?? {})) if (v !== undefined && v !== null) parts.push(`${k === 'name' && (fn === 'program' || fn === 'signal') ? fn : k}=${qv(v as string | number | boolean)}`);
     if (n.timeout !== undefined) parts.push(`timeout=${n.timeout}`);
     if (n.pre) parts.push(`pre="${n.pre}"`); if (n.post) parts.push(`post="${n.post}"`);
     return ind + parts.join(' ');
@@ -211,7 +256,9 @@ export function btWalk(root: BTNodeSpec): Array<{ node: BTNodeSpec; parent: BTNo
 export const btParentOf = (root: BTNodeSpec, node: BTNodeSpec): BTNodeSpec | null => btWalk(root).find((e) => e.node === node)?.parent ?? null;
 export const btIsAncestor = (a: BTNodeSpec, b: BTNodeSpec): boolean => a === b || (a.children ?? []).some((c) => btIsAncestor(c, b));
 export function newBtNode(type: BTNodeType): BTNodeSpec {
-  if (type === 'action') return { type, fn: 'wait', args: { seconds: 1 }, timeout: 5 };
+  // no default timeout: a timeout is a contract the user sets for the bound program / skill (a default shorter than the
+  // program would fail it on every run)
+  if (type === 'action') return { type, fn: 'wait', args: { seconds: 1 } };
   if (type === 'condition') return { type, fn: 'true' };
   const n: BTNodeSpec = { type, name: type, children: [] };
   if (type === 'parallel') n.threshold = 1; if (type === 'retry' || type === 'repeat') n.count = 2; if (type === 'timeout') n.seconds = 10;

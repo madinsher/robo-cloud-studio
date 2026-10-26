@@ -6,3 +6,4 @@ dist-server
 __pycache__/
 coverage/
 test-results/
+undefined/

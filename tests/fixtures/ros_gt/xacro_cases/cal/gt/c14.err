@@ -1,0 +1,2 @@
+error: unknown macro name: xacro:foo
+when processing file: c14.xacro

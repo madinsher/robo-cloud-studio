@@ -1,5 +1,6 @@
-import { Mat4, slerpPose, getPos, distance, rotationAngle, multiply, invert, transformPoint, sub, add, scale, norm, cross, normalize, poseFromZ, RAD, dot } from '../math/pose';
+import { Mat4, slerpPose, multiply, invert, transformPoint, poseFromZ } from '../math/pose';
 import { Robot } from '../items/robot';
+import { planSingle, densify, MotionSettings } from './planner';
 
 export interface TrajectorySample {
   /** Time since motion start (s). */
@@ -54,119 +55,32 @@ export function trapezoid(d: number, v: number, a: number): { duration: number; 
   };
 }
 
-/** Joint-space (MoveJ) trajectory: synchronised trapezoidal profile on the slowest joint. */
+const settingsOf = (speedLinear: number, speedJoints: number, accelLinear: number, accelJoints: number): MotionSettings => ({ speedLinear, speedJoints, accelLinear, accelJoints, rounding: -1 });
+
+/** Joint-space (MoveJ) trajectory: synchronised profile on the slowest joint (per-joint velocity limits honoured). */
 export function planMoveJ(robot: Robot, q0: number[], q1: number[], speedJoints: number, accelJoints: number, dt = 0.02, tool: Mat4 = robot.poseTool()): Trajectory {
-  const n = q0.length;
-  const dq = q1.map((v, i) => v - q0[i]);
-  const dmax = Math.max(...dq.map(Math.abs));
-  const prof = trapezoid(dmax, speedJoints, accelJoints);
-  const samples: TrajectorySample[] = [];
-  let length = 0;
-  let prevPos = getPos(robot.solveFK(q0, tool));
-  const steps = Math.max(1, Math.ceil(prof.duration / dt));
-  for (let k = 0; k <= steps; k++) {
-    const t = (k / steps) * prof.duration;
-    const f = dmax > 1e-9 ? prof.s(t) / dmax : 1;
-    const q = new Array(n);
-    for (let i = 0; i < n; i++) q[i] = q0[i] + dq[i] * f;
-    const pose = robot.solveFK(q, tool);
-    const p = getPos(pose);
-    length += distance(p, prevPos);
-    prevPos = p;
-    samples.push({ t, joints: q, pose });
-  }
-  if (!robot.jointsValid(q1)) return { samples, duration: prof.duration, length, ok: false, error: 'Target joints outside limits' };
-  return { samples, duration: prof.duration, length, ok: true };
+  const m = planSingle(robot, q0, { data: { kind: 'move', moveType: 'MoveJ', targetId: null, joints: q1.slice(0, robot.dof) }, tool, settings: settingsOf(robot.motion.speedLinear, speedJoints, robot.motion.accelLinear, accelJoints) });
+  const tr = densify(m.trajectory, dt);
+  if (!robot.jointsValid(q1)) { tr.ok = false; tr.error = 'Target joints outside limits'; }
+  return tr;
 }
 
-/** Cartesian linear (MoveL) trajectory with IK at each sample. Poses are TCP relative to the robot base. */
+/** Cartesian linear (MoveL) trajectory (adaptive IK knots, densified every dt). Poses are TCP relative to the robot base. */
 export function planMoveL(robot: Robot, q0: number[], p1: Mat4, speedLinear: number, accelLinear: number, dt = 0.02, speedJoints = 180, tool: Mat4 = robot.poseTool()): Trajectory {
-  const p0 = robot.solveFK(q0, tool);
-  const d = distance(getPos(p0), getPos(p1));
-  const ang = rotationAngle(p0, p1);
-  // duration bounded by linear speed and by a nominal rotational speed (deg/s) ~ speedJoints
-  const profLin = trapezoid(d, speedLinear, accelLinear);
-  const profRot = trapezoid(ang * RAD, speedJoints, speedJoints * 4);
-  const duration = Math.max(profLin.duration, profRot.duration, 1e-6);
-  const steps = Math.max(1, Math.ceil(duration / dt));
-  const samples: TrajectorySample[] = [];
-  let q = [...q0];
-  let length = 0;
-  let prevPos = getPos(p0);
-  for (let k = 0; k <= steps; k++) {
-    const t = (k / steps) * duration;
-    // use the dominant profile normalised to [0,1]
-    const f = profLin.duration >= profRot.duration ? (d > 1e-9 ? profLin.s((t / duration) * profLin.duration) / d : k / steps) : (ang > 1e-9 ? profRot.s((t / duration) * profRot.duration) / (ang * RAD) : k / steps);
-    const pose = slerpPose(p0, p1, f);
-    const r = robot.solveIK(pose, { seed: q, restarts: 2, maxIterations: 100, keepFirstSolution: true }, tool);
-    if (!r.ok) {
-      const near = r.posError < 1 && r.rotError < 0.01;
-      return { samples, duration, length, ok: false, error: near ? `MoveL crosses a singularity at ${(f * 100).toFixed(1)}% (residual ${r.posError.toFixed(2)} mm) — start from a non-singular configuration or use MoveJ` : `MoveL unreachable at ${(f * 100).toFixed(1)}% (pos err ${r.posError.toFixed(2)} mm)` };
-    }
-    // detect joint jumps (singularity / configuration flip)
-    const jump = Math.max(...r.joints.map((v, i) => Math.abs(v - q[i])));
-    if (k > 0 && jump > 45) return { samples, duration, length, ok: false, error: `Joint jump of ${jump.toFixed(0)} deg (singularity) at ${(f * 100).toFixed(0)}%` };
-    q = r.joints;
-    const p = getPos(pose);
-    length += distance(p, prevPos);
-    prevPos = p;
-    samples.push({ t, joints: q, pose });
-  }
-  return { samples, duration, length, ok: true };
+  const m = planSingle(robot, q0, { data: { kind: 'move', moveType: 'MoveL', targetId: null, pose: Array.from(p1) }, tool, settings: settingsOf(speedLinear, speedJoints, accelLinear, speedJoints * 4) });
+  return densify(m.trajectory, dt);
 }
 
-/** Circular (MoveC) trajectory through a via pose to a final pose. */
+/** Circular (MoveC) trajectory through a via pose to a final pose (TCP poses relative to the robot base). */
 export function planMoveC(robot: Robot, q0: number[], pVia: Mat4, p1: Mat4, speedLinear: number, accelLinear: number, dt = 0.02, tool: Mat4 = robot.poseTool()): Trajectory {
-  const p0 = robot.solveFK(q0, tool);
-  const A = getPos(p0), B = getPos(pVia), C = getPos(p1);
-  // circumcircle of A,B,C
-  const a = sub(A, C), b = sub(B, C);
-  const axb = cross(a, b);
-  const denom = 2 * dot(axb, axb);
-  if (denom < 1e-9) return planMoveL(robot, q0, p1, speedLinear, accelLinear, dt, 180, tool); // collinear
-  const term = scale(cross(sub(scale(b, dot(a, a)), scale(a, dot(b, b))), axb), 1 / denom);
-  const center = add(C, term);
-  const radius = norm(term);
-  const nrm = normalize(axb);
-  const u = normalize(sub(A, center));
-  const v = cross(nrm, u);
-  const angleOf = (P: [number, number, number]) => {
-    const r = sub(P, center);
-    return Math.atan2(dot(r, v), dot(r, u));
-  };
-  let thB = angleOf(B), thC = angleOf(C);
-  if (thB < 0) thB += 2 * Math.PI;
-  if (thC < 0) thC += 2 * Math.PI;
-  if (thB > thC) {
-    // going the other way round
-    thC -= 2 * Math.PI;
-  }
-  const arc = Math.abs(thC) * radius;
-  const prof = trapezoid(arc, speedLinear, accelLinear);
-  const duration = Math.max(prof.duration, 1e-6);
-  const steps = Math.max(2, Math.ceil(duration / dt));
-  const samples: TrajectorySample[] = [];
-  let q = [...q0];
-  let length = 0, prevPos = A;
-  for (let k = 0; k <= steps; k++) {
-    const t = (k / steps) * duration;
-    const f = arc > 1e-9 ? prof.s(t) / arc : k / steps;
-    const th = thC * f;
-    const pos = add(center, add(scale(u, radius * Math.cos(th)), scale(v, radius * Math.sin(th))));
-    const pose = slerpPose(p0, p1, f);
-    pose[12] = pos[0]; pose[13] = pos[1]; pose[14] = pos[2];
-    const r = robot.solveIK(pose, { seed: q, restarts: 2, maxIterations: 100, keepFirstSolution: true }, tool);
-    if (!r.ok) return { samples, duration, length, ok: false, error: `MoveC unreachable at ${(f * 100).toFixed(0)}%` };
-    q = r.joints;
-    length += distance(pos, prevPos);
-    prevPos = pos;
-    samples.push({ t, joints: q, pose });
-  }
-  return { samples, duration, length, ok: true };
+  const m = planSingle(robot, q0, { data: { kind: 'move', moveType: 'MoveC', targetId: null, pose: Array.from(p1), viaPose: Array.from(pVia) }, tool, settings: settingsOf(speedLinear, robot.motion.speedJoints, accelLinear, robot.motion.accelJoints) });
+  return densify(m.trajectory, dt);
 }
 
-/** Sample a trajectory at time t (linear interpolation of joints). */
+/** Sample a trajectory at time t (exact profile when the trajectory has an evaluator, else linear interpolation). */
 export function sampleAt(tr: Trajectory, t: number): TrajectorySample {
+  const ev = (tr as { eval?: (t: number) => TrajectorySample }).eval;
+  if (typeof ev === 'function' && tr.samples.length) return ev.call(tr, t);
   const s = tr.samples;
   if (s.length === 0) throw new Error('empty trajectory');
   if (t <= 0) return s[0];

@@ -1,0 +1,4 @@
+<?xml version="1.0"?>
+<robot name="r" xmlns:xacro="http://www.ros.org/wiki/xacro">
+<xacro:property name="rm" value="1"/><xacro:property name="rm" remove="true"/><v rm="${rm}"/>
+</robot>

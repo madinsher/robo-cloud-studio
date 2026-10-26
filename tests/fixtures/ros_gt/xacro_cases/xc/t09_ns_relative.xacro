@@ -1,0 +1,1 @@
+<robot name="t" xmlns:xacro="http://www.ros.org/wiki/xacro"><xacro:include filename="sub/part.xacro" ns="p"/><link name="l"><visual><geometry><box size="${p.len} 1 1"/></geometry></visual></link></robot>

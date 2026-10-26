@@ -66,7 +66,7 @@ describe('URDF export', () => {
     expect(res.urdf).toContain('<link name="Table">');
     expect(res.urdf).toMatch(/<joint name="KUKA_KR_6_R900_sixx_Agilus_base_joint" type="fixed">[\s\S]*xyz="1 0 0"/);
     // object mesh written in metres: 200 mm cube -> 0.1 m half size
-    const stl = Object.entries(res.files).find(([f]) => f.startsWith('meshes/'))![1] as Uint8Array;
+    const stl = Object.entries(res.files).find(([f]) => f === 'meshes/Table.stl')![1] as Uint8Array; // (the robot's procedural link meshes are exported too)
     const m = parseSTL(stl.buffer.slice(stl.byteOffset, stl.byteOffset + stl.byteLength) as ArrayBuffer);
     expect(m.max[0]).toBeCloseTo(0.1, 5);
   });

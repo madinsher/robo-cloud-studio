@@ -4,8 +4,9 @@
  * every export dialog and robot post selector. Execution happens in Pyodide with the official
  * robodk.robomath / robofileio modules and a headless robodialogs (see python_post.ts).
  */
-import { registerPythonPost } from './python_post';
-import { getPost, PostProcessor } from './base';
+import { registerPythonPost, setSiblingPostSource } from './python_post';
+import { getPost, PostProcessor, registerPost } from './base';
+import { nativePost, nativePostServer } from './native_client';
 
 const KEY = 'studio.userPosts.v1';
 
@@ -40,9 +41,19 @@ export function guessBrand(file: string): string {
   return 'Custom';
 }
 
-/** Validate that a file looks like a RoboDK post (defines class RobotPost). */
+/**
+ * Kind of a RoboDK post file: 'source' (defines class RobotPost: runs in Pyodide in the browser), 'compiled' (the
+ * 3-line wrappers RoboDK ships, `from libspp.<post> import RobotPost` / `exec("from v"+ver+...)`, which load native
+ * .pyd / version-specific .pyc modules: they run on the studio server with RoboDK's Python), or 'none'.
+ */
+export function classifyRoboDKPost(source: string): 'source' | 'compiled' | 'none' {
+  if (/class\s+RobotPost\b/.test(source) && /def\s+(MoveJ|MoveL|ProgStart)\s*\(/.test(source)) return 'source';
+  if (/from\s+libspp\.\w+\s+import\s+RobotPost|import\s+RobotPost\s+as\s+MainPost|exec\(\s*["']from\s+v["']|from\s+v\d{2,3}\.\w+\s+import/.test(source)) return 'compiled';
+  return 'none';
+}
+/** Validate that a file is a RoboDK source post (defines class RobotPost with motion callbacks). */
 export function looksLikeRoboDKPost(source: string): boolean {
-  return /class\s+RobotPost\b/.test(source) && /def\s+(MoveJ|MoveL|ProgStart)\s*\(/.test(source);
+  return classifyRoboDKPost(source) === 'source';
 }
 
 export function postIdFor(file: string): string {
@@ -54,6 +65,7 @@ export function addUserPost(file: string, source: string, persist = true): PostP
   const id = postIdFor(file);
   const name = file.replace(/\.py$/i, '');
   const ext = source.match(/PROG_EXT\s*=\s*['"]([^'"]+)['"]/)?.[1] ?? 'txt';
+  setSiblingPostSource(file, source);
   const post = registerPythonPost(id, name, source);
   (post as any).brand = guessBrand(file);
   (post as any).extension = ext;
@@ -80,15 +92,26 @@ export function restoreUserPosts(): number {
   return n;
 }
 
-/** Import many files (e.g. the whole RoboDK Posts folder). Returns accepted/skipped names. */
-export async function importPostFiles(files: File[]): Promise<{ added: string[]; skipped: string[] }> {
-  const added: string[] = [], skipped: string[] = [];
+/**
+ * Import many files (e.g. the whole RoboDK Posts folder). Source posts run in Pyodide; RoboDK's compiled posts are
+ * registered as server posts when the studio server is configured (setNativePostServer), otherwise skipped with a
+ * note. Every .py file is also made available to the others (sibling imports). Returns accepted / skipped names.
+ */
+export async function importPostFiles(files: File[]): Promise<{ added: string[]; skipped: string[]; notes?: string[] }> {
+  const added: string[] = [], skipped: string[] = [], notes: string[] = [];
+  const texts: Array<[File, string | null]> = [];
   for (const f of files) {
-    if (!/\.py$/i.test(f.name)) { skipped.push(f.name); continue; }
-    const src = await f.text();
-    if (!looksLikeRoboDKPost(src)) { skipped.push(f.name); continue; }
-    addUserPost(f.name, src);
-    added.push(f.name);
+    const src = /\.py$/i.test(f.name) ? await f.text() : null;
+    if (src !== null) setSiblingPostSource(f.name, src);
+    texts.push([f, src]);
   }
-  return { added, skipped };
+  for (const [f, src] of texts) {
+    if (src === null) { skipped.push(f.name); continue; }
+    const kind = classifyRoboDKPost(src);
+    if (kind === 'source') { addUserPost(f.name, src); added.push(f.name); continue; }
+    if (kind === 'compiled' && nativePostServer()) { registerPost(nativePost(f.name.replace(/\.py$/i, ''))); added.push(f.name); continue; }
+    if (kind === 'compiled') notes.push(`${f.name}: compiled RoboDK post (native module) - runs on the studio server with RoboDK installed`);
+    skipped.push(f.name);
+  }
+  return notes.length ? { added, skipped, notes } : { added, skipped };
 }

@@ -17,7 +17,7 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .panel-body { padding: 8px 10px; overflow: auto; }
 .tree-filter { width: 110px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 4px; padding: 2px 6px; }
 .tree-list { overflow: auto; flex: 1; padding: 4px 0; }
-.tree-row { display: flex; align-items: center; gap: 4px; padding: 2px 6px; cursor: pointer; white-space: nowrap; user-select: none; }
+.tree-row { display: flex; align-items: center; gap: 4px; padding: 2px 6px; height: 22px; box-sizing: border-box; cursor: pointer; white-space: nowrap; user-select: none; }
 .tree-row:hover { background: var(--panel-2); }
 .tree-row.selected { background: var(--sel); }
 .tree-row.active .tree-name { color: var(--accent); }
@@ -43,7 +43,7 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .tb-sep { width: 1px; height: 18px; background: var(--border); margin: 0 4px; }
 .statusbar { height: 22px; background: var(--panel); border-top: 1px solid var(--border); padding: 2px 10px; color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; }
 .bottom-dock { height: 260px; background: var(--panel); border-top: 1px solid var(--border); display: flex; flex-direction: column; }
-.bottom-dock.collapsed { height: 28px; }
+.bottom-dock.collapsed { height: 28px !important; }  /* over the dragged height */
 .bottom-dock.collapsed .tab-content { display: none; }
 .tab-bar { display: flex; gap: 2px; padding: 2px 6px 0; border-bottom: 1px solid var(--border); }
 .tab { background: none; border: none; padding: 4px 10px; cursor: pointer; border-bottom: 2px solid transparent; color: var(--muted); }
@@ -104,7 +104,8 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .pe-add { display: flex; flex-wrap: wrap; gap: 3px; align-items: center; color: var(--muted); font-size: 12px; }
 .prog-select { background: var(--panel-2); border: 1px solid var(--border); border-radius: 4px; padding: 2px 6px; max-width: 200px; }
 .ins-list { flex: 1; overflow: auto; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; }
-.ins-row { display: flex; align-items: center; gap: 8px; padding: 2px 8px; cursor: pointer; border-left: 3px solid transparent; }
+.ins-row { display: flex; align-items: center; gap: 8px; padding: 2px 8px; height: 22px; box-sizing: border-box; white-space: nowrap; cursor: pointer; border-left: 3px solid transparent; }
+.ins-row.error-at { background: rgba(255,77,77,0.18); }
 .ins-row:hover { background: var(--panel-2); }
 .ins-row.selected { background: var(--sel); }
 .ins-row.running { border-left-color: var(--accent-2); background: rgba(81,207,102,0.12); }
@@ -159,6 +160,10 @@ progress { accent-color: var(--accent-2); }
 @media (max-width: 1000px) { .tree-panel { width: 200px; } .props-panel { width: 260px; } }
 
 .cam-canvas { background: #000; border: 1px solid var(--border); max-width: 100%; }
+/* the Vision tab's camera image is scaled to the dock height (it used to be cut: 229 px of a 538 px canvas) */
+.tab-content .vision-canvas { width: auto; height: auto; max-width: 100%; max-height: calc(var(--dock-h, 260px) - 150px); min-height: 90px; object-fit: contain; }
+.dock-resize { height: 5px; margin-bottom: -5px; cursor: ns-resize; position: relative; z-index: 2; flex: none; }
+.dock-resize:hover { background: var(--accent, #4dabf7); opacity: 0.5; }
 .cam-panel { display: flex; flex-direction: column; gap: 6px; }
 .mini-chart { display: block; margin: 6px 0; border: 1px solid var(--border); max-width: 100%; }
 
@@ -255,3 +260,29 @@ progress { accent-color: var(--accent-2); }
 .ctl-plot { background: var(--panel-2); border-radius: 4px; display: block; } .ctl-plot .plot-title { fill: var(--text); font-size: 11px; font-weight: 600; } .ctl-plot .plot-tick { fill: var(--muted); font-size: 9px; } .ctl-plot .plot-label { fill: var(--muted); font-size: 10px; } .ctl-plot .plot-grid { stroke: var(--border); stroke-width: 0.6; } .ctl-plot .plot-frame { fill: none; stroke: var(--muted); stroke-width: 0.8; opacity: 0.6; } .ctl-plot .plot-obstacle { fill: var(--muted); opacity: 0.45; }
 .ctl-plot .plot-marker.goal { stroke: #ff6b6b; stroke-width: 1.6; } .ctl-plot .plot-marker.source { fill: #fab005; } .ctl-plot .plot-marker.station { fill: #4dabf7; } .ctl-plot .plot-marker.task { fill: #51cf66; } .ctl-plot .plot-marker.robot { fill: none; stroke: var(--text); stroke-width: 1.2; } .ctl-plot .plot-marker.start { fill: none; stroke: #51cf66; stroke-width: 1.4; } .ctl-plot .plot-marker.obstacle { fill: var(--muted); }
 .ctx-item.disabled { opacity: 0.55; font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; }
+
+.progress-pill { position: fixed; left: 50%; bottom: 34px; transform: translateX(-50%); background: var(--panel-2); border: 1px solid var(--border); border-radius: 14px; padding: 4px 14px; font-size: 12px; z-index: 90; pointer-events: none; }
+.vlist-pad { flex: none; }
+.sim-state { margin-left: 8px; color: var(--muted); }
+
+/* Fleet tab KPI groups */
+.kpi-groups { display: flex; flex-wrap: wrap; gap: 6px 18px; margin: 6px 0; }
+.kpi-group { min-width: 220px; }
+.kpi-group .kv { display: flex; flex-direction: row; justify-content: space-between; gap: 10px; font-size: 12px; }
+.export-problems { max-height: 120px; overflow: auto; margin: 4px 0; }
+
+/* side docks: resizable / collapsible Station tree and Properties panels */
+.side-dock { display: flex; min-height: 0; flex: 0 0 auto; }
+.side-dock > .panel { min-width: 0; }
+.dock-splitter { width: 6px; flex: 0 0 6px; cursor: col-resize; position: relative; background: var(--panel); }
+.dock-splitter:hover, .side-dock.resizing .dock-splitter { background: var(--sel); }
+.side-dock.resizing { user-select: none; }
+.dock-toggle { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 16px; height: 44px; padding: 0; border: 1px solid var(--border); border-radius: 4px; background: var(--panel-2); color: var(--muted); font-size: 13px; line-height: 1; cursor: pointer; z-index: 2; }
+.dock-toggle:hover { color: var(--text); border-color: var(--accent); }
+.dock-rail { display: none; width: 24px; flex: 0 0 24px; background: var(--panel); cursor: pointer; flex-direction: column; align-items: center; gap: 10px; padding-top: 8px; color: var(--muted); }
+.side-dock.left .dock-rail { border-right: 1px solid var(--border); }
+.side-dock.right .dock-rail { border-left: 1px solid var(--border); }
+.dock-rail:hover { color: var(--text); background: var(--panel-2); }
+.dock-rail-label { writing-mode: vertical-rl; font-weight: 600; letter-spacing: 0.04em; }
+.side-dock.collapsed > .panel, .side-dock.collapsed > .dock-splitter { display: none; }
+.side-dock.collapsed > .dock-rail { display: flex; }

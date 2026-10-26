@@ -439,6 +439,8 @@ export interface SupervisorTable {
   initial: number;
   uncontrollable: string[];
   unobservable: string[];
+  /** built over the observer (partial observation): states are cells of indistinguishable states, unobservable events are ignored */
+  observer?: boolean;
   states: Array<{ id: number; plant: string[]; marked: boolean; next: Record<string, number>; enabled_controllable: string[] }>;
 }
 
@@ -459,10 +461,59 @@ export function supervisorTable(sup: DES, uncontrollable: Iterable<string>, unob
 
 export class SupervisorViolation extends Error {}
 
-/** Runtime executor: allowed(e) for controllable commands, observe(e) to advance on any observed event. */
+/**
+ * Supervisor implementable under partial observation. Its states are the cells of the observer of the supervisor
+ * (the sets of supervisor states consistent with the observed string); a cell enables a controllable event only when
+ * every state of the cell where the plant can execute it allows it (antipermissive policy, safe: the closed loop stays
+ * inside the supervised language). Unobservable events do not move the table. The closed loop plant × policy is
+ * checked for non-blocking: when it blocks, the decisions depend on unobservable history and the supervisor is NOT
+ * implementable as specified (add sensing). Without unobservable events this is the plain table.
+ */
+export interface ObservedSupervisor { table: SupervisorTable; observable: boolean; issues: ObservabilityIssue[]; nonblocking: boolean; blockingTrace: string[] | null; closedLoopStates: number; ambiguous: number }
+export function observedSupervisor(plant: DES, sup: DES, uncontrollable: Iterable<string>, unobservable: Iterable<string> = [], plantParts?: number): ObservedSupervisor {
+  const uc = new Set(uncontrollable); const uo = new Set([...unobservable].filter((e) => sup.sigma.has(e) || plant.sigma.has(e)));
+  if (!uo.size) return { table: supervisorTable(sup, uc, [], plantParts), observable: true, issues: [], nonblocking: true, blockingTrace: null, closedLoopStates: sup.X.size, ambiguous: 0 };
+  const obs = observer(sup, uo);
+  const gx = (x: string) => { const p = sup.parts.get(x) ?? [x]; return plant.components.length ? joinState(p.slice(0, plant.components.length)) : p[0]; };
+  const ctrl = [...sup.sigma].filter((e) => !uc.has(e)).sort();
+  const keys = [...obs.states.keys()]; const idx = new Map(keys.map((k, i) => [k, i]));
+  const enabledIn = new Map<string, Set<string>>();
+  for (const [k, cell] of obs.states) enabledIn.set(k, new Set(ctrl.filter((e) => cell.some((x) => sup.next(x, e) !== undefined) && cell.every((x) => plant.next(gx(x), e) === undefined || sup.next(x, e) !== undefined))));
+  const issues: ObservabilityIssue[] = [];
+  for (const [k, cell] of obs.states) for (const e of ctrl) { const en = cell.filter((x) => sup.next(x, e) !== undefined), dis = cell.filter((x) => sup.next(x, e) === undefined && plant.next(gx(x), e) !== undefined); if (en.length && dis.length) issues.push({ cell: k, event: e, enabledIn: en, disabledIn: dis }); }
+  // closed loop: (true supervisor state, observer cell)
+  const start = `${sup.x0}#${obs.initial}`; const seen = new Map<string, { x: string; c: string; from?: string; ev?: string }>([[start, { x: sup.x0, c: obs.initial }]]); const succ = new Map<string, string[]>(); const q = [start];
+  for (let i = 0; i < q.length; i++) {
+    const key = q[i]; const { x, c } = seen.get(key)!; const out: string[] = [];
+    for (const [e, y] of sup.f.get(x) ?? []) {
+      if (!uc.has(e) && !enabledIn.get(c)!.has(e)) continue;
+      const c2 = uo.has(e) ? c : obs.delta.get(c)?.get(e); if (c2 === undefined) continue;
+      const k2 = `${y}#${c2}`; out.push(k2); if (!seen.has(k2)) { seen.set(k2, { x: y, c: c2, from: key, ev: e }); q.push(k2); }
+    }
+    succ.set(key, out);
+  }
+  const good = new Set([...seen.entries()].filter(([, v]) => sup.xm.has(v.x)).map(([k]) => k)); const pred = new Map<string, string[]>();
+  for (const [k, out] of succ) for (const k2 of out) { let l = pred.get(k2); if (!l) { l = []; pred.set(k2, l); } l.push(k); }
+  const stack = [...good]; while (stack.length) { const k = stack.pop()!; for (const p of pred.get(k) ?? []) if (!good.has(p)) { good.add(p); stack.push(p); } }
+  const bad = q.find((k) => !good.has(k)); let blockingTrace: string[] | null = null;
+  if (bad) { blockingTrace = []; let cur: string | undefined = bad; while (cur && seen.get(cur)!.from) { blockingTrace.unshift(seen.get(cur)!.ev!); cur = seen.get(cur)!.from; } }
+  const n = plantParts ?? (plant.components.length || 1);
+  const table: SupervisorTable = {
+    initial: idx.get(obs.initial)!, uncontrollable: [...uc].sort(), unobservable: [...uo].sort(), observer: true,
+    states: keys.map((k) => {
+      const cell = obs.states.get(k)!; const next: Record<string, number> = {};
+      for (const [e, to] of [...(obs.delta.get(k)?.entries() ?? [])].sort()) next[e] = idx.get(to)!;
+      const parts = cell.map((x) => (sup.parts.get(x) ?? [x]).slice(0, n));
+      return { id: idx.get(k)!, plant: Array.from({ length: n }, (_, i) => [...new Set(parts.map((p) => p[i]))].join('/')), marked: cell.some((x) => sup.xm.has(x)), next, enabled_controllable: [...enabledIn.get(k)!].sort() };
+    }),
+  };
+  return { table, observable: issues.length === 0, issues, nonblocking: !bad, blockingTrace, closedLoopStates: seen.size, ambiguous: keys.filter((k) => obs.states.get(k)!.length > 1).length };
+}
+
+/** Runtime executor: allowed(e) for controllable commands, observe(e) to advance on an observed event (unobservable events are ignored — build the table with observedSupervisor). */
 export class SupervisorRuntime {
   state: number;
-  readonly log: Array<{ kind: 'denied' | 'event'; state: number; event: string; next?: number }> = [];
+  readonly log: Array<{ kind: 'denied' | 'event' | 'ignored'; state: number; event: string; next?: number }> = [];
   private byId: Map<number, SupervisorTable['states'][number]>;
   constructor(readonly table: SupervisorTable) { this.state = table.initial; this.byId = new Map(table.states.map((s) => [s.id, s])); }
   allowed(event: string): boolean {
@@ -470,12 +521,13 @@ export class SupervisorRuntime {
     if (!ok) this.log.push({ kind: 'denied', state: this.state, event });
     return ok;
   }
-  observe(event: string): void {
-    if (this.table.unobservable.includes(event)) throw new Error(`event ${event} is unobservable`);
+  /** Returns false for an unobservable event (nothing changes); throws SupervisorViolation for an impossible one. */
+  observe(event: string): boolean {
+    if (this.table.unobservable.includes(event)) { this.log.push({ kind: 'ignored', state: this.state, event }); return false; }
     const nxt = this.byId.get(this.state)!.next[event];
     if (nxt === undefined) throw new SupervisorViolation(`event ${event} impossible in state ${this.state} ${this.plantState().join(',')}`);
     this.log.push({ kind: 'event', state: this.state, event, next: nxt });
-    this.state = nxt;
+    this.state = nxt; return true;
   }
   plantState(): string[] { return this.byId.get(this.state)!.plant; }
   marked(): boolean { return this.byId.get(this.state)!.marked; }
@@ -514,12 +566,14 @@ class Supervisor:
 
     def observe(self, event):
         if event in self.uo:
-            raise ValueError('event %s is unobservable' % event)
+            self.log.append(('ignored', self.state, event))
+            return False  # unobservable: the table is built over the observer, there is nothing to track
         nxt = self.states[self.state]['next'].get(event)
         if nxt is None:
             raise SupervisorViolation('event %s impossible in state %s %s' % (event, self.state, self.states[self.state]['plant']))
         self.log.append(('event', self.state, event, nxt))
         self.state = nxt
+        return True
 
     def plant_state(self):
         return self.states[self.state]['plant']

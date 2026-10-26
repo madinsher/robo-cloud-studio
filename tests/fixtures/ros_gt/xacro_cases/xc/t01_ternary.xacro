@@ -1,0 +1,1 @@
+<robot name="t" xmlns:xacro="http://www.ros.org/wiki/xacro"><xacro:property name="big" value="1"/><link name="l"><visual><geometry><box size="${0.2 if big else 0.1} 1 1"/></geometry></visual></link></robot>

@@ -129,9 +129,10 @@ export function buildBtEditor(opts: { onChange: (source: string) => void; catalo
       inspector.append(field('Binding', selectOrText(BT_ACTION_BINDINGS, n.fn ?? '', (v) => guarded(() => { n.fn = v.trim() || 'wait'; }))));
       const argSel = (key: string, label: string, options: string[]) => field(label, selectOrText(options, String(a[key] ?? ''), (v) => guarded(() => { if (v) a[key] = v; else delete a[key]; })));
       if (n.fn === 'goto') inspector.append(argSel('zone', 'Zone', cat.zones));
-      if (n.fn === 'program') inspector.append(argSel('name', 'Program', cat.programs.map((p) => p.name)), argSel('robot', 'Robot', cat.robots.filter((r) => !r.mobile).map((r) => r.name)));
+      if ((n.fn === 'program' || n.fn === 'signal') && a.name !== undefined && a[n.fn] === undefined) { a[n.fn] = a.name; delete a.name; } // legacy key: name= is the node label in the DSL
+      if (n.fn === 'program') inspector.append(argSel('program', 'Program', cat.programs.map((p) => p.name)), argSel('robot', 'Robot', cat.robots.filter((r) => !r.mobile).map((r) => r.name)));
       if (n.fn === 'move') inspector.append(argSel('target', 'Target', cat.targets), argSel('robot', 'Robot', cat.robots.filter((r) => !r.mobile).map((r) => r.name)));
-      if (n.fn === 'signal') inspector.append(argSel('name', 'Signal', cat.signals), field('Value', text(String(a.value ?? 'true'), (v) => guarded(() => { a.value = v === 'true' ? true : v === 'false' ? false : Number.isFinite(Number(v)) && v.trim() !== '' ? Number(v) : v; }))));
+      if (n.fn === 'signal') inspector.append(argSel('signal', 'Signal', cat.signals), field('Value', text(String(a.value ?? 'true'), (v) => guarded(() => { a.value = v === 'true' ? true : v === 'false' ? false : Number.isFinite(Number(v)) && v.trim() !== '' ? Number(v) : v; }))));
       if (n.fn === 'wait') inspector.append(field('Seconds', num(Number(a.seconds ?? 1), (v) => guarded(() => { a.seconds = v ?? 1; }))));
       if (n.fn === 'event') inspector.append(field('Emit event', text(String(a.emit ?? ''), (v) => guarded(() => { a.emit = v.trim(); }))));
       if (n.fn === 'grasp') inspector.append(field('Success probability p', num(a.p === undefined ? undefined : Number(a.p), (v) => guarded(() => { if (v === undefined) delete a.p; else a.p = v; }))));

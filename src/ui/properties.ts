@@ -191,9 +191,11 @@ export class PropertiesPanel {
     const res = p.lastResult;
     return this.section('Program',
       formField({ key: 'r', label: 'Robot', type: 'select', value: p.robotId ?? '', options: [{ value: '', label: '(none)' }, ...robots.map((r) => ({ value: r.id, label: r.name }))] }, (v) => this.app.cmd(() => p.setRobot(v ? this.app.station.findById(v) : null))).el,
-      h('div', { class: 'kv' }, kv('Instructions', String(p.instructions().length)), kv('Cycle time', res ? `${res.duration.toFixed(2)} s` : '—'), kv('Distance', res ? `${(res.distance / 1000).toFixed(2)} m` : '—'), kv('Status', res ? (res.ok ? 'OK' : `${res.problems.length} problem(s)`) : 'not validated')),
+      // "Cycle time" is RoboDK's (Item.Update(): moves at the robot's speeds, Set speed instructions not applied);
+      // the playback time honours the programmed speeds like RoboDK's own playback (05.e Main_Program 237.7 / 1542.6 s)
+      h('div', { class: 'kv' }, kv('Instructions', String(p.instructions().length)), kv('Cycle time', res ? `${(res.updateTime ?? res.duration).toFixed(2)} s` : '—'), ...(res && res.updateTime !== undefined && Math.abs(res.updateTime - res.duration) > 0.005 ? [kv('Playback time', `${res.duration.toFixed(2)} s`)] : []), kv('Distance', res ? `${(res.distance / 1000).toFixed(2)} m` : '—'), kv('Status', res ? (res.ok ? 'OK' : `${res.problems.length} problem(s)`) : 'not validated')),
       res && res.problems.length ? h('ul', { class: 'problems' }, ...res.problems.map((pr) => h('li', { class: pr.severity }, pr.message))) : null,
-      h('div', { class: 'btn-row' }, h('button', { class: 'btn primary', onClick: () => this.app.runProgram(p) }, '▶ Run'), h('button', { class: 'btn', onClick: () => { this.app.setActiveProgram(p); this.app.previewProgram(); this.render(); } }, 'Validate'), h('button', { class: 'btn', onClick: () => exportDialog(this.app, p) }, 'Export…')));
+      h('div', { class: 'btn-row' }, h('button', { class: 'btn primary', onClick: () => this.app.runProgram(p) }, '▶ Run'), h('button', { class: 'btn', onClick: () => { this.app.setActiveProgram(p); this.app.validateProgram(p); this.render(); } }, 'Validate'), h('button', { class: 'btn', onClick: () => exportDialog(this.app, p) }, 'Export…')));
   }
 
   private instructionEditor(ins: Instruction): HTMLElement {

@@ -1,0 +1,493 @@
+<?xml version="1.0"?>
+<!--
+  URDF робота MUROM, облик v2 «Капсула»: TF-дерево + визуализация для RViz.
+
+  Меши meshes/v2/<звено>.stl (retail_render/export_webots.py) заданы прямо в СК своих звеньев, без поворотов
+  и смещений в visual; base_link: X вперёд, Y влево, Z вверх, начало — середина колёсной оси на полу.
+  В Murom.proto те же звенья нарисованы PBR-мешами OBJ (murom_webots/protos/meshes/murom_v2).
+  Руки: 4 DOF до кончика предплечья (l/r_tool_link) + запястье (wrist_roll, wrist_pitch) и ладонь
+  l/r_palm_link (= DEF L_PALM/R_PALM в PROTO). Камера головы — 0.11 м перед осью наклона (перед линзой корпуса).
+
+  Физика симулируется в Webots (Murom.proto) и MuJoCo (murom_mujoco/robot.py); этот URDF — кинематика/TF.
+  Имена суставов совпадают с устройствами Webots и /joint_states драйвера.
+-->
+<robot name="murom">
+
+  <material name="body_grey"><color rgba="0.75 0.75 0.78 1.0"/></material>
+  <material name="dark_grey"><color rgba="0.25 0.25 0.28 1.0"/></material>
+  <material name="accent_orange"><color rgba="0.90 0.45 0.10 1.0"/></material>
+
+  <!-- ================= База ================= -->
+  <link name="base_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><mesh filename="package://murom_description/meshes/v2/base_link.stl"/></geometry>
+      <material name="v2_base_link"><color rgba="0.700 0.720 0.740 1.0"/></material>
+    </visual>
+    <collision>
+      <origin xyz="-0.05 0 0.34" rpy="0 0 0"/>
+      <geometry><box size="0.78 0.79 0.55"/></geometry>
+    </collision>
+    <inertial>
+      <mass value="55.0"/>
+      <origin xyz="-0.05 0 0.28"/>
+      <inertia ixx="2.5" ixy="0" ixz="0" iyy="2.5" iyz="0" izz="3.5"/>
+    </inertial>
+  </link>
+
+  <!-- base_footprint (проекция на пол) для Nav2 -->
+  <link name="base_footprint"/>
+  <joint name="base_footprint_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="base_footprint"/>
+    <origin xyz="0 0 0"/>
+  </joint>
+
+  <!-- ================= Колёса ================= -->
+  <link name="left_wheel_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><mesh filename="package://murom_description/meshes/v2/left_wheel_link.stl"/></geometry>
+      <material name="v2_left_wheel_link"><color rgba="0.032 0.032 0.034 1.0"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="1.5708 0 0"/>
+      <geometry><cylinder radius="0.177" length="0.08"/></geometry>
+    </collision>
+    <inertial>
+      <mass value="3.0"/>
+      <inertia ixx="0.025" ixy="0" ixz="0" iyy="0.047" iyz="0" izz="0.025"/>
+    </inertial>
+  </link>
+  <joint name="left_wheel_joint" type="continuous">
+    <parent link="base_link"/>
+    <child link="left_wheel_link"/>
+    <origin xyz="0 0.2205 0.181" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit effort="30.0" velocity="15.0"/>
+  </joint>
+
+  <link name="right_wheel_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><mesh filename="package://murom_description/meshes/v2/right_wheel_link.stl"/></geometry>
+      <material name="v2_right_wheel_link"><color rgba="0.032 0.032 0.034 1.0"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="1.5708 0 0"/>
+      <geometry><cylinder radius="0.177" length="0.08"/></geometry>
+    </collision>
+    <inertial>
+      <mass value="3.0"/>
+      <inertia ixx="0.025" ixy="0" ixz="0" iyy="0.047" iyz="0" izz="0.025"/>
+    </inertial>
+  </link>
+  <joint name="right_wheel_joint" type="continuous">
+    <parent link="base_link"/>
+    <child link="right_wheel_link"/>
+    <origin xyz="0 -0.2205 0.181" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit effort="30.0" velocity="15.0"/>
+  </joint>
+
+  <!-- Рояльное колесо (пассивное, в TF - фиксированное) -->
+  <link name="caster_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><mesh filename="package://murom_description/meshes/v2/caster_link.stl"/></geometry>
+      <material name="v2_caster_link"><color rgba="0.032 0.032 0.034 1.0"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0"/>
+      <geometry><sphere radius="0.0703"/></geometry>
+    </collision>
+    <inertial>
+      <mass value="1.0"/>
+      <inertia ixx="0.002" ixy="0" ixz="0" iyy="0.002" iyz="0" izz="0.002"/>
+    </inertial>
+  </link>
+  <joint name="caster_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="caster_link"/>
+    <origin xyz="-0.280 -0.006 0.0757"/>
+  </joint>
+
+  <!-- ================= Торс (фиксированный) ================= -->
+  <link name="torso_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><mesh filename="package://murom_description/meshes/v2/torso_link.stl"/></geometry>
+      <material name="v2_torso_link"><color rgba="0.900 0.905 0.910 1.0"/></material>
+    </visual>
+    <collision>
+      <origin xyz="-0.055 0 0.44" rpy="0 0 0"/>
+      <geometry><box size="0.23 0.38 0.88"/></geometry>
+    </collision>
+    <inertial>
+      <mass value="12.0"/>
+      <origin xyz="-0.05 0 0.5"/>
+      <inertia ixx="0.9" ixy="0" ixz="0" iyy="0.9" iyz="0" izz="0.3"/>
+    </inertial>
+  </link>
+  <joint name="torso_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="torso_link"/>
+    <origin xyz="0 0 0.612"/>
+  </joint>
+
+  <!-- ================= Шея и голова ================= -->
+  <link name="neck_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><mesh filename="package://murom_description/meshes/v2/neck_link.stl"/></geometry>
+      <material name="v2_neck_link"><color rgba="0.042 0.045 0.051 1.0"/></material>
+    </visual>
+    <inertial>
+      <mass value="0.2"/>
+      <inertia ixx="0.0002" ixy="0" ixz="0" iyy="0.0002" iyz="0" izz="0.0002"/>
+    </inertial>
+  </link>
+  <joint name="head_pan_joint" type="revolute">
+    <parent link="torso_link"/>
+    <child link="neck_link"/>
+    <origin xyz="-0.076 0 0.844"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-1.6" upper="1.6" effort="10.0" velocity="3.0"/>
+  </joint>
+
+  <link name="head_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><mesh filename="package://murom_description/meshes/v2/head_link.stl"/></geometry>
+      <material name="v2_head_link"><color rgba="0.900 0.905 0.910 1.0"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0.0 0 0.055" rpy="0 0 0"/>
+      <geometry><box size="0.17 0.30 0.11"/></geometry>
+    </collision>
+    <inertial>
+      <mass value="1.2"/>
+      <inertia ixx="0.005" ixy="0" ixz="0" iyy="0.005" iyz="0" izz="0.008"/>
+    </inertial>
+  </link>
+  <joint name="head_tilt_joint" type="revolute">
+    <parent link="neck_link"/>
+    <child link="head_link"/>
+    <origin xyz="0 0 0.066"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-0.9" upper="0.6" effort="10.0" velocity="3.0"/>
+  </joint>
+
+  <!-- Камера в голове (смотрит вперёд, +X) -->
+  <link name="camera_link"/>
+  <joint name="camera_joint" type="fixed">
+    <parent link="head_link"/>
+    <child link="camera_link"/>
+    <origin xyz="0.11 0 0.053"/>  <!-- v2: перед линзой корпуса головы -->
+  </joint>
+  <link name="camera_link_optical"/>
+  <joint name="camera_optical_joint" type="fixed">
+    <parent link="camera_link"/>
+    <child link="camera_link_optical"/>
+    <origin xyz="0 0 0" rpy="-1.5708 0 -1.5708"/>
+  </joint>
+
+  <!-- ================= Левая рука (+Y) ================= -->
+  <link name="l_clavicle_b_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><mesh filename="package://murom_description/meshes/v2/l_clavicle_b_link.stl"/></geometry>
+      <material name="v2_l_clavicle_b_link"><color rgba="0.042 0.045 0.051 1.0"/></material>
+    </visual>
+    <inertial>
+      <mass value="0.4"/>
+      <inertia ixx="0.0004" ixy="0" ixz="0" iyy="0.0004" iyz="0" izz="0.0004"/>
+    </inertial>
+  </link>
+  <joint name="l_shoulder_pitch_joint" type="revolute">
+    <parent link="torso_link"/>
+    <child link="l_clavicle_b_link"/>
+    <origin xyz="-0.092 0.185 0.835"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-2.6" upper="2.6" effort="60.0" velocity="2.0"/>
+  </joint>
+
+  <link name="l_clavicle_l_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><mesh filename="package://murom_description/meshes/v2/l_clavicle_l_link.stl"/></geometry>
+      <material name="v2_l_clavicle_l_link"><color rgba="0.900 0.905 0.910 1.0"/></material>
+    </visual>
+    <inertial>
+      <mass value="0.3"/>
+      <inertia ixx="0.0003" ixy="0" ixz="0" iyy="0.0003" iyz="0" izz="0.0003"/>
+    </inertial>
+  </link>
+  <joint name="l_shoulder_roll_joint" type="revolute">
+    <parent link="l_clavicle_b_link"/>
+    <child link="l_clavicle_l_link"/>
+    <origin xyz="0 0.083 -0.0023"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="-2.1" upper="2.1" effort="60.0" velocity="2.0"/>
+  </joint>
+
+  <link name="l_upper_arm_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><mesh filename="package://murom_description/meshes/v2/l_upper_arm_link.stl"/></geometry>
+      <material name="v2_l_upper_arm_link"><color rgba="0.900 0.905 0.910 1.0"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 -0.14" rpy="0 0 0"/>
+      <geometry><cylinder radius="0.035" length="0.27"/></geometry>
+    </collision>
+    <inertial>
+      <mass value="1.2"/>
+      <origin xyz="0 0 -0.14"/>
+      <inertia ixx="0.008" ixy="0" ixz="0" iyy="0.008" iyz="0" izz="0.001"/>
+    </inertial>
+  </link>
+  <joint name="l_shoulder_yaw_joint" type="revolute">
+    <parent link="l_clavicle_l_link"/>
+    <child link="l_upper_arm_link"/>
+    <origin xyz="0 0.087 -0.0047"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-1.6" upper="1.6" effort="30.0" velocity="2.5"/>
+  </joint>
+
+  <link name="l_forearm_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><mesh filename="package://murom_description/meshes/v2/l_forearm_link.stl"/></geometry>
+      <material name="v2_l_forearm_link"><color rgba="0.900 0.905 0.910 1.0"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 -0.12" rpy="0 0 0"/>
+      <geometry><cylinder radius="0.028" length="0.24"/></geometry>
+    </collision>
+    <inertial>
+      <mass value="0.8"/>
+      <origin xyz="0 0 -0.12"/>
+      <inertia ixx="0.004" ixy="0" ixz="0" iyy="0.004" iyz="0" izz="0.0006"/>
+    </inertial>
+  </link>
+  <joint name="l_elbow_joint" type="revolute">
+    <parent link="l_upper_arm_link"/>
+    <child link="l_forearm_link"/>
+    <origin xyz="0 -0.003 -0.281"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-2.4" upper="2.4" effort="40.0" velocity="2.5"/>
+  </joint>
+
+  <!-- Кончик инструмента левой руки (точка «магнитного» захвата) -->
+  <link name="l_tool_link"/>
+  <joint name="l_tool_joint" type="fixed">
+    <parent link="l_forearm_link"/>
+    <child link="l_tool_link"/>
+    <origin xyz="0 0 -0.248"/>
+  </joint>
+
+  <!-- Запястье и кисть (облик v2): roll вдоль предплечья в точке прежнего кончика, pitch — сгиб кисти -->
+  <link name="l_wrist_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><mesh filename="package://murom_description/meshes/v2/l_wrist_link.stl"/></geometry>
+      <material name="v2_l_wrist_link"><color rgba="0.042 0.045 0.051 1.0"/></material>
+    </visual>
+    <inertial><mass value="0.1"/><origin xyz="0 0 -0.015"/><inertia ixx="0.0001" ixy="0" ixz="0" iyy="0.0001" iyz="0" izz="0.0001"/></inertial>
+  </link>
+  <joint name="l_wrist_roll_joint" type="revolute">
+    <parent link="l_forearm_link"/>
+    <child link="l_wrist_link"/>
+    <origin xyz="0 0 -0.248"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-2.6" upper="2.6" effort="8.0" velocity="4.0"/>
+  </joint>
+  <link name="l_palm_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><mesh filename="package://murom_description/meshes/v2/l_palm_link.stl"/></geometry>
+      <material name="v2_l_palm_link"><color rgba="0.060 0.064 0.072 1.0"/></material>
+    </visual>
+    <inertial><mass value="0.25"/><origin xyz="0 0 -0.06"/><inertia ixx="0.0004" ixy="0" ixz="0" iyy="0.0004" iyz="0" izz="0.0002"/></inertial>
+  </link>
+  <joint name="l_wrist_pitch_joint" type="revolute">
+    <parent link="l_wrist_link"/>
+    <child link="l_palm_link"/>
+    <origin xyz="0 0 -0.03"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="-1.55" upper="1.55" effort="8.0" velocity="4.0"/>
+  </joint>
+  <!-- /кисть l -->
+
+
+
+
+  <!-- ================= Правая рука (-Y) ================= -->
+  <link name="r_clavicle_b_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><mesh filename="package://murom_description/meshes/v2/r_clavicle_b_link.stl"/></geometry>
+      <material name="v2_r_clavicle_b_link"><color rgba="0.042 0.045 0.051 1.0"/></material>
+    </visual>
+    <inertial>
+      <mass value="0.4"/>
+      <inertia ixx="0.0004" ixy="0" ixz="0" iyy="0.0004" iyz="0" izz="0.0004"/>
+    </inertial>
+  </link>
+  <joint name="r_shoulder_pitch_joint" type="revolute">
+    <parent link="torso_link"/>
+    <child link="r_clavicle_b_link"/>
+    <origin xyz="-0.092 -0.185 0.835"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-2.6" upper="2.6" effort="60.0" velocity="2.0"/>
+  </joint>
+
+  <link name="r_clavicle_l_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><mesh filename="package://murom_description/meshes/v2/r_clavicle_l_link.stl"/></geometry>
+      <material name="v2_r_clavicle_l_link"><color rgba="0.900 0.905 0.910 1.0"/></material>
+    </visual>
+    <inertial>
+      <mass value="0.3"/>
+      <inertia ixx="0.0003" ixy="0" ixz="0" iyy="0.0003" iyz="0" izz="0.0003"/>
+    </inertial>
+  </link>
+  <joint name="r_shoulder_roll_joint" type="revolute">
+    <parent link="r_clavicle_b_link"/>
+    <child link="r_clavicle_l_link"/>
+    <origin xyz="0 -0.083 -0.0023"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="-2.1" upper="2.1" effort="60.0" velocity="2.0"/>
+  </joint>
+
+  <link name="r_upper_arm_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><mesh filename="package://murom_description/meshes/v2/r_upper_arm_link.stl"/></geometry>
+      <material name="v2_r_upper_arm_link"><color rgba="0.900 0.905 0.910 1.0"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 -0.14" rpy="0 0 0"/>
+      <geometry><cylinder radius="0.035" length="0.27"/></geometry>
+    </collision>
+    <inertial>
+      <mass value="1.2"/>
+      <origin xyz="0 0 -0.14"/>
+      <inertia ixx="0.008" ixy="0" ixz="0" iyy="0.008" iyz="0" izz="0.001"/>
+    </inertial>
+  </link>
+  <joint name="r_shoulder_yaw_joint" type="revolute">
+    <parent link="r_clavicle_l_link"/>
+    <child link="r_upper_arm_link"/>
+    <origin xyz="0 -0.087 -0.0047"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-1.6" upper="1.6" effort="30.0" velocity="2.5"/>
+  </joint>
+
+  <link name="r_forearm_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><mesh filename="package://murom_description/meshes/v2/r_forearm_link.stl"/></geometry>
+      <material name="v2_r_forearm_link"><color rgba="0.900 0.905 0.910 1.0"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 -0.12" rpy="0 0 0"/>
+      <geometry><cylinder radius="0.028" length="0.24"/></geometry>
+    </collision>
+    <inertial>
+      <mass value="0.8"/>
+      <origin xyz="0 0 -0.12"/>
+      <inertia ixx="0.004" ixy="0" ixz="0" iyy="0.004" iyz="0" izz="0.0006"/>
+    </inertial>
+  </link>
+  <joint name="r_elbow_joint" type="revolute">
+    <parent link="r_upper_arm_link"/>
+    <child link="r_forearm_link"/>
+    <origin xyz="0 0.003 -0.281"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-2.4" upper="2.4" effort="40.0" velocity="2.5"/>
+  </joint>
+
+  <link name="r_tool_link"/>
+  <joint name="r_tool_joint" type="fixed">
+    <parent link="r_forearm_link"/>
+    <child link="r_tool_link"/>
+    <origin xyz="0 0 -0.248"/>
+  </joint>
+
+  <!-- Запястье и кисть (облик v2): roll вдоль предплечья в точке прежнего кончика, pitch — сгиб кисти -->
+  <link name="r_wrist_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><mesh filename="package://murom_description/meshes/v2/r_wrist_link.stl"/></geometry>
+      <material name="v2_r_wrist_link"><color rgba="0.042 0.045 0.051 1.0"/></material>
+    </visual>
+    <inertial><mass value="0.1"/><origin xyz="0 0 -0.015"/><inertia ixx="0.0001" ixy="0" ixz="0" iyy="0.0001" iyz="0" izz="0.0001"/></inertial>
+  </link>
+  <joint name="r_wrist_roll_joint" type="revolute">
+    <parent link="r_forearm_link"/>
+    <child link="r_wrist_link"/>
+    <origin xyz="0 0 -0.248"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-2.6" upper="2.6" effort="8.0" velocity="4.0"/>
+  </joint>
+  <link name="r_palm_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><mesh filename="package://murom_description/meshes/v2/r_palm_link.stl"/></geometry>
+      <material name="v2_r_palm_link"><color rgba="0.060 0.064 0.072 1.0"/></material>
+    </visual>
+    <inertial><mass value="0.25"/><origin xyz="0 0 -0.06"/><inertia ixx="0.0004" ixy="0" ixz="0" iyy="0.0004" iyz="0" izz="0.0002"/></inertial>
+  </link>
+  <joint name="r_wrist_pitch_joint" type="revolute">
+    <parent link="r_wrist_link"/>
+    <child link="r_palm_link"/>
+    <origin xyz="0 0 -0.03"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="-1.55" upper="1.55" effort="8.0" velocity="4.0"/>
+  </joint>
+  <!-- /кисть r -->
+
+
+
+
+  <!-- ================= Сенсоры базы ================= -->
+  <link name="laser_frame">
+  </link>
+  <joint name="laser_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="laser_frame"/>
+    <origin xyz="0.30 0 0.66"/>
+  </joint>
+
+  <link name="imu_link"/>
+  <joint name="imu_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="imu_link"/>
+    <origin xyz="0 0 0.30"/>
+  </joint>
+
+  <link name="gps_link"/>
+  <joint name="gps_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="gps_link"/>
+    <origin xyz="0 0 0.50"/>
+  </joint>
+
+  <!-- Корзина для заказов на корме (на стойке, дно z=0.86) -->
+  <link name="basket_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry><mesh filename="package://murom_description/meshes/v2/basket_link.stl"/></geometry>
+      <material name="v2_basket_link"><color rgba="0.900 0.905 0.910 1.0"/></material>
+    </visual>
+  </link>
+  <joint name="basket_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="basket_link"/>
+    <origin xyz="-0.33 0 0.85"/>
+  </joint>
+
+</robot>

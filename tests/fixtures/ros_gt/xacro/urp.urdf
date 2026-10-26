@@ -1,0 +1,591 @@
+<?xml version="1.0"?>
+<robot name="urp">
+    <link name="base_link">
+      <visual>
+        <origin rpy="1.57 0 0" xyz="0 0 0"/>
+        <geometry>
+          <mesh filename="package://urp_description/meshes/vehicle/base.stl" scale="0.01 0.01 0.01"/>
+        </geometry>
+      </visual>
+      <collision>
+        <geometry>
+          <mesh filename="package://urp_description/meshes/vehicle/base.stl" scale="0.01 0.01 0.01"/>
+        </geometry>
+        <origin rpy="1.57 0 0" xyz="0 0 0"/>
+      </collision>
+    <inertial>
+      <origin xyz="0 0 -0.005"/>
+      <mass value="2.788"/>
+      <inertia ixx="0.0065806093333333334" ixy="0" ixz="0" iyy="0.015488269333333332" iyz="0" izz="0.022022411999999995"/>
+    </inertial>
+    </link>
+    
+    <link name="front_right_wheel">
+      <visual>
+        <geometry>
+          <mesh filename="package://urp_description/meshes/vehicle/wheel.stl" scale="0.01 0.01 0.01"/>
+        </geometry>
+      </visual>
+      <collision>
+        <geometry>
+          <mesh filename="package://urp_description/meshes/vehicle/wheel.stl" scale="0.01 0.01 0.01"/>
+        </geometry>
+      </collision>
+    <inertial>
+      <mass value="0.29"/>
+      <inertia ixx="0.0007464659129791666" ixy="0" ixz="0" iyy="0.0007464659129791666" iyz="0" izz="0.001110943342625"/>
+    </inertial>
+    </link>  
+  
+    <link name="front_left_wheel">
+      <visual>
+        <geometry>
+          <mesh filename="package://urp_description/meshes/vehicle/wheel.stl" scale="0.01 0.01 0.01"/>
+        </geometry>
+      </visual>
+      <collision>
+        <geometry>
+          <mesh filename="package://urp_description/meshes/vehicle/wheel.stl" scale="0.01 0.01 0.01"/>
+        </geometry>
+      </collision>
+    <inertial>
+      <mass value="0.29"/>
+      <inertia ixx="0.0007464659129791666" ixy="0" ixz="0" iyy="0.0007464659129791666" iyz="0" izz="0.001110943342625"/>
+    </inertial>
+    </link>  
+
+    <link name="front_right_wheel_rot">
+    <visual>
+        <origin rpy="-1.57 -1.57 0" xyz="0 -0.088 0.06"/>
+        <geometry>
+          <mesh filename="package://urp_description/meshes/vehicle/fl.stl" scale="0.01 0.01 0.01"/>
+        </geometry>
+      </visual>
+      <collision>
+      <origin rpy="-1.57 -1.57 0" xyz="0 -0.088 0.06"/>
+        <geometry>
+          <mesh filename="package://urp_description/meshes/vehicle/fl.stl" scale="0.01 0.01 0.01"/>
+        </geometry>
+      </collision>
+    <inertial>
+      <mass value="0.001"/>
+      <inertia ixx="0.001" ixy="0" ixz="0" iyy="0.001" iyz="0" izz="0.001"/>
+    </inertial>
+    </link>  
+
+    <link name="front_left_wheel_rot">
+    <visual>
+    <origin rpy="1.57 -1.57 0" xyz="0 0.088 0.06"/>
+        <geometry>
+          <mesh filename="package://urp_description/meshes/vehicle/fl.stl" scale="0.01 0.01 0.01"/>
+        </geometry>
+      </visual>
+      <collision>
+      <origin rpy="1.57 -1.57 0" xyz="0 0.088 0.06"/>
+        <geometry>
+          <mesh filename="package://urp_description/meshes/vehicle/fl.stl" scale="0.01 0.01 0.01"/>
+        </geometry>
+    </collision>
+    <inertial>
+      <mass value="0.001"/>
+      <inertia ixx="0.001" ixy="0" ixz="0" iyy="0.001" iyz="0" izz="0.001"/>
+    </inertial>
+    </link>  
+        
+    <link name="back_right_wheel">
+      <visual>
+        <geometry>
+          <mesh filename="package://urp_description/meshes/vehicle/wheel.stl" scale="0.01 0.01 0.01"/>
+        </geometry>
+      </visual>
+      <collision>
+        <geometry>
+          <mesh filename="package://urp_description/meshes/vehicle/wheel.stl" scale="0.01 0.01 0.01"/>
+        </geometry>
+      </collision>
+    <inertial>
+      <mass value="0.29"/>
+      <inertia ixx="0.0007464659129791666" ixy="0" ixz="0" iyy="0.0007464659129791666" iyz="0" izz="0.001110943342625"/>
+    </inertial>
+    </link>  
+
+    <link name="back_left_wheel">
+      <visual>
+        <geometry>
+          <mesh filename="package://urp_description/meshes/vehicle/wheel.stl" scale="0.01 0.01 0.01"/>
+        </geometry>
+      </visual>
+      <collision>
+        <geometry>
+          <mesh filename="package://urp_description/meshes/vehicle/wheel.stl" scale="0.01 0.01 0.01"/>
+        </geometry>
+      </collision>
+    <inertial>
+      <mass value="0.29"/>
+      <inertia ixx="0.0007464659129791666" ixy="0" ixz="0" iyy="0.0007464659129791666" iyz="0" izz="0.001110943342625"/>
+    </inertial>
+    </link> 
+
+<link name="crate">
+
+      <visual>
+        <geometry>
+          <mesh filename="package://urp_description/meshes/vehicle/CRATE.stl" scale="0.03 0.05 0.05" />
+        </geometry>
+      </visual>
+      <collision>
+        <geometry>
+          <mesh filename="package://urp_description/meshes/vehicle/CRATE.stl" scale="0.05 0.05 0.05"/>
+        </geometry>
+      </collision>
+    <inertial>
+      <mass value="0.29"/>
+      <inertia ixx="0.0007464659129791666" ixy="0" ixz="0" iyy="0.0007464659129791666" iyz="0" izz="0.001110943342625"/>
+    </inertial>
+    </link> 
+    
+    <link name="hokuyo_link">
+        <collision>
+          <geometry>
+        <box size="0.1 0.1 0.1"/>
+          </geometry>
+        </collision>
+        <visual>
+          <geometry>
+            <mesh filename="package://urp_description/meshes/vehicle/hokuyo.dae"/>
+          </geometry>
+        </visual>
+
+        <inertial>
+          <mass value="1e-5" />
+          <origin xyz="0 0 0" rpy="0 0 0"/>
+          <inertia ixx="1e-6" ixy="0" ixz="0" iyy="1e-6" iyz="0" izz="1e-6" />
+        </inertial>
+  </link>
+
+    <link name="imu_link">
+        <collision>
+          <geometry>
+        <box size="0.1 0.1 0.1"/>
+          </geometry>
+        </collision>
+        <visual>
+          <geometry>
+            <mesh filename="package://urp_description/meshes/vehicle/hokuyo.dae"/>
+          </geometry>
+        </visual>
+
+        <inertial>
+          <mass value="1e-5" />
+          <origin xyz="0 0 0" rpy="0 0 0"/>
+          <inertia ixx="1e-6" ixy="0" ixz="0" iyy="1e-6" iyz="0" izz="1e-6" />
+        </inertial>
+  </link>
+  
+  <gazebo reference="front_right_wheel">
+    <material>Gazebo/Black</material>
+  </gazebo>
+    <gazebo reference="front_left_wheel">
+    <material>Gazebo/Black</material>
+  </gazebo>
+    <gazebo reference="back_right_wheel">
+    <material>Gazebo/Black</material>
+  </gazebo>
+    <gazebo reference="back_left_wheel">
+    <material>Gazebo/Black</material>
+  </gazebo>
+    <gazebo reference="crate">
+    <material>Gazebo/Orange</material>
+  </gazebo>
+   <joint name="front_right_wheel_rot_to_base_link" type="revolute">
+    <parent link="base_link"/>
+    <child link="front_right_wheel_rot"/>
+    <origin rpy="0 -1.57 0" xyz="-0.708 -2.54 -0.501"/>
+    <axis xyz="1 0 0" />
+      <limit effort="10000" velocity="100" lower="-0.3" upper="0.3"/>
+      <joint_properties damping="0.0" friction="0.0"/>
+  </joint>   
+
+   <joint name="front_left_wheel_rot_to_base_link" type="revolute">
+    <parent link="base_link"/>
+    <child link="front_left_wheel_rot"/>
+    <origin rpy="0 1.57 0" xyz="0.708 -2.54 -0.501"/>
+    <axis xyz="-1 0 0" />
+      <limit effort="10000" velocity="100" lower="-0.3" upper="0.3"/>
+      <joint_properties damping="0.0" friction="0.0"/>
+  </joint> 
+                      
+      <joint name="front_right_wheel_rot_to_wheel" type="continuous">
+    <parent link="front_right_wheel_rot"/>
+    <child link="front_right_wheel"/>
+    <origin rpy="0 0 0" xyz="-0.03 0 0.2"/>
+    <axis xyz="0 0 -1" />
+      <limit effort="10000" velocity="100"/>
+      <joint_properties damping="0.0" friction="0.0"/>
+  </joint>        
+
+      <joint name="front_left_wheel_rot_to_wheel" type="continuous">
+    <parent link="front_left_wheel_rot"/>
+    <child link="front_left_wheel"/>
+    <origin rpy="0 0 0" xyz="0.03 0 0.2"/>
+    <axis xyz="0 0 1" />
+      <limit effort="10000" velocity="100"/>
+      <joint_properties damping="0.0" friction="0.0"/>
+  </joint>   
+
+      <joint name="back_right_wheel_to_base_link" type="continuous">
+    <parent link="base_link"/>
+    <child link="back_right_wheel"/>
+    <origin rpy="0 -1.57 0" xyz="-0.91 -0.35 -0.535"/>
+    <axis xyz="0 0 -1" />
+      <limit effort="10000" velocity="100"/>
+      <joint_properties damping="0.0" friction="0.0"/>
+  </joint>  
+
+     <joint name="back_left_wheel_to_base_link" type="continuous">
+    <parent link="base_link"/>
+    <child link="back_left_wheel"/>
+    <origin rpy="0 1.57 0" xyz="0.93 -0.35 -0.535"/>
+    <axis xyz="0 0 1" />
+      <limit effort="10000" velocity="100"/>
+      <joint_properties damping="0.0" friction="0.0"/>
+  </joint>  
+
+  <joint name="hokuyo_joint" type="fixed">
+        <origin xyz="0 -2.5 0.95" rpy="0 0 -1.57"/>
+        <parent link="base_link"/>
+        <child link="hokuyo_link"/>
+    </joint>  
+
+  <joint name="imu_joint" type="fixed">
+        <origin xyz="0 -2.5 0.95" rpy="0 0 -0.1"/>
+        <parent link="base_link"/>
+        <child link="imu_link"/>
+    </joint> 
+        
+    <joint name="crate_joint" type="fixed">
+        <origin xyz="-0.3 -1.1 -0.6" rpy="1.57 0 0"/>
+        <parent link="base_link"/>
+        <child link="crate"/>
+    </joint> 
+
+    <joint name="manipulator_joint" type="fixed">
+        <origin xyz="-0.12 -1.4 0.45" rpy="1.57 3.14 0"/>
+        <parent link="base_link"/>
+        <child link="manipulator_base"/>
+    </joint> 
+        
+      <gazebo reference="hokuyo_link">
+    <sensor type="ray" name="head_hokuyo_sensor">
+      <pose>0 0 0 0 0 0</pose>
+      <visualize>false</visualize>
+      <update_rate>40</update_rate>
+      <ray>
+        <scan>
+          <horizontal>
+            <samples>720</samples>
+            <resolution>1</resolution>
+            <min_angle>-1.570796</min_angle>
+            <max_angle>1.570796</max_angle>
+          </horizontal>
+        </scan>
+        <range>
+          <min>0.10</min>
+          <max>30.0</max>
+          <resolution>0.01</resolution>
+        </range>
+        <noise>
+          <type>gaussian</type>
+          <mean>0.0</mean>
+          <stddev>0.01</stddev>
+        </noise>
+      </ray>
+      <plugin name="gazebo_ros_head_hokuyo_controller" filename="libgazebo_ros_laser.so">
+        <topicName>/scan_front</topicName>
+        <frameName>hokuyo_link</frameName>
+      </plugin>
+    </sensor>
+  </gazebo>
+  
+  <gazebo reference="imu_link">
+    <gravity>true</gravity>
+    <sensor name="imu_sensor" type="imu">
+      <always_on>true</always_on>
+      <update_rate>100</update_rate>
+      <visualize>true</visualize>
+      <topic>__default_topic__</topic>
+      <plugin filename="libgazebo_ros_imu_sensor.so" name="imu_plugin">
+        <topicName>imu</topicName>
+        <bodyName>imu_link</bodyName>
+        <updateRateHZ>10.0</updateRateHZ>
+        <gaussianNoise>0.0</gaussianNoise>
+        <xyzOffset>0 0 0</xyzOffset>
+        <rpyOffset>0 0 0</rpyOffset>
+        <frameName>imu_link</frameName>
+        <initialOrientationAsReference>false</initialOrientationAsReference>
+      </plugin>
+      <pose>0 0 0 0 0 0</pose>
+    </sensor>
+  </gazebo>
+  
+    
+ 
+    <transmission name="front_right_wheel_rot_trans">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="front_right_wheel_rot_to_base_link">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="front_right_wheel_rot_to_base_link_act">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+
+    <transmission name="front_left_wheel_rot_trans">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="front_left_wheel_rot_to_base_link">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="front_left_wheel_rot_to_base_link_act">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+
+    <transmission name="front_right_wheel_rot_to_wheel_trans">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="front_right_wheel_rot_to_wheel">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="front_right_wheel_rot_to_wheel_act">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>      
+  
+    <transmission name="front_left_wheel_rot_to_wheel_trans">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="front_left_wheel_rot_to_wheel">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="front_left_wheel_rot_to_wheel_act">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission> 
+  
+    <transmission name="back_right_wheel_to_base_link_trans">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="back_right_wheel_to_base_link">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="back_right_wheel_to_base_link_act">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>      
+  
+    <transmission name="back_left_wheel_to_base_link_trans">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="back_left_wheel_to_base_link">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="back_left_wheel_to_base_link_act">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>  
+  
+<!-- Manipulator   -->
+
+    <link name="manipulator_base">
+        
+    <inertial>
+      <mass value="0.29"/>
+      <inertia ixx="0.0007464659129791666" ixy="0" ixz="0" iyy="0.0007464659129791666" iyz="0" izz="0.001110943342625"/>
+    </inertial>
+
+        <visual>
+            <origin xyz="0 0 0" rpy="0 0 0" />
+            <geometry>
+                <mesh filename="package://urp_description/meshes/manipulator/base_link.STL" />
+            </geometry>
+            <material name="">
+                <color rgba="0.79216 0.81961 0.93333 1" />
+            </material>
+        </visual>
+        <collision>
+            <origin xyz="0 0 0" rpy="0 0 0" />
+            <geometry>
+                <mesh filename="package://urp_description/meshes/manipulator/base_link.STL" />
+            </geometry>
+        </collision>
+    </link>
+    
+    <link name="Link_1">
+        
+    <inertial>
+      <mass value="0.29"/>
+      <inertia ixx="0.0007464659129791666" ixy="0" ixz="0" iyy="0.0007464659129791666" iyz="0" izz="0.001110943342625"/>
+    </inertial>
+
+        <visual>
+            <origin xyz="0 0 0" rpy="0 0 0" />
+            <geometry>
+                <mesh filename="package://urp_description/meshes/manipulator/Link_1.STL" />
+            </geometry>
+            <material name="">
+                <color rgba="0.79216 0.81961 0.93333 1" />
+            </material>
+        </visual>
+        <!--<collision>
+            <origin xyz="0 0 0" rpy="0 0 0" />
+            <geometry>
+                <mesh filename="package://urp_description/meshes/manipulator/Link_1.STL" />
+            </geometry>
+        </collision>-->
+    </link>
+    <joint name="Joint_1" type="revolute">
+        <origin xyz="0 0 0" rpy="1.5708 0.020229 0" />
+        <parent link="manipulator_base" />
+        <child link="Link_1" />
+        <axis xyz="0 0 1" />
+        <limit lower="-6.28" upper="6.28" effort="150.0" velocity="3.15" />
+    </joint>
+    <link name="Link_2">
+        
+    <inertial>
+      <mass value="0.29"/>
+      <inertia ixx="0.0007464659129791666" ixy="0" ixz="0" iyy="0.0007464659129791666" iyz="0" izz="0.001110943342625"/>
+    </inertial>
+
+        <visual>
+            <origin xyz="0 0 0" rpy="0 0 0" />
+            <geometry>
+                <mesh filename="package://urp_description/meshes/manipulator/Link_2.STL" />
+            </geometry>
+            <material name="">
+                <color rgba="0.79216 0.81961 0.93333 1" />
+            </material>
+        </visual>
+        <!--<collision>
+            <origin xyz="0 0 0" rpy="0 0 0" />
+            <geometry>
+                <mesh filename="package://urp_description/meshes/manipulator/Link_2.STL" />
+            </geometry>
+        </collision>-->
+    </link>
+    <joint name="Joint_2" type="revolute">
+        <origin xyz="0 0 0.052" rpy="0 -0.024533 0" />
+        <parent link="Link_1" />
+        <child link="Link_2" />
+        <axis xyz="0 1 0" />
+        <limit lower="-0.31" upper="1.63" effort="150.0" velocity="3.15" />
+    </joint>
+    <link name="Link_3">
+        
+    <inertial>
+      <mass value="0.29"/>
+      <inertia ixx="0.0007464659129791666" ixy="0" ixz="0" iyy="0.0007464659129791666" iyz="0" izz="0.001110943342625"/>
+    </inertial>
+
+        <visual>
+            <origin xyz="0 0 0" rpy="0 0 0" />
+            <geometry>
+                <mesh filename="package://urp_description/meshes/manipulator/Link_3.STL" />
+            </geometry>
+            <material name="">
+                <color rgba="0.79216 0.81961 0.93333 1" />
+            </material>
+        </visual>
+       <!-- <collision>
+            <origin xyz="0 0 0" rpy="0 0 0" />
+            <geometry>
+                <mesh filename="package://urp_description/meshes/manipulator/Link_3.STL" />
+            </geometry>
+        </collision> -->
+    </link>
+    <joint name="Joint_3" type="revolute">
+        <origin xyz="-0.006677 0 1.0568" rpy="0 0.024533 0" />
+        <parent link="Link_2" />
+        <child link="Link_3" />
+        <axis xyz="0 1 0" />
+        <limit lower="-0.86" upper="1.56" effort="150.0" velocity="3.15" />
+    </joint>
+    <link name="Link_4">
+        
+    <inertial>
+      <mass value="0.29"/>
+      <inertia ixx="0.0007464659129791666" ixy="0" ixz="0" iyy="0.0007464659129791666" iyz="0" izz="0.001110943342625"/>
+    </inertial>
+
+        <visual>
+            <origin xyz="0 0 0" rpy="0 0 0" />
+            <geometry>
+                <mesh filename="package://urp_description/meshes/manipulator/Link_4.STL" />
+            </geometry>
+            <material name="">
+                <color rgba="0.79216 0.81961 0.93333 1" />
+            </material>
+        </visual>
+        <!--<collision>
+            <origin xyz="0 0 0" rpy="0 0 0" />
+            <geometry>
+                <mesh filename="package://urp_description/meshes/manipulator/Link_4.STL" />
+            </geometry>
+        </collision> -->
+    </link>
+    <joint name="Joint_4" type="prismatic">
+        <origin xyz="-0.00014422 -4.0468E-05 0.094011" rpy="0 -0.0015395 0" />
+        <parent link="Link_3" />
+        <child link="Link_4" />
+        <axis xyz="1 0 0" />
+        <limit lower="-0.14" upper="0.65" effort="150.0" velocity="3.15" />
+    </joint>
+       
+<transmission name="trans_Joint_1">
+        <type>transmission_interface/SimpleTransmission</type>
+        <joint name="Joint_1">
+            <hardwareInterface>hardware_interface/PositionJointInterface</hardwareInterface>
+        </joint>
+        <actuator name="Joint_1_motor">
+            <hardwareInterface>hardware_interface/PositionJointInterface</hardwareInterface>
+            <mechanicalReduction>1</mechanicalReduction>
+        </actuator>
+    </transmission>
+    <transmission name="trans_Joint_2">
+        <type>transmission_interface/SimpleTransmission</type>
+        <joint name="Joint_2">
+            <hardwareInterface>hardware_interface/PositionJointInterface</hardwareInterface>
+        </joint>
+        <actuator name="Joint_2_motor">
+            <hardwareInterface>hardware_interface/PositionJointInterface</hardwareInterface>
+            <mechanicalReduction>1</mechanicalReduction>
+        </actuator>
+    </transmission>
+    <transmission name="trans_Joint_3">
+        <type>transmission_interface/SimpleTransmission</type>
+        <joint name="Joint_3">
+            <hardwareInterface>hardware_interface/PositionJointInterface</hardwareInterface>
+        </joint>
+        <actuator name="Joint_3_motor">
+            <hardwareInterface>hardware_interface/PositionJointInterface</hardwareInterface>
+            <mechanicalReduction>1</mechanicalReduction>
+        </actuator>
+    </transmission>
+    <transmission name="trans_Joint_4">
+        <type>transmission_interface/SimpleTransmission</type>
+        <joint name="Joint_4">
+            <hardwareInterface>hardware_interface/PositionJointInterface</hardwareInterface>
+        </joint>
+        <actuator name="Joint_4_motor">
+            <hardwareInterface>hardware_interface/PositionJointInterface</hardwareInterface>
+            <mechanicalReduction>1</mechanicalReduction>
+        </actuator>
+    </transmission>
+      
+  <gazebo>
+    <plugin filename="libgazebo_ros_control.so" name="gazebo_ros_control"/>
+  </gazebo>
+
+</robot>

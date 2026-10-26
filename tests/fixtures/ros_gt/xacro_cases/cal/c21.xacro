@@ -1,0 +1,4 @@
+<?xml version="1.0"?>
+<robot name="r" xmlns:xacro="http://www.ros.org/wiki/xacro">
+<xacro:property name="blk"><b1/><b2/></xacro:property><o><xacro:insert_block name="blk"/></o><v t="${1 == 1.0}" u="${True == 1}" w="${'1' == 1}"/>
+</robot>

@@ -1,0 +1,4 @@
+<?xml version="1.0"?>
+<robot name="r" xmlns:xacro="http://www.ros.org/wiki/xacro">
+<xacro:macro name="m" params="name"><link name="${name}"/></xacro:macro><xacro:m name="a"/><xacro:property name="t"><o x="${1+1}"/></xacro:property><xacro:insert_block name="t"/><!-- keep me --><xacro:property name="s" value="${'%05.1f|%-4s|%+d|%x|%e|%r' % (3.14159, 'ab', 5, 255, 12345.678, 'q')}"/><v s="${s}"/>
+</robot>

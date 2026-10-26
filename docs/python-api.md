@@ -40,9 +40,15 @@ prog.setDO('Gripper', 1)
 prog.RunInstruction('Done', INSTRUCTION_SHOW_MESSAGE)
 
 valid, seconds, mm, ratio, msg = prog.Update()
-ok, code, filename = prog.MakeProgram('', post='ABB_RAPID_IRC5')
-print(code)
+ok, log, transfer_ok = prog.MakeProgram('C:/Temp', RUNMODE_MAKE_ROBOTPROG, 'ABB_RAPID_IRC5')   # writes C:/Temp/Pick.mod
+print(log)
 ```
+
+The legacy imports of older RoboDK scripts work too (`from robolink import *`, `from robodk import *`). Every
+official constant, exception class and method signature is generated from RoboDK's own `robolink.py`
+(`python/robodk/_generate_api.py`), so values such as `ROBOTCOM_*`, `MAKE_ROBOT_*`, `SPRAY_*` match RoboDK.
+Transports, station Python programs, the RoboDK binary protocol (official `robodk` package unmodified) and the
+Library compatibility results: `docs/api.md`.
 
 ## Studio extensions
 
@@ -63,7 +69,9 @@ library by name; programs are rebuilt from the instruction list.
 ## Protocol
 
 JSON-RPC over WebSocket. Request: `{"id": 1, "method": "MoveJ", "target": "<item id>", "params": [...]}`.
-Items serialise as `{"$item": id, "name": ..., "type": ...}`, poses as `{"$pose": [[r0],[r1],[r2],[r3]]}` (row-major).
+Items serialise as `{"$item": id, "name": ..., "type": ...}` (`"$item": null` = invalid item: calls on it raise
+`InputError`), poses as `{"$pose": [[r0],[r1],[r2],[r3]]}` (row-major), other matrices as `{"$mat": rows}`, binary
+data as `{"$bytes": base64}`; lists and dicts are decoded recursively. A request without `target` is a Robolink call.
 Responses: `{"id": 1, "result": ...}` or `{"id": 1, "error": "message"}`. See `src/api/rpc.ts`.
 
 ## Running on the real robot (drivers)
@@ -79,5 +87,7 @@ robot.setDO('1', True)
 print(RDK.Driver('state', robot=robot.Name()))
 ```
 
-Other languages: the server also listens on `port + 1` (20501) with newline-delimited JSON, used by the C#
-(`clients/csharp`), C++ (`clients/cpp`) and MATLAB (`clients/matlab`) clients.
+Other languages: the server also listens on `port + 1` (20501) with newline-delimited JSON (relayed to the browser
+like the WebSocket), used by the C# (`clients/csharp`), C++ (`clients/cpp`, Winsock or BSD sockets) and MATLAB
+(`clients/matlab`) clients. With `STUDIO_RDK_PORT` set the server also speaks RoboDK's binary API protocol, so the
+official RoboDK Python package and RoboDK's own C#/C++/MATLAB APIs connect unmodified (`docs/api.md`).

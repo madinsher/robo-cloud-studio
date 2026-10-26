@@ -48,8 +48,8 @@ function allEventsProgram(): PostProgram {
   return { name: 'All Events 1', robot, robotName: robot.name, dof: 6, jointNames: robot.jointNames(), events, subprograms: [sub], frame: { pose: transl(500, 0, 0), name: 'Table 1' }, tool: { pose: transl(0, 0, 120), name: 'Gripper' }, problems: [] };
 }
 
-/** Posts that echo target names into their output. */
-const LABELLED = ['KUKA_KRC4', 'ABB_RAPID_IRC5', 'Fanuc_R30iA', 'Universal_Robots', 'RoboDK_Python', 'Generic', 'JSON', 'KUKA_KRC2', 'Fanuc_RJ3', 'ABB_RAPID_S4C'];
+/** Posts that echo target names into their output (RoboDK's KUKA / ABB / Fanuc / UR / Motoman posts do not). */
+const LABELLED = ['RoboDK_Python', 'Generic', 'JSON'];
 
 describe('post processor registry', () => {
   it('registers every vendor post with a unique id and extension', () => {
@@ -68,129 +68,118 @@ describe('post processor registry', () => {
       const files = post.generate(prog, { topic: '/traj', uframe: 2, utool: 3, toolIndex: 2, baseIndex: 2 });
       expect(files.length, post.id).toBeGreaterThan(0);
       const main = files[0];
-      expect(main.name.toLowerCase(), post.id).toMatch(new RegExp(`\\.${post.extension.toLowerCase()}$`));
+      expect(main.name.toLowerCase(), post.id).toMatch(post.id === 'Nachi_AX_FD' ? /-01-a[.][0-9]{3}$/ : new RegExp(`\\.${post.extension.toLowerCase()}$`));
       expect(main.content.length, post.id).toBeGreaterThan(100);
       const all = files.map((x) => x.content).join('\n');
       // posts that label their moves carry every target name; all posts carry the home joints (-90) and the pick X (300 mm / 0.3 m)
       if (LABELLED.includes(post.id)) for (const label of ['Home', 'Pick 1', 'Place']) expect(all, `${post.id} ${label}`).toContain(label);
       // no NaN or undefined leaks
-      expect(main.content, post.id).not.toMatch(/NaN|undefined/);
+      expect(main.content.replace('undefined post processor', ''), post.id).not.toMatch(/NaN|undefined/);
       // sub program is emitted (as extra file or inline)
-      if (post.id !== 'ROS2') expect(all, post.id).toMatch(/Sub_Routine|SubRoutine|SUB_ROUTINE|Sub Routine/i); // ROS2 emits one flat trajectory
+      // ROS2 inlines sub-programs in its trajectory; JAKA's controller script has no program calls (RoboDK: same)
+      if (post.id !== 'ROS2' && post.id !== 'JAKA') expect(all, post.id).toMatch(/Sub[_ ]?Ro/i); // Fanuc / Motoman truncate names
     }
   });
 
   it('vendor specifics: KUKA, ABB, Fanuc, UR, ROS2, RoboDK, Generic, JSON', () => {
     const prog = allEventsProgram();
+    // KUKA / ABB / Fanuc / UR reproduce RoboDK's own posts (token-equal output in tests/posts_gt.test.ts); here: the
+    // semantics RoboDK's GT does not cover (names with blanks, events outside a compiled program, per-move overrides).
     const kuka = getPost('KUKA_KRC4')!.generate(prog);
-    expect(kuka.map((x) => x.name)).toEqual(['ALL_EVENTS_1.src', 'ALL_EVENTS_1.dat', 'SUB_ROUTINE.src', 'SUB_ROUTINE.dat']);
+    expect(kuka.map((x) => x.name)).toEqual(['AllEvents1.src', 'SubRoutine.src']);
     const src = kuka[0].content;
-    expect(src).toContain('DEF ALL_EVENTS_1 ( )');
-    expect(src).toContain('$BASE = {FRAME: {X 500.000,Y 0.000,Z 0.000,A 0.000,B 0.000,C 0.000}} ; Table 1');
-    expect(src).toContain('$VEL.CP = 0.250');
-    expect(src).toContain('$ACC.CP = 1.200');
-    expect(src).toContain('$VEL_AXIS[1] = 17');
-    expect(src).toContain('$APO.CDIS = 10.0');
-    expect(src).toContain('PTP {A1 10.000,A2 -90.000,A3 90.000,A4 -90.000,A5 -90.000,A6 0.000,E1 0.000,E2 0.000,E3 0,E4 0,E5 0,E6 0} C_PTP ; Home');
-    expect(src).toContain('LIN {X 300.000,Y 100.000,Z 200.000,A 0.000,B 0.000,C 180.000} C_DIS ; Pick 1');
-    expect(src).toMatch(/CIRC \{X 350.000.*\}, \{X 400.000.*\} C_DIS ; Arc/);
-    expect(src).toMatch(/LIN \{X 400.000,Y -100.000.*\} ; Place/); // rounding 0 -> no C_DIS
+    expect(src).toContain('DEF AllEvents1 ( )');
+    expect(src).toContain('$BASE = {FRAME: X 500.000,Y 0.000,Z 0.000,A 0.000,B 0.000,C 0.000}');
+    expect(src).not.toMatch(/\{FRAME: \{/); // RoboDK aggregate syntax, not a nested one
+    expect(src).toContain('$TOOL = {FRAME: X 0.000,Y 0.000,Z 120.000,A 0.000,B 0.000,C 0.000}');
+    expect(src).toContain('$VEL.CP = 0.25000');
+    expect(src).toContain('$ACC.CP = 1.20000');
+    expect(src).toContain('$VEL.ORI1 = 30.00000'); // joint speed -> orientation speed like RoboDK
+    expect(src).toContain('$APO.CDIS = 10.000');
+    expect(src).toContain('PTP {A1 10.00000,A2 -90.00000,A3 90.00000,A4 -90.00000,A5 -90.00000,A6 0.00000} C_PTP');
+    // per-move speed 100 applied to Pick 1 only, then the program speed is restored
+    expect(src).toMatch(/\$VEL\.CP = 0\.10000\r?\n(\$APO.*\r?\n)*LIN \{X 300\.000,Y 100\.000,Z 200\.000,A 0\.000,B 0\.000,C 180\.000\} C_DIS\r?\n\$VEL\.CP = 0\.25000\r?\nCIRC \{X 350\.000/);
     expect(src).toContain('WAIT SEC 0.500');
     expect(src).toContain('HALT');
-    expect(src).toContain('$OUT[3] = TRUE');
-    expect(src).toContain('$OUT[gripper] = FALSE');
-    expect(src).toContain('WAIT FOR $IN[7] == FALSE');
+    expect(src).toContain('DO3=TRUE'); // named IO kept verbatim
     expect(src).toContain('MyRoutine()');
-    expect(src).toContain("MsgNotify(\"Cycle 'done'\")");
-    expect(src).toContain('SUB_ROUTINE()');
-    expect(src).toContain('$OUT[1] = TRUE ; gripper close');
+    expect(src).toContain('SubRoutine()');
+    expect(kuka[1].content).toContain('DEF SubRoutine ( )');
+    // simulation events (attach / gripper) never become outputs
+    expect(src).not.toMatch(/\$OUT\[/);
+    expect(src).toContain('; gripper close');
     expect(src).toContain('; NAVIGATE X 1500.000 Y -200.000');
-    expect(src).toContain('; TASK harvest {"rows":2}');
-    expect(src).toContain('E1 100.000'); // 7th axis
 
-    const abb = getPost('ABB_RAPID_IRC5')!.generate(prog)[0].content;
-    expect(abb).toContain('MODULE All_Events_1');
-    expect(abb).toContain('PERS tooldata Gripper := [TRUE,[[0.000,0.000,120.000],[1.000000,0.000000,0.000000,0.000000]],[1,[0,0,50],[1,0,0,0],0,0,0]];');
-    expect(abb).toContain('PERS wobjdata Table_1 :=');
-    expect(abb).toContain('PERS speeddata vbs_v250 := [250,60,5000,1000];');
-    expect(abb).toMatch(/CONST jointtarget jt_Home_1 := \[\[10.000,-90.000,90.000,-90.000,-90.000,0.000\],\[9E9,9E9,9E9,9E9,9E9,9E9\]\];/);
-    expect(abb).toMatch(/CONST jointtarget jt_Home_2_\d+ := \[\[.*\],\[100.000,9E9/); // external axis
-    expect(abb).toContain('MoveAbsJ jt_Home_1,vbs_v250,z10,Gripper\\WObj:=Table_1;');
-    expect(abb).toMatch(/MoveL \[\[300.000,100.000,200.000\],\[0.000000,1.000000,0.000000,0.000000\],\[0,-2,0,0\],\[9E9,9E9,9E9,9E9,9E9,9E9\]\],vbs_v250,z10,Gripper\\WObj:=Table_1;  ! Pick 1/);
-    expect(abb).toMatch(/MoveC .*,vbs_v250,z10,Gripper/);
-    expect(abb).toMatch(/MoveL \[\[400.000,-100.000,300.000\].*,fine,Gripper/);
-    expect(abb).toContain('WaitTime 0.50;');
-    expect(abb).toContain('Stop;');
+    const abbF = getPost('ABB_RAPID_IRC5')!.generate(prog);
+    expect(abbF.map((x) => x.name)).toEqual(['AllEvents1.mod']);
+    const abb = abbF[0].content;
+    expect(abb).toContain('PERS tooldata Gripper := [TRUE,[[0.000,0.000,120.000],[1.00000000,0.00000000,0.00000000,0.00000000]]');
+    expect(abb).toContain('PERS wobjdata Table1 := [FALSE, TRUE, "", [[0,0,0],[1,0,0,0]],[[500.000,0.000,0.000]');
+    // every declaration once, sub-program as its own PROC in the same module, called by name
+    for (const decl of abb.match(/PERS \w+ \w+/g) ?? []) expect(abb.split(decl).length - 1, decl).toBe(1);
+    expect(abb).toContain('PROC SubRoutine()');
+    expect(abb).toMatch(/^\t\tSubRoutine;$/m);
+    expect(abb).toMatch(/MoveAbsJ \[\[10\.000000,-90\.000000,90\.000000,-90\.000000,-90\.000000,0\.000000\],\[9E\+09,9E\+09,9E\+09,9E\+09,9E\+09,9E\+09\]\],\[250\.00,500,5000,1000\],z10,Gripper \\WObj:=Table1;/);
+    expect(abb).toMatch(/MoveL \[\[300\.000,100\.000,200\.000\],\[0\.00000000,1\.00000000,0\.00000000,0\.00000000\],\[0,-2,0,0\],.*\],v100,z10,Gripper \\WObj:=Table1;/);
+    expect(abb).toMatch(/MoveC \[\[350\.000,150\.000,200\.000\].*\[\[400\.000,100\.000,200\.000\].*,\[250\.00,500,5000,1000\],z10,Gripper/);
+    expect(abb).toMatch(/MoveL \[\[400\.000,-100\.000,300\.000\].*,z0,Gripper/);
+    expect(abb).toContain('WaitTime 0.500;');
     expect(abb).toContain('SetDO DO3, 1;');
-    expect(abb).toContain('WaitDI DI7, 0;');
+    expect(abb).toContain('WaitDI DI7, 0, \\MaxTime:=2.0;');
     expect(abb).toContain('MyRoutine;');
-    expect(abb).toContain('x = 1');
-    expect(abb).toContain("TPWrite \"Cycle 'done'\";");
-    expect(abb).toContain('Sub_Routine;');
-    expect(abb).toContain('PROC Sub_Routine()');
-    expect(abb).toContain('SetDO doGripper, 1;');
+    expect(abb).not.toMatch(/doGripper/);
     expect(abb.trim().endsWith('ENDMODULE')).toBe(true);
 
-    const fanuc = getPost('Fanuc_R30iA')!.generate(prog, { uframe: 2, utool: 3 });
-    expect(fanuc.length).toBe(2);
+    const fanuc = getPost('Fanuc_R30iA')!.generate(prog);
+    expect(fanuc.map((x) => x.name)).toEqual(['AllEvents1.LS', 'SubRoutine.LS']);
     const ls = fanuc[0].content;
-    expect(ls).toContain('/PROG  ALL_EVENTS_1');
-    expect(ls).toContain('UFRAME_NUM=2');
-    expect(ls).toContain('UFRAME_NUM=3'); // setFrame increments
-    expect(ls).toContain('UTOOL_NUM=4');
-    expect(ls).toMatch(/J P\[1\] 15% CNT10 ;/); // speedJoints 30 -> 15 %
-    expect(ls).toMatch(/L P\[2\] 100mm\/sec CNT10 ;/);
-    expect(ls).toMatch(/C P\[3\]\s+;\n\s*\d+:\s+P\[4\] 250mm\/sec CNT10 ;/);
-    expect(ls).toMatch(/L P\[5\] 250mm\/sec FINE ;/);
-    expect(ls).toContain('WAIT 0.50(sec)');
+    expect(ls).toContain('/PROG  AllEvents1');
+    // un-numbered frame / tool are written into PR[9] and activated
+    expect(ls).toMatch(/PR\[9,1\]=500\.000 ;[\s\S]*UFRAME\[9\]=PR\[9\] ;\r\n\s+\d+:\s+UFRAME_NUM=9 ;/);
+    expect(ls).toMatch(/PR\[9,3\]=120\.000 ;[\s\S]*UTOOL\[9\]=PR\[9\] ;\r\n\s+\d+:\s+UTOOL_NUM=9 ;/);
+    expect(ls).toMatch(/J P\[1\] 15% CNT10 ACC100 ;/); // speedJoints 30 -> 15 %
+    expect(ls).toMatch(/L P\[2\] 100mm\/sec CNT10 ACC100 ;/); // per-move speed
+    expect(ls).toMatch(/C P\[3\] \r\n\s+P\[4\] 250mm\/sec CNT10 ;/); // continuation line has no number
+    expect(ls).toContain('WAIT  0.50(sec)');
     expect(ls).toContain('PAUSE');
-    expect(ls).toContain('DO[3]=ON');
-    expect(ls).toContain('DO[1]=OFF');
-    expect(ls).toContain('WAIT DI[7]=OFF');
-    expect(ls).toContain('CALL MYROUTINE');
-    expect(ls).toContain('CALL SUB_ROUTINE');
-    expect(ls).toContain('RO[1]=ON');
-    expect(ls).toContain('P[1:"Home"]{');
-    expect(ls).toMatch(/J3=\s+0.000 deg/); // J3 = j3 + j2 = 0
-    expect(ls).toContain('/POS');
-    expect(ls).toContain("CONFIG : 'F U B', 0, -1, 0"); // Pick 1 joints: j5 -90 -> F/B, j4 -100
+    expect(ls).toContain('WAIT DI7=OFF TIMEOUT, LBL[1]');
+    expect(ls).toContain('CALL MyRoutine');
+    expect(ls).toContain('CALL SubRoutine ;'); // calls the program by its file name
+    expect(ls).toMatch(/J1=\s+10\.000 deg,\tJ2=\s+-90\.000 deg,\tJ3=\s+90\.000 deg/); // J3 as given (RoboDK)
+    expect(ls).toContain("CONFIG : 'N U T, 0, 0, 0'");
+    expect(ls).not.toMatch(/RO\[|DO\[1\]/); // no fabricated gripper outputs
     expect(ls).toMatch(/LINE_COUNT\t= \d+;/);
 
-    const ur = getPost('Universal_Robots')!.generate(prog)[0].content;
-    expect(ur).toContain('def All_Events_1():');
-    expect(ur).toContain('set_tcp(p[0.000000, 0.000000, 0.120000, 0.000000, 0.000000, 0.000000])  # Gripper');
-    expect(ur).toContain('frame = p[0.500000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000]  # Table 1');
-    expect(ur).toMatch(/movej\(\[0.174533, -1.570796, 1.570796, -1.570796, -1.570796, 0.000000\], a=5.236, v=0.524, r=0.0100\)  # Home/);
-    expect(ur).toMatch(/movel\(pose_trans\(frame, p\[0.300000, 0.100000, 0.200000, 3.141593, 0.000000, 0.000000\]\), a=1.200, v=0.100, r=0.0100\)  # Pick 1/);
-    expect(ur).toMatch(/movec\(pose_trans\(frame, p\[0.350000.*\), pose_trans\(frame, p\[0.400000.*\), a=1.200, v=0.250, r=0.0100\)  # Arc/);
-    expect(ur).toMatch(/movel\(.*Place/);
+    const urF = getPost('Universal_Robots')!.generate(prog);
+    expect(urF.map((x) => x.name)).toEqual(['AllEvents1.script', 'AllEvents1.urp']);
+    const ur = urF[0].content;
+    expect(ur).toContain('def AllEvents1():');
+    expect(ur).toContain('ref_frame = p[0.500000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000]');
+    expect(ur).toContain('set_tcp(p[0.000000, 0.000000, 0.120000, 0.000000, 0.000000, 0.000000])');
+    // a speed change right after a blended move stops the blend like RoboDK ("# end trace")
+    expect(ur).toContain('movej([0.174533, -1.570796, 1.570796, -1.570796, -1.570796, 0.000000],accel_radss,speed_rads,0,0) # end trace');
+    expect(ur).toMatch(/speed_ms\s+= 0\.100\r?\n\s+movel\(pose_trans\(ref_frame,p\[0\.300000, 0\.100000, 0\.200000, 3\.141593, 0\.000000, 0\.000000\]\),accel_mss,speed_ms,0,0\) # end trace/);
+    expect(ur).toMatch(/movec\(pose_trans\(ref_frame,p\[0\.350000.*\]\),pose_trans\(ref_frame,p\[0\.400000.*\]\),accel_mss,speed_ms,0/);
     expect(ur).toContain('sleep(0.500)');
-    expect(ur).toContain('popup("Paused: press continue", blocking=True)');
-    expect(ur).toContain('set_standard_digital_out(3, True)');
-    expect(ur).toContain('set_standard_digital_out(0, False)');
-    expect(ur).toContain('while get_standard_digital_in(7) != False:');
-    expect(ur).toContain('  MyRoutine()');
-    expect(ur).toContain('  x = 1');
-    expect(ur).toContain("textmsg(\"Cycle 'done'\")");
-    expect(ur).toContain('  Sub_Routine()');
-    expect(ur).toContain('set_tool_digital_out(0, True)  # gripper close');
-    expect(ur.indexOf('def Sub_Routine():')).toBeLessThan(ur.indexOf('def All_Events_1():'));
-    expect(ur.trim().endsWith('All_Events_1()')).toBe(true);
-
-    const ros = getPost('ROS2')!.generate(prog, { topic: '/arm/traj' });
-    expect(ros.map((x) => x.name)).toEqual(['All_Events_1_ros2.py', 'All_Events_1_trajectory.json']);
-    const traj = JSON.parse(ros[1].content);
-    expect(traj.joint_names.length).toBe(6);
-    expect(traj.points.length).toBe(3); // Home, Pick 1, Home 2 (moveC / Place carry no joints)
-    expect(traj.points[0].positions[0]).toBeCloseTo(10 * DEG, 6);
-    expect(traj.points[0].time_from_start).toEqual({ sec: 0, nanosec: 500000000 });
-    expect(traj.points[1].time_from_start.sec).toBeGreaterThanOrEqual(0);
-    expect(traj.waypoints.some((w: any) => w.navigate && w.navigate.x === 1.5)).toBe(true);
-    expect(traj.waypoints.some((w: any) => w.set_io === 'DO3' && w.value === true)).toBe(true);
-    expect(traj.waypoints[0].position.x).toBeCloseTo(getPos(prog.robot!.solveFK([10, -90, 90, -90, -90, 0]))[0] / 1000, 6);
-    expect(ros[0].content).toContain("'/arm/traj'");
-    expect(ros[0].content).toContain('class All_Events_1Node(Node):');
-    expect(ros[1].mime).toBe('application/json');
+    expect(ur).toContain('MyRoutine()');
+    // the sub-program is defined inside the main program and called once from it
+    expect(ur.indexOf('def SubRoutine():')).toBeGreaterThan(ur.indexOf('def AllEvents1():'));
+    expect(ur.match(/^\s*SubRoutine\(\)$/gm)?.length).toBe(1);
+    expect(ur.trim().endsWith('AllEvents1()')).toBe(true);
+    expect(ur).not.toMatch(/set_tool_digital_out/);
+    // ROS 2: ament_python package with a FollowJointTrajectory client (system test in tests/posts_ros2.test.ts)
+    const ros = getPost('ROS2')!.generate(prog, { controller: 'arm_controller' });
+    expect(ros.map((x) => x.name)).toEqual(expect.arrayContaining(['allevents1_ros2/package.xml', 'allevents1_ros2/setup.py', 'allevents1_ros2/allevents1_ros2/allevents1_node.py', 'allevents1_ros2/trajectory.json']));
+    const traj = JSON.parse(ros.find((f) => f.name.endsWith('trajectory.json'))!.content);
+    expect(traj.joint_names).toEqual(prog.robot!.jointNames());
+    expect(traj.controller).toBe('arm_controller');
+    const tsegs = traj.segments.filter((x: any) => x.type === 'traj');
+    expect(tsegs[0].points[0].positions[0]).toBeCloseTo(10 * DEG, 6);
+    expect(tsegs[0].points[0].first).toBe(true); // timed from the current state at run time
+    expect(traj.segments.some((x: any) => x.type === 'io' && x.name === 'DO3' && x.value === 1)).toBe(true);
+    expect(traj.segments.some((x: any) => x.type === 'pause' && x.seconds === 0.5)).toBe(true);
+    expect(ros[0].content).toContain("'/%s/follow_joint_trajectory' % controller");
+    expect(ros.find((f) => f.name.endsWith('trajectory.json'))!.mime).toBe('application/json');
 
     const rdk = getPost('RoboDK_Python')!.generate(prog);
     expect(rdk.map((x) => x.name)).toEqual(['All_Events_1_robodk.py', 'Sub_Routine_robodk.py']);
@@ -233,6 +222,45 @@ describe('post processor registry', () => {
     expect(json.subprograms[0].program).toBe('Sub Routine');
   });
 
+  it('Elite (RoboDK EC V3): definitions, Lua base conversion, then the motions; IO-before-motion warning; RoboDK split', () => {
+    const post = getPost('Elite_Robots_EC_V3')!;
+    expect(post.id).toBe('Elite_EC');
+    const prog = allEventsProgram();
+    const files = post.generate(prog, { date: new Date(2026, 9, 25, 12, 0, 0) });
+    expect(files.map((x) => x.name)).toEqual(['AllEvents1.jbi', 'SubRoutine.jbi']);
+    const lines = files[0].content.split('\r\n');
+    expect(lines.slice(0, 3)).toEqual(['NOP', '// HEADER', '// DATE 2026/10/25 12:00']);
+    const firstMove = lines.findIndex((l) => /^MOV[JLC] /.test(l));
+    const lua = lines.indexOf('//set total pose number and use lua to tranf pose in user to in_base');
+    expect(lua).toBeGreaterThan(0);
+    expect(firstMove).toBeGreaterThan(lua);
+    expect(lines.findIndex((l) => l.startsWith('DOUT '))).toBeLessThan(lua);
+    expect(lines.findIndex((l) => l.startsWith('WAIT ') && l.includes(' T=2'))).toBeLessThan(lua);
+    expect(lines).toContain('CALL JOB:SubRoutine');
+    expect(lines).toContain('SETUSERFRAME USER #(1) V000');
+    expect(lines).toContain('SETTOOLNUMBER TF=1');
+    // MoveC: last linear target, via, end; rounding clamped to 7 mm
+    const movc = lines.filter((l) => l.startsWith('MOVC '));
+    expect(movc.length).toBe(3);
+    expect(movc[0]).toMatch(/^MOVC V000 V=250MM\/S CR=7.0MM ACC=50 DEC=50$/);
+    expect(lines[lines.length - 2]).toBe('END');
+    expect(prog.problems.some((p) => /executed before the motion block/.test(p))).toBe(true);
+
+    const split = post.generate(allEventsProgram(), { maxLines: 8 });
+    const main = split[0].content.split('\r\n');
+    expect(split[0].name).toBe('M_AllEvents1.jbi');
+    const parts = main.filter((l) => l.startsWith('CALL JOB:')).map((l) => l.slice(9));
+    expect(parts.length).toBeGreaterThan(1);
+    expect(parts[0]).toBe('AllEvents1');
+    for (const [i, name] of parts.entries()) expect(split.map((x) => x.name)).toContain(`${name}.jbi`), expect(name).toBe(i ? `AllEvents1${i + 1}` : 'AllEvents1');
+    // every part re-runs the motions so far; the last part and the main run all of them
+    const motions = (txt: string) => txt.split('\r\n').filter((l) => /^MOV[JLC] /.test(l));
+    const last = split.find((x) => x.name === `${parts[parts.length - 1]}.jbi`)!;
+    expect(motions(last.content)).toEqual(motions(split[0].content));
+    expect(motions(split[0].content)).toEqual(motions(files[0].content));
+    expect(motions(split.find((x) => x.name === 'AllEvents1.jbi')!.content).length).toBeLessThan(motions(split[0].content).length);
+  });
+
   it('runs every post on the demo pick & place program compiled from the station', () => {
     const st = demos.find((d) => d.id === 'pickplace')!.build();
     const prog = st.itemsOfType<Program>(ItemType.PROGRAM)[0];
@@ -250,7 +278,13 @@ describe('post processor registry', () => {
     expect(compiled.events.filter((e) => e.kind === 'gripper').length).toBe(6);
     expect(compiled.events.filter((e) => e.kind === 'setDO').length).toBe(6);
     expect(compiled.events.filter((e) => e.kind === 'pause').length).toBe(3);
+    // like RoboDK's MakeProgram, a program without "Set reference frame" / "Set tool" instructions gets no implicit
+    // frame / tool lines (RoboDK 5.9.4 code of the Library programs, tests/posts_library_code.test.ts): it starts with
+    // the program's speed instruction
     expect(compiled.events[0]).toMatchObject({ kind: 'setSpeed', speedLinear: 600, speedJoints: 120 });
+    expect(compiled.events.some((e) => e.kind === 'setFrame' || e.kind === 'setTool')).toBe(false);
+    // with initialFrameTool the program's frame and tool are stated first
+    expect(compileForPost(st, prog, { initialFrameTool: true }).events.slice(0, 3)).toMatchObject([{ kind: 'setFrame', name: 'Table' }, { kind: 'setTool', name: 'Vacuum gripper' }, { kind: 'setSpeed', speedLinear: 600, speedJoints: 120 }]);
     // every moveL has a joint solution and its pose is expressed in the Table frame
     const first = compiled.events.find((e) => e.kind === 'moveL') as any;
     expect(first.joints).toBeTruthy();
@@ -258,7 +292,7 @@ describe('post processor registry', () => {
     for (const post of listPosts()) {
       const files = post.generate(compiled);
       expect(files.length, post.id).toBeGreaterThan(0);
-      expect(files[0].name.toLowerCase(), post.id).toMatch(new RegExp(`\\.${post.extension.toLowerCase()}$`));
+      expect(files[0].name.toLowerCase(), post.id).toMatch(post.id === 'Nachi_AX_FD' ? /-01-a[.][0-9]{3}$/ : new RegExp(`\\.${post.extension.toLowerCase()}$`));
       const all = files.map((x) => x.content).join('\n');
       expect(all.length, post.id).toBeGreaterThan(200);
       if (LABELLED.includes(post.id)) { expect(all, post.id).toContain('Home'); expect(all, post.id).toContain('Pick 1'); }
@@ -351,29 +385,39 @@ describe('compileForPost resolves every instruction kind', () => {
     prog.addInstruction({ kind: 'wait', what: 'move_done' });
     const disabled = prog.pause(999);
     disabled.enabled = false;
-    const c = compileForPost(st, prog);
+    // like RoboDK's MakeProgram a "Start thread" reaches the posts as code (the program name); the control-model code
+    // generator asks for native threads
+    expect(compileForPost(st, prog).events.filter((e) => e.kind === 'runCode' && e.thread).map((e: any) => e.code)).toEqual([sub.name.replace(/\s+/g, '')]);
+    const c = compileForPost(st, prog, { nativeThreads: true });
     const kinds = c.events.map((e) => e.kind);
-    expect(kinds.slice(0, 7)).toEqual(['moveJ', 'moveL', 'moveC', 'moveJ', 'moveL', 'moveJ', 'moveC']);
-    expect(c.problems).toEqual(expect.arrayContaining([expect.stringMatching(/T1: MoveC needs via/), expect.stringMatching(/Far: unreachable/), expect.stringMatching(/no joint solution for MoveJ/), expect.stringMatching(/no pose for MoveL/), 'Program ghost not found']));
-    expect(c.problems.length).toBe(5);
-    const moveL = c.events[1] as any;
+    const moves = c.events.filter((e) => /^move/.test(e.kind)) as any[];
+    expect(moves.slice(0, 7).map((e) => e.kind)).toEqual(['moveJ', 'moveL', 'moveC', 'moveJ', 'moveL', 'moveJ', 'moveC']);
+    // RoboDK keeps every move it can express: only the MoveC without via and the MoveL without pose are skipped
+    expect(c.problems).toEqual(expect.arrayContaining([expect.stringMatching(/T1: MoveC needs via/), expect.stringMatching(/Far: unreachable/), expect.stringMatching(/MoveJ: no joint values for MoveJ, previous joints kept/), expect.stringMatching(/MoveL without a pose skipped/)]));
+    expect(c.problems.length).toBe(4);
+    // no implicit frame / tool (RoboDK); the per-move override becomes explicit speed / zone events around the move
+    // (posts have no per-move parameters, like RoboDK)
+    expect(kinds.slice(0, 7)).toEqual(['moveJ', 'setSpeed', 'setRounding', 'moveL', 'setSpeed', 'setRounding', 'moveC']);
+    expect(c.events.slice(1, 6)).toMatchObject([{ speedLinear: 80 }, { radius: 2 }, { kind: 'moveL' }, { speedLinear: 500 }, { radius: -1 }]);
+    const moveL = moves[1];
     expect(moveL.speed).toBe(80);
-    expect(moveL.rounding).toBe(2);
     // pose w.r.t. frame F: target is 400 up in F
     expect(getPos(moveL.pose).map(Math.round)).toEqual([0, 0, 400]);
     expect(moveL.joints.length).toBe(6);
-    const mc = c.events[2] as any;
+    const mc = moves[2];
     expect(mc.viaName).toBe('Via');
     expect(getPos(mc.via).map(Math.round)).toEqual([50, 50, 400]);
-    expect((c.events[6] as any).viaName).toBe('via');
+    expect(mc.viaJoints.length).toBe(6); // MoveC carries the via joints (RoboDK passes both joint sets)
+    expect(moves[6].viaName).toBe('via');
     // the unreachable target still produces a moveL (pose kept, joints from seed)
     expect(kinds.filter((k) => k === 'moveL').length).toBe(3);
     // joint path -> 5 joint moves named "Joint path ... i"
     const jp = c.events.filter((e) => e.kind === 'moveJ' && /Joint path/.test((e as any).name));
     expect(jp.length).toBe(5);
     expect((jp[4] as any).joints[0]).toBe(4);
-    expect(kinds).toEqual(expect.arrayContaining(['setFrame', 'setTool', 'setSpeed', 'setRounding', 'pause', 'setDO', 'waitDI', 'runCode', 'message', 'comment', 'gripper', 'callProgram', 'navigate', 'task']));
+    expect(kinds).toEqual(expect.arrayContaining(['setFrame', 'setTool', 'setSpeed', 'setRounding', 'pause', 'setDO', 'waitDI', 'runCode', 'message', 'comment', 'gripper', 'callProgram', 'navigate', 'task', 'loop', 'if', 'thread']));
     const frames = c.events.filter((e) => e.kind === 'setFrame') as any[];
+    // only the program's own frame instructions (no implicit initial frame, like RoboDK)
     expect(frames.map((x) => x.name)).toEqual(['World', 'F']);
     expect(getPos(frames[0].pose)).toEqual([0, 0, 0]);
     expect(getPos(frames[1].pose)).toEqual([300, 0, -100]); // frame in robot base
@@ -382,8 +426,14 @@ describe('compileForPost resolves every instruction kind', () => {
     expect(tools[1].toolId).toBe(tool.id);
     expect(c.events.find((e) => e.kind === 'waitDI' && (e as any).io === 'D2')).toMatchObject({ value: 0, timeoutMs: 500 });
     expect(c.events.filter((e) => e.kind === 'gripper').map((e: any) => e.close)).toEqual([true, false]);
-    expect(c.events.filter((e) => e.kind === 'comment').map((e: any) => e.text)).toEqual(['note', 'event show', 'follow path p1', 'loop (not supported by post)', 'if (not supported by post)', 'start thread Sub', 'wait move done']);
+    expect(c.events.filter((e) => e.kind === 'comment').map((e: any) => e.text)).toEqual(['note', 'show Box', 'follow path p1', 'wait move done']);
+    // control flow stays structured for the posts (I6)
+    expect(c.events.find((e) => e.kind === 'loop')).toMatchObject({ count: 2, body: 'Sub' });
+    expect(c.events.find((e) => e.kind === 'if')).toMatchObject({ condition: 'x', then: 'Sub', else: null });
+    expect(c.events.find((e) => e.kind === 'thread')).toMatchObject({ name: 'Sub' });
     expect(c.events.filter((e) => e.kind === 'callProgram').length).toBe(3);
+    // a call to a program that is not in the station is still emitted as a call (RoboDK "Call program")
+    expect(c.events.find((e) => e.kind === 'runCode' && (e as any).code === 'ghost')).toMatchObject({ isCall: true });
     expect(c.subprograms.length).toBe(1);
     expect(c.subprograms[0].name).toBe('Sub');
     expect(c.events.find((e) => e.kind === 'setDO' && (e as any).io === 's1')).toMatchObject({ value: 1 });
@@ -404,10 +454,13 @@ describe('compileForPost resolves every instruction kind', () => {
     expect(c.robot).toBeNull();
     expect(c.dof).toBe(6);
     expect(c.jointNames).toEqual([]);
-    expect(c.frame.name).toBe('World');
-    expect(c.events.length).toBe(2); // MoveL (pose relative to station) + inline joints; target MoveJ has no joints
-    expect(getPos((c.events[0] as any).pose)).toEqual([300, 0, 400]);
-    expect(c.problems).toEqual(['T1: no joint solution for MoveJ']);
+    // without a robot the targets stay relative to their frame and the frame is given w.r.t. the station
+    expect(c.frame.name).toBe('F');
+    expect(getPos(c.frame.pose)).toEqual([300, 0, 0]);
+    expect(c.events.map((e) => e.kind)).toEqual(['moveL', 'moveJ']); // target MoveJ has no joints
+    expect(getPos((c.events[0] as any).pose)).toEqual([0, 0, 400]);
+    expect((c.events[1] as any).joints).toEqual([1, 2, 3]);
+    expect(c.problems).toEqual(['T1: no joint values for MoveJ (no robot), move skipped']);
     const p2 = st.addChild(new Program('Explicit'));
     p2.setRobot(robot);
     p2.frameId = frame.id;
@@ -416,7 +469,7 @@ describe('compileForPost resolves every instruction kind', () => {
     const c2 = compileForPost(st, p2);
     expect(c2.frame.name).toBe('F');
     expect(c2.tool.name).toBe('T');
-    expect(c2.events.length).toBe(1);
+    expect(c2.events.map((e) => e.kind)).toEqual(['setFrame', 'setTool', 'moveL']);
   });
   it('shared helpers format numbers and names', () => {
     expect(f(-0.0001)).toBe('0.000');
@@ -438,10 +491,11 @@ describe('euler ZYZ', () => {
     const back = zyzToPose(...v);
     for (let i = 0; i < 16; i++) expect(back[i]).toBeCloseTo(m[i], 9);
     // b = 0 / 180 singularities
+    // RoboDK Pose_2_Adept puts a pure Z rotation into the last angle
     const up = poseToZyz(mul(transl(0, 0, 0), rotz(20 * DEG)));
-    expect(up[3]).toBeCloseTo(20, 9);
+    expect(up[3]).toBe(0);
     expect(up[4]).toBe(0);
-    expect(up[5]).toBe(0);
+    expect(up[5]).toBeCloseTo(20, 9);
     const down = poseToZyz(rotx(180 * DEG));
     expect(down[4]).toBeCloseTo(180, 9);
     expect(distance(getPos(zyzToPose(...down)), [0, 0, 0])).toBe(0);
@@ -469,9 +523,11 @@ describe('Python (RoboDK) posts', () => {
       globals: { set: (k: string, v: any) => globals.set(k, v) },
       runPythonAsync: async (code: string) => {
         runs.push(code);
-        if (/post_shim\.run_from_json/.test(code)) {
-          const events = JSON.parse(globals.get('__events'));
-          return JSON.stringify({ program: `PROGRAM ${globals.get('__prog')} for ${globals.get('__robot')} dof=${globals.get('__dof')}\n${events.map((e: any) => e.kind).join('\n')}`, extension: 'jbi', log: globals.get('__prog') === 'Sub Routine' ? '' : 'ok' });
+        if (/post_shim\.run_job_source\(__post_src, __job/.test(code)) {
+          // the job carries the main program and its sub-programs (RoboDK names without blanks)
+          const job = JSON.parse(globals.get('__job'));
+          const files = [job, ...job.subprograms].map((p: any) => ({ name: `${p.name}.jbi`, encoding: 'utf-8', content: `PROGRAM ${p.name} for ${job.robot} dof=${job.dof}\n${p.events.map((e: any) => e.kind).join('\n')}` }));
+          return JSON.stringify({ ok: true, files, log: job.subprograms.length ? 'ok' : '' });
         }
         return '';
       },
@@ -483,10 +539,12 @@ describe('Python (RoboDK) posts', () => {
     expect(post.name).toBe('TestPost (Python post)');
     expect(post.generate(allEventsProgram())[0].name).toBe('README.txt');
     const files = await post.generateAsync(allEventsProgram());
-    expect(files.map((x) => x.name)).toEqual(['All_Events_1.jbi', 'All_Events_1.log', 'Sub_Routine.jbi']);
-    expect(files[0].content).toContain('PROGRAM All Events 1 for Universal Robots UR10e dof=6');
+    // every file the post writes comes back (main + sub-program in one job, ProgSave), the post log as post_log.txt
+    expect(files.map((x) => x.name)).toEqual(['AllEvents1.jbi', 'SubRoutine.jbi', 'post_log.txt']);
+    expect(files[0].content).toContain('PROGRAM AllEvents1 for Universal Robots UR10e dof=6');
     expect(files[0].content).toContain('moveC');
-    expect(files[1].content).toBe('ok');
+    expect(files[0].content).toContain('callProgram');
+    expect(files[2].content).toBe('ok');
     // the robodk shim modules were installed once and the shim imported
     expect(Object.keys(written)).toEqual(expect.arrayContaining(['/studio/robodk/__init__.py', '/studio/robodk/robomath.py', '/studio/robodk/robodialogs.py', '/studio/robodk/robofileio.py', '/studio/robodk/robolink.py', '/studio/robolink.py', '/studio/post_shim.py']));
     expect(written['/studio/robodk/robomath.py'].length).toBeGreaterThan(1000);

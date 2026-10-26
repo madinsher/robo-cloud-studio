@@ -1,0 +1,4 @@
+<?xml version="1.0"?>
+<robot name="r" xmlns:xacro="http://www.ros.org/wiki/xacro">
+<v a="${'abc'[1:]}" b="${[1,2,3][-1]}" c="${'-'.join(['a','b'])}" d="${1 if True else 2 if False else 3}" e="${not True or False}" f="${3 % 2 == 1 and 4}" g="${str(True).lower()}" h="${'a' + 'b' * 2}" i="${-2**2}" j="${(-2)**2}" k="${2**3**2}" l="${7 // 2 * 2}" m="${1 != 2}" n="${'x' not in 'abc'}" o="${None is None}" p="${int('12')}" q="${float('1.5')}" r="${0.1*3}" s="${1/3}" t="${2.0/3}" u="${100.0}" w="${1.5e-7}" x="${12345678901234567.0}" y="${0.000123}" z="${1e15}"/>
+</robot>

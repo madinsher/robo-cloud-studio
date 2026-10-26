@@ -1,0 +1,4 @@
+<?xml version="1.0"?>
+<robot name="r" xmlns:xacro="http://www.ros.org/wiki/xacro">
+<xacro:element xacro:name="${'li'+'nk'}" name="e1"><xacro:attribute name="extra" value="v${1+1}"/></xacro:element><v d="$${notexp}" f="$$$${y}" g="a$b"/>
+</robot>

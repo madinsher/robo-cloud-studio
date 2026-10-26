@@ -37,8 +37,29 @@
   restarts, optional position-only / free-tool-Z relaxation.
 - **Motion** (`src/core/motion`): trapezoidal profiles; MoveJ synchronises joints on the slowest axis; MoveL/MoveC
   interpolate pose (slerp) and solve IK per sample, detecting unreachable segments and configuration jumps.
-  `ProgramSimulator.compile` turns a program into timed steps (trajectories + discrete events) so the timeline can
-  seek in both directions; `tick`/`seek` apply joints and attachments.
+  `ProgramSimulator.compile` turns a program into timed steps (trajectories + discrete events) for previews,
+  validation and cycle-time estimates. Playback in the app runs on the station's `StationRuntime` (one shared clock;
+  programs on different robots run concurrently, a busy robot queues): `App.runProgram / pauseProgram /
+  resumeProgram / stopProgram / resetSimulation` (Reset restores the home state captured at the first Play: object
+  poses, attachments, joints, IO — RoboDK "Replace objects"), `seekProgram` is deterministic (backwards = reset +
+  replay of the session's starts), a run stops at its first error and the program editor marks that instruction.
+  Previews use a separate simulator and are deferred while a simulation plays, so they never disturb playback.
+  `runToEnd` (⏭ End) is synchronous unless a run calls a station script: script runners (Pyodide, the server's
+  CPython, the vision runner) answer asynchronously, so the clock stands still while the page yields (the live tick is
+  suspended meanwhile) and a script that answered without consuming simulated time resumes its run at the call;
+  stations with several runs are stepped finely (0.05 s) so the others do not run ahead of a waiting run. The result
+  equals a run without runners (`tests/ui_r2_wiring.test.ts`, the Library sweep `tests/e2e/library.e2e.test.ts`:
+  browser == headless runtime on all 57 RoboDK Library stations). `runProgram` also starts station Python programs
+  (tree › Run Python program, RoboDK's double-click).
+- **App scalability** (`src/app.ts`, `src/scene/worker.ts`, `src/ui/vlist.ts`): `.rdk` import and the compile of
+  programs above 400 instructions run in a module Web Worker with a progress indicator; the tree and the program
+  editor are virtualised and update rows incrementally (joint / pose events never rebuild them); no collision check
+  runs on load or selection (only on explicit Validate).
+- **MURKA examples** (`src/ui/murka_ui.ts`, File › MURKA examples): the MURKA reproductions (`src/murka`, loaded on
+  demand) from a picked MURKA_Simulation folder — retail store missions (`buildMurkaRetailStation` +
+  `runMurkaRetailMission`), orchard Mission B on the world clock (`buildMurkaOrchardStation` + `App.playScriptedFleet`),
+  benchmark S1 and the article experiments exp1–exp5 (KPI JSON). Unreadable files of a synced folder are skipped.
+  `tests/e2e/murka.e2e.test.ts` runs the retail undock mission and Mission B in Chrome from real folder picks.
 - **Posts** (`src/posts`): `compileForPost` resolves targets into poses in the active reference frame and joint
   values, producing a flat `PostEvent[]` that each vendor emitter renders.
 - **Mobile/fleet** (`src/mobile`, `src/fleet`): 2D state on the ground plane synchronised with the 3D pose;

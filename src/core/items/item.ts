@@ -100,7 +100,8 @@ export class Item {
     child.parent = this;
     if (index === undefined || index >= this.children.length) this.children.push(child);
     else this.children.splice(Math.max(0, index), 0, child);
-    this.station?.notifyTree('childAdded', { parent: this, child });
+    const st = this.station;
+    if (st) { st.indexAdd(child); st.notifyTree('childAdded', { parent: this, child }); }
     return child;
   }
 
@@ -108,7 +109,9 @@ export class Item {
     const i = this.children.indexOf(child);
     if (i >= 0) {
       this.children.splice(i, 1);
-      if (notify) this.station?.notifyTree('childRemoved', { parent: this, child });
+      const st = this.station;
+      st?.indexRemove(child);
+      if (notify) st?.notifyTree('childRemoved', { parent: this, child });
       child.parent = null;
     }
   }
@@ -280,6 +283,24 @@ export interface DeserializeContext {
   byId: Map<string, Item>;
 }
 
+/**
+ * Item types whose visibility flag hides only the item itself, not its children (RoboDK semantics: hiding a
+ * reference frame hides its triad while the robot / objects under it stay drawn, Library 03.b, 02.b, 06.d, 06.f; a
+ * hidden robot or tool leaves its tools / attached objects visible, 06.e SimulateToolOpen hides the open gripper model
+ * that carries the part). Studio containers (folders, mobile robots, fields, ...) still hide their whole subtree.
+ */
+export const OWN_VISIBILITY_TYPES: ReadonlySet<ItemType> = new Set([
+  ItemType.ROBOT, ItemType.FRAME, ItemType.TOOL, ItemType.OBJECT, ItemType.TARGET, ItemType.CURVE, ItemType.PROGRAM,
+  ItemType.PROGRAM_PYTHON, ItemType.MACHINING, ItemType.CAMERA, ItemType.ROBOT_ARM, ItemType.ROBOT_AXES,
+]);
+
+/** The item is drawn (3D view, simulated cameras): its own flag is set and no hiding container is above it. */
+export function isShown(item: Item): boolean {
+  if (!item.visible) return false;
+  for (let p = item.parent; p && p.type !== ItemType.STATION; p = p.parent) if (!p.visible && !OWN_VISIBILITY_TYPES.has(p.type)) return false;
+  return true;
+}
+
 /** Registry of item constructors by type for deserialization. */
 export const itemFactories = new Map<ItemType, (name: string, id: string) => Item>();
 
@@ -309,6 +330,12 @@ export interface GeometryRef {
   color?: string;
   scale?: [number, number, number];
   opacity?: number;
+  /**
+   * Physically based material (Webots PBRAppearance; a legacy Appearance{Material} converted like Webots does):
+   * metalness / roughness 0..1, emissive colour '#rrggbb' × emissiveIntensity, ibl = IBLStrength (environment
+   * reflection scale). Absent: the studio's default material.
+   */
+  pbr?: { metalness?: number; roughness?: number; emissive?: string; emissiveIntensity?: number; ibl?: number };
 }
 
 /** 3D object (workpiece, fixture, tree, crate...). */
@@ -321,16 +348,22 @@ export class SceneObject extends Item {
   mass = 0;
   /** Bounding box half extents in local frame (mm), for cheap collision checks. */
   bbox?: { min: [number, number, number]; max: [number, number, number] };
+  /**
+   * Separate collision geometry (e.g. Webots boundingObject, URDF <collision>). When defined it replaces
+   * `geometry` for collision checking; an empty list means the object has no collider.
+   */
+  colliders?: GeometryRef[];
 
   constructor(name = 'Object', id?: string) {
     super(ItemType.OBJECT, name, id);
   }
 
   protected override serializeExtra() {
-    return { geometry: this.geometry, curves: this.curves, points: this.points, mass: this.mass, bbox: this.bbox };
+    return { geometry: this.geometry, curves: this.curves, points: this.points, mass: this.mass, bbox: this.bbox, ...(this.colliders && { colliders: this.colliders }) };
   }
   override deserializeExtra(d: SerializedItem, _ctx: DeserializeContext) {
     this.geometry = (d.geometry as GeometryRef[]) ?? [];
+    this.colliders = Array.isArray(d.colliders) ? (d.colliders as GeometryRef[]) : undefined;
     this.curves = (d.curves as any) ?? [];
     this.points = (d.points as any) ?? [];
     this.mass = (d.mass as number) ?? 0;
@@ -426,14 +459,16 @@ export class Camera extends Item {
   width = 640;
   height = 480;
   kind: 'rgb' | 'depth' | 'lidar2d' | 'lidar3d' = 'rgb';
+  /** Image axis spanned by `fov`: 'vertical' (RoboDK Cam2D FOV, three.js) or 'horizontal' (Webots fieldOfView, URDF/SDF horizontal_fov). The pinhole model is src/vision/camera_model.ts cameraIntrinsics. */
+  fovAxis: 'vertical' | 'horizontal' = 'vertical';
   constructor(name = 'Camera', id?: string) {
     super(ItemType.CAMERA, name, id);
   }
   protected override serializeExtra() {
-    return { fov: this.fov, near: this.near, far: this.far, width: this.width, height: this.height, kind: this.kind };
+    return { fov: this.fov, near: this.near, far: this.far, width: this.width, height: this.height, kind: this.kind, fovAxis: this.fovAxis };
   }
   override deserializeExtra(d: SerializedItem) {
-    Object.assign(this, { fov: d.fov ?? 60, near: d.near ?? 10, far: d.far ?? 20000, width: d.width ?? 640, height: d.height ?? 480, kind: d.kind ?? 'rgb' });
+    Object.assign(this, { fov: d.fov ?? 60, near: d.near ?? 10, far: d.far ?? 20000, width: d.width ?? 640, height: d.height ?? 480, kind: d.kind ?? 'rgb', fovAxis: d.fovAxis === 'horizontal' ? 'horizontal' : 'vertical' });
   }
 }
 
@@ -470,6 +505,8 @@ export class Station extends Item {
   selection: Item[] = [];
   /** Suppress notifications during bulk operations. */
   private quiet = 0;
+  /** id -> item index of the whole tree (kept by addChild/removeChild; findById is O(depth)). */
+  private index = new Map<string, Item>();
 
   constructor(name = 'Station', id?: string) {
     super(ItemType.STATION, name, id);
@@ -477,6 +514,29 @@ export class Station extends Item {
 
   override get station(): Station {
     return this;
+  }
+
+  /** Register an item and its subtree in the id index. */
+  indexAdd(item: Item): void {
+    for (const it of item.walk()) this.index.set(it.id, it);
+  }
+  /** Remove an item and its subtree from the id index. */
+  indexRemove(item: Item): void {
+    for (const it of item.walk()) if (this.index.get(it.id) === it) this.index.delete(it.id);
+  }
+  /** Rebuild the id index from the tree (after building children without addChild). */
+  reindex(): void {
+    this.index.clear();
+    for (const c of this.children) this.indexAdd(c);
+  }
+
+  override findById(id: string): Item | null {
+    if (id === this.id) return this;
+    const it = this.index.get(id);
+    if (!it) return null;
+    if (it.station === this) return it;
+    this.index.delete(id);
+    return null;
   }
 
   notifyTree<K extends keyof ItemEvents>(ev: K, payload: ItemEvents[K]): void {
@@ -537,6 +597,7 @@ export class Station extends Item {
       for (const c of d.children ?? []) build(item, c);
     };
     for (const c of data.children ?? []) build(st, c);
+    st.reindex();
     for (const fn of ctx.deferred) fn();
     return st;
   }

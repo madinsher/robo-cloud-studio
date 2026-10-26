@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { MeshData } from '../io/mesh/stl';
+import { MeshData, MeshMaterial } from '../io/mesh/stl';
 import { GeometryRef } from '../core/items/item';
 import { LinkVisual } from '../core/kinematics/chain';
 import { AssetStore } from './assets';
@@ -43,9 +43,15 @@ export function smoothTriangleSoup(positions: Float32Array, creaseDeg = CREASE_D
     faceA[t] = area;
     if (area > 1e-12) { faceN[t * 3] = nx / area; faceN[t * 3 + 1] = ny / area; faceN[t * 3 + 2] = nz / area; }
   }
+  // corners are welded on a grid relative to the mesh size (1e-6 of its diagonal): the former fixed 0.05-unit grid
+  // collapsed meshes stored in metres (ROS packages: 50 mm cells, a UR5e shoulder lost 4 mm per side)
+  let lo = Infinity, hi = -Infinity;
+  for (let i = 0; i < positions.length; i++) { const v = positions[i]; if (v < lo) lo = v; if (v > hi) hi = v; }
+  const span = Number.isFinite(hi - lo) && hi > lo ? hi - lo : 1;
+  const inv = 1 / (span * 1e-6);
   const groups = new Map<string, number[]>();
   for (let i = 0; i < corners; i++) {
-    const key = `${Math.round(positions[i * 3] * 20)},${Math.round(positions[i * 3 + 1] * 20)},${Math.round(positions[i * 3 + 2] * 20)}`;
+    const key = `${Math.round(positions[i * 3] * inv)},${Math.round(positions[i * 3 + 1] * inv)},${Math.round(positions[i * 3 + 2] * inv)}`;
     const list = groups.get(key);
     if (list) list.push(i);
     else groups.set(key, [i]);
@@ -98,14 +104,81 @@ export function smoothTriangleSoup(positions: Float32Array, creaseDeg = CREASE_D
   return g;
 }
 
+/** Signed volume of a triangle soup (negative: faces wound inwards, e.g. a mirrored STL) and its bounding-box volume. */
+export function soupVolume(positions: Float32Array): { volume: number; box: number } {
+  let v = 0;
+  const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+  for (let o = 0; o + 8 < positions.length; o += 9) {
+    const ax = positions[o], ay = positions[o + 1], az = positions[o + 2], bx = positions[o + 3], by = positions[o + 4], bz = positions[o + 5], cx = positions[o + 6], cy = positions[o + 7], cz = positions[o + 8];
+    v += ax * (by * cz - bz * cy) - ay * (bx * cz - bz * cx) + az * (bx * cy - by * cx);
+    for (let k = 0; k < 9; k++) { const c = k % 3, x = positions[o + k]; if (x < lo[c]) lo[c] = x; if (x > hi[c]) hi[c] = x; }
+  }
+  const box = Number.isFinite(lo[0]) ? Math.max(0, hi[0] - lo[0]) * Math.max(0, hi[1] - lo[1]) * Math.max(0, hi[2] - lo[2]) : 0;
+  return { volume: v / 6, box };
+}
+
+/** The same soup with every triangle wound the other way. */
+function flipWinding(positions: Float32Array): Float32Array {
+  const out = new Float32Array(positions);
+  for (let o = 0; o + 8 < out.length; o += 9) for (let k = 0; k < 3; k++) { const t = out[o + 3 + k]; out[o + 3 + k] = out[o + 6 + k]; out[o + 6 + k] = t; }
+  return out;
+}
+
 export function meshDataToGeometry(m: MeshData): THREE.BufferGeometry {
-  if (!authoredSmoothNormals(m)) return smoothTriangleSoup(m.positions);
+  // textured meshes keep their corners (welding by position would merge UV seams)
+  const textured = !!m.uvs && !!m.materials?.some((x) => x.map);
+  // a closed mesh wound inwards (mirrored *_l STLs of the MUROM v1 arms) is turned outwards so it is lit correctly; every
+  // mesh is drawn double-sided as RoboDK does: thin shells (a car windshield, a sheet part) have no reliable inside, and a
+  // volume test misjudges them, so their back faces vanished
+  const { volume, box } = soupVolume(m.positions);
+  const closed = box > 0 && Math.abs(volume) > 0.02 * box;
+  const inwards = closed && volume < 0;
+  if (!textured && !authoredSmoothNormals(m)) {
+    const g = addMeshGroups(smoothTriangleSoup(inwards ? flipWinding(m.positions) : m.positions), m);
+    g.userData.doubleSided = true;
+    return g;
+  }
   const g = new THREE.BufferGeometry();
+  g.userData.doubleSided = true;
   g.setAttribute('position', new THREE.BufferAttribute(m.positions, 3));
   g.setAttribute('normal', new THREE.BufferAttribute(m.normals, 3));
+  if (m.uvs && m.uvs.length === (m.positions.length / 3) * 2) g.setAttribute('uv', new THREE.BufferAttribute(m.uvs, 2));
   g.computeBoundingBox();
   g.computeBoundingSphere();
+  return addMeshGroups(g, m);
+}
+
+/** Material groups of a mesh (OBJ usemtl / COLLADA materials); the corner order is kept by both geometry paths. */
+function addMeshGroups(g: THREE.BufferGeometry, m: MeshData): THREE.BufferGeometry {
+  if (m.groups?.length && m.materials?.length) for (const gr of m.groups) g.addGroup(gr.start, gr.count, gr.material);
   return g;
+}
+
+const textureCache = new WeakMap<Uint8Array, THREE.Texture | null>();
+function textureFromBytes(map: NonNullable<MeshMaterial['map']>): THREE.Texture | null {
+  if (textureCache.has(map.data)) return textureCache.get(map.data)!;
+  let tex: THREE.Texture | null = null;
+  if (typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function' && typeof Blob !== 'undefined' && typeof document !== 'undefined') {
+    const url = URL.createObjectURL(new Blob([map.data as BlobPart], { type: map.mime }));
+    tex = new THREE.TextureLoader().load(url, () => URL.revokeObjectURL(url), undefined, () => URL.revokeObjectURL(url));
+    tex.colorSpace = THREE.SRGBColorSpace;
+    tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  }
+  textureCache.set(map.data, tex);
+  return tex;
+}
+
+/** three material for a file material (colour, opacity, emission, base colour texture). */
+export function fileMaterial(fm: MeshMaterial, fallback = '#9aa3ad', opacity = 1): THREE.MeshStandardMaterial {
+  const c = fm.color ? new THREE.Color(fm.color[0], fm.color[1], fm.color[2]) : new THREE.Color(fallback);
+  const m = new THREE.MeshStandardMaterial({ color: c, metalness: fm.metalness ?? 0.1, roughness: fm.roughness ?? 0.6 });
+  const o = (fm.opacity ?? 1) * opacity;
+  if (o < 1) { m.transparent = true; m.opacity = o; }
+  if (fm.emissive) m.emissive = new THREE.Color(fm.emissive[0], fm.emissive[1], fm.emissive[2]);
+  if (fm.map) { const t = textureFromBytes(fm.map); if (t) m.map = t; }
+  // environment reflections only for PBR materials (a Webots PBRAppearance: IBLStrength), not for file / studio ones
+  m.envMapIntensity = fm.ibl ?? 0;
+  return m;
 }
 
 export function mat4ToThree(m: Mat4 | number[] | undefined): THREE.Matrix4 {
@@ -133,9 +206,17 @@ export function primitiveGeometry(p: NonNullable<GeometryRef['primitive']> | Non
   return g;
 }
 
-export function materialFor(color: string | undefined, opacity = 1, fallback = '#9aa3ad'): THREE.MeshStandardMaterial {
-  const m = new THREE.MeshStandardMaterial({ color: new THREE.Color(color ?? fallback), metalness: 0.22, roughness: 0.42, flatShading: false });
+/**
+ * Material of a coloured geometry. Without `pbr`: the studio material (metalness 0.22, roughness 0.42, no environment
+ * reflection). With `pbr` (a Webots PBRAppearance): its metalness / roughness, emissive colour × intensity, and the
+ * scene environment (SceneRenderer: the world's Background as a uniform or gradient sky, like Webots' IBL without a
+ * cube map) scaled by IBLStrength.
+ */
+export function materialFor(color: string | undefined, opacity = 1, fallback = '#9aa3ad', pbr?: GeometryRef['pbr']): THREE.MeshStandardMaterial {
+  const m = new THREE.MeshStandardMaterial({ color: new THREE.Color(color ?? fallback), metalness: pbr?.metalness ?? 0.22, roughness: pbr?.roughness ?? 0.42, flatShading: false });
   if (opacity < 1) { m.transparent = true; m.opacity = opacity; }
+  m.envMapIntensity = pbr ? pbr.ibl ?? 1 : 0;
+  if (pbr?.emissive) { m.emissive = new THREE.Color(pbr.emissive); m.emissiveIntensity = pbr.emissiveIntensity ?? 1; }
   return m;
 }
 
@@ -160,7 +241,10 @@ export function buildGeometry(refs: GeometryRef[], assets: AssetStore, defaultCo
       }
     } else if (r.primitive) geometry = primitiveGeometry(r.primitive);
     if (!geometry) continue;
-    const mesh = new THREE.Mesh(geometry, materialFor(r.color ?? defaultColor, r.opacity ?? 1));
+    // meshes without an explicit colour use the materials of their file (OBJ+MTL, COLLADA, textured Webots meshes)
+    const fileMats = r.mesh && !r.color ? (assets.get(r.mesh) ?? findByBasename(assets, r.mesh))?.mesh?.materials : undefined;
+    const mesh = new THREE.Mesh(geometry, fileMats?.length ? (fileMats.length === 1 ? fileMaterial(fileMats[0], defaultColor, r.opacity ?? 1) : fileMats.map((fm) => fileMaterial(fm, defaultColor, r.opacity ?? 1))) : materialFor(r.color ?? defaultColor, r.opacity ?? 1, undefined, r.pbr));
+    if (geometry.userData.doubleSided) for (const mt of Array.isArray(mesh.material) ? mesh.material : [mesh.material]) mt.side = THREE.DoubleSide;
     mesh.castShadow = true;
     mesh.receiveShadow = true;
     mesh.matrixAutoUpdate = false;
@@ -173,16 +257,11 @@ export function buildGeometry(refs: GeometryRef[], assets: AssetStore, defaultCo
 }
 
 export function buildLinkVisuals(visuals: LinkVisual[], assets: AssetStore, defaultColor: string): THREE.Group {
-  return buildGeometry(visuals.map((v) => ({ mesh: v.mesh, primitive: v.primitive as any, origin: Array.from(v.origin), color: v.color, scale: v.scale })), assets, defaultColor);
+  return buildGeometry(visuals.map((v) => ({ mesh: v.mesh, primitive: v.primitive as any, origin: Array.from(v.origin), color: v.color, scale: v.scale, opacity: (v as LinkVisual & { opacity?: number }).opacity, pbr: (v as LinkVisual & { pbr?: GeometryRef['pbr'] }).pbr })), assets, defaultColor);
 }
 
 export function findByBasename(assets: AssetStore, uri: string) {
-  const base = uri.split(/[\\/]/).pop()?.toLowerCase();
-  if (!base) return undefined;
-  for (const [id, a] of assets.entries()) {
-    if (id.split(/[\\/]/).pop()?.toLowerCase() === base || a.name?.toLowerCase() === base) return a;
-  }
-  return undefined;
+  return assets.resolve(uri);
 }
 
 /** Axis triad (X red, Y green, Z blue). */

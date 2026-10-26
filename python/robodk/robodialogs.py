@@ -13,8 +13,23 @@ FILE_TYPES_3D_OBJECT = ('3D Object Files', '.sld .stl .iges .igs .step .stp .obj
 FILE_TYPES_TEXT = ('Text Files', '.txt .csv')
 FILE_TYPES_IMG = ('Image Files', '.png .jpg')
 
+FILE_TYPES_CAM = ('CAM Files', '.cnc .nc .apt .gcode .ngc .nci .anc .dxf .aptsource .cls .acl .cl .clt .ncl .knc')
+FILE_TYPES_ROBOT = ('Robot Files', '.mod .src .ls .jbi .prm .script .urp')
+DEFAULT_FOLDER = "C:/RoboDK/Library/"
+DEFAULT_FILE_EXT = '.*'
+DEFAULT_FILE_TYPES = [FILE_TYPES_ALL, FILE_TYPES_ROBODK, FILE_TYPES_3D_OBJECT, FILE_TYPES_TEXT, FILE_TYPES_IMG, FILE_TYPES_CAM, FILE_TYPES_ROBOT]
+
+# The official module imports tkinter and exports `tkinter`, `filedialog`, `messagebox` through `import *` (some
+# Library macros rely on that). The dialogs below stay headless; ENABLE_TK reports whether tkinter imported.
 ENABLE_QT = False
 ENABLE_TK = False
+try:
+    import tkinter
+    from tkinter import filedialog
+    from tkinter import messagebox
+    ENABLE_TK = True
+except Exception:  # pragma: no cover - Pyodide has no tkinter
+    pass
 
 LOG = []  #: every message that would have been shown to the user
 
@@ -79,7 +94,7 @@ def ShowMessageOkCancel(msg, title=None):
     return True
 
 
-def mbox(msg, b1='OK', b2='Cancel', frame=True, t=False, entry=None):
+def mbox(msg, b1='OK', b2='Cancel', frame=True, t=False, entry=None, *args, **kwargs):
     """Message box: returns True for the first button, or the default entry text when `entry` is given."""
     if entry is not None:
         _log("input", "%s -> %r (headless default)" % (msg, entry))
@@ -88,7 +103,7 @@ def mbox(msg, b1='OK', b2='Cancel', frame=True, t=False, entry=None):
     return True
 
 
-def InputDialog(msg, value, title=None, default_button=False, default_value=None, embed=False, actions=None):
+def InputDialog(msg, value, title=None, default_button=False, default_value=None, embed=False, actions=None, *args, **kwargs):
     _log("input", "%s -> %r (headless default)" % (msg, value))
     return value
 

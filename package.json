@@ -14,7 +14,7 @@
     "server": "npm run build:server && node dist-server/index.js",
     "build:server": "vite build -c vite.server.config.ts",
     "smoke": "node scripts/smoke.mjs",
-    "scenarios": "SCENARIO_REPORT=1 vitest run tests/scenarios.test.ts",
+    "scenarios": "node scripts/scenarios.mjs",
     "test:coverage": "vitest run --coverage --reporter=default --reporter=json --outputFile.json=coverage/unit-results.json",
     "test:e2e": "vitest run -c vitest.e2e.config.ts",
     "test:all": "npm run build && npm run test:coverage && npm run test:e2e && npm run scenarios && node scripts/test-report.mjs",

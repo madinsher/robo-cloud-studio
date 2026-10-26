@@ -1,0 +1,11 @@
+{
+ "mode": "robodk",
+ "version": "5.9.4.25510",
+ "shots": {
+  "rampA": 1,
+  "rampB": 1,
+  "plate": 1,
+  "rampA_small": 1,
+  "rampB_small": 1
+ }
+}

@@ -1,0 +1,4 @@
+<?xml version="1.0"?>
+<robot name="r" xmlns:xacro="http://www.ros.org/wiki/xacro">
+<xacro:arg name="x" default="4"/><v a="$(eval 2*3)" b="$(eval x * 2)" h="$(eval x == 4)" c="$(eval true)" d="$(optenv NOPE_XX a b)" e="${'$(arg x)' == '4'}" f="$(arg x)" g="$(eval 1.5*2)"/>
+</robot>

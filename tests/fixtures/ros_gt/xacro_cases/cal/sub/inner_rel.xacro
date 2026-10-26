@@ -1,0 +1,1 @@
+<?xml version="1.0"?><robot xmlns:xacro="http://www.ros.org/wiki/xacro"><link name="from_inner_rel"/><xacro:property name="outer_from_inc" value="7"/></robot>

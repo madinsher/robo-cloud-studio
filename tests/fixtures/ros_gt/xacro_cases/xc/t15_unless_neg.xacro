@@ -1,0 +1,1 @@
+<robot name="t" xmlns:xacro="http://www.ros.org/wiki/xacro"><xacro:property name="o" value="0.2"/><link name="a"/><link name="b"/><joint name="j" type="prismatic"><parent link="a"/><child link="b"/><origin xyz="${-o} 0 0"/><axis xyz="1 0 0"/><limit lower="0" upper="${o*2}" effort="1" velocity="1"/></joint><xacro:unless value="false"><link name="kept"/></xacro:unless></robot>

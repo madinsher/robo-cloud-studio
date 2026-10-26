@@ -1,0 +1,3 @@
+error: Invalid parameter "bad"
+when instantiating macro: m (c22.xacro)
+in file: c22.xacro

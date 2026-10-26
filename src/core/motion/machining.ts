@@ -8,7 +8,7 @@
 import { Station, SceneObject, Frame, Target } from '../items/item';
 import { Robot } from '../items/robot';
 import { Program } from '../items/program';
-import { Mat4, poseFromZ, multiply, invert, transl, mul, normalize, sub, norm, Vec3, transformPoint, transformDir, rotz, DEG } from '../math/pose';
+import { Mat4, poseFromZ, multiply, invert, transl, mul, normalize, sub, norm, cross, Vec3, transformPoint, transformDir, rotz, DEG } from '../math/pose';
 
 /** A curve produced from NC code: polyline + metadata (stored on SceneObject.curves). */
 export interface MachiningCurve {
@@ -121,6 +121,9 @@ export function generateMachining(station: Station, robot: Robot, part: SceneObj
     const r = robot.solveIK(multiply(invert(base), abs), { seed: q, ...ikOpts, ...(first ? { restarts: 6, maxIterations: 200 } : {}) });
     return r.ok ? r.joints : null;
   };
+  // tool-axis freedom: aim each target's X axis like the last reached pose (no needless rotation about the tool axis,
+  // so the wrist does not wind up along closed curves and run into its joint limit)
+  let lastReached: Mat4 | null = null;
   const poseAt = (c: MachiningCurve, pts: number[][], i: number): Mat4 => {
     const p = pts[i];
     const pw = transformPoint(objAbs, [p[0], p[1], p[2] ?? 0]);
@@ -128,13 +131,19 @@ export function generateMachining(station: Station, robot: Robot, part: SceneObj
     const nxt = pts[Math.min(i + 1, pts.length - 1)], prv = pts[Math.max(i - 1, 0)];
     const dirLocal = normalize(sub([nxt[0], nxt[1], nxt[2] ?? 0], [prv[0], prv[1], prv[2] ?? 0]));
     const dirW = norm(dirLocal) > 1e-9 ? transformDir(objAbs, dirLocal) : ([1, 0, 0] as Vec3);
-    let abs = poseFromZ(pw, zw, dirW);
-    if (opts.spin) abs = mul(abs, rotz(opts.spin * DEG));
+    const lx: Vec3 | null = ikOpts.freeToolZ && lastReached ? [lastReached[0], lastReached[1], lastReached[2]] : null;
+    const hint = lx && norm(cross(lx, zw)) > 0.2 ? lx : dirW;
+    let abs = poseFromZ(pw, zw, hint);
+    if (opts.spin && !lx) abs = mul(abs, rotz(opts.spin * DEG));
     return abs;
   };
   const addTarget = (name: string, abs: Mat4, joints: number[]): Target => {
     const t = frame.addChild(new Target(name));
-    t.setPose(multiply(invert(frame.poseAbs()), abs));
+    // with tool-axis freedom the solver picked its own rotation about tool Z: store the pose the robot really reaches
+    // (RoboDK machining projects store the optimised targets), so the simulator replays the same joints
+    const reached = ikOpts.freeToolZ ? multiply(base, robot.solveFK(joints)) : abs;
+    lastReached = reached;
+    t.setPose(multiply(invert(frame.poseAbs()), reached));
     t.setJoints(joints);
     return t;
   };

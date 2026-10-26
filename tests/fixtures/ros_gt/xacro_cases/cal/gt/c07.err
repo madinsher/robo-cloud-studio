@@ -1,0 +1,2 @@
+error: Xacro conditional "yes" evaluated to "yes", which is not a boolean expression.
+when processing file: c07.xacro

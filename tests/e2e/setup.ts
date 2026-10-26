@@ -1,5 +1,5 @@
 /** Global setup for the browser tests: serve the production build (dist/) on a free port with `vite preview`. */
-import { spawn, ChildProcess } from 'node:child_process';
+import { spawn, spawnSync, ChildProcess } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 
@@ -17,9 +17,15 @@ export default async function setup(): Promise<() => Promise<void>> {
   if (!existsSync(path.join(root, 'dist/index.html'))) throw new Error('dist/index.html not found — run `npm run build` before `npm run test:e2e`');
   const base = `http://127.0.0.1:${PORT}/`;
   if (!(await up(base, 500))) {
-    child = spawn('npx', ['vite', 'preview', '--port', String(PORT), '--strictPort'], { cwd: root, stdio: 'ignore', detached: true });
+    // node + the vite CLI directly (no npx shell shim: works the same on Windows and POSIX)
+    const vite = path.join(root, 'node_modules/vite/bin/vite.js');
+    child = spawn(process.execPath, [vite, 'preview', '--port', String(PORT), '--strictPort', '--host', '127.0.0.1'], { cwd: root, stdio: 'ignore', detached: process.platform !== 'win32' });
     if (!(await up(base, 30000))) throw new Error(`preview server did not start on ${base}`);
   }
   process.env.E2E_BASE = base;
-  return async () => { if (child?.pid) { try { process.kill(-child.pid, 'SIGTERM'); } catch { /* gone */ } } };
+  return async () => {
+    if (!child?.pid) return;
+    if (process.platform === 'win32') spawnSync('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore' });
+    else { try { process.kill(-child.pid, 'SIGTERM'); } catch { /* gone */ } }
+  };
 }

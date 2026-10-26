@@ -1,0 +1,27 @@
+{
+ "ok": true,
+ "error": null,
+ "log": "",
+ "files": [
+  "MainSplitTest/MainSplitTest.dtx",
+  "MainSplitTest/MainSplitTest.pjx",
+  "MainSplitTest/loadNextOne.pgx",
+  "MainSplitTest/start.pgx",
+  "MainSplitTest/stop.pgx",
+  "MainSplitTest/SplitTest/MoveJoint.pgx",
+  "MainSplitTest/SplitTest/MoveLine.pgx",
+  "MainSplitTest/SplitTest/SplitTest.dtx",
+  "MainSplitTest/SplitTest/SplitTest.pjx",
+  "MainSplitTest/SplitTest/main.pgx",
+  "MainSplitTest/SplitTest2/MoveJoint.pgx",
+  "MainSplitTest/SplitTest2/MoveLine.pgx",
+  "MainSplitTest/SplitTest2/SplitTest2.dtx",
+  "MainSplitTest/SplitTest2/SplitTest2.pjx",
+  "MainSplitTest/SplitTest2/main.pgx",
+  "MainSplitTest/SplitTest3/MoveJoint.pgx",
+  "MainSplitTest/SplitTest3/MoveLine.pgx",
+  "MainSplitTest/SplitTest3/SplitTest3.dtx",
+  "MainSplitTest/SplitTest3/SplitTest3.pjx",
+  "MainSplitTest/SplitTest3/main.pgx"
+ ]
+}

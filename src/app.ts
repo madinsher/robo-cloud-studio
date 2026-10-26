@@ -1,15 +1,16 @@
-/** Application context: station, renderer, simulators, undo/redo, file I/O and high-level commands. */
+/** Application context: station, renderer, simulation runtime, previews, undo/redo, file I/O and high-level commands. */
 import { Station, Item, ItemType, Frame, Target, Tool, SceneObject, Folder, Camera } from './core/items/item';
 import { Robot } from './core/items/robot';
-import { Program, Instruction, PathItem } from './core/items/program';
+import { Program, Instruction, PathItem, ProgramRunResult } from './core/items/program';
 import { createRobotFromLibrary, ROBOT_LIBRARY } from './core/items/library';
 import { ProgramSimulator } from './core/motion/simulator';
+import { StationRuntime } from './core/motion/runtime';
 import { planMoveJ, planMoveL, Trajectory } from './core/motion/trajectory';
 import { AssetStore } from './scene/assets';
 import { SceneRenderer } from './scene/renderer';
 import { EventBus } from './core/events';
 import { Mat4, multiply, invert, transl, identity, getPos } from './core/math/pose';
-import { saveStation, loadStation, StationFile } from './io/station-file';
+import { saveStation, loadStation, StationFile, referencedMeshIds } from './io/station-file';
 import { robotFromURDF, parseURDF } from './io/urdf/urdf';
 import { fetchOnlineRobot, fetchPackageMeshes, resolvePackageUri, OnlineRobotResult } from './io/library/online_library';
 import { restoreUserPosts } from './posts/user_posts';
@@ -18,40 +19,75 @@ import { importTargets } from './io/robodk/targets';
 import { importRdkBestEffort } from './io/robodk/rdk_container';
 import { parseOBJ } from './io/mesh/obj';
 import { parseDHText, robotFromDH } from './io/robodk/dh';
-import { isRdkExport, postProcessRdkExport } from './io/robodk/rdk_import';
+import { isRdkExport, postProcessRdkExport, importRdkExport } from './io/robodk/rdk_import';
 import { parseGcode, gcodeToMachiningCurves, gcodeStats } from './io/programs/gcode';
 import { isCadFile, importCad } from './io/mesh/step';
 import { stationToRoboDKScript } from './io/robodk/station_script';
-import { compileForPost, getPost, listPosts, PostFile } from './posts/index';
+import { compileForPost, getPost, listPosts, generateProgram, PostFile } from './posts/index';
 import { MobileRobot, MapItem, ZoneItem } from './mobile/items';
 import { FleetItem, FleetManager } from './fleet/fleet';
 import { ProcessSimulator, Component } from './vc/component';
 import { FieldItem, MissionItem, CropRow } from './agri/items';
-import { updateMissionProgress } from './agri/missions';
+import { updateMissionProgress, bindHarvestEvents, fruitByRef } from './agri/missions';
+import { workerImportRdk, workerCompile, workerAvailable, cancelWorkerJobs, ImportProgress } from './scene/worker_client';
 import { toast } from './ui/dom';
+import { viewpointLook } from './io/webots/shots';
 
 export interface AppEvents extends Record<string, unknown> {
   stationChanged: { station: Station };
   activeProgram: { program: Program | null };
   activeRobot: { robot: Robot | null };
-  simulation: { playing: boolean; time: number; duration: number };
+  simulation: { playing: boolean; time: number; duration: number; paused?: boolean };
+  /** A preview / validation result for a program is available (cycle time, steps, problems). */
+  preview: { program: Program };
   log: { text: string; level: 'info' | 'warn' | 'error' };
   undo: { canUndo: boolean; canRedo: boolean };
+  /** Long operation progress (import / compile in the worker). done=true closes the indicator. */
+  progress: { label: string; detail?: string; done?: boolean };
 }
+
+/** Run handle of the station runtime (I1). The optional fields are read when the runtime provides them. */
+export interface RunInfo {
+  id: string | number;
+  program: Program;
+  robot?: Item | null;
+  status: 'queued' | 'running' | 'done' | 'error' | 'stopped';
+  error?: { message: string; instructionIndex: number };
+  done: Promise<unknown>;
+  /** Index (in program.instructions()) of the instruction being executed, when the runtime reports it. */
+  instructionIndex?: number;
+}
+
+/** Step timing of a preview compile, by instruction (main-thread compile or worker). */
+export interface StepInfo { t0: number; t1: number; trajectory?: { duration: number } }
+
+/** Programs above this size are not compiled on the UI thread automatically (worker / explicit Validate). */
+export const PREVIEW_LIMIT = 400;
+const ACTIVE = new Set(['queued', 'running']);
 
 export class App {
   station: Station;
   readonly assets = new AssetStore();
   renderer!: SceneRenderer;
+  /**
+   * Preview / validation / cycle-time simulator. It never plays: playback runs on `runtime`.
+   * `sim.playing` mirrors the runtime playback state for older callers.
+   */
   sim: ProgramSimulator;
+  /** Deterministic station runtime (shared clock, concurrent programs on different robots, signals). */
+  runtime!: StationRuntime;
+  /** Applied to every new runtime (script runners, signal bridges registered by other modules). */
+  runtimeHooks: Array<(rt: StationRuntime, app: App) => void> = [];
+  /** Fruit picked by harvest programs since the home state (restored by Reset). */
+  private harvestPicked: string[] = [];
+  private harvestBinding: { off: () => void } | null = null;
   processSim: ProcessSimulator;
   fleets = new Map<string, FleetManager>();
   readonly events = new EventBus<AppEvents>();
   activeProgram: Program | null = null;
   activeRobot: Robot | null = null;
-  private undoStack: string[] = [];
-  private redoStack: string[] = [];
-  private lastSnapshot = '';
+  /** Undo history per open station. */
+  private history = new Map<Station, { undo: string[]; redo: string[]; last: string }>();
   simSpeed = 1;
   /** Global sim clock for fleet & process simulation (independent from program playback). */
   worldRunning = false;
@@ -63,12 +99,31 @@ export class App {
   stations: Station[] = [];
   /** External listeners for API event queues. */
   onStationEvent: ((type: string, itemId?: string, data?: any) => void) | null = null;
+  private stationOffs: Array<() => void> = [];
+
+  // -- Playback state --------------------------------------------------------
+  /** 'idle': nothing runs; 'playing': the clock advances; 'paused': runs are frozen and resume on Play. */
+  simState: 'idle' | 'playing' | 'paused' = 'idle';
+  /** Simulation time since the last reset (s). */
+  simTime = 0;
+  /** Runs of the current session (since the last reset). */
+  runs: RunInfo[] = [];
+  /** Starts of the current session (time + options), replayed for deterministic seeking. */
+  private session: Array<{ program: Program | Item; at: number; opts: RunOptions }> = [];
+  /** True while the station is in its home state (nothing ran since load / reset). */
+  atHome = true;
+  /** Restart from the home state when Play is pressed after the session finished (repeatable runs). */
+  restartFromHome = true;
+  private previewDeferred = false;
+  private previewSteps = new Map<string, StepInfo>();
+  private problemCache = new WeakMap<ProgramRunResult, Map<string, ProgramRunResult['problems'][number]>>();
 
   constructor() {
     try { const n = restoreUserPosts(); if (n) console.info(`Restored ${n} user post processors`); } catch { /* no storage */ }
     this.station = new Station('New station');
-    this.sim = new ProgramSimulator(this.station);
+    this.sim = this.makePreviewSim(this.station);
     this.processSim = new ProcessSimulator(this.station);
+    this.makeRuntime(this.station);
   }
 
   /** Collision checking during program validation. */
@@ -77,19 +132,59 @@ export class App {
   mount(host: HTMLElement): void {
     this.renderer = new SceneRenderer(host, this.station, this.assets);
     this.renderer.onSelect = (item, additive) => this.select(item, additive);
-    this.renderer.onPoseEdit = (item, pose) => { item.setPoseAbs(pose); if (item instanceof MobileRobot) item.syncStateFromPose(); };
+    this.renderer.onPoseEdit = (item, pose) => this.editPose(item, pose);
     this.renderer.onGizmoEnd = () => { this.snapshot(); this.previewProgram(); };
     this.renderer.onAnimate((dt) => this.tick(dt));
     this.snapshot();
   }
 
+  /**
+   * Gizmo drag. On a tool mounted on a robot the gizmo is the robot TCP: dragging jogs the robot through IK
+   * (the tool's TCP definition is only edited in its dialog). Anything else is moved.
+   */
+  editPose(item: Item, pose: Mat4): void {
+    if (item instanceof Tool && item.parent instanceof Robot) {
+      const robot = item.parent;
+      const res = robot.solveIK(multiply(invert(robot.poseAbs()), pose), { seed: robot.joints() }, item.poseTool());
+      if (res.ok && robot.jointsValid(res.joints)) robot.setJoints(res.joints);
+      return;
+    }
+    item.setPoseAbs(pose);
+    if (item instanceof MobileRobot) item.syncStateFromPose();
+  }
+
   // -- Logging -------------------------------------------------------------
-  log(text: string, level: 'info' | 'warn' | 'error' = 'info'): void {
+  /** Log line (Log tab); warnings and errors also pop up a toast unless `popup` is false (import reports: one summary toast). */
+  log(text: string, level: 'info' | 'warn' | 'error' = 'info', popup = level !== 'info'): void {
     this.logs.push({ t: Date.now(), text, level });
     if (this.logs.length > 1000) this.logs.shift();
     this.events.emit('log', { text, level });
-    if (level !== 'info') toast(text, level === 'warn' ? 'warn' : 'error');
+    if (popup && level !== 'info') toast(text, level === 'warn' ? 'warn' : 'error');
   }
+
+  /**
+   * Import report lines: what did not come in (skipped robots, PROTOs / meshes not found, remote files not available)
+   * is a warning in the Log, and one toast sums them up.
+   */
+  logImportReport(title: string, lines: string[]): number {
+    const bad = (s: string) => /not available offline|skipped|cannot be resolved|not found|failed|error|unknown node|could not|missing|undefined substitution|no such/i.test(s);
+    let n = 0, first = '';
+    for (const l of lines) { const w = bad(String(l)); if (w) { n++; first ||= String(l); } this.log(String(l), w ? 'warn' : 'info', false); }
+    if (n) toast(`${title}: ${n} part(s) could not be imported — ${first.slice(0, 140)}${n > 1 ? ' … (see the Log tab)' : ''}`, 'warn', 9000);
+    return n;
+  }
+
+  /**
+   * Import choices asked from the user (set by main.ts with dialogs; null headless: the defaults are taken).
+   *  - chooseWorld: several .wbt worlds in an opened folder;
+   *  - chooseKind: a folder that is both a Webots project and a ROS robot description;
+   *  - rosOptions: ROS robot description entry points / xacro args after a first import.
+   */
+  importUi: {
+    chooseWorld?(worlds: string[], def: string): Promise<string | null>;
+    chooseKind?(choices: Array<{ value: 'webots' | 'ros'; label: string }>): Promise<'webots' | 'ros' | null>;
+    rosOptions?(info: { entries: Array<{ file: string; args: Record<string, string>; source: string }>; imported: string[]; errors: string[] }): Promise<{ entries: string[]; args: Record<string, string> } | null>;
+  } | null = null;
 
   // -- Station lifecycle ---------------------------------------------------
   /** Open a new empty station tab and make it active. */
@@ -104,93 +199,162 @@ export class App {
   closeStation(): void {
     const i = this.stations.indexOf(this.station);
     if (i >= 0) this.stations.splice(i, 1);
+    this.history.delete(this.station);
     if (!this.stations.length) this.stations.push(new Station('New station'));
-    this.setStation(this.stations[Math.min(i, this.stations.length - 1)]);
+    this.setStation(this.stations[Math.min(Math.max(0, i), this.stations.length - 1)]);
+  }
+
+  private makePreviewSim(st: Station): ProgramSimulator {
+    const sim = new ProgramSimulator(st);
+    // the preview simulator never plays; older callers read `app.sim.playing` as "a program is playing"
+    Object.defineProperty(sim, 'playing', { get: () => this.simState === 'playing', set: () => { /* preview never plays */ }, configurable: true });
+    return sim;
+  }
+
+  private makeRuntime(st: Station): void {
+    try { this.runtime?.stop(); } catch { /* old runtime already gone */ }
+    if (this.workerJob && workerAvailable()) { this.workerJob++; cancelWorkerJobs('compile', 'station closed'); }
+    // the station's shared runtime (StationRuntime.of): the API, control models and the UI drive the same clock
+    this.runtime = StationRuntime.of(st);
+    this.runtime.stop();
+    this.runtime.assets = this.assets;
+    this.runtime.sink.message ??= (text, level) => this.log(text, level);
+    for (const hook of this.runtimeHooks) { try { hook(this.runtime, this); } catch (e) { console.error(e); } }
+    // harvest programs: a fruit leaves the plant when the gripper closes on it (event 'fruit:…'); Reset puts it back
+    this.harvestBinding?.off();
+    this.harvestPicked = [];
+    this.harvestBinding = bindHarvestEvents(this.runtime as any, st, (ref) => this.harvestPicked.push(ref));
+    // a station that already ran (tab switched back, API runs) keeps its home state: Reset / the next Play restore it
+    this.simState = 'idle'; this.simTime = 0; this.runs = []; this.session = []; this.atHome = !this.runtime.hasHome;
+  }
+
+  /** Bind the per-station subscriptions (released on switch, so tab round trips do not accumulate listeners). */
+  private bindStation(st: Station): void {
+    for (const off of this.stationOffs) off();
+    this.stationOffs = [
+      st.events.on('selection', ({ items }) => this.onStationEvent?.('selection', items[0]?.id)),
+      st.events.on('changed', ({ item, what }) => { if (what === 'pose') this.onStationEvent?.('moved', item.id); else if (what === 'joints') this.onStationEvent?.('robotMoved', item.id); else if (what === 'name') this.onStationEvent?.('renamed', item.id); else if (what === 'visible') this.onStationEvent?.('visibility', item.id); }),
+    ];
   }
 
   setStation(st: Station): void {
     if (!this.stations.includes(st)) {
       const i = this.stations.indexOf(this.station);
-      if (i >= 0) this.stations[i] = st; else this.stations.push(st);
+      if (i >= 0) { this.history.delete(this.stations[i]); this.stations[i] = st; } else this.stations.push(st);
     }
     this.worldHooks.length = 0;
     this.worldRunning = false;
     this.worldTime = 0;
     this.station = st;
-    st.events.on('selection', ({ items }) => this.onStationEvent?.('selection', items[0]?.id));
-    st.events.on('changed', ({ item, what }) => { if (what === 'pose') this.onStationEvent?.('moved', item.id); else if (what === 'joints') this.onStationEvent?.('robotMoved', item.id); else if (what === 'name') this.onStationEvent?.('renamed', item.id); else if (what === 'visible') this.onStationEvent?.('visibility', item.id); });
+    this.bindStation(st);
     this.onStationEvent?.('station', st.id);
-    this.sim = new ProgramSimulator(st);
+    this.sim = this.makePreviewSim(st);
+    this.makeRuntime(st);
     this.processSim = new ProcessSimulator(st);
     this.fleets.clear();
+    this.previewSteps.clear();
     this.activeProgram = st.itemsOfType<Program>(ItemType.PROGRAM)[0] ?? null;
     this.activeRobot = st.itemsOfType<Robot>(ItemType.ROBOT)[0] ?? null;
     this.renderer?.bindStation(st);
-    this.undoStack = [];
-    this.redoStack = [];
-    this.snapshot();
+    if (!this.history.has(st)) this.snapshot(); else this.emitUndo();
     this.events.emit('stationChanged', { station: st });
     this.events.emit('activeProgram', { program: this.activeProgram });
     this.events.emit('activeRobot', { robot: this.activeRobot });
     this.renderer?.showTrajectoryPreview(null, []);
     this.renderer?.setCollisionHighlight([]);
-    setTimeout(() => this.renderer?.fitAll(), 50);
+    this.emitSim();
+    setTimeout(() => this.applyInitialView(st), 50);
+  }
+
+  /**
+   * Initial 3D view of a station: the Viewpoint of an imported Webots world (station.settings.viewpoint), else fit all.
+   * A Viewpoint `follow "<robot name>"` keeps that robot in view while it drives (the camera translates with it, as
+   * Webots' follow types do; the user can still orbit and zoom around it).
+   */
+  applyInitialView(st: Station = this.station): void {
+    if (!this.renderer || st !== this.station) return;
+    const vp = st.settings.viewpoint as { position?: number[]; orientation?: number[]; fieldOfView?: number; follow?: string; followType?: string } | undefined;
+    if (vp && Array.isArray(vp.position) && vp.position.length >= 3 && Array.isArray(vp.orientation) && vp.orientation.length >= 4) {
+      const look = viewpointLook({ position: [vp.position[0], vp.position[1], vp.position[2]], orientation: [vp.orientation[0], vp.orientation[1], vp.orientation[2], vp.orientation[3]], fieldOfView: Number(vp.fieldOfView ?? 0.785398) });
+      this.renderer.lookAt(look.eye, look.target, look.up, look.fovDeg, 'horizontal');
+    } else this.renderer.fitAll();
+    this.renderer.setFollow(followTarget(st, vp?.follow, vp?.followType));
   }
 
   newStation(): void {
     this.setStation(new Station('New station'));
   }
 
-  // -- Undo/redo (snapshot based) --------------------------------------------
-  snapshot(): void {
-    const s = JSON.stringify(this.station.serialize());
-    if (s === this.lastSnapshot) return;
-    if (this.lastSnapshot) this.undoStack.push(this.lastSnapshot);
-    if (this.undoStack.length > 50) this.undoStack.shift();
-    this.redoStack = [];
-    this.lastSnapshot = s;
-    this.events.emit('undo', { canUndo: this.undoStack.length > 0, canRedo: this.redoStack.length > 0 });
+  // -- Undo/redo (snapshot based, per station) ---------------------------------
+  private hist() {
+    let h = this.history.get(this.station);
+    if (!h) { h = { undo: [], redo: [], last: '' }; this.history.set(this.station, h); }
+    return h;
   }
-  /** Run a mutating command and record an undo step. */
+  private emitUndo() { const h = this.hist(); this.events.emit('undo', { canUndo: h.undo.length > 0, canRedo: h.redo.length > 0 }); }
+  snapshot(): void {
+    const h = this.hist();
+    const s = JSON.stringify(this.station.serialize());
+    if (s === h.last) return;
+    if (h.last) h.undo.push(h.last);
+    // whole-station snapshots: keep fewer of them for big stations (memory bound ~100 MB)
+    const max = s.length > 2e6 ? Math.max(3, Math.floor(1e8 / s.length)) : 50;
+    while (h.undo.length > max) h.undo.shift();
+    h.redo = [];
+    h.last = s;
+    this.emitUndo();
+  }
+  /** Run a mutating command and record one undo step. */
   cmd<T>(fn: () => T): T {
     const r = fn();
     this.snapshot();
     return r;
   }
+  get canUndo(): boolean { return this.hist().undo.length > 0; }
   undo(): void {
-    const s = this.undoStack.pop();
+    const h = this.hist();
+    const s = h.undo.pop();
     if (!s) return;
-    this.redoStack.push(this.lastSnapshot);
-    this.restore(s);
+    h.redo.push(h.last);
+    this.restore(s, h);
   }
   redo(): void {
-    const s = this.redoStack.pop();
+    const h = this.hist();
+    const s = h.redo.pop();
     if (!s) return;
-    this.undoStack.push(this.lastSnapshot);
-    this.restore(s);
+    h.undo.push(h.last);
+    this.restore(s, h);
   }
-  private restore(s: string) {
-    this.lastSnapshot = s;
+  private restore(s: string, h: { undo: string[]; redo: string[]; last: string }) {
+    h.last = s;
     const st = loadStation(JSON.parse(s), this.assets);
-    const progId = this.activeProgram?.id, robId = this.activeRobot?.id;
+    const progId = this.activeProgram?.id, robId = this.activeRobot?.id, selIds = this.station.selection.map((x) => x.id);
     const i = this.stations.indexOf(this.station);
     if (i >= 0) this.stations[i] = st; else this.stations.push(st);
+    this.history.delete(this.station);
+    this.history.set(st, h);
     this.worldHooks.length = 0;
     this.worldRunning = false;
     this.worldTime = 0;
     this.station = st;
-    this.sim = new ProgramSimulator(st);
+    this.bindStation(st);
+    this.sim = this.makePreviewSim(st);
+    this.makeRuntime(st);
     this.processSim = new ProcessSimulator(st);
     this.fleets.clear();
+    this.previewSteps.clear();
     this.renderer?.bindStation(st);
     this.activeProgram = (progId && (st.findById(progId) as Program)) || st.itemsOfType<Program>(ItemType.PROGRAM)[0] || null;
     this.activeRobot = (robId && (st.findById(robId) as Robot)) || st.itemsOfType<Robot>(ItemType.ROBOT)[0] || null;
     this.events.emit('stationChanged', { station: st });
     this.events.emit('activeProgram', { program: this.activeProgram });
     this.events.emit('activeRobot', { robot: this.activeRobot });
-    this.events.emit('undo', { canUndo: this.undoStack.length > 0, canRedo: this.redoStack.length > 0 });
+    this.emitUndo();
+    const sel = selIds.map((id) => st.findById(id)).filter((x): x is Item => !!x);
+    if (sel.length) st.setSelection(sel);
     this.renderer?.showTrajectoryPreview(null, []);
     this.renderer?.setCollisionHighlight([]);
+    this.emitSim();
   }
 
   // -- Selection -----------------------------------------------------------
@@ -257,26 +421,31 @@ export class App {
   addFrame(parent: Item = this.station, name?: string): Frame {
     return this.cmd(() => { const f = parent.addChild(new Frame(name ?? `Frame ${this.station.itemsOfType(ItemType.FRAME).length + 1}`)); this.select(f); return f; });
   }
-  addTarget(parent?: Item, name?: string): Target | null {
+  /** Create a target at the active robot's TCP (no undo step: callers wrap it). */
+  private makeTarget(parent?: Item, name?: string): Target {
     const robot = this.activeRobot;
     const frame = parent ?? robot?.activeFrame() ?? this.station;
-    return this.cmd(() => {
-      const t = new Target(name ?? `Target ${this.station.itemsOfType(ItemType.TARGET).length + 1}`);
-      if (robot) {
-        const tcpAbs = robot.poseTCPAbs();
-        frame.addChild(t);
-        t.setPoseAbs(tcpAbs);
-        t.setJoints(robot.joints());
-        t.robotId = robot.id;
-      } else frame.addChild(t);
-      this.select(t);
-      return t;
-    });
+    const t = new Target(name ?? `Target ${this.station.itemsOfType(ItemType.TARGET).length + 1}`);
+    if (robot) {
+      const tcpAbs = robot.poseTCPAbs();
+      frame.addChild(t);
+      t.setPoseAbs(tcpAbs);
+      t.setJoints(robot.joints());
+      t.robotId = robot.id;
+    } else frame.addChild(t);
+    return t;
+  }
+  addTarget(parent?: Item, name?: string): Target | null {
+    return this.cmd(() => { const t = this.makeTarget(parent, name); this.select(t); return t; });
+  }
+  private makeProgram(robot: Robot | MobileRobot | null, name?: string): Program {
+    const p = this.station.addChild(new Program(name ?? `Prog ${this.station.itemsOfType(ItemType.PROGRAM).length + 1}`));
+    if (robot) p.setRobot(robot);
+    return p;
   }
   addProgram(robot: Robot | MobileRobot | null = this.activeRobot, name?: string): Program {
     return this.cmd(() => {
-      const p = this.station.addChild(new Program(name ?? `Prog ${this.station.itemsOfType(ItemType.PROGRAM).length + 1}`));
-      if (robot) p.setRobot(robot);
+      const p = this.makeProgram(robot, name);
       this.setActiveProgram(p);
       this.select(p);
       return p;
@@ -316,21 +485,38 @@ export class App {
   }
 
   // -- Program helpers ------------------------------------------------------
-  /** Teach current robot position as a new target and append a move to the active program. */
+  /** Teach the current robot position as a new target and append a move to the active program: one undo step. */
   teach(moveType: 'MoveJ' | 'MoveL' = 'MoveJ'): void {
     const robot = this.activeRobot;
     if (!robot) return this.log('Select a robot first', 'warn');
-    const prog = this.activeProgram ?? this.addProgram(robot);
-    const t = this.addTarget();
-    if (!t) return;
     this.cmd(() => {
-      if (moveType === 'MoveJ') prog.addMoveJ(t); else prog.addMoveL(t);
-      if (moveType === 'MoveJ') t.setAsJointTarget();
+      let prog = this.activeProgram;
+      if (!prog) { prog = this.makeProgram(robot); this.activeProgram = prog; this.events.emit('activeProgram', { program: prog }); }
+      // like RoboDK, the first move taught into an empty program brings the robot's reference frame and tool with it
+      // (the posts then write $BASE / $TOOL, WObj / tooldata, ref_frame / set_tcp for it)
+      if (!prog.instructions().length) { prog.setFrame(robot.activeFrame() ?? null); prog.setTool(robot.activeTool() ?? null); }
+      const t = this.makeTarget();
+      if (moveType === 'MoveJ') { prog.addMoveJ(t); t.setAsJointTarget(); } else prog.addMoveL(t);
+      this.select(t);
     });
     this.previewProgram();
   }
 
-  /** Compile the active program and show its trajectory. */
+  /** Problems of the program's last compile, by instruction id. */
+  problemsOf(p: Program): Map<string, ProgramRunResult['problems'][number]> {
+    const r = p.lastResult;
+    if (!r) return new Map();
+    let m = this.problemCache.get(r);
+    if (!m) { m = new Map(); for (const pr of r.problems) if (!m.has(pr.instructionId)) m.set(pr.instructionId, pr); this.problemCache.set(r, m); }
+    return m;
+  }
+  /** Timing of an instruction in the last preview compile of its program. */
+  stepOf(ins: Instruction): StepInfo | undefined { return this.previewSteps.get(ins.id); }
+
+  /**
+   * Compile the active program for its preview (trajectory line, cycle time, per-instruction times). Never touches
+   * the playing runtime: deferred while a simulation plays; programs above PREVIEW_LIMIT go to the worker.
+   */
   previewProgram(): void {
     const p = this.activeProgram;
     if (!p || !(p.robot() instanceof Robot)) {
@@ -338,35 +524,387 @@ export class App {
       this.renderer?.setCollisionHighlight([]);
       return;
     }
-    const robot = p.robot() as Robot;
-    const q0 = robot.joints();
-    this.sim.collisionOptions = { enabled: true, selfOnly: !this.checkCollisions, assets: this.assets, sampleStep: 0.02 };
-    const res = this.sim.compile(p);
-    this.renderer?.setCollisionHighlight(this.sim.collisions.flatMap((c) => c.pairs.flatMap((pr) => [pr.a.item.id, pr.b.item.id])));
-    const trajs = this.sim.steps.filter((s) => s.trajectory).map((s) => s.trajectory as Trajectory);
-    this.renderer?.showTrajectoryPreview(robot, trajs);
-    robot.setJoints(q0);
-    this.events.emit('simulation', { playing: this.sim.playing, time: 0, duration: this.sim.duration });
-    void res;
+    if (this.simState === 'playing') { this.previewDeferred = true; return; }
+    if (p.instructions().length > PREVIEW_LIMIT) { void this.compileInWorker(p, false); return; }
+    this.compilePreview(p, false);
   }
 
-  runProgram(p: Program | null = this.activeProgram): void {
-    if (!p) return this.log('No program selected', 'warn');
-    this.sim.collisionOptions = { enabled: true, selfOnly: !this.checkCollisions, assets: this.assets, sampleStep: 0.02 };
+  /** Explicit validation: compile with self-collision checks (station collisions when enabled). */
+  validateProgram(p: Program | null = this.activeProgram): ProgramRunResult | null {
+    if (!p) return null;
+    if (p.instructions().length > PREVIEW_LIMIT && workerAvailable()) { void this.compileInWorker(p, true); return p.lastResult; }
+    return this.compilePreview(p, true);
+  }
+
+  private compilePreview(p: Program, collisions: boolean): ProgramRunResult {
+    const robot = p.robot() as Robot | null;
+    const saved = this.station.itemsOfType<Robot>(ItemType.ROBOT).map((r) => [r, r.joints()] as const);
+    this.sim.collisionOptions = { enabled: collisions, selfOnly: !this.checkCollisions, assets: this.assets, sampleStep: 0.05 };
     const res = this.sim.compile(p);
+    for (const [r, q] of saved) if (r.joints().some((v, i) => v !== q[i])) r.setJoints(q);
+    this.previewSteps.clear();
+    for (const s of this.sim.steps) this.previewSteps.set(s.instruction.id, { t0: s.t0, t1: s.t1, trajectory: s.trajectory ? { duration: s.trajectory.duration } : undefined });
     this.renderer?.setCollisionHighlight(this.sim.collisions.flatMap((c) => c.pairs.flatMap((pr) => [pr.a.item.id, pr.b.item.id])));
-    for (const pr of res.problems) this.log(`${p.name}: ${pr.message}`, pr.severity === 'error' ? 'error' : 'warn');
-    if (!res.ok) {
-      this.events.emit('simulation', { playing: false, time: 0, duration: this.sim.duration });
+    if (robot instanceof Robot) this.renderer?.showTrajectoryPreview(robot, this.sim.steps.filter((s) => s.trajectory).map((s) => s.trajectory as Trajectory));
+    this.events.emit('preview', { program: p });
+    this.emitSim();
+    return res;
+  }
+
+  private workerJob = 0;
+  /** Compile a large program in the worker (UI stays responsive), then show its preview. */
+  private async compileInWorker(p: Program, collisions: boolean): Promise<void> {
+    if (!workerAvailable()) {
+      this.renderer?.showTrajectoryPreview(null, []);
+      this.log(`${p.name}: ${p.instructions().length} instructions — preview skipped on the UI thread (use Validate)`, 'info');
       return;
     }
-    this.sim.speedFactor = this.simSpeed;
-    this.sim.play();
-    this.events.emit('simulation', { playing: true, time: 0, duration: this.sim.duration });
+    const job = ++this.workerJob;
+    this.events.emit('progress', { label: `Compiling ${p.name}`, detail: `${p.instructions().length} instructions` });
+    try {
+      const file = collisions ? saveStation(this.station, this.assets) : { format: 'vbstation', version: 1, savedAt: '', app: '', station: this.station.serialize(), assets: {} } as StationFile;
+      const out = await workerCompile(file, p.id, { collisions, selfOnly: !this.checkCollisions });
+      if (job !== this.workerJob || !p.station) return;
+      p.lastResult = out.result;
+      this.previewSteps.clear();
+      for (const [id, t0, t1, d] of out.steps) this.previewSteps.set(id, { t0, t1, trajectory: d >= 0 ? { duration: d } : undefined });
+      this.renderer?.showPathPreview?.(out.points);
+      for (const pr of out.result.problems.slice(0, 5)) if (collisions) this.log(`${p.name}: ${pr.message}`, pr.severity === 'error' ? 'error' : 'warn');
+      this.events.emit('preview', { program: p });
+      this.emitSim();
+    } catch (e) {
+      if (job === this.workerJob) this.log(`Compile of ${p.name} failed: ${(e as Error).message}`, 'error');
+    } finally {
+      if (job === this.workerJob) this.events.emit('progress', { label: `Compiling ${p.name}`, done: true });
+    }
   }
-  pauseProgram(): void { this.sim.pause(); this.events.emit('simulation', { playing: false, time: this.sim.time, duration: this.sim.duration }); }
-  stopProgram(): void { this.sim.stop(); this.events.emit('simulation', { playing: false, time: 0, duration: this.sim.duration }); }
-  seekProgram(t: number): void { this.sim.seek(t); this.events.emit('simulation', { playing: this.sim.playing, time: this.sim.time, duration: this.sim.duration }); }
+
+  // -- Simulation (StationRuntime) ---------------------------------------------
+  isPlaying(): boolean { return this.simState === 'playing'; }
+  /** Runs that are queued or running. */
+  activeRuns(): RunInfo[] { return this.runs.filter((r) => ACTIVE.has(r.status)); }
+
+  /** Estimated end of the session (s): program start time + its cycle-time estimate. */
+  get simDuration(): number {
+    let d = 0;
+    for (const s of this.session) d = Math.max(d, s.at + (s.program instanceof Program ? s.program.lastResult?.duration ?? 0 : 0));
+    if (!this.session.length && this.activeProgram?.lastResult) d = this.activeProgram.lastResult.duration;
+    return Math.max(d, this.simTime);
+  }
+
+  private emitSim() {
+    this.events.emit('simulation', { playing: this.simState === 'playing', paused: this.simState === 'paused', time: this.simTime, duration: this.simDuration });
+  }
+
+  /**
+   * Play a program on the station runtime. Programs on other robots keep running (concurrent, shared clock);
+   * a program on a busy robot is queued by the runtime. When paused, Play resumes. After a finished session
+   * the station is restored to its home state first (repeatable runs); `restartFromHome=false` continues
+   * from the current state like RoboDK.
+   */
+  /** Play a program, or a station Python program (RoboDK PROGRAM_PYTHON item: runs through the registered script runners). */
+  runProgram(p: Program | Item | null = this.activeProgram, opts: RunOptions = {}): RunInfo | null {
+    if (!p) { this.log('No program selected', 'warn'); return null; }
+    if (this.simState === 'paused') this.resumeProgram();
+    const running = this.activeRuns().find((r) => r.program === p);
+    if (running) {
+      if (opts.fromIndex === undefined) return running;
+      this.runtime.stop(running.id as any);
+    }
+    if (!this.activeRuns().length) {
+      if (!this.atHome && this.restartFromHome) this.resetSimulation();
+      if (this.atHome) { this.runtime.captureHome(); this.atHome = false; }
+    }
+    if (p instanceof Program && !p.lastResult && p.instructions().length <= PREVIEW_LIMIT && p.robot() instanceof Robot) this.compilePreview(p, false);
+    const start: Record<string, unknown> = {};
+    const robot = p instanceof Program ? p.robot() : null;
+    if (robot) start.robot = robot;
+    if (opts.args) start.args = opts.args;
+    if (opts.fromIndex !== undefined && opts.fromIndex > 0 && p instanceof Program) {
+      start.fromIndex = opts.fromIndex;
+      const q = this.jointsBefore(p, opts.fromIndex);
+      if (q && robot instanceof Robot) { start.startJoints = q; robot.setJoints(q); }
+    }
+    const h = this.runtime.start(p, start as any) as unknown as RunInfo;
+    if (opts.fromIndex) this.startAt(h, opts.fromIndex);
+    this.runs.push(h);
+    this.session.push({ program: p, at: this.simTime, opts });
+    this.simState = 'playing';
+    void h.done.then(() => this.onRunFinished(h), (e) => this.log(`${p.name}: ${(e as Error)?.message ?? e}`, 'error'));
+    this.emitSim();
+    return h;
+  }
+
+  /**
+   * "Run from here": a run that has not executed anything yet starts at instruction `index`. Uses the runtime's
+   * StartOptions.fromIndex when it honours it (requested from T3); otherwise the new run's top frame is positioned
+   * before its first step (start() only queues / begins it, instructions execute on the next tick).
+   */
+  private startAt(h: RunInfo, index: number) {
+    if (typeof h.instructionIndex === 'number' && h.instructionIndex >= index) return;
+    const rt = this.runtime as unknown as { ctxs?: Array<{ handle: unknown; frames: Array<{ pc: number; list: unknown[] }> }>; queue?: Array<{ handle: unknown; frames: Array<{ pc: number; list: unknown[] }> }> };
+    const c = [...(rt.ctxs ?? []), ...(rt.queue ?? [])].find((x) => x.handle === h);
+    const fr = c?.frames?.[0];
+    if (fr && fr.pc === 0 && index < fr.list.length) { fr.pc = index; h.instructionIndex = index; }
+  }
+
+  /** Joints of the program's robot at the start of instruction `index` (from the preview compile). */
+  private jointsBefore(p: Program, index: number): number[] | null {
+    const ins = p.instructions();
+    for (let i = Math.min(index, ins.length) - 1; i >= 0; i--) {
+      const d = ins[i].data;
+      if (d.kind !== 'move') continue;
+      const t = d.targetId ? this.station.findById(d.targetId) as Target | null : null;
+      if (d.joints) return [...d.joints];
+      if (t?.joints && p.robot() instanceof Robot) { const r = p.robot() as Robot; const q = r.jointsForTarget(t); if (q) return q; }
+    }
+    return null;
+  }
+
+  private onRunFinished(h: RunInfo) {
+    if (h.status === 'error' && h.error) {
+      this.log(`${h.program.name}: stopped at instruction ${h.error.instructionIndex + 1}: ${h.error.message}`, 'error');
+    }
+    if (!this.activeRuns().length && this.simState === 'playing') { this.simState = 'idle'; this.flushDeferredPreview(); }
+    this.emitSim();
+  }
+
+  private flushDeferredPreview() {
+    if (this.previewDeferred && this.simState !== 'playing') { this.previewDeferred = false; this.previewProgram(); }
+  }
+
+  /** Index of the instruction a live run of `p` is executing (-1 when not running). */
+  runningInstruction(p: Program): number {
+    for (let i = this.runs.length - 1; i >= 0; i--) {
+      const r = this.runs[i];
+      if (r.program === p && ACTIVE.has(r.status)) return typeof r.instructionIndex === 'number' ? r.instructionIndex : -1;
+    }
+    return -1;
+  }
+  /** Instruction index where the last run of `p` stopped with an error (-1 if none). */
+  errorInstruction(p: Program): number {
+    for (let i = this.runs.length - 1; i >= 0; i--) {
+      const r = this.runs[i];
+      if (r.program === p) return r.status === 'error' && r.error ? r.error.instructionIndex : -1;
+    }
+    return -1;
+  }
+
+  pauseProgram(): void {
+    if (this.simState === 'playing') this.simState = 'paused';
+    this.emitSim();
+  }
+  resumeProgram(): void {
+    if (this.simState === 'paused') this.simState = this.activeRuns().length ? 'playing' : 'idle';
+    this.emitSim();
+  }
+  /** Stop every run; the station stays where it is (Reset restores the home state). */
+  stopProgram(): void {
+    if (this.activeRuns().length) this.runtime.stop();
+    this.simState = 'idle';
+    this.flushDeferredPreview();
+    this.emitSim();
+  }
+  /** Stop and restore the home state: object poses, attachments, robot joints, IO ("Replace objects"). */
+  resetSimulation(): void {
+    this.runtime.stop();
+    if (!this.atHome) this.runtime.reset();
+    for (const ref of this.harvestPicked.splice(0)) { const f = fruitByRef(this.station, ref); if (f) { f.fruit.picked = false; f.row.notify('plants'); } }
+    this.runs = [];
+    this.session = [];
+    this.simTime = 0;
+    this.simState = 'idle';
+    this.atHome = true;
+    this.flushDeferredPreview();
+    this.emitSim();
+  }
+  /** Make the current station state the home state restored by Reset. */
+  setHome(): void {
+    this.runtime.captureHome();
+    this.atHome = false;
+    this.runs = this.activeRuns();
+    this.session = this.session.filter((s) => this.runs.some((r) => r.program === s.program));
+    this.simTime = 0;
+    this.emitSim();
+  }
+
+  /**
+   * Seek the session to time t, deterministically: forward runs the clock, backward restores the home state and
+   * replays the session's starts. With no session yet, the active program is started from home and run to t.
+   */
+  seekProgram(t: number): void {
+    t = Math.max(0, t);
+    if (!this.session.length) {
+      if (!this.activeProgram || t <= 0) return;
+      const state = this.simState;
+      this.runProgram(this.activeProgram);
+      this.advance(t);
+      if (state !== 'playing') this.simState = this.activeRuns().length ? 'paused' : 'idle';
+      this.emitSim();
+      return;
+    }
+    if (t < this.simTime) {
+      const replay = [...this.session];
+      const state = this.simState;
+      this.resetSimulation();
+      this.atHome = false;
+      for (const s of replay) {
+        if (s.at > t) break;
+        this.advance(s.at - this.simTime);
+        const prog = s.program instanceof Program ? s.program : null;
+        const from = prog ? s.opts.fromIndex ?? 0 : 0, rb = prog?.robot() ?? null;
+        const q = prog && from > 0 ? this.jointsBefore(prog, from) : null;
+        const h = this.runtime.start(s.program, { ...(rb ? { robot: rb } : {}), ...(s.opts.args ? { args: s.opts.args } : {}), ...(q && rb instanceof Robot ? { startJoints: q } : {}), ...(from > 0 ? { fromIndex: from } : {}) } as any) as unknown as RunInfo;
+        if (from > 0) this.startAt(h, from);
+        this.runs.push(h);
+        this.session.push({ program: s.program, at: s.at, opts: s.opts });
+        void h.done.then(() => this.onRunFinished(h));
+      }
+      this.advance(t - this.simTime);
+      this.simState = this.activeRuns().length ? (state === 'playing' ? 'playing' : 'paused') : 'idle';
+    } else this.advance(t - this.simTime);
+    this.emitSim();
+  }
+
+  /**
+   * Advance the shared clock by dt simulated seconds (no real-time pacing). Instructions are event driven inside the
+   * runtime; the step only sets how often robots are sampled on the way, so long seeks use coarser steps.
+   */
+  private advance(dt: number) {
+    if (dt <= 0) return;
+    this.runtime.runFor(dt, Math.min(1, Math.max(0.02, dt / 500)));
+    this.simTime += dt;
+  }
+
+  /**
+   * Run every active program to its end (bounded by `maxSeconds` of simulated time). Synchronous unless a run waits for
+   * a station script (Python program / script runner call): script runners answer asynchronously, so the clock stands
+   * still while the page yields until the script returns (at most `scriptWaitMs` of wall time per wait, then the clock
+   * moves on as during live playback); the returned promise resolves at the end.
+   */
+  runToEnd(maxSeconds = 36000, scriptWaitMs = 60000): void | Promise<void> {
+    let left = maxSeconds;
+    let waitSince = 0;
+    // a station whose programs may call scripts is stepped finely, so the clock stops close to a script call
+    const fine = this.mayCallScripts();
+    // a script wait left open by the previous call (its budget ended during the wait) is settled by this one
+    let waitClock = this.pendingScriptClock;
+    this.pendingScriptClock = -1;
+    const finish = () => {
+      this.fastForward = false;
+      if (this.waitingForScript()) this.pendingScriptClock = waitClock >= 0 ? waitClock : this.runtime.time;
+      else if (waitClock >= 0) this.resumeScriptsAtCall(waitClock);
+      if (!this.activeRuns().length) this.simState = 'idle';
+      this.emitSim();
+    };
+    this.fastForward = true;
+    const loop = (): void | Promise<void> => {
+      while (this.activeRuns().length && left > 0) {
+        if (this.waitingForScript()) {
+          const now = Date.now();
+          if (!waitSince) { waitSince = now; if (waitClock < 0) waitClock = this.runtime.time; }
+          if (now - waitSince < scriptWaitMs) return this.yieldForScript().then(loop);
+        } else { waitSince = 0; }
+        // the simulated time a waiting run did not use is given back to the budget
+        if (waitClock >= 0) { left += this.resumeScriptsAtCall(waitClock); waitClock = -1; }
+        const big = Math.min(left, Math.max(1, this.simDuration - this.simTime + 0.5));
+        // one run: a script wait found after a big step resumes at the call (resumeScriptsAtCall), nothing else moved
+        // meanwhile; several runs: fine steps, so the others do not run far ahead of a run waiting for its script
+        left -= fine && this.runtimeRunCount() > 1 ? this.advanceUntilScript(big) : (this.advance(big), big);
+      }
+      finish();
+    };
+    return loop();
+  }
+
+  /**
+   * A script that answered without consuming simulated time (its runner declined, or the script did not move the clock
+   * past `clock`, the time when the wait was seen) resumes its run at the call itself, not at the end of the sub-step in
+   * which the call happened: runToEnd then gives the same timing as a runtime without script runners.
+   */
+  private resumeScriptsAtCall(clock: number): number {
+    const ctxs = (this.runtime as unknown as { ctxs?: Array<{ cursor: number; block?: { kind?: string; state?: { done?: boolean; at?: number } } | null }> }).ctxs ?? [];
+    let rewind = 0;
+    for (const c of ctxs) {
+      const st = c.block?.kind === 'script' ? c.block.state : undefined;
+      if (st?.done && st.at !== undefined && st.at <= clock + 1e-12 && c.cursor < st.at) { rewind = Math.max(rewind, st.at - c.cursor); st.at = c.cursor; }
+    }
+    return rewind;
+  }
+
+  /** Set while runToEnd drives the clock (the live tick stands still). */
+  private fastForward = false;
+  /** Runtime time when a script wait began that the last runToEnd left open (-1: none). */
+  private pendingScriptClock = -1;
+
+  /**
+   * Let a script runner answer: microtasks first (runners that decline or finish synchronously answer within a few promise
+   * hops, without paying for a rendered frame per call), then a macrotask (network, Pyodide loading, the server).
+   */
+  private async yieldForScript(): Promise<void> {
+    for (let i = 0; i < 64 && this.waitingForScript(); i++) await null;
+    if (this.waitingForScript()) await new Promise<void>((r) => setTimeout(r, 2));
+  }
+
+  /** Runs of the station runtime (threads and API runs included, not only the app's own runs). */
+  private runtimeRunCount(): number {
+    const rt = this.runtime as unknown as { ctxs?: unknown[]; queue?: unknown[] };
+    return (rt.ctxs?.length ?? 0) + (rt.queue?.length ?? 0);
+  }
+
+  /** true while a run is blocked in a station script call whose runner has not answered yet. */
+  private waitingForScript(): boolean {
+    const ctxs = (this.runtime as unknown as { ctxs?: Array<{ block?: { kind?: string; state?: { done?: boolean } } | null }> }).ctxs ?? [];
+    return ctxs.some((c) => c.block?.kind === 'script' && !c.block.state?.done);
+  }
+
+  /** Station Python programs or calls / function-call code that no program of the station resolves: runs may wait for script runners. */
+  private mayCallScripts(): boolean {
+    for (const it of this.station.walk()) {
+      if (it.type === ItemType.PROGRAM_PYTHON) return true;
+      if (it instanceof Program) for (const ins of it.instructions()) { const d = ins.data as { kind: string; asFunctionCall?: boolean; programId?: string | null }; if ((d.kind === 'code' && d.asFunctionCall) || (d.kind === 'call' && !d.programId)) return true; }
+    }
+    return false;
+  }
+
+  /**
+   * advance up to dt in 0.05 s sub-steps that stop as soon as a run starts waiting for a script (the waiting run resumes
+   * at the time its runner answers: the clock must not run past the call). Returns the time advanced.
+   */
+  private advanceUntilScript(dt: number): number {
+    if (this.waitingForScript()) { this.advance(Math.min(dt, 0.05)); return Math.min(dt, 0.05); }
+    const n = Math.max(1, Math.ceil(dt / 0.05)), h = dt / n;
+    for (let i = 0; i < n; i++) {
+      this.advance(h);
+      if (this.waitingForScript()) return h * (i + 1);
+    }
+    return dt;
+  }
+
+  /**
+   * Run `fn` (an exporter sampling the preview simulator, which moves robots and objects) and put the station
+   * back exactly as it was: object parents / poses / visibility, robot joints / frame / tool, gripper state.
+   */
+  async withStateRestored<T>(fn: () => T | Promise<T>): Promise<T> {
+    const objs: Array<[SceneObject, Item | null, Mat4, boolean]> = [];
+    const robots: Array<[Robot, number[], string | null, string | null]> = [];
+    const tools: Array<[Tool, boolean, string[]]> = [];
+    for (const it of this.station.walk()) {
+      if (it instanceof SceneObject) objs.push([it, it.parent, it.pose(), it.visible]);
+      if (it instanceof Tool) tools.push([it, it.closed, [...it.attached]]);
+      if (it instanceof Robot) robots.push([it, it.joints(), it.activeFrameId, it.activeToolId]);
+    }
+    try { return await fn(); } finally {
+      for (const [r, q, f, t] of robots) { r.setJoints(q); r.activeFrameId = f; r.activeToolId = t; }
+      for (const [o, parent, pose, vis] of objs) { if (parent && o.parent !== parent) parent.addChild(o); o.setPose(pose); if (o.visible !== vis) o.setVisible(vis); }
+      for (const [t, closed, att] of tools) { t.closed = closed; t.attached = att; }
+    }
+  }
+
+  /** Wait (in real time, while the frame loop ticks) until no program is running. */
+  async waitIdle(): Promise<void> {
+    await Promise.all(this.activeRuns().map((r) => r.done.catch(() => undefined)));
+  }
 
   /** Move the active robot to a target instantly (or preview MoveJ/MoveL path). */
   moveRobotTo(target: Target, linear = false): void {
@@ -398,6 +936,35 @@ export class App {
     return fm;
   }
   startWorld(): void { this.worldRunning = true; }
+
+  /**
+   * Play a Webots supervisor fleet script (agromarca scripted_fleet JSON; default: MURKA Mission B) on the world clock:
+   * the script's time is the world time since this call, poses go to the station items named like the Webots nodes.
+   * Throws when the station lacks a node the script drives. Returns the fleet (errors / warnings) and the script end.
+   */
+  async playScriptedFleet(script?: unknown, opts: { depotModules?: string[] } = {}): Promise<{ fleet: import('./io/webots/scripted_fleet').ScriptedFleet; tEnd: number }> {
+    const { ScriptedFleet, StationFleetWorld } = await import('./io/webots/scripted_fleet');
+    const data = (script ?? (await import('./io/webots/murka_missions')).defaultMissionBScript()) as Parameters<typeof ScriptedFleet.fromScript>[0];
+    const fleet = ScriptedFleet.fromScript(data);
+    const world = new StationFleetWorld(this.station);
+    // shelf poses of the depot modules are taken before the first tick (as the Webots supervisor does)
+    if (opts.depotModules?.length) fleet.snapshotDepotModules(world, opts.depotModules);
+    fleet.requireWorld(world);
+    fleet.log = (m) => this.log(`[scripted fleet] ${m}`);
+    const tEnd = Math.max(0, ...(data.waypoints ?? []).map((w) => Number(w.end_s) || 0), ...(data.carries ?? []).map((c) => Number(c.end_s) || 0), ...(data.reconfigs ?? []).map((r) => (Number(r.start_s) || 0) + (Number(r.transfer_s) || 0)));
+    let t = 0;
+    const st = this.station;
+    const hook = (h: number) => {
+      if (this.station !== st) return;
+      t += h;
+      fleet.tick(world, t);
+      if (t > tEnd + 1) { const i = this.worldHooks.indexOf(hook); if (i >= 0) this.worldHooks.splice(i, 1); this.log(`Scripted fleet finished at ${t.toFixed(1)} s${fleet.errors.length ? ` with ${fleet.errors.length} error(s): ${fleet.errors.slice(0, 3).join('; ')}` : ''}`, fleet.errors.length ? 'warn' : 'info'); }
+    };
+    this.worldHooks.push(hook);
+    this.startWorld();
+    this.log(`Scripted fleet: ${data.waypoints?.length ?? 0} waypoints, ${data.reconfigs?.length ?? 0} reconfigurations, ${tEnd.toFixed(0)} s`);
+    return { fleet, tEnd };
+  }
   pauseWorld(): void { this.worldRunning = false; }
   resetWorld(): void {
     this.worldRunning = false;
@@ -410,10 +977,14 @@ export class App {
   }
 
   private tick(dt: number): void {
-    if (this.sim.playing) {
-      this.sim.speedFactor = this.simSpeed;
-      const still = this.sim.tick(dt);
-      this.events.emit('simulation', { playing: still, time: this.sim.time, duration: this.sim.duration });
+    // runToEnd owns the clock while it waits for a script runner: the animation loop must not advance it meanwhile
+    // ... nor while a run waits for a script runner that is still loading (Pyodide download: not simulation time)
+    if (this.simState === 'playing' && !this.fastForward && !this.runtime.holding()) {
+      const step = dt * this.simSpeed;
+      this.runtime.tick(step);
+      this.simTime += step;
+      if (!this.activeRuns().length) { this.simState = 'idle'; this.flushDeferredPreview(); }
+      this.emitSim();
     }
     if (this.worldRunning) {
       const step = dt * this.simSpeed;
@@ -438,14 +1009,128 @@ export class App {
     return JSON.stringify(saveStation(this.station, this.assets));
   }
 
+  /** Read every file of a drop / picker into a path -> bytes map (paths relative to the dropped folder). */
+  static async filesToMap(files: File[]): Promise<Map<string, Uint8Array>> {
+    const m = new Map<string, Uint8Array>();
+    // a file that cannot be read (cloud placeholder of a synced folder, broken link) is left out instead of failing the import
+    for (const f of files) { try { m.set(((f as any).webkitRelativePath || (f as any).relativePath || f.name).replace(/\\/g, '/'), new Uint8Array(await f.arrayBuffer())); } catch { /* unreadable: skipped */ } }
+    return m;
+  }
+
+  /**
+   * Webots projects (.wbt / .proto, folders with worlds/ protos/) and ROS packages (package.xml, urdf/ meshes/)
+   * are imported as a whole; returns the files left for the per-file importers.
+   */
+  private async openProjects(files: File[]): Promise<File[]> {
+    const path = (f: File) => ((f as any).webkitRelativePath || (f as any).relativePath || f.name) as string;
+    // a .zip holding a Webots project (.wbt) or a ROS package (package.xml) goes to that importer: entry names are read
+    // without inflating anything
+    const zipKind = new Map<File, 'webots' | 'ros'>();
+    for (const f of files) {
+      if (!/\.zip$/i.test(f.name)) continue;
+      const names: string[] = [];
+      try { const { unzipSync } = await import('fflate'); unzipSync(new Uint8Array(await f.arrayBuffer()), { filter: (e) => { names.push(e.name); return false; } }); } catch { continue; }
+      if (names.some((n) => /\.wbt$/i.test(n))) zipKind.set(f, 'webots');
+      else if (names.some((n) => /(^|\/)package\.xml$/i.test(n))) zipKind.set(f, 'ros');
+    }
+    let webots = files.some((f) => /\.(wbt|proto)$/i.test(f.name)) || [...zipKind.values()].includes('webots');
+    const hasPkgXml = files.some((f) => /(^|\/)package\.xml$/i.test(path(f))) || [...zipKind.values()].includes('ros');
+    // a robot description folder without package.xml (ur_description copied out of a package): imported as a package
+    // named after the folder instead of file by file (which made 0-DOF robots of the xacro macros and stray meshes)
+    const topDirs = new Set(files.map((f) => path(f).replace(/\\/g, '/').split('/')).filter((s) => s.length > 1).map((s) => s[0]));
+    const descriptionFolder = !hasPkgXml && topDirs.size === 1 && files.some((f) => /\.(urdf|xacro)$/i.test(f.name)) && files.some((f) => /(^|\/)(urdf|meshes|launch|config)\//i.test(path(f)));
+    let rosPkg = hasPkgXml || descriptionFolder;
+    if (webots && rosPkg) {
+      // a ROS package that ships Webots worlds (webots_ros2_*): the world or the robot description
+      const robots = files.filter((f) => /\.(urdf|xacro)$/i.test(f.name)).map((f) => f.name);
+      const worldN = files.filter((f) => /\.wbt$/i.test(f.name)).length;
+      const kind = (await this.importUi?.chooseKind?.([
+        { value: 'webots', label: `Webots world (${worldN} world file${worldN === 1 ? '' : 's'})` },
+        { value: 'ros', label: `ROS robot description (${robots.slice(0, 4).join(', ')}${robots.length > 4 ? ', …' : ''})` },
+      ])) ?? 'webots';
+      if (kind === 'ros') webots = false; else rosPkg = false;
+    } else if (webots) rosPkg = false;
+    if (!webots && !rosPkg) return files;
+    const map = await App.filesToMap(files);
+    if (rosPkg && descriptionFolder) {
+      const pkg = [...topDirs][0];
+      map.set(`${pkg}/package.xml`, new TextEncoder().encode(`<?xml version="1.0"?>\n<package format="3"><name>${pkg.replace(/[^\w]/g, '_')}</name></package>\n`));
+      this.log(`${pkg}: no package.xml in the folder — imported as ROS package "${pkg}" (package://${pkg}/... resolves to it)`, 'warn', false);
+    }
+    if (webots) {
+      // the Webots importer reads plain files: expand project zips in place (paths inside the zip kept)
+      for (const [f, k] of zipKind) if (k === 'webots') {
+        const { unzipSync } = await import('fflate');
+        map.delete(path(f).replace(/\\/g, '/'));
+        for (const [zk, zv] of Object.entries(unzipSync(new Uint8Array(await f.arrayBuffer())))) if (!zk.endsWith('/')) map.set(zk, zv);
+      }
+      // several worlds: the user picks one (the importer would take the shallowest, alphabetically first)
+      const worlds = [...map.keys()].filter((p) => /\.wbt$/i.test(p)).sort((a, b) => a.split('/').length - b.split('/').length || a.localeCompare(b));
+      let world: string | undefined;
+      if (worlds.length > 1) world = (await this.importUi?.chooseWorld?.(worlds, worlds[0])) ?? undefined;
+      this.events.emit('progress', { label: 'Importing Webots world', detail: `${map.size} files` });
+      try {
+        const { importWebotsFiles } = await import('./io/webots/index');
+        const { withRemoteWebotsFiles } = await import('./io/library/webots_remote');
+        // standard Webots robots / objects are remote PROTOs (cyberbotics GitHub): downloaded in rounds, then imported
+        const { result: { station, report }, stats } = await withRemoteWebotsFiles((remote) => importWebotsFiles(map, this.assets, { ...(world ? { world } : {}), remote }),
+          { onProgress: (d) => this.events.emit('progress', { label: 'Importing Webots world', detail: d }) });
+        this.setStation(station);
+        const lines = report.map(String);
+        if (stats.fetched.length) lines.push(`${stats.fetched.length} remote Webots file(s) downloaded (PROTOs, meshes, textures from raw.githubusercontent.com)`);
+        if (stats.failed.length) lines.push(`${stats.failed.length} remote Webots file(s) could not be downloaded: ${stats.failed.slice(0, 3).join(', ')}${stats.failed.length > 3 ? ', …' : ''}`);
+        this.logImportReport(`Webots world ${station.name}`, lines);
+        this.log(`Opened Webots world ${station.name}`);
+      } finally { this.events.emit('progress', { label: 'Importing Webots world', done: true }); }
+      return [];
+    }
+    this.events.emit('progress', { label: 'Importing ROS package', detail: `${map.size} files` });
+    try {
+      const { importRosPackageFiles } = await import('./io/urdf/package');
+      let res = await importRosPackageFiles(map, this.assets);
+      // entry points / xacro args: asked when there is a choice (several descriptions, xacro args, or errors)
+      // descriptions that failed with the defaults (a xacro needing name:=...) are offered too, so args can fix them
+      const offered = [...res.entries.map((e) => ({ file: e.file, args: e.args, source: e.source }))];
+      for (const e of res.errors) { const m = /^(\S+\.(?:urdf|xacro))(?:\s+\(([^)]*)\))?:/i.exec(e); if (m && !offered.some((o) => o.file === m[1])) offered.push({ file: m[1], args: m[2] ? Object.fromEntries(m[2].split(/\s+/).map((kv) => kv.split(':=')).filter((kv) => kv.length === 2)) : {}, source: 'top-level' }); }
+      const choice = this.importUi?.rosOptions && (offered.length > 1 || res.errors.length || offered.some((e) => /\.xacro$/i.test(e.file) && Object.keys(e.args).length))
+        ? await this.importUi.rosOptions({ entries: offered, imported: res.robots.map((r) => r.name), errors: res.errors }) : null;
+      if (choice) res = await importRosPackageFiles(map, this.assets, { entries: choice.entries, args: choice.args });
+      const items = res.items as Item[];
+      if (items.length) this.cmd(() => { for (const it of items) this.station.addChild(it); const r = items.find((x) => x instanceof Robot) as Robot | undefined; if (r) { this.setActiveRobot(r); this.select(r); } else this.select(items[0]); });
+      this.logImportReport('ROS package', (res.report ?? []).map(String));
+      for (const e of res.errors ?? []) this.log(`ROS package: ${e}`, 'error');
+      this.log(`Imported ROS package: ${items.map((x) => x.name).join(', ') || 'no items'}`, items.length ? 'info' : 'warn');
+    } finally { this.events.emit('progress', { label: 'Importing ROS package', done: true }); }
+    return [];
+  }
+
+
+  /** Basenames (lower case) of mesh references in the station that no asset resolves yet. */
+  private missingMeshNames(): Set<string> {
+    const out = new Set<string>();
+    for (const ref of referencedMeshIds(this.station.serialize())) if (!this.assets.resolve(ref)) out.add(ref.split(/[\\/]/).pop()!.toLowerCase());
+    return out;
+  }
+
   async openFiles(files: File[]): Promise<void> {
+    files = await this.openProjects(files);
+    if (!files.length) { this.previewProgram(); return; }
+    // meshes needed by URDFs in this drop, or by items already in the station, are assets only (no stray objects)
+    const consumed = this.missingMeshNames();
+    const others = new Map(files.map((x) => [x.name, x]));
+    const urdfCache = new Map<string, string>();
+    for (const [n, x] of others) if (/\.(xacro|urdf)$/i.test(n)) urdfCache.set(n, await x.text());
+    for (const [n, text] of urdfCache) {
+      try { for (const m of parseURDF(text, { resolveInclude: (fn) => urdfCache.get(fn.split('/').pop()!) ?? null }).meshes) consumed.add(m.split(/[\\/]/).pop()!.toLowerCase()); } catch { /* reported when the URDF is opened */ void n; }
+    }
+    const isConsumed = (name: string) => consumed.has(name.toLowerCase());
     // Load meshes first so URDFs can resolve them
     const meshes = files.filter((f) => /\.(stl|obj|dae|glb|gltf)$/i.test(f.name));
     for (const f of meshes) {
       const buf = new Uint8Array(await f.arrayBuffer());
       const ext = f.name.split('.').pop()!.toLowerCase();
       if (ext === 'stl') this.assets.registerRaw(f.name, 'stl', buf, f.name);
-      else if (ext === 'obj') this.assets.registerMesh(f.name, parseOBJ(new TextDecoder().decode(buf)), f.name);
+      else if (ext === 'obj') this.assets.registerRaw(f.name, 'obj', buf, f.name);
       else if (ext === 'dae') this.assets.registerRaw(f.name, 'dae', buf, f.name);
       else if (ext === 'glb' || ext === 'gltf') {
         try {
@@ -460,12 +1145,12 @@ export class App {
     for (const f of files) {
       const name = f.name;
       const ext = name.split('.').pop()?.toLowerCase() ?? '';
-      const await_text = ext === 'dh' ? await f.text() : '';
       try {
         if (ext === 'vbstation' || (ext === 'json' && /station/i.test(name))) {
           const data = JSON.parse(await f.text());
-          const st = loadStation(data, this.assets);
-          if (isRdkExport(st)) {
+          // an rdk_export.py / rdk2vbs.py file carrying the RoboDK-saved .rdk (station.params.rdkFile) is decoded losslessly
+          const st = (await this.loadRdkExportFile(data)) ?? loadStation(data, this.assets);
+          if (isRdkExport(st) && !st.params.rdkConvertedBy) {
             const rep = postProcessRdkExport(st);
             for (const r of rep.robots) this.log(`RoboDK robot ${r.name}: ${r.source === 'dh' ? 'kinematics from DH table' : r.source === 'library' ? `matched library ${r.matched}` : 'no kinematics found (placeholder)'}`, r.source === 'none' ? 'warn' : 'info');
             for (const p of rep.programs) this.log(`RoboDK program ${p.name}: ${p.instructions} instructions`);
@@ -485,22 +1170,22 @@ export class App {
         } else if (ext === 'geojson') {
           await this.importGeoJSON(JSON.parse(await f.text()), name);
         } else if (ext === 'urdf' || ext === 'xacro') {
-          const text = await f.text();
-          const others = new Map(files.map((x) => [x.name, x]));
-          const cache = new Map<string, string>();
-          for (const [n, x] of others) if (/\.(xacro|urdf)$/i.test(n)) cache.set(n, await x.text());
-          const robot = robotFromURDF(text, { resolveInclude: (fn) => cache.get(fn.split('/').pop()!) ?? null });
+          const text = urdfCache.get(name) ?? await f.text();
+          const robot = robotFromURDF(text, { resolveInclude: (fn) => urdfCache.get(fn.split('/').pop()!) ?? null });
           this.cmd(() => { this.station.addChild(robot); this.select(robot); this.setActiveRobot(robot); });
-          const model = parseURDF(text, { resolveInclude: (fn) => cache.get(fn.split('/').pop()!) ?? null });
-          const missing = model.meshes.filter((m) => !this.assets.get(m) && ![...this.assets.entries()].some(([id]) => id.split(/[\\/]/).pop()?.toLowerCase() === m.split(/[\\/]/).pop()?.toLowerCase()));
+          const model = parseURDF(text, { resolveInclude: (fn) => urdfCache.get(fn.split('/').pop()!) ?? null });
+          const missing = model.meshes.filter((m) => !this.assets.resolve(m));
           const online = missing.filter((m) => resolvePackageUri(m));
-          this.log(`Imported URDF ${robot.name} (${robot.dof} DOF)${missing.length ? `; ${missing.length} meshes missing${online.length ? ` — fetching ${online.length} from the online library` : ' — drop the STL files onto the viewport'}` : ''}`, missing.length && !online.length ? 'warn' : 'info');
+          this.log(`Imported URDF ${robot.name} (${robot.dof} DOF)${missing.length ? `; ${missing.length} meshes missing${online.length ? ` — fetching ${online.length} from the online library` : ' — drop the mesh files onto the viewport'}` : ''}`, missing.length && !online.length ? 'warn' : 'info');
           if (online.length) fetchPackageMeshes(online, this.assets).then((r) => { this.log(`Online meshes for ${robot.name}: ${r.loaded.length} loaded${r.failed.length ? `, ${r.failed.length} failed` : ''}`, r.failed.length ? 'warn' : 'info'); }).catch((e) => this.log(`Mesh download failed: ${(e as Error).message}`, 'warn'));
-        } else if (ext === 'dh' || (ext === 'json' && false)) {
-          const robot = this.cmd(() => { const r = robotFromDH(parseDHText(await_text), name.replace(/\.dh$/i, '')); this.station.addChild(r); this.select(r); this.setActiveRobot(r); return r; });
+        } else if (ext === 'dh') {
+          const text = await f.text();
+          const robot = this.cmd(() => { const r = robotFromDH(parseDHText(text), name.replace(/\.dh$/i, '')); this.station.addChild(r); this.select(r); this.setActiveRobot(r); return r; });
           this.log(`Imported DH robot ${robot.name} (${robot.dof} DOF)`);
         } else if (ext === 'stl' || ext === 'obj' || ext === 'dae' || ((ext === 'glb' || ext === 'gltf') && this.assets.has(name))) {
-          const a = this.assets.get(name)!;
+          if (isConsumed(name)) { this.log(`Mesh ${name} resolved for the robot / items that reference it`); continue; }
+          const a = this.assets.get(name);
+          if (!a) continue;
           this.cmd(() => {
             const o = new SceneObject(name.replace(/\.(stl|obj|dae|glb|gltf)$/i, ''));
             o.geometry = [{ mesh: name, origin: Array.from(identity()), color: '#a5b1c2' }];
@@ -512,18 +1197,12 @@ export class App {
         } else if ((ext === 'rdk' || ext === 'robot' || ext === 'tool') && (await this.convertWithRoboDK(f))) {
           // converted losslessly by a RoboDK instance behind the studio server
         } else if (ext === 'robot' || ext === 'tool' || ext === 'sld') {
-          const { station, report } = await importRdkBestEffort(await f.arrayBuffer(), name.replace(/\.(robot|tool|sld)$/i, ''), this.assets);
+          const { station, report } = await this.importRdk(await f.arrayBuffer(), name.replace(/\.(robot|tool|sld)$/i, ''));
           const level = report.fidelity === 'full' ? 'info' : 'warn';
-          this.cmd(() => {
-            const kids = [...station.children];
-            for (const c of kids) this.station.addChild(c);
-            const robot = kids.find((c) => c instanceof Robot);
-            if (robot instanceof Robot) { this.select(robot); this.setActiveRobot(robot); }
-            else if (kids[0]) this.select(kids[0]);
-          });
+          this.cmd(() => this.mergeImported(station, ext === 'tool'));
           for (const n of report.notes) this.log(n, level);
         } else if (ext === 'rdk') {
-          const { station, report } = await importRdkBestEffort(await f.arrayBuffer(), name.replace(/\.rdk$/i, ''), this.assets);
+          const { station, report } = await this.importRdk(await f.arrayBuffer(), name.replace(/\.rdk$/i, ''));
           this.setStation(station);
           const robot = station.itemsOfType<Robot>(ItemType.ROBOT)[0];
           if (robot) this.setActiveRobot(robot);
@@ -589,6 +1268,64 @@ export class App {
     this.previewProgram();
   }
 
+  /**
+   * Add the items of an imported .robot/.tool/.sld station. A tool is mounted on the active robot's flange
+   * (RoboDK behaviour) and becomes its active tool.
+   */
+  private mergeImported(station: Station, isTool: boolean): void {
+    const kids = [...station.children];
+    const robot = this.activeRobot;
+    if (isTool && robot) {
+      if (!kids.some((c) => c instanceof Tool)) {
+        // importer returned the tool body as a plain object: mount it as a tool (geometry in flange coordinates)
+        const body = kids.find((c) => c instanceof SceneObject) as SceneObject | undefined;
+        if (body) {
+          const tool = new Tool(body.name);
+          tool.geometry = body.geometry.map((g) => ({ ...g, origin: Array.from(multiply(body.pose(), (g.origin ?? Array.from(identity())) as unknown as Mat4)) }));
+          tool.color = body.color;
+          const tcp = body.params?.poseTool;
+          if (Array.isArray(tcp) && tcp.length === 16) tool.setPoseTool(tcp as unknown as Mat4);
+          kids.splice(kids.indexOf(body), 1, tool);
+          if (!Array.isArray(tcp)) this.log(`${body.name}: no TCP in the file, TCP set to the flange`, 'warn');
+        }
+      }
+      for (const c of kids) {
+        if (c instanceof Tool) { robot.addChild(c); robot.setTool(c); }
+        else robot.addChild(c);
+      }
+      const tool = kids.find((c) => c instanceof Tool);
+      if (tool) { this.select(tool); this.log(`Tool ${tool.name} mounted on ${robot.name}`); }
+      return;
+    }
+    for (const c of kids) this.station.addChild(c);
+    const r = kids.find((c) => c instanceof Robot);
+    if (r instanceof Robot) { this.select(r); this.setActiveRobot(r); }
+    else if (kids[0]) this.select(kids[0]);
+  }
+
+  /** RoboDK binary import, in the worker when available (progress, no UI freeze), else on this thread. */
+  private async importRdk(data: ArrayBuffer, name: string): Promise<{ station: Station; report: Awaited<ReturnType<typeof importRdkBestEffort>>['report'] }> {
+    if (!workerAvailable()) return importRdkBestEffort(data, name, this.assets);
+    const label = `Opening ${name}`;
+    const onProgress = (p: ImportProgress) => this.events.emit('progress', { label, detail: p.detail });
+    this.events.emit('progress', { label, detail: `${(data.byteLength / 1e6).toFixed(1)} MB` });
+    try {
+      const out = await workerImportRdk(data, name, onProgress);
+      for (const m of out.meshes) {
+        const a = this.assets.registerMesh(m.id, m.mesh, m.name, m.units);
+        if (m.source) { a.source = m.source; a.type = m.type; }
+      }
+      onProgress({ detail: `building ${out.itemCount} items` });
+      await new Promise((r) => setTimeout(r, 0));
+      return { station: Station.deserialize(out.tree), report: out.report };
+    } catch (e) {
+      this.log(`Worker import failed (${(e as Error).message}); importing on the UI thread`, 'warn');
+      return importRdkBestEffort(data, name, this.assets);
+    } finally {
+      this.events.emit('progress', { label, done: true });
+    }
+  }
+
   /** Ask the studio server to convert a RoboDK file with a local RoboDK installation; returns true when loaded. */
   private async convertWithRoboDK(f: File): Promise<boolean> {
     const base = this.serverHttpBase();
@@ -597,14 +1334,31 @@ export class App {
       const res = await fetch(`${base}/convert/rdk`, { method: 'POST', body: await f.arrayBuffer(), headers: { 'x-filename': encodeURIComponent(f.name) } });
       if (!res.ok) { const j = await res.json().catch(() => ({})); this.log(`RoboDK converter not available on the server (${j.error ?? res.status}); using best-effort import`, 'warn'); return false; }
       const data = await res.json();
-      const st = loadStation(data, this.assets);
-      const { isRdkExport, postProcessRdkExport } = await import('./io/robodk/rdk_import');
-      if (isRdkExport(st)) postProcessRdkExport(st);
+      const st = (await this.loadRdkExportFile(data)) ?? loadStation(data, this.assets);
+      if (isRdkExport(st) && !st.params.rdkConvertedBy) postProcessRdkExport(st);
       if (f.name.toLowerCase().endsWith('.rdk')) this.setStation(st);
-      else this.cmd(() => { for (const c of [...st.children]) this.station.addChild(c); });
+      else this.cmd(() => this.mergeImported(st, f.name.toLowerCase().endsWith('.tool')));
       this.log(`${f.name} converted with RoboDK (lossless)`);
       return true;
     } catch { return false; }
+  }
+
+  /**
+   * Lossless path for RoboDK exports (rdk2vbs.py / rdk_export.py): the RoboDK-saved .rdk embedded in
+   * station.params.rdkFile is decoded by the binary reader and cross-checked with RoboDK's listing. Null when the file
+   * carries no embedded station (then loadStation + postProcessRdkExport apply).
+   */
+  private async loadRdkExportFile(data: unknown): Promise<Station | null> {
+    try {
+      const r = await importRdkExport(data, this.assets);
+      if (!r) return null;
+      for (const n of r.report.notes ?? []) this.log(String(n), r.report.fidelity === 'full' ? 'info' : 'warn');
+      for (const d of r.report.dropped ?? []) this.log(String(d), 'warn');
+      return r.station;
+    } catch (e) {
+      this.log(`Embedded RoboDK station could not be decoded (${(e as Error).message}); using the exported item tree`, 'warn');
+      return null;
+    }
   }
 
   /** HTTP base of the studio server if the page was opened with ?server=ws://host:port. */
@@ -629,12 +1383,35 @@ export class App {
   }
 
   exportProgram(postId: string, program: Program | null = this.activeProgram): PostFile[] {
-    if (!program) { this.log('No program to export', 'warn'); return []; }
+    const r = this.exportProgramChecked(postId, program);
+    for (const p of r.problems) this.log(p, 'warn');
+    return r.files;
+  }
+
+  /** Synchronous post-processing with its problems (compiler problems plus the post's warnings); an asynchronous post returns its placeholder. */
+  exportProgramChecked(postId: string, program: Program | null = this.activeProgram): { files: PostFile[]; problems: string[] } {
+    if (!program) { this.log('No program to export', 'warn'); return { files: [], problems: [] }; }
     const post = getPost(postId);
-    if (!post) { this.log(`Unknown post ${postId}`, 'error'); return []; }
+    if (!post) { this.log(`Unknown post ${postId}`, 'error'); return { files: [], problems: [] }; }
     const compiled = compileForPost(this.station, program);
-    for (const p of compiled.problems) this.log(p, 'warn');
-    return post.generate(compiled);
+    const files = post.generate(compiled);
+    return { files, problems: [...compiled.problems] };
+  }
+
+  /** true when the post generates asynchronously (user Python posts, RoboDK native posts on the server). */
+  isAsyncPost(postId: string): boolean { return !!getPost(postId)?.generateAsync; }
+
+  /**
+   * Post-process with the post's asynchronous path when it has one (user Python posts in Pyodide, RoboDK's native posts
+   * on the studio server). `problems` = compiler problems plus the warnings the post reported while generating.
+   */
+  async exportProgramAsync(postId: string, program: Program | null = this.activeProgram): Promise<{ files: PostFile[]; problems: string[] }> {
+    if (!program) { this.log('No program to export', 'warn'); return { files: [], problems: [] }; }
+    const post = getPost(postId);
+    if (!post) { this.log(`Unknown post ${postId}`, 'error'); return { files: [], problems: [] }; }
+    const compiled = compileForPost(this.station, program);
+    const files = await generateProgram(post, compiled);
+    return { files, problems: [...compiled.problems] };
   }
 
   exportRoboDKScript(): string {
@@ -647,6 +1424,23 @@ export class App {
   get library() {
     return ROBOT_LIBRARY;
   }
+}
+
+export interface RunOptions { fromIndex?: number; args?: string[] }
+
+/** The item a Webots Viewpoint `follow` names (the robot's name field; DEF names too), or null. */
+export function followTarget(st: Station, follow?: string, followType?: string): Item | null {
+  const name = follow?.trim();
+  if (!name || /^none$/i.test(followType ?? '')) return null;
+  const lc = name.toLowerCase();
+  let best: Item | null = null;
+  for (const it of st.walk()) {
+    if (it === st) continue;
+    const names = [it.name, it.params?.webotsName, it.params?.webotsDef, it.params?.def].filter((x): x is string => typeof x === 'string');
+    if (names.some((n) => n === name)) return it;
+    if (!best && names.some((n) => n.toLowerCase() === lc)) best = it;
+  }
+  return best;
 }
 
 import * as collisionModule from './core/collision/collision';

@@ -6,12 +6,17 @@ import { Robot } from '../core/items/robot';
 import { MobileRobot } from '../mobile/items';
 import { integrate } from '../mobile/controller';
 import { TASK_LABELS, MODALITY_LABELS, COMPUTE_LABELS, VISION_SENSORS, COMPUTE_TARGETS, VISION_MODELS, recommendVisionStacks, configFromRecommendation, getVisionStack, setVisionStack, modalityForCamera, cameraKindForModality, errorBudget, VisionStackConfig, VisionTask, VisionModality, ComputeClass, VisionRecommendation, VisionRequest } from '../vision/stack';
-import { ensureVisionRuntime, visionRuntimeOf, createTargetsFromOutput, followCommand, summarize, PipelineOutput, analyseCloud } from '../vision/pipeline';
-import { generateRosVisionPackage, rosVisionPackageZip } from '../vision/vision_ros';
+import { ensureVisionRuntime, visionRuntimeOf, createTargetsFromOutput, followCommand, summarize, PipelineOutput, analyseCloud, solveTcpAbs, fpText } from '../vision/pipeline';
+import { generateRosVisionPackage, rosVisionPackageZip, publishCameraFrame } from '../vision/vision_ros';
 import { parsePCD, parsePLY, PointCloud, decimate, pointCount, cloudStats, writePCD } from '../vision/pointcloud';
-import { intrinsicsFromCamera } from '../vision/camera_model';
+import { intrinsicsFromCamera, applySensorToCamera } from '../vision/camera_model';
+import { setCameraRenderer, setSensingAssets, CameraRender } from '../vision/sensing';
+import { installVisionRunnerGlobal } from '../vision/program_vision';
+import { collectHandEyeSamples, solveEyeToHand, solveEyeInHand, applyHandEye } from '../vision/handeye';
+import { captureDatasetSample, yoloDataset, cocoDataset, DatasetSample } from '../vision/dataset';
+import { zipSync } from 'fflate';
 import { visionSummary, publishVisionOutput } from '../ros/publishers';
-import { multiply, transl, rotx, DEG } from '../core/math/pose';
+import { multiply, transl, rotx, rotz, DEG } from '../core/math/pose';
 import { t } from './i18n';
 
 const ENVIRONMENTS: Array<[string, string]> = [['orchard', 'Orchard'], ['vineyard', 'Vineyard'], ['open_field', 'Open field'], ['greenhouse', 'Greenhouse'], ['warehouse', 'Warehouse'], ['factory', 'Factory / cell'], ['forest', 'Forest'], ['urban', 'Urban / yard'], ['underground', 'Underground'], ['mixed', 'Mixed']];
@@ -43,8 +48,16 @@ export function addCamera(app: App, parent?: Item, modality: VisionModality = 'm
   return cam;
 }
 
+/** Camera renders in the browser come from WebGL (exact depth + instance IDs); vision/sensing.ts falls back to software otherwise. */
+export function registerCameraRenderer(app: App): void {
+  setCameraRenderer((st, cam, req) => app.renderer.renderCameraBuffers(st, cam, req));
+  setSensingAssets(app.assets); // meshes for software renders of other stations (and the Node-side fallback)
+  installVisionRunnerGlobal(); // VisionDetect("<camera>") in robot programs (StationRuntime script runner)
+}
+
 /** Properties section for a camera item. */
 export function visionSection(app: App, cam: CameraItem, liveFields: Array<() => void>): HTMLElement {
+  registerCameraRenderer(app);
   const stats = h('div', { class: 'kv' });
   const upd = () => {
     clear(stats);
@@ -55,16 +68,20 @@ export function visionSection(app: App, cam: CameraItem, liveFields: Array<() =>
     const eb = errorBudget(c);
     stats.append(kv('Error budget', `${eb.depthSigmaMm === null ? 'no depth' : `depth σ ${eb.depthSigmaMm.toFixed(1)} mm`} · ${eb.pixelMm.toFixed(2)} mm/px · ${eb.latencyMs.toFixed(0)} ms`));
     const rt = visionRuntimeOf(cam);
-    if (rt?.last) { const st = rt.stats; const p = st.tp + st.fp ? st.tp / (st.tp + st.fp) : 0, r = st.tp + st.fn ? st.tp / (st.tp + st.fn) : 0; stats.append(kv('Last run', `${rt.last.detections.length} detections · P ${(p * 100).toFixed(0)} % R ${(r * 100).toFixed(0)} % · pos. error ${st.posErrN ? (st.posErrSum / st.posErrN).toFixed(0) : '–'} mm · ${st.lastLatencyMs.toFixed(0)} ms`)); }
+    if (rt?.last) { const st = rt.stats; const p = st.tp + st.fp ? st.tp / (st.tp + st.fp) : 0, r = st.tp + st.fn ? st.tp / (st.tp + st.fn) : 0; stats.append(kv('Last run', `${rt.last.detections.length} detections · P ${(p * 100).toFixed(0)} % R ${(r * 100).toFixed(0)} % · pos. error ${st.posErrN ? (st.posErrSum / st.posErrN).toFixed(0) : '–'} mm (true positives)${fpText(st)} · ${st.lastLatencyMs.toFixed(0)} ms`)); }
   };
   upd();
   liveFields.push(upd);
   const cfg = getVisionStack(cam);
-  return section('Machine vision', stats,
+  // which image axis the field of view spans: RoboDK Cam2D / three.js = vertical, Webots / URDF / datasheets = horizontal
+  const fovAxis = formField({ key: 'fovAxis', label: 'Field of view spans', type: 'select', value: cam.fovAxis, options: [{ value: 'vertical', label: 'image height (RoboDK, vertical)' }, { value: 'horizontal', label: 'image width (Webots / URDF / datasheet, horizontal)' }] }, (v) => app.cmd(() => { cam.fovAxis = v === 'horizontal' ? 'horizontal' : 'vertical'; cam.notify('camera'); })).el;
+  return section('Machine vision', fovAxis, stats,
     h('div', { class: 'btn-row' },
       h('button', { class: 'btn primary', onClick: () => visionStackDialog(app, cam) }, t(cfg ? 'Change vision stack…' : 'Select vision stack…')),
       cfg ? h('button', { class: 'btn', onClick: () => { (app as any).bottom?.show?.('vision'); } }, t('Vision tab')) : null,
       cfg ? h('button', { class: 'btn', onClick: () => exportVisionPackage(app, cam) }, t('Export ROS 2 package')) : null,
+      cfg ? h('button', { class: 'btn', onClick: () => handEyeDialog(app, cam) }, t('Hand-eye calibration…')) : null,
+      h('button', { class: 'btn', onClick: () => datasetDialog(app, cam) }, t('Dataset (YOLO / COCO)…')),
       cfg ? h('button', { class: 'btn', onClick: () => { app.cmd(() => setVisionStack(cam, null)); app.select(cam); } }, t('Remove')) : null));
 }
 
@@ -149,8 +166,8 @@ export async function visionStackDialog(app: App, cam: CameraItem): Promise<void
   app.cmd(() => {
     setVisionStack(cam, cfg);
     cam.kind = cameraKindForModality(rec.sensor.modality);
-    if (rec.sensor.modality === 'lidar3d') { cam.fov = rec.sensor.hfov; cam.far = Math.max(cam.far, rec.sensor.depthRange![1] * 1000); }
-    else { cam.fov = rec.sensor.hfov; cam.width = rec.sensor.resolution[0] > 1280 ? 1280 : rec.sensor.resolution[0]; cam.height = Math.round(cam.width * rec.sensor.resolution[1] / rec.sensor.resolution[0]); if (rec.sensor.depthRange) cam.far = Math.max(cam.far, rec.sensor.depthRange[1] * 1000); }
+    // the datasheet hfov spans the image width (fovAxis horizontal), so the render, K and the overlays agree
+    applySensorToCamera(cam, rec.sensor);
     cam.notify('kind');
   });
   app.log(`${cam.name}: ${rec.sensor.name} + ${rec.compute.name} — ${Object.entries(rec.models).map(([task, m]) => `${task}: ${m!.name}`).join(', ')} (score ${rec.score})${rec.warnings.length ? ` ⚠ ${rec.warnings.join('; ')}` : ''}`, rec.warnings.length ? 'warn' : 'info');
@@ -191,6 +208,7 @@ export function importPointCloud(app: App, name: string, buf: ArrayBuffer): Scen
 
 /** Bottom "Vision" tab: camera image with detections / masks / keypoints / tracks, point-cloud BEV, stats, VLM/VLA. */
 export function buildVisionPanel(app: App): { el: HTMLElement; render: () => void; stop: () => void } {
+  registerCameraRenderer(app);
   const sel = h('select') as HTMLSelectElement;
   const robotSel = h('select') as HTMLSelectElement;
   const info = h('div', { class: 'hint' });
@@ -216,15 +234,22 @@ export function buildVisionPanel(app: App): { el: HTMLElement; render: () => voi
     for (const r of robots) robotSel.appendChild(h('option', { value: r.id }, r.name));
     if (robots.some((r) => r.id === rc)) robotSel.value = rc;
   };
-  const capturePixels = (cam: CameraItem): { rgba: Uint8ClampedArray; dataUrl: string } | null => {
+  /** Exact-resolution WebGL render of the camera: colour + metric depth + instance IDs (the frame size is the camera size). */
+  const capturePixels = (cam: CameraItem): { rgba: Uint8ClampedArray; dataUrl: string; render: CameraRender } | null => {
     if (cam.kind === 'lidar3d') return null;
-    const w = Math.min(1280, cam.width), hgt = Math.round(w * cam.height / cam.width);
-    off.width = w; off.height = hgt;
-    try { app.renderer.renderFromItem(cam, off, cam.fov, cam.near, cam.far, false); } catch { return null; }
+    const cfg = getVisionStack(cam);
+    const depthMod = !!cfg && (cfg.modality === 'rgbd' || cfg.modality === 'stereo' || cfg.modality === 'tof');
+    let r: CameraRender | null = null;
+    try { r = app.renderer.renderCameraBuffers(app.station, cam, { rgb: true, ground: depthMod }); } catch (e) { app.log(`${cam.name}: camera render failed: ${(e as Error).message}`, 'warn'); return null; }
+    if (!r?.rgba) return null;
+    off.width = r.width; off.height = r.height;
     const ctx = off.getContext('2d')!;
-    return { rgba: ctx.getImageData(0, 0, w, hgt).data, dataUrl: off.toDataURL('image/jpeg', 0.85) };
+    ctx.putImageData(new ImageData(new Uint8ClampedArray(r.rgba), r.width, r.height), 0, 0);
+    return { rgba: r.rgba, dataUrl: off.toDataURL('image/jpeg', 0.85), render: r };
   };
   const draw = (cam: CameraItem, out: PipelineOutput | null) => {
+    // the view keeps the camera aspect, so overlays map with one scale
+    if (cam.kind !== 'lidar3d') { const hh = Math.round(canvas.width * cam.height / cam.width); if (canvas.height !== hh) canvas.height = hh; }
     const ctx = canvas.getContext('2d')!;
     const cfg = getVisionStack(cam);
     ctx.fillStyle = '#111'; ctx.fillRect(0, 0, canvas.width, canvas.height);
@@ -277,21 +302,26 @@ export function buildVisionPanel(app: App): { el: HTMLElement; render: () => voi
       const cfg = getVisionStack(c);
       if (cfg?.publishUrl && performance.now() - lastWebhook > 200) { lastWebhook = performance.now(); fetch(cfg.publishUrl, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(visionSummary(c, o)) }).catch((e) => app.log(`webhook ${cfg.publishUrl}: ${(e as Error).message}`, 'warn')); }
       const ros = (app as any).ros;
-      if (cfg?.publishRos && ros?.connected) { const parent = c.parent instanceof MobileRobot ? c.parent : null; publishVisionOutput(ros, c, o, { namespace: parent?.rosNamespace ?? '' }); }
+      if (cfg?.publishRos && ros?.connected) {
+        const parent = c.parent instanceof MobileRobot ? c.parent : null;
+        publishVisionOutput(ros, c, o, { namespace: parent?.rosNamespace ?? '' });
+        // sensor streams for ROS perception nodes: Image, CameraInfo (render K), 32FC1 depth, camera TF
+        publishCameraFrame(ros, c, { rgba: o.frame.rgba, depth: o.frame.depth, width: o.frame.width, height: o.frame.height, timeS: o.frame.time }, { namespace: parent?.rosNamespace ?? '' });
+      }
     } });
     if (!rt) { info.textContent = t('No vision stack on this camera — press Stack… to choose one.'); draw(cam, null); return; }
     busy = true;
     try {
       const px = capturePixels(cam);
       const robot = cam.parent instanceof Robot ? cam.parent : (cam.parent?.parent instanceof Robot ? cam.parent.parent : null);
-      const out = await rt.step(app.station, { rgba: px?.rgba, dataUrl: px?.dataUrl, time: performance.now() / 1000, prompt: opts.prompt, instruction: opts.prompt, tcp: robot ? robot.poseTCPAbs() : undefined, proprio: robot ? { joints: robot.joints(), tcp: Array.from(robot.poseTCPAbs()) } : undefined });
+      const out = await rt.step(app.station, { rgba: px?.rgba, dataUrl: px?.dataUrl, render: px?.render, time: performance.now() / 1000, prompt: opts.prompt, instruction: opts.prompt, tcp: robot ? robot.poseTCPAbs() : undefined, proprio: robot ? { joints: robot.joints(), tcp: Array.from(robot.poseTCPAbs()) } : undefined });
       lastOut = out;
       draw(cam, out);
       info.textContent = summarize(out, rt.cfg);
       const st = rt.stats; const p = st.tp + st.fp ? st.tp / (st.tp + st.fp) : 0, r = st.tp + st.fn ? st.tp / (st.tp + st.fn) : 0;
-      statsEl.textContent = `${st.frames} frames · precision ${(p * 100).toFixed(0)} % · recall ${(r * 100).toFixed(0)} % · position error ${st.posErrN ? (st.posErrSum / st.posErrN).toFixed(0) : '–'} mm · ${st.lastLatencyMs.toFixed(0)} ms/frame${out.frame.truth ? ` · truth ${out.frame.truth.filter((x) => x.visible).length} visible` : ''}`;
+      statsEl.textContent = `${st.frames} frames · precision ${(p * 100).toFixed(0)} % · recall ${(r * 100).toFixed(0)} % · position error ${st.posErrN ? (st.posErrSum / st.posErrN).toFixed(0) : '–'} mm (true positives)${fpText(st)} · ${st.lastLatencyMs.toFixed(0)} ms/frame${out.frame.truth ? ` · truth ${out.frame.truth.filter((x) => x.visible).length} visible` : ''}`;
       if (out.text) answer.textContent = out.text;
-      if (out.vla?.tcp && robot && rt.cfg.vla && opts.prompt !== undefined) { const ik = robot.solveIK(out.vla.tcp); if (ik.ok) app.cmd(() => robot.setJoints(ik.joints)); }
+      if (out.vla?.tcp && robot && rt.cfg.vla && opts.prompt !== undefined) { const ik = solveTcpAbs(robot, out.vla.tcp); if (ik.ok) app.cmd(() => robot.setJoints(ik.joints)); else app.log(`${cam.name}: VLA step out of reach`, 'warn'); }
       if (follow.checked) doFollow(out);
       for (const w of out.warnings) app.log(`${cam.name}: ${w}`, 'warn');
     } catch (e) { info.textContent = `Vision error: ${(e as Error).message}`; app.log(`vision: ${(e as Error).message}`, 'error'); }
@@ -352,6 +382,65 @@ export function buildVisionPanel(app: App): { el: HTMLElement; render: () => voi
   const timer = setInterval(() => { if (live.checked && el.offsetParent !== null) run(); }, 400);
   const render = () => { refreshLists(); const cam = camOf(); if (!cam) { info.textContent = t('Add a camera (Add › Camera / vision sensor) and select a vision stack.'); return; } if (!lastOut) run(); else draw(cam, lastOut); };
   return { el, render, stop: () => clearInterval(timer) };
+}
+
+/** Hand-eye calibration: move the robot through reachable poses, measure the marker with the camera, solve, store cfg.handEye. */
+export async function handEyeDialog(app: App, cam: CameraItem): Promise<void> {
+  const cfg = getVisionStack(cam);
+  if (!cfg) return toast('Select a vision stack first', 'warn');
+  const robots = app.station.itemsOfType<Robot>(ItemType.ROBOT);
+  if (!robots.length) return toast('Hand-eye calibration needs a robot in the station', 'warn');
+  const objs = app.station.itemsOfType<SceneObject>(ItemType.OBJECT);
+  const r = await dialog<{ robot: string; mode: string; n: number; radius: number; tilt: number; marker: string; noise: boolean }>(t('Hand-eye calibration'), [
+    { key: 'robot', label: 'Robot', type: 'select', value: (app.activeRobot ?? robots[0]).id, options: robots.map((x) => ({ value: x.id, label: x.name })) },
+    { key: 'mode', label: 'Mounting', type: 'select', value: cfg.handEyeMode ?? (cam.parent instanceof Robot || cam.parent?.parent instanceof Robot ? 'eye_in_hand' : 'eye_to_hand'), options: [{ value: 'eye_to_hand', label: 'Eye-to-hand (camera fixed, marker on the TCP)' }, { value: 'eye_in_hand', label: 'Eye-in-hand (camera on the robot, fixed marker)' }] },
+    { key: 'n', label: 'Poses', type: 'number', value: 12, min: 4, max: 60 },
+    { key: 'radius', label: 'Position spread (mm)', type: 'number', value: 150 },
+    { key: 'tilt', label: 'Rotation spread (deg)', type: 'number', value: 20 },
+    { key: 'marker', label: 'Fixed marker (eye-in-hand)', type: 'select', value: objs[0]?.id ?? '', options: objs.map((o) => ({ value: o.id, label: o.name })) },
+    { key: 'noise', label: 'Measurement noise (sensor model)', type: 'checkbox', value: true },
+  ], { okLabel: 'Calibrate' });
+  if (!r) return;
+  const robot = app.station.findById(r.robot) as Robot;
+  const mode = r.mode as 'eye_to_hand' | 'eye_in_hand';
+  const mk = mode === 'eye_in_hand' ? app.station.findById(r.marker) : null;
+  const markerWorld = mk ? [mk.poseAbs()[12], mk.poseAbs()[13], mk.poseAbs()[14]] as [number, number, number] : undefined;
+  const samples = collectHandEyeSamples(app.station, robot, cam, mode, { n: Number(r.n), radiusMm: Number(r.radius), tiltDeg: Number(r.tilt), markerWorld, noise: !!r.noise, sensor: cfg.sensor });
+  if (samples.length < 4) return toast(`Only ${samples.length} poses had the marker in view — move the robot closer to the camera view`, 'warn');
+  const res = mode === 'eye_to_hand' ? solveEyeToHand(samples) : solveEyeInHand(samples);
+  app.cmd(() => applyHandEye(cam, cfg, res));
+  app.log(`${cam.name}: hand-eye ${mode} from ${res.samples} poses, RMS ${res.rms.toFixed(2)} mm — stored in the vision stack (exported as the static TF)`);
+  toast(`Hand-eye calibrated (RMS ${res.rms.toFixed(2)} mm)`, 'ok');
+}
+
+/** Render N labelled frames of the camera (moving the selected objects randomly within ±spread) and download a YOLO or COCO dataset. */
+export async function datasetDialog(app: App, cam: CameraItem): Promise<void> {
+  const cfg = getVisionStack(cam);
+  const r = await dialog<{ format: string; n: number; spread: number; yaw: number; classes: string; seg: boolean }>(t('Synthetic dataset'), [
+    { key: 'format', label: 'Format', type: 'select', value: 'yolo', options: [{ value: 'yolo', label: 'YOLO (Ultralytics)' }, { value: 'coco', label: 'COCO (RLE masks)' }] },
+    { key: 'n', label: 'Frames', type: 'number', value: 20, min: 1, max: 2000 },
+    { key: 'spread', label: 'Randomise selected objects ± (mm)', type: 'number', value: 100 },
+    { key: 'yaw', label: 'Randomise yaw ± (deg)', type: 'number', value: 45 },
+    { key: 'classes', label: 'Classes (comma separated, empty = all visible)', type: 'text', value: (cfg?.classes ?? []).join(', ') },
+    { key: 'seg', label: 'YOLO segmentation polygons', type: 'checkbox', value: false },
+  ], { okLabel: 'Render' });
+  if (!r) return;
+  const sel = app.station.selection.filter((i): i is SceneObject => i instanceof SceneObject);
+  const saved = sel.map((o) => o.pose());
+  let seed = 12345; const rnd = () => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 4294967296; };
+  const samples: DatasetSample[] = [];
+  let classes = String(r.classes).split(',').map((s) => s.trim()).filter(Boolean);
+  try {
+    for (let i = 0; i < Number(r.n); i++) {
+      sel.forEach((o, k) => o.setPose(multiply(multiply(saved[k], transl((rnd() * 2 - 1) * r.spread, (rnd() * 2 - 1) * r.spread, 0)), rotz((rnd() * 2 - 1) * r.yaw * DEG))));
+      samples.push(captureDatasetSample(app.station, cam, `${cam.name.replace(/[^\w-]+/g, '_')}_${String(i).padStart(5, '0')}`, { classes, assets: app.assets }));
+    }
+  } finally { sel.forEach((o, k) => o.setPose(saved[k])); }
+  if (!classes.length) classes = [...new Set(samples.flatMap((s) => s.objects.map((o) => o.cls)))];
+  const files = r.format === 'coco' ? cocoDataset(samples, classes) : yoloDataset(samples, classes, { seg: !!r.seg });
+  const zip = zipSync(Object.fromEntries(Object.entries(files).map(([k, v]) => [k, typeof v === 'string' ? new TextEncoder().encode(v) : v])));
+  downloadBlob(`${cam.name.replace(/[^\w-]+/g, '_')}_${r.format}.zip`, new Blob([zip.buffer as ArrayBuffer], { type: 'application/zip' }));
+  app.log(`${cam.name}: ${samples.length} frames, ${samples.reduce((s, x) => s + x.objects.length, 0)} labels (${classes.join(', ')}) exported as ${r.format.toUpperCase()}`);
 }
 
 function hslToRgb(hsl: string): [number, number, number] {

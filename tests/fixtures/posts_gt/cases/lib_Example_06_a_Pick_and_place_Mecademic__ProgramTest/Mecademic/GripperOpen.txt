@@ -1,0 +1,4 @@
+// Gripper(1)
+StartProgram(1)
+// Detach from Gripper
+Delay(0.500)

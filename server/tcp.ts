@@ -2,7 +2,8 @@
 import net from 'node:net';
 import { RpcRequest, RpcResponse } from '../src/api/rpc.ts';
 
-export function parseTcpJsonLines(port: number, handler: (req: RpcRequest) => Promise<RpcResponse>): net.Server {
+/** Listens on `host` (default 127.0.0.1: this machine only, see server/security.ts). */
+export function parseTcpJsonLines(port: number, handler: (req: RpcRequest) => Promise<RpcResponse>, host = '127.0.0.1'): net.Server {
   const server = net.createServer((sock) => {
     let buf = '';
     sock.on('data', (d) => {
@@ -19,6 +20,6 @@ export function parseTcpJsonLines(port: number, handler: (req: RpcRequest) => Pr
     });
     sock.on('error', () => {});
   });
-  server.listen(port, () => console.log(`[studio-server] TCP JSON-lines API on port ${port}`));
+  server.listen(port, host, () => console.log(`[studio-server] TCP JSON-lines API on ${host}:${port}`));
   return server;
 }

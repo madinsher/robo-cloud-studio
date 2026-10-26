@@ -134,10 +134,15 @@ export function odometryMsg(p: { x: number; y: number; theta: number }, vel: { v
   return { header: header(opts.frame ?? 'map', opts.timeS), child_frame_id: opts.child ?? 'base_link', pose: { pose: { position: { x: M(p.x), y: M(p.y), z: 0 }, orientation: yawQuat(p.theta) }, covariance: cov }, twist: { twist: { linear: { x: M(vel.v), y: 0, z: 0 }, angular: { x: 0, y: 0, z: vel.omega * DEG } }, covariance: new Array(36).fill(0) } };
 }
 
-export function laserScanMsg(scan: LidarScan, frameId = 'laser', timeS?: number) {
+/**
+ * LaserScan in the sensor frame. The simulated scans carry world-absolute beam angles (rad, robot heading included):
+ * `headingRad` (the heading the scan was cast with) is removed so angle_min / angle_max are relative to the sensor.
+ */
+export function laserScanMsg(scan: LidarScan, frameId = 'laser', timeS?: number, headingRad = 0) {
   const n = scan.angles.length;
   const inc = n > 1 ? scan.angles[1] - scan.angles[0] : 0;
-  return { header: header(frameId, timeS), angle_min: scan.angles[0] ?? 0, angle_max: scan.angles[n - 1] ?? 0, angle_increment: inc, time_increment: 0, scan_time: 0.1, range_min: 0.05, range_max: M(scan.maxRange), ranges: scan.ranges.map((r) => M(r)), intensities: [] };
+  const a0 = Math.atan2(Math.sin((scan.angles[0] ?? 0) - headingRad), Math.cos((scan.angles[0] ?? 0) - headingRad));
+  return { header: header(frameId, timeS), angle_min: a0, angle_max: a0 + inc * Math.max(0, n - 1), angle_increment: inc, time_increment: 0, scan_time: 0.1, range_min: 0.05, range_max: M(scan.maxRange), ranges: scan.ranges.map((r) => M(r)), intensities: [] };
 }
 
 export function occupancyGridMsg(map: { width: number; height: number; resolution: number; originX: number; originY: number; cells: Uint8Array }, frameId = 'map', timeS?: number) {
@@ -152,13 +157,19 @@ export function navSummary(robot: MobileRobot, rt: NavRuntime) {
   return { x: Math.round(e.x), y: Math.round(e.y), theta: Number(e.theta.toFixed(2)), error: Math.round(e.error), rmse: Math.round(e.rmse), maxError: Math.round(e.maxError), lost: e.lost, lostEvents: e.lostEvents, fixes: e.fixes, gnss: e.gnssAvailable, distanceSinceFix: Math.round(e.distanceSinceFix), scale: Number(e.scale.toFixed(4)), method: rt.estimator.config.localization, truth: { x: Math.round(robot.state.x), y: Math.round(robot.state.y), theta: Number(robot.state.theta.toFixed(2)) }, slamCoverage: rt.slam ? Number(rt.slam.coverage().toFixed(3)) : null };
 }
 
+/** Heading (rad) the last simulated scan was cast with (navstack casts from the true pose; recorded when available). */
+export function scanHeading(robot: MobileRobot, rt: NavRuntime): number {
+  const h = (rt.lastScan as { heading?: number } | null)?.heading;
+  return h !== undefined ? h : robot.state.theta * DEG;
+}
+
 export function publishNavRuntime(ros: RosPublisher, robot: MobileRobot, rt: NavRuntime, opts: { namespace?: string; map?: boolean; timeS?: number } = {}): string[] {
   const ns = (opts.namespace ?? robot.rosNamespace ?? '').replace(/\/$/, '');
   const e = rt.estimator.state;
   const topics: string[] = [];
   ros.publish(`${ns}/odom_estimate`, 'nav_msgs/msg/Odometry', odometryMsg({ x: e.x, y: e.y, theta: e.theta }, { v: robot.state.v, omega: robot.state.omega }, { sigmaMm: Math.max(10, e.error), sigmaDeg: 1, timeS: opts.timeS })); topics.push(`${ns}/odom_estimate`);
   ros.publish(`${ns}/ground_truth`, 'nav_msgs/msg/Odometry', odometryMsg({ x: robot.state.x, y: robot.state.y, theta: robot.state.theta }, { v: robot.state.v, omega: robot.state.omega }, { timeS: opts.timeS })); topics.push(`${ns}/ground_truth`);
-  if (rt.lastScan) { ros.publish(`${ns}/scan`, 'sensor_msgs/msg/LaserScan', laserScanMsg(rt.lastScan, 'laser', opts.timeS)); topics.push(`${ns}/scan`); }
+  if (rt.lastScan) { ros.publish(`${ns}/scan`, 'sensor_msgs/msg/LaserScan', laserScanMsg(rt.lastScan, 'laser', opts.timeS, scanHeading(robot, rt))); topics.push(`${ns}/scan`); }
   if (opts.map !== false && rt.slam) { ros.publish(`${ns}/slam_map`, 'nav_msgs/msg/OccupancyGrid', occupancyGridMsg(rt.slam as SlamMap, 'map', opts.timeS)); topics.push(`${ns}/slam_map`); }
   return topics;
 }

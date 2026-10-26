@@ -1,0 +1,4 @@
+.PROGRAM TablePosition5()
+  JMOVE #[0.00000]
+  BASE NULL
+.END

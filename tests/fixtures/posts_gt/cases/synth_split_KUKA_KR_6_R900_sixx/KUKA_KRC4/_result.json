@@ -1,0 +1,12 @@
+{
+ "ok": true,
+ "error": null,
+ "log": "",
+ "files": [
+  "SplitTest.src",
+  "SplitTest1.src",
+  "SplitTest2.src",
+  "SplitTest3.src",
+  "SplitTestMain.src"
+ ]
+}

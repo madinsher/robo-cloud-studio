@@ -36,7 +36,7 @@ export interface BTNodeSpec {
 
 export interface TickContext { time: number; dt: number; bb: Record<string, unknown>; log?: (msg: string) => void }
 export type ActionHandler = (ctx: TickContext, args: Record<string, unknown>, node: BTNode) => BTStatus | void;
-export interface BTBindings { actions?: Record<string, ActionHandler>; conditions?: Record<string, (ctx: TickContext, args: Record<string, unknown>) => boolean>; halt?: Record<string, (ctx: TickContext, args: Record<string, unknown>) => void> }
+export interface BTBindings { actions?: Record<string, ActionHandler>; conditions?: Record<string, (ctx: TickContext, args: Record<string, unknown>) => boolean>; halt?: Record<string, (ctx: TickContext, args: Record<string, unknown>, node?: BTNode) => void> }
 
 let nodeSeq = 0;
 
@@ -46,6 +46,8 @@ export class BTNode {
   status: BTStatus | 'idle' = 'idle';
   /** memory cursor (sequence / fallback with memory), retry / repeat counters, timeout start */
   cursor = 0; attempts = 0; startedAt: number | null = null;
+  /** Parallel: completed children (BT.CPP ParallelNode semantics — a finished child is not re-ticked until the parallel completes). */
+  childDone: Array<BTStatus | undefined> = [];
   ticks = 0;
   constructor(readonly spec: BTNodeSpec, readonly parent: BTNode | null = null) {
     this.children = (spec.children ?? []).map((c) => new BTNode(c, this));
@@ -54,7 +56,7 @@ export class BTNode {
   get type(): BTNodeType { return this.spec.type; }
   isLeaf(): boolean { return this.type === 'action' || this.type === 'condition'; }
   *walk(): Generator<BTNode> { yield this; for (const c of this.children) yield* c.walk(); }
-  reset(): void { this.status = 'idle'; this.cursor = 0; this.attempts = 0; this.startedAt = null; for (const c of this.children) c.reset(); }
+  reset(): void { this.status = 'idle'; this.cursor = 0; this.attempts = 0; this.startedAt = null; this.childDone = []; for (const c of this.children) c.reset(); }
 }
 
 export class BehaviorTree {
@@ -65,12 +67,14 @@ export class BehaviorTree {
   /** Names of actions currently Running (after the last tick). */
   running = new Set<BTNode>();
   readonly trace: Array<{ time: number; node: string; status: BTStatus }> = [];
+  /** Action names ticked without a binding (each tick of such a leaf fails). */
+  readonly unknown = new Set<string>();
   private runningPrev = new Set<BTNode>();
   private ticked = new Set<BTNode>();
-  constructor(spec: BTNodeSpec, bindings: BTBindings = {}, bb: Record<string, unknown> = {}) { this.root = new BTNode(spec); this.bindings = bindings; this.bb = bb; }
+  constructor(spec: BTNodeSpec, bindings: BTBindings = {}, bb: Record<string, unknown> = {}, readonly log?: (msg: string) => void) { this.root = new BTNode(spec); this.bindings = bindings; this.bb = bb; }
 
   tick(dt = 0.1): BTStatus {
-    const ctx: TickContext = { time: this.time, dt, bb: this.bb };
+    const ctx: TickContext = { time: this.time, dt, bb: this.bb, log: this.log };
     this.runningPrev = this.running; this.running = new Set(); this.ticked = new Set();
     const st = this.tickNode(this.root, ctx);
     // pre-emption: actions that were running and were not ticked this cycle are halted
@@ -81,7 +85,7 @@ export class BehaviorTree {
 
   private halt(n: BTNode, ctx: TickContext): void {
     const fn = n.spec.fn ? this.bindings.halt?.[n.spec.fn] : undefined;
-    fn?.(ctx, n.spec.args ?? {});
+    fn?.(ctx, n.spec.args ?? {}, n);
     n.status = 'idle'; n.startedAt = null;
   }
 
@@ -102,8 +106,9 @@ export class BehaviorTree {
         if (s.pre && n.status !== 'running' && !evalBB(s.pre, ctx.bb)) return this.done(n, 'failure');
         if (n.status !== 'running') n.startedAt = ctx.time;
         const fn = s.fn ? this.bindings.actions?.[s.fn] : undefined;
-        let st: BTStatus = fn ? (fn(ctx, s.args ?? {}, n) ?? 'success') : 'success';
-        if (st === 'running' && s.timeout !== undefined && n.startedAt !== null && ctx.time - n.startedAt >= s.timeout) { this.halt(n, ctx); st = 'failure'; }
+        if (!fn) { this.unknown.add(s.fn ?? '?'); ctx.log?.(`action '${s.fn ?? '?'}' has no binding — failure`); n.startedAt = null; return this.done(n, 'failure'); }
+        let st: BTStatus = fn(ctx, s.args ?? {}, n) ?? 'success';
+        if (st === 'running' && s.timeout !== undefined && n.startedAt !== null && ctx.time - n.startedAt >= s.timeout) { this.halt(n, ctx); st = 'failure'; ctx.log?.(`action ${s.name ?? s.fn ?? '?'} timed out after ${s.timeout} s — failure`); }
         if (st === 'success' && s.post && !evalBB(s.post, ctx.bb)) st = 'failure';
         if (st === 'running') this.running.add(n); else n.startedAt = null;
         return this.done(n, st);
@@ -121,10 +126,12 @@ export class BehaviorTree {
       }
       case 'parallel': {
         const M = s.threshold ?? n.children.length; let succ = 0, fail = 0;
-        for (const c of n.children) { const st = this.tickNode(c, ctx); if (st === 'success') succ++; else if (st === 'failure') fail++; }
-        if (succ >= M) return this.done(n, 'success');
-        if (fail > n.children.length - M) return this.done(n, 'failure');
-        return this.done(n, 'running');
+        n.children.forEach((c, i) => { const st = n.childDone[i] ?? this.tickNode(c, ctx); if (st !== 'running') n.childDone[i] = st; if (st === 'success') succ++; else if (st === 'failure') fail++; });
+        const res: BTStatus | null = succ >= M ? 'success' : fail > n.children.length - M ? 'failure' : null;
+        if (!res) return this.done(n, 'running');
+        for (const c of n.children) { for (const d of c.walk()) if (this.running.has(d)) { this.running.delete(d); this.halt(d, ctx); } c.reset(); }
+        n.childDone = [];
+        return this.done(n, res);
       }
       case 'inverter': { const st = this.tickNode(n.children[0], ctx); return this.done(n, st === 'success' ? 'failure' : st === 'failure' ? 'success' : 'running'); }
       case 'force_success': { const st = this.tickNode(n.children[0], ctx); return this.done(n, st === 'running' ? 'running' : 'success'); }
@@ -191,7 +198,8 @@ export function skill(c: SkillContract): BTNodeSpec {
 
 export interface BTIssue { level: 'error' | 'warning' | 'info'; node: string; message: string }
 
-export function checkBehaviorTree(spec: BTNodeSpec): BTIssue[] {
+/** Structural checks; with `actions` (the binding vocabulary) an action name outside it is an error (it fails at run time). */
+export function checkBehaviorTree(spec: BTNodeSpec, opts: { actions?: string[] } = {}): BTIssue[] {
   const out: BTIssue[] = [];
   const visit = (n: BTNodeSpec, path: string, depth: number, parentType?: BTNodeType) => {
     const name = n.name ?? n.fn ?? n.type; const p = `${path}/${name}`;
@@ -200,6 +208,8 @@ export function checkBehaviorTree(spec: BTNodeSpec): BTIssue[] {
     if (['inverter', 'retry', 'repeat', 'timeout', 'force_success', 'force_failure'].includes(n.type) && kids.length !== 1) out.push({ level: 'error', node: p, message: 'decorator must have exactly one child' });
     if ((n.type === 'action' || n.type === 'condition') && kids.length) out.push({ level: 'error', node: p, message: 'leaf with children' });
     if (n.type === 'action' && !n.fn) out.push({ level: 'error', node: p, message: 'action without a binding (fn)' });
+    if (n.type === 'action' && n.fn && opts.actions && !opts.actions.includes(n.fn)) out.push({ level: 'error', node: p, message: `unknown action '${n.fn}' — it fails at run time (known: ${opts.actions.join(', ')})` });
+    if (n.type === 'sequence' && !n.memory && kids.slice(0, -1).some((k) => k.type === 'action')) out.push({ level: 'warning', node: p, message: 'reactive sequence (no memory): an action that finished is re-executed on every tick while a later child runs (py_trees / BT.CPP ReactiveSequence); add `memory` for a plain BT.CPP Sequence' });
     if (n.type === 'action' && n.timeout === undefined && parentType !== 'timeout') out.push({ level: 'warning', node: p, message: 'action without timeout — a liveness obligation that cannot be monitored (chapter 9)' });
     if (n.type === 'parallel' && n.threshold !== undefined && (n.threshold < 1 || n.threshold > kids.length)) out.push({ level: 'error', node: p, message: 'parallel threshold out of range' });
     if (n.type === 'sequence' && n.memory && depth <= 1) out.push({ level: 'warning', node: p, message: 'memory sequence near the root: the tree is not reactive at this level (document why)' });

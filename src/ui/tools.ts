@@ -152,11 +152,12 @@ export async function exportAnimationGltf(app: App): Promise<void> {
     { key: 'helpers', label: 'Include frame / target helpers', type: 'checkbox', value: false },
   ], { okLabel: 'Export', body: h('p', { class: 'hint' }, 'The program is simulated from start to end; every robot link, tool and moved object gets position/rotation keyframes. Units are converted to metres (root node scaled 0.001). Blender: File › Import › glTF 2.0, then play the timeline.') });
   if (!r) return;
-  app.previewProgram();
+  app.stopProgram();
+  app.validateProgram(prog);
   if (!app.sim.duration) return toast('Program has no duration (compile problems?)', 'warn');
   toast('Sampling simulation…', 'info', 2500);
   const { exportAnimatedGLB } = await import('../io/export/gltf_anim');
-  const res = await exportAnimatedGLB(app.renderer, app.sim, { fps: r.fps || 30, name: prog.name, hideHelpers: !r.helpers });
+  const res = await app.withStateRestored(() => exportAnimatedGLB(app.renderer, app.sim, { fps: r.fps || 30, name: prog.name, hideHelpers: !r.helpers }));
   downloadBlob(`${app.station.name.replace(/\W+/g, '_')}_${prog.name.replace(/\W+/g, '_')}_anim.glb`, new Blob([res.glb], { type: 'model/gltf-binary' }));
   app.log(`Animated glTF: ${res.frames} frames, ${res.duration.toFixed(2)} s, ${res.tracks} tracks`);
   toast(`Animation exported (${res.frames} frames, ${res.tracks} tracks)`, 'ok');
@@ -180,6 +181,32 @@ export async function exportUrdfPackage(app: App): Promise<void> {
   toast(`URDF package exported (${Object.keys(res.files).length} files)`, 'ok');
 }
 
+/**
+ * MoveIt 2 configuration of a robot (src/io/urdf/moveit_export.ts): the description package plus <robot>_moveit_config
+ * (SRDF planning group, kinematics, joint limits, ros2_control mock hardware, controllers, bringup / demo launch), zipped
+ * as a colcon src folder.
+ */
+export async function exportMoveItPackage(app: App): Promise<void> {
+  const robots = app.station.itemsOfType<Robot>(ItemType.ROBOT).filter((x) => x.dof > 0);
+  if (!robots.length) { toast('No robot with joints in the station', 'warn'); return; }
+  const r = await dialog<{ robot: string }>('Export MoveIt 2 config', [
+    { key: 'robot', label: 'Robot', type: 'select', value: (app.activeRobot && robots.includes(app.activeRobot) ? app.activeRobot : robots[0]).id, options: robots.map((x) => ({ value: x.id, label: `${x.name} (${x.dof} axes)` })) },
+  ], { okLabel: 'Export', body: h('p', { class: 'hint' }, 'Writes <robot>_description + <robot>_moveit_config (MoveIt Setup Assistant layout) in a zip: unzip into a colcon workspace src/, colcon build, ros2 launch <robot>_moveit_config demo.launch.py.') });
+  if (!r) return;
+  const robot = app.station.findById(r.robot) as Robot | null;
+  if (!robot) return;
+  const { exportMoveItConfig } = await import('../io/urdf/moveit_export');
+  const { zipSync, strToU8 } = await import('fflate');
+  const res = exportMoveItConfig(robot, app.assets);
+  for (const w of res.warnings.slice(0, 8)) app.log(w, 'warn');
+  const srdf = Object.entries(res.files).find(([k]) => /\.srdf$/.test(k))?.[1];
+  if (!srdf || !String(typeof srdf === 'string' ? srdf : new TextDecoder().decode(srdf)).includes('<group')) app.log(`MoveIt config of ${robot.name}: the SRDF has no planning group — move_group will not start`, 'error');
+  const zip = zipSync(Object.fromEntries(Object.entries(res.files).map(([k, v]) => [k, typeof v === 'string' ? strToU8(v) : v])));
+  downloadBlob(`${res.packages.moveit}.zip`, new Blob([zip.buffer.slice(zip.byteOffset, zip.byteOffset + zip.byteLength) as ArrayBuffer], { type: 'application/zip' }));
+  app.log(`MoveIt 2 config ${res.packages.moveit}: group ${res.group} (${res.joints.length} joints), controller ${res.controller}, ${Object.keys(res.files).length} files`);
+  toast(`MoveIt 2 config exported (${Object.keys(res.files).length} files)`, 'ok');
+}
+
 /** Import RoboDK post processors (one or many .py files, e.g. the whole RoboDK/Posts folder). */
 export async function importRoboDKPosts(app: App): Promise<void> {
   const files = await pickFiles('.py', true);
@@ -196,8 +223,9 @@ export async function saveForBlender(app: App): Promise<void> {
   const { saveStation } = await import('../io/station-file');
   const file: any = saveStation(app.station, app.assets);
   const prog = app.activeProgram;
-  if (prog) {
-    app.previewProgram();
+  if (prog) await app.withStateRestored(async () => {
+    app.stopProgram();
+    app.validateProgram(prog);
     const sim = app.sim;
     const dt = 1 / 30;
     const robots = app.station.itemsOfType<Robot>(ItemType.ROBOT);
@@ -212,7 +240,7 @@ export async function saveForBlender(app: App): Promise<void> {
     sim.seek(saved);
     for (const [id, poses] of series) { const p0 = poses[0]; if (poses.some((p) => p.some((v, i) => Math.abs(v - p0[i]) > 1e-6))) anim.items[id] = poses; }
     file.animation = anim;
-  }
+  });
   downloadText(`${app.station.name.replace(/\W+/g, '_')}_blender.vbstation`, JSON.stringify(file), 'application/json');
   toast(prog ? `Saved with ${prog.name} animation for the Blender add-on` : 'Saved for the Blender add-on (no active program: no animation)', 'ok', 5000);
 }

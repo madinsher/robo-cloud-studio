@@ -1,0 +1,5 @@
+Instruction,X (mm),Y (mm),Z (mm),Rx (deg),Ry (deg),Rz (deg),J1 (deg),J2 (deg),J3 (deg),J4 (deg),J5 (deg),J6 (deg)
+Program Start,SubPick
+Move Linear,250.374,61.096,29.401,-179.670,27.700,93.186,18.000000,24.000000,90.000000,30.000000,45.000000,60.000000
+Set DO,OUT[7],1
+Program Finish,SubPick

@@ -5,22 +5,21 @@ import { AssetStore } from '../src/scene/assets';
 import { Robot } from '../src/core/items/robot';
 import { Program } from '../src/core/items/program';
 import { SceneObject, Tool, Target, ItemType } from '../src/core/items/item';
-import { getPos, multiply } from '../src/core/math/pose';
+import { getPos, invert, multiply } from '../src/core/math/pose';
 
 const lib = 'C:/RoboDK/Library';
 const file = (name: string) => `${lib}/${name}`;
 
-function load(name: string) {
-  const path = file(name);
-  if (!existsSync(path)) return null;
-  const buf = readFileSync(path);
+/** Library file as an ArrayBuffer (tests that need one are skipped, visibly, when C:/RoboDK is absent). */
+function load(name: string): ArrayBuffer {
+  const buf = readFileSync(file(name));
   return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
 }
+const has = (...names: string[]) => names.every((n) => existsSync(file(n)));
 
 describe('RoboDK container import', () => {
-  it('builds the ABB IRB 1600 from its .robot file', async () => {
+  it.skipIf(!has('ABB-IRB-1600-6-1-45.robot'))('builds the ABB IRB 1600 from its .robot file', async () => {
     const data = load('ABB-IRB-1600-6-1-45.robot');
-    if (!data) return;
     const assets = new AssetStore();
     const { station, report } = await importRdkBestEffort(data, 'ABB-IRB-1600-6-1-45.robot', assets);
     expect(report.fidelity).toBe('full');
@@ -40,12 +39,13 @@ describe('RoboDK container import', () => {
     expect(assets.get(robot.chain.links.find((l) => l.visuals.length)?.visuals[0].mesh ?? '')?.mesh?.triangles).toBeGreaterThan(10);
   });
 
-  it('opens a painting station with the robot, tool and program', async () => {
+  it.skipIf(!has('Example-03.c-Painting curve - KUKA.rdk'))('opens a painting station with the robot, tool and program', async () => {
     const data = load('Example-03.c-Painting curve - KUKA.rdk');
-    if (!data) return;
     const assets = new AssetStore();
     const { station, report } = await importRdkBestEffort(data, 'painting.rdk', assets);
-    expect(report.fidelity).toBe('full');
+    // honest report: the curve-follow project keeps only its links and input file
+    expect(report.fidelity).toBe('partial');
+    expect(report.dropped).toEqual([expect.stringMatching(/^machining project Path1 settings: /)]);
     expect(station.name).toMatch(/painting/i);
     const robot = station.itemsOfType<Robot>(ItemType.ROBOT)[0];
     expect(robot).toBeTruthy();
@@ -59,19 +59,19 @@ describe('RoboDK container import', () => {
     expect(program.robot()?.name).toBe(robot.name);
     const moves = program.instructions().filter((i) => i.data.kind === 'move');
     expect(moves.length).toBeGreaterThan(10);
-    const first = moves[0].data as { moveType: string; targetId: string | null };
+    const first = moves[0].data as { moveType: string; targetId: string | null; joints?: number[] };
     expect(first.moveType).toBe('MoveJ');
-    const target = station.findById(first.targetId ?? '') as { joints: number[] | null } | null;
-    expect(target?.joints?.[0]).toBeCloseTo(-35.08, 1);
+    // curve-follow programs store inline moves (joints + pose in the instruction, no target item)
+    expect(first.targetId).toBeNull();
+    expect(first.joints?.[0]).toBeCloseTo(-35.08, 1);
     const speed = program.instructions().find((i) => i.data.kind === 'speed');
     expect(speed?.data).toMatchObject({ speedLinear: 1000 });
   });
 
-  it('opens several other library robots without losing the kinematic table', async () => {
+  it.skipIf(!has('Denso-Cobotta.robot', 'Doosan-M1013.robot', 'ABB-IRB-120-3-0-6.robot'))('opens several other library robots without losing the kinematic table', async () => {
     const names = ['Denso-Cobotta.robot', 'Doosan-M1013.robot', 'ABB-IRB-120-3-0-6.robot'];
     for (const name of names) {
       const data = load(name);
-      if (!data) continue;
       const { station, report } = await importRdkBestEffort(data, name, new AssetStore());
       const robot = station.itemsOfType<Robot>(ItemType.ROBOT)[0];
       expect(report.fidelity, name).toBe('full');
@@ -82,9 +82,8 @@ describe('RoboDK container import', () => {
     }
   });
 
-  it('keeps the UR painting station inside the view', async () => {
+  it.skipIf(!has('Example-01.a-Robot Painting - Universal Robots.rdk'))('keeps the UR painting station inside the view', async () => {
     const data = load('Example-01.a-Robot Painting - Universal Robots.rdk');
-    if (!data) return;
     const { station } = await importRdkBestEffort(data, 'ur-paint.rdk', new AssetStore());
     const positions = [...station.walk()].map((item) => getPos(item.poseAbs()));
     expect(positions.every((p) => p.every((v) => Number.isFinite(v) && Math.abs(v) < 1e6))).toBe(true);
@@ -101,9 +100,8 @@ describe('RoboDK container import', () => {
     expect(station.find('MainProg', ItemType.PROGRAM)).toBeTruthy();
   });
 
-  it('loads Tutorial-UR-Painting with link meshes and program calls', async () => {
+  it.skipIf(!has('Tutorial-UR-Painting.rdk'))('loads Tutorial-UR-Painting with link meshes and program calls', async () => {
     const data = load('Tutorial-UR-Painting.rdk');
-    if (!data) return;
     const assets = new AssetStore();
     const { station } = await importRdkBestEffort(data, 'Tutorial-UR-Painting.rdk', assets);
     const robot = station.find('UR10', ItemType.ROBOT) as Robot;
@@ -121,30 +119,39 @@ describe('RoboDK container import', () => {
     expect(res.executed).toBeGreaterThan(calls.length);
   }, 60000);
 
-  it('lays out the 2D-camera pick-and-place cell', async () => {
+  it.skipIf(!has('Example-06.c-Pick and place with 2D camera.rdk'))('lays out the 2D-camera pick-and-place cell', async () => {
     const data = load('Example-06.c-Pick and place with 2D camera.rdk');
-    if (!data) return;
-    const { station } = await importRdkBestEffort(data, 'camera.rdk', new AssetStore());
+    const assets = new AssetStore();
+    const { station } = await importRdkBestEffort(data, 'camera.rdk', assets);
     expect(getPos(station.find('Part 1')!.pose()).map((v) => Math.round(v))).toEqual([75, 100, 75]);
     expect(getPos(station.find('Part 12')!.pose()).map((v) => Math.round(v))).toEqual([225, 500, 225]);
     const belt = station.find('Conveyor Belt') as Robot;
-    expect(getPos(belt.pose()).map((v) => Math.round(v))).toEqual([440, 200, 0]);
-    const mount = belt.pose();
+    // RoboDK keeps the conveyor's base offset in the kinematics (SolveFK), not in the item pose
+    expect(getPos(belt.pose()).map((v) => Math.round(v))).toEqual([0, 0, 0]);
+    const mount = multiply(belt.pose(), belt.chain.base!);
+    expect(getPos(mount).map((v) => Math.round(v))).toEqual([440, 200, 0]);
     expect(mount[9]).toBeCloseTo(1, 2);
     expect(mount[2]).toBeCloseTo(-1, 2);
-    expect(belt.chain.links[0].visuals.length).toBeGreaterThan(1000);
+    // every triangle of the belt mesh link (16 870, counted by an independent walker of the file), merged per colour
+    expect(belt.chain.links[0].visuals.reduce((n, v) => n + (assets.get(v.mesh ?? '')?.mesh?.triangles ?? 0), 0)).toBe(16870);
     const move = station.find('MoveConveyor') as Program;
     expect(move.robot()?.name).toBe('Conveyor Belt');
     const main = station.find('MainSimulation') as Program;
-    expect(main.instructions().some((ins) => ins.data.kind === 'call' && ins.data.programName === 'MoveConveyor')).toBe(true);
+    // "Run MoveConveyor" starts the conveyor on a parallel thread; calls to station Python programs stay code calls (I5)
+    expect(main.instructions().map((ins) => [ins.data.kind, ins.name])).toEqual([['code', 'Call PrepareSimulation'], ['code', 'Call SimulateCamera'], ['thread', 'Run MoveConveyor'], ['thread', 'Run PartsToConveyor'], ['code', 'Call PartsToPallet']]);
+    const run = main.instructions()[2].data as { programId: string };
+    expect(run.programId).toBe(move.id);
     const pallet = station.find('Europallet') as SceneObject;
-    expect(pallet.geometry[0].origin![13]).toBeCloseTo(145, 0);
-    expect(pallet.geometry[0].origin![6]).toBeCloseTo(-1, 3);
+    // the stored geometry frame is inverted (RoboDK 5.9.4 collides probe shapes with the mesh at the inverse, round 2):
+    // the 145 mm pallet hangs below its frame, whose plane is the top the parts are stacked on
+    expect(pallet.geometry[0].origin![14]).toBeCloseTo(-145, 0);
+    expect(pallet.geometry[0].origin![6]).toBeCloseTo(1, 3);
+    expect(pallet.bbox!.max[2]).toBeLessThanOrEqual(0);
+    expect(pallet.bbox!.min[2]).toBeCloseTo(-145, 0);
   }, 60000);
 
-  it('plays the dual-gripper CNC cycle without forearm collisions', async () => {
+  it.skipIf(!has('Example-06.f-Pick and Place CNC and Dual RobotiQ Gripper-UR10.rdk'))('plays the dual-gripper CNC cycle without forearm collisions', async () => {
     const data = load('Example-06.f-Pick and Place CNC and Dual RobotiQ Gripper-UR10.rdk');
-    if (!data) return;
     const assets = new AssetStore();
     const { station } = await importRdkBestEffort(data, 'cnc.rdk', assets);
     expect((station.find('OpenDoor1') as Program).robot()?.name).toBe('Mazak Lathe');
@@ -173,22 +180,27 @@ describe('RoboDK container import', () => {
     expect(jaw.chain.links[1].visuals.length).toBeGreaterThan(0);
     expect(jaw.chain.links[2].visuals.length).toBeGreaterThan(0);
     jaw.setJoints([50]);
-    const fingers = jaw.fk().linkPoses;
-    expect(fingers[1][14]).toBeCloseTo(25, 0);
-    expect(fingers[2][14]).toBeCloseTo(-25, 0);
-    expect(fingers[2][10]).toBeCloseTo(-1, 2);
+    // fingers travel ±q/2 along the z axis of the gripper's base-offset frame (chain.base); the flange stays put
+    const inBase = (m: Float64Array) => multiply(invert(jaw.chain.base!), m);
+    const fingers = jaw.fk().linkPoses.map(inBase);
+    expect(fingers[1][14]).toBeCloseTo(25, 6);
+    expect(fingers[2][14]).toBeCloseTo(-25, 6);
+    expect(fingers[2][10]).toBeCloseTo(-1, 6);
+    const fl0 = jaw.solveFKFlange([0]), fl50 = jaw.solveFKFlange([50]);
+    expect(Array.from(fl50).map((v, i) => v - fl0[i]).every((v) => Math.abs(v) < 1e-9)).toBe(true);
     const { ProgramSimulator } = await import('../src/core/motion/simulator');
     const sim = new ProgramSimulator(station);
     sim.collisionOptions = { enabled: true, selfOnly: true, assets, sampleStep: 0.5 };
     const res = sim.compile(station.find('MainProgram') as Program);
-    expect(res.problems.filter((p) => p.severity === 'error').map((p) => p.message)).toEqual([]);
+    // no collision of the arm (the forearm passing the lathe door); contacts of the gripper fingers with the part they
+    // hold are collisions under RoboDK's map (round 2: RoboDK checks a held part against its holder, 02.i)
+    expect(res.problems.filter((p) => p.severity === 'error' && /UR10e\/link/.test(p.message)).map((p) => p.message)).toEqual([]);
     const throughDoor = sim.steps.some((s) => s.robot?.name === 'UR10e' && !!s.trajectory?.samples.at(-1)?.joints.every((v) => Math.abs(v) < 1));
     expect(throughDoor).toBe(false);
   }, 90000);
 
-  it('assembles the Comau Smart5 at the RoboDK link frames', async () => {
+  it.skipIf(!has('Example-09.c-PRM Automated Collision Avoidance - Comau.rdk'))('assembles the Comau Smart5 at the RoboDK link frames', async () => {
     const data = load('Example-09.c-PRM Automated Collision Avoidance - Comau.rdk');
-    if (!data) return;
     const { station } = await importRdkBestEffort(data, 'comau.rdk', new AssetStore());
     const robot = station.find('Comau Smart5 NJ 165-3.4 SH') as Robot;
     expect(robot.dof).toBe(6);
@@ -202,10 +214,9 @@ describe('RoboDK container import', () => {
     for (let i = 0; i < robot.chain.links.length; i++) expect(robot.chain.links[i].visuals.length).toBeGreaterThan(0);
   }, 60000);
 
-  it('reads a library tool and a solid', async () => {
+  it.skipIf(!has('paint_gun.tool', 'box.sld'))('reads a library tool and a solid', async () => {
     const gun = load('paint_gun.tool');
     const box = load('box.sld');
-    if (!gun || !box) return;
     const assets = new AssetStore();
     const tool = await importRdkBestEffort(gun, 'paint_gun.tool', assets);
     expect(tool.report.fidelity).toBe('full');

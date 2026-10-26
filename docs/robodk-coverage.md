@@ -7,16 +7,16 @@ Legend: ✅ implemented · 🟡 partial / simplified · ❌ not implemented
 | RoboDK feature | Status | Notes |
 |---|---|---|
 | Station tree (frames, robots, tools, targets, programs, objects, folders) | ✅ | |
-| Robot library (online library with hundreds of robots, .robot files) | ✅ | 22 built-in models (UR exact DH) + **online library of 91 robots** (Fanuc, ABB, KUKA, Yaskawa/Motoman, Stäubli, UR, Franka, Kinova, Doosan) fetched as open URDF packages from GitHub with exact kinematics and meshes (`src/io/library/online_library.ts`); URDF/DH import; RoboDK `.robot` files are proprietary — convert with `rdk2vbs.py` / `POST /convert/rdk` |
+| Robot library (online library with hundreds of robots, .robot files) | ✅ | 22 built-in models (UR exact DH) + **online library of 91 robots** (Fanuc, ABB, KUKA, Yaskawa/Motoman, Stäubli, UR, Franka, Kinova, Doosan) fetched as open URDF packages from GitHub with exact kinematics and meshes (`src/io/library/online_library.ts`); URDF/DH import; RoboDK `.robot` files decode natively (kinematics = RoboDK SolveFK, all link meshes; docs/robodk-library-compat.md) |
 | Import geometry: STL, OBJ, COLLADA (.dae) | ✅ | COLLADA reader handles unit scale, Y-up conversion, node transforms |
 | Import geometry: STEP/IGES/BREP | ✅ | OpenCascade WebAssembly (occt-import-js), loaded on demand; SLDPRT/3DS/WRL ❌ |
 | Program playback of recorded joint paths (RoboDK InstructionListJoints, ROS bags, CSV logs) | ✅ | `jointPath` instruction: exact replay in the simulator, exported through posts as joint moves; created automatically for RoboDK programs whose robot kinematics could not be rebuilt |
-| .rdk station load/save | 🟡 | lossless import through a headless RoboDK behind the studio server (`python/rdk2vbs.py`, `POST /convert/rdk`, tried automatically when a `.rdk`/`.robot`/`.tool` is dropped): targets, programs + RoboDK's simulated joint path, object curves/points, machining projects (curve/point follow, 3D print, milling), Python programs; otherwise best-effort binary reader; export via `rdk_export.py` + API script |
+| .rdk station load/save | ✅ | native reader checked against RoboDK 5.9.4 for all 96 Library files (tree, poses, FK, targets, programs by item reference incl. IO / threads / code calls, Python programs, curves / points, station parameters, collision map; `docs/robodk-library-compat.md`); not reproduced: machining settings, Comau / delta / 4-bar passive links (KUKA / ABB / Fanuc counterbalances follow J2; listed in the import report); `POST /convert/rdk` re-saves files of other RoboDK versions; export via `rdk_export.py` + API script |
 | .robot / .tool file build ("Robot builder") | ✅ | `BuildMechanism` (1R/1T/2R/2T/3R/3T/4R/4T/6DOF/7DOF/SCARA), `setRobotParams` (modified DH), DH import/export |
 | Targets: cartesian / joint, teach, configuration flags | ✅ | flags derived (elbow/wrist/front), no explicit conf editing |
 | Programs: MoveJ/MoveL/MoveC, speed, rounding, frame/tool, pause, IO, code, comment, message, call | ✅ | |
 | Program instruction types: Wait, thread start | ✅ | threads compile on parallel timelines |
-| Program simulation, timeline, cycle time, run modes | ✅ | RUN_ON_ROBOT only via ROS bridge |
+| Program simulation, timeline, cycle time, run modes | ✅ | every Library program checked against RoboDK 5.9.4 (validity, `Item.Update()` cycle time ±10 %, joints, collisions: docs/robodk-library-sim.md); RUN_ON_ROBOT only via ROS bridge |
 | Collision checking (mesh-accurate, collision map, `Collision_SetPair`, `Collision_Line`) | ✅ | BVH triangle checks for meshes, collision map with pair rules + dialog, ray casting |
 | Singularity / joint limit / reach checks in linear moves | ✅ | |
 | Post processors (~100 vendor posts in RoboDK) | 🟡 | 27 built-in posts + any RoboDK Python post via Pyodide: KUKA KRC2/KRC4, ABB IRC5/S4C, Fanuc R30/RJ3, UR, Motoman, Stäubli, Doosan, Mecademic, Denso, Kawasaki, Nachi, Comau, Epson, Techman/Omron TM, Hanwha, Kinova, Mitsubishi, AUBO, JAKA, Elite, Dobot, CSV, JSON, RoboDK, ROS 2; **original RoboDK posts import unmodified** (`Program › Import RoboDK post processors`, Pyodide + official robomath/robofileio + headless robodialogs) |
@@ -28,7 +28,7 @@ Legend: ✅ implemented · 🟡 partial / simplified · ❌ not implemented
 | Conveyor tracking | 🟡 | process conveyors move products; no tracked picking |
 | Robot drivers (live connection to controllers) | ✅ | server drivers: UR (URScript + real-time joints), ABB RWS, KUKA KUKAVARPROXY, generic ROS 2 (rosbridge + ros2_control, covers Fanuc/Yaskawa/Stäubli/Techman ROS drivers); `RUNMODE_RUN_ROBOT` from Python |
 | Robot calibration, ballbar, ISO 9283, laser tracker, TCP/frame calibration | ✅ | numeric DH identification, ISO cube/ballbar programs and statistics, TCP by point/line, frame 3P/6P/turntable; measuring devices simulated |
-| 2D/3D camera simulation (`Cam2D_*`) | 🟡 | `Cam2D_Add/SetParams/Snapshot/Close`, camera view render, camera parameters dialog, simulated detections; depth/segmentation buffers ❌ |
+| 2D/3D camera simulation (`Cam2D_*`) | ✅ | `Cam2D_Add/SetParams/Settings/Snapshot/Close` ("Camera N" names, RoboDK settings string), RGB PNG and RoboDK `.grey32` depth (`DEPTH`), per-pixel item ids (segmentation), `Cam2D_Snapshot(file)` saves and returns 1 (server: disk; browser: the session's files, File › Files saved by scripts), `setColor` / `Recolor` drawn by the cameras; docs/vision.md |
 | Simulation events (attach/detach objects, show/hide) | ✅ | |
 | Python API (`robolink`, `robomath`) | 🟡 | see tables below |
 | C#, C++, MATLAB APIs, plugin interface | 🟡 | C# (WebSocket), C++ and MATLAB (TCP JSON-lines) clients in `clients/`; JS plugins via `PluginLoad` (ES modules); Simulink and C++ add-ins ❌ |
@@ -47,10 +47,11 @@ setWindowState setInteractiveMode setViewPose ViewPose Joints setJoints setPoses
 ShowSequence FilterTarget getParams SimulationTime setSimulationTime Spray_Add Spray_SetState Spray_GetStats Spray_Clear
 EventsListen WaitForEvent PluginLoad PluginCommand ProjectPoints IsInside Save`.
 
-Previously implemented (39): `ActiveStation AddCurve AddFile(stub) AddFolder AddFrame AddPoints AddProgram AddShape AddStation AddTarget
-Cam2D_Snapshot(stub) Collisions(stub) Command Connect Delete Disconnect Finish IsInside(stub) Item ItemList ItemUserPick License
-ProjectPoints(stub) Render RunMode Save(stub) Selection ShowMessage SimulationSpeed Update Version getParam setParam setRunMode
-setSelection setSimulationSpeed` + extensions `AddRobot AddMobileRobot App`.
+Implemented in the first version (39; the "stub" marks of that list are history — AddFile, Cam2D_Snapshot,
+Collisions, IsInside, ProjectPoints and Save are implemented now; their parity is covered in the tables below): `ActiveStation AddCurve AddFile AddFolder AddFrame AddPoints
+AddProgram AddShape AddStation AddTarget Cam2D_Snapshot Collisions Command Connect Delete Disconnect Finish IsInside Item
+ItemList ItemUserPick License ProjectPoints Render RunMode Save Selection ShowMessage SimulationSpeed Update Version getParam
+setParam setRunMode setSelection setSimulationSpeed` + extensions `AddRobot AddMobileRobot App`.
 
 Still missing / stubbed: `EmbedWindow` (no native windows in a browser), `AddFile` from a local path (browser sandbox:
 use drag & drop or the station file). Measurement functions return simulated values (configurable noise) unless a real
@@ -85,7 +86,8 @@ robots replace their DH tables instead).
 
 ## Remaining gaps
 
-- Proprietary binary containers (`.rdk`, `.robot`, `.tool`) stay best-effort; the lossless path is the API bridge.
+- RoboDK binary files are read natively (format: docs/robodk-file-format.md); machining project settings and Comau / delta / 4-bar passive links are not reproduced.
+- `Update()` time is RoboDK's estimate model (moves rest to rest at the robot's motion state, Set speed / rounding instructions ignored: `ProgramRunResult.updateTime`); playback honours the programmed speeds (`duration`).
 - Native (non-ROS) drivers exist for UR, ABB (RWS) and KUKA (KVP); other brands connect through their ROS 2 drivers.
 - Depth/segmentation camera buffers, 3D PDF export, Simulink blocks and C++ add-ins are not implemented.
 - `EmbedWindow` and file-path based `AddFile` do not apply to a browser application.

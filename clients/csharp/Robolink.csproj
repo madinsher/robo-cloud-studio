@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- VerticalBot Studio C# client (WebSocket JSON-RPC). Library: dotnet build -c Release -->
+  <PropertyGroup>
+    <TargetFramework>net6.0</TargetFramework>
+    <OutputType>Library</OutputType>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <RootNamespace>VerticalBotStudio</RootNamespace>
+    <AssemblyName>VerticalBotStudio.Robolink</AssemblyName>
+  </PropertyGroup>
+</Project>

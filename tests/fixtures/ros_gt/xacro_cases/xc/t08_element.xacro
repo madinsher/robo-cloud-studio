@@ -1,0 +1,1 @@
+<robot name="t" xmlns:xacro="http://www.ros.org/wiki/xacro"><xacro:property name="tag" value="link"/><xacro:element xacro:name="${tag}" name="dyn"/><link name="x"><xacro:attribute name="extra" value="1"/></link></robot>

@@ -1,0 +1,4 @@
+<?xml version="1.0"?>
+<robot name="r" xmlns:xacro="http://www.ros.org/wiki/xacro">
+<xacro:property name="fw" value="42"/><xacro:macro name="m" params="fw:=^ x:=^|5"><o fw="${fw}" x="${x}"/></xacro:macro><xacro:m/>
+</robot>

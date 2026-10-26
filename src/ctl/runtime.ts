@@ -14,20 +14,27 @@ import { SupervisorRuntime, SupervisorTable, SupervisorViolation } from './des';
 import { LTL3Monitor, Verdict } from './temporal';
 import { ModeMachine, HybridSpec } from './hybrid';
 import { Signal } from './vv';
-import { Env, Value } from './expr';
+import { Env, Value, expr } from './expr';
 import type { Station, Item } from '../core/items/item';
 import { ItemType } from '../core/items/item';
 import { MobileRobot, ZoneItem } from '../mobile/items';
-import type { Robot } from '../core/items/robot';
+import { Robot } from '../core/items/robot';
 import type { Program } from '../core/items/program';
 import type { Target } from '../core/items/item';
-import { followPath, stepMobile } from '../mobile/controller';
+import type { Trajectory } from '../core/motion/trajectory';
+import { MapItem } from '../mobile/items';
+import { followPath, stepMobile, powerDraw } from '../mobile/controller';
+import { planAndFollow, NavResult } from '../mobile/navigate';
+import { planPath } from '../mobile/planner';
+import { ProgramBackend, ProgramRunHandle, planArmMove, robotForTarget, sampleAt, carryAttachedObjects } from './host';
+import { invert } from '../core/math/pose';
 
 export interface WorldBindings {
   /** Values merged into the blackboard every tick (battery, dist_human, estop, …). */
   sense(): Env;
   actions: Record<string, (ctx: TickContext, args: Record<string, unknown>, node: BTNode) => BTStatus | void>;
-  halt?: Record<string, (ctx: TickContext, args: Record<string, unknown>) => void>;
+  /** Halt a running action; `node` identifies the action instance (so a halt stops only its own program / move). */
+  halt?: Record<string, (ctx: TickContext, args: Record<string, unknown>, node?: BTNode) => void>;
   /** Uncontrollable events that happened since the last tick (fed to the supervisor). */
   events?(): string[];
   /** Advance the world by dt (simulated worlds only; the station is stepped by the app). */
@@ -36,6 +43,19 @@ export interface WorldBindings {
 }
 
 export interface RuntimeOptions { bt: BtDoc; supervisor?: SupervisorTable; monitors?: string[]; modes?: HybridSpec; bindings: WorldBindings; log?: (msg: string) => void }
+
+/** Instant bookkeeping actions that are not written to the mission log on success. */
+const QUIET_ACTIONS = new Set(['set', 'log', 'report', 'event', 'signal', 'select_target']);
+/** "program A_Pick on R1", "move to T1", "goto zone=dock" … for the mission log. */
+function describeAction(name: string, args: Record<string, unknown>): string {
+  const robot = typeof args.robot === 'string' && args.robot ? ` on ${args.robot}` : '';
+  if (name === 'program') return `program ${String(args.program ?? args.name ?? '?')}${robot}`;
+  if (name === 'move') return `move to ${String(args.target ?? '?')}${robot}`;
+  if (name === 'wait') return `wait ${String(args.seconds ?? 1)} s`;
+  if (name === 'await') return `await ${String(args.expr ?? args.await ?? args.condition ?? '')}`;
+  const rest = Object.entries(args).filter(([k]) => !['robot', 'event', 'done', 'fail', 'timeout'].includes(k)).map(([k, v]) => `${k}=${String(v)}`).join(' ');
+  return `${name}${rest ? ` ${rest}` : ''}${robot}`;
+}
 
 export class ControlRuntime {
   readonly tree: BehaviorTree;
@@ -61,18 +81,28 @@ export class ControlRuntime {
           if (!this.supervisor.allowed(ev)) { this.denied++; this.say(`supervisor denied ${ev} (${name}) in plant state ${this.supervisor.plantState().join(',')}`); ctx.bb.lastDenied = ev; return 'failure'; }
           this.observe(ev);
         }
+        const starting = node.status !== 'running';
         const st = fn(ctx, args, node) ?? 'success';
+        // mission log: an action that runs over several ticks is logged when it starts and when it ends, a failing
+        // one always (an arm-only tree of programs left the log empty)
+        if (!QUIET_ACTIONS.has(name) || st === 'failure') {
+          const what = `${node.name && node.name !== name ? `${node.name}: ` : ''}${describeAction(name, args)}`;
+          if (starting && st === 'running') this.say(`${what} started`);
+          else if (!starting && st !== 'running') this.say(`${what} ${st}`);
+          else if (starting && st === 'failure') this.say(`${what} failure`);
+        }
         if (st !== 'running') Object.assign(ctx.bb, b.sense()); // post-conditions see the world after the action
         if (st !== 'running' && typeof args.done === 'string' && this.supervisor && st === 'success') this.observe(args.done);
         return st;
       };
     }
-    this.tree = new BehaviorTree(opts.bt.root, { actions, halt: b.halt }, this.bb);
+    this.tree = new BehaviorTree(opts.bt.root, { actions, halt: b.halt }, this.bb, (m) => this.say(m));
   }
   private say(msg: string): void { this.log.push(`[${this.time.toFixed(1)}] ${msg}`); this.opts.log?.(msg); }
   /** Feed the uncontrollable events the world reported so far (arrivals, sensor events) to the supervisor. */
   private drain(): void { for (const ev of this.opts.bindings.events?.() ?? []) this.observe(ev); }
-  private observe(ev: string): void { if (!this.supervisor) return; try { this.supervisor.observe(ev); } catch (e) { if (e instanceof SupervisorViolation) { this.supervisorErrors++; this.say(`model mismatch: ${e.message}`); } else throw e; } }
+  /** Never throws: an impossible event is a model mismatch (counted, logged), an unobservable one is ignored by the observer-based table. */
+  private observe(ev: string): void { if (!this.supervisor) return; try { this.supervisor.observe(ev); } catch (e) { this.supervisorErrors++; this.say(`model mismatch: ${e instanceof SupervisorViolation ? e.message : (e as Error).message}`); } }
 
   tick(dt = 0.1): BTStatus {
     const b = this.opts.bindings;
@@ -81,7 +111,9 @@ export class ControlRuntime {
     this.bb.time = this.time;
     if (this.modes) { const env = envOf(this.bb); const m = this.modes.step(this.time, env); this.bb.mode = m; this.bb.vmax = this.modes.current().vMax ?? null; }
     if (this.supervisor) { this.bb.plantState = this.supervisor.plantState().join(','); this.bb.enabled = this.supervisor.enabled().join(' '); }
+    const prev = this.status;
     this.status = this.tree.tick(dt);
+    if (this.status !== prev && this.status !== 'running') this.say(`tree ${this.status}`);
     const env = envOf(this.bb);
     this.trace.t.push(this.time); this.trace.values.push(env);
     for (const m of this.monitors) {
@@ -107,9 +139,26 @@ function envOf(bb: Record<string, unknown>): Env { const e: Env = {}; for (const
 // Station bindings
 // ---------------------------------------------------------------------------------------------
 
-export interface StationWorldOptions { robot: MobileRobot; station: Station; /** seconds for timed actions */ durations?: Partial<Record<'grasp' | 'place' | 'dock' | 'stow' | 'reach', number>>; humanPosition?: () => [number, number] | null }
+/** Path planner for `goto` (I8: src/mobile/navigate.ts registers a footprint / drive-aware planner). Returns waypoints (mm) or null. */
+export type GotoPlanner = (station: Station, robot: MobileRobot, goal: [number, number]) => number[][] | null;
+let gotoPlanner: GotoPlanner | null = null;
+export function registerGotoPlanner(p: GotoPlanner | null): void { gotoPlanner = p; }
+/** Waypoints for a goto: the registered planner, else A* on the station's occupancy map (inflated by half the footprint width), else a straight line. */
+export function gotoPath(station: Station, robot: MobileRobot, goal: [number, number]): number[][] | null {
+  if (gotoPlanner) return gotoPlanner(station, robot, goal);
+  const map = station.itemsOfType<MapItem>(ItemType.MAP)[0];
+  if (map) { const r = planPath(map, [robot.state.x, robot.state.y], goal, { inflation: Math.max(robot.kin.footprint[0], robot.kin.footprint[1]) / 2, smooth: true }); return r.ok ? r.path : null; }
+  return [[robot.state.x, robot.state.y], goal];
+}
 
-/** Bind BT actions to a mobile robot in the station: goto zone=<name>, dock, grasp, place, stow, reach, halt, wait seconds=, set key=value, event emit=<uncontrollable event>. */
+export interface StationWorldOptions { robot: MobileRobot; station: Station; /** seconds for timed actions */ durations?: Partial<Record<'grasp' | 'place' | 'dock' | 'stow' | 'reach', number>>; humanPosition?: () => [number, number] | null; /** arm programs replacing the timed skills (a mobile manipulator: Reach / Stow / Grasp / Place programs of its arm) */ skills?: Partial<Record<'reach' | 'stow' | 'grasp' | 'place', (ctx: TickContext, args: Record<string, unknown>, node: BTNode) => BTStatus | void>> }
+
+/**
+ * Bind BT actions to a mobile robot in the station: goto zone=<name>, dock, grasp, place, stow, reach, halt, wait seconds=,
+ * set key=value, event emit=<uncontrollable event>. `goto` plans with planAndFollow (I8: footprint- / drive-aware path on
+ * the map and the crop obstacles, simulated with the drive model) and plays that trajectory; a planner registered with
+ * registerGotoPlanner replaces it by its waypoints followed with the path tracker.
+ */
 export function stationBindings(o: StationWorldOptions): WorldBindings & { stepRobot(dt: number): void } {
   const { robot, station } = o; const dur = { grasp: 4, place: 3, dock: 5, stow: 2, reach: 2, ...(o.durations ?? {}) };
   const timers = new Map<string, number>();
@@ -118,39 +167,101 @@ export function stationBindings(o: StationWorldOptions): WorldBindings & { stepR
   const timed = (key: string, seconds: number, ctx: TickContext, node: BTNode, onDone?: () => void): BTStatus => { const k = `${key}#${node.id}`; if (node.status !== 'running') timers.set(k, ctx.time); if (ctx.time - (timers.get(k) ?? ctx.time) >= seconds) { timers.delete(k); onDone?.(); return 'success'; } return 'running'; };
   const pending: string[] = [];
   let arrivedLast = false;
+  /** goto in progress: the planned + simulated drive (I8) being played. */
+  let drive: { nav: NavResult; t: number } | null = null;
+  /** A skill run by an arm program (o.skills); null when the skill has no program (the timed stand-in is used). */
+  const viaArm = (name: 'reach' | 'stow' | 'grasp' | 'place', ctx: TickContext, args: Record<string, unknown>, node: BTNode, onOk: () => void, onFail?: () => void): BTStatus | null => {
+    const h = o.skills?.[name]; if (!h) return null;
+    const st = h(ctx, args, node) ?? 'success';
+    if (st === 'success') onOk(); else if (st === 'failure') onFail?.();
+    return st;
+  };
+  /** Loose parts (visible, not held, largest box side ≤ 300 mm: not tables or bins) standing in a zone - what a camera on the base sees there. */
+  const partsIn = (z: ZoneItem | undefined): number => {
+    if (!z) return 0;
+    let n = 0;
+    for (const it of station.walk()) {
+      if (it.type !== ItemType.OBJECT || !it.visible || it.parent?.type === ItemType.TOOL || it === robot || robot.isAncestorOf(it)) continue;
+      const g = (it as Item & { geometry?: Array<{ primitive?: { kind: string; size?: number[]; radius?: number; length?: number } }> }).geometry ?? [];
+      const sizes = g.map((x) => x.primitive).filter((p): p is NonNullable<typeof p> => !!p).map((p) => (p.kind === 'box' ? Math.max(...(p.size ?? [Infinity])) : p.kind === 'sphere' ? 2 * (p.radius ?? Infinity) : Math.max(2 * (p.radius ?? Infinity), p.length ?? 0)));
+      if (!sizes.length || Math.max(...sizes) > 300) continue;
+      const P = it.poseAbs(); if (z.contains(P[12], P[13])) n++;
+    }
+    return n;
+  };
   const bindings: WorldBindings & { stepRobot(dt: number): void } = {
     sense: () => {
       const z = zones().find((zz) => zz.contains(robot.state.x, robot.state.y));
       const hp = o.humanPosition?.() ?? null;
       const distHuman = hp ? Math.hypot(hp[0] - robot.state.x, hp[1] - robot.state.y) / 1000 : 99;
-      return { battery: robot.batteryLevel(), x: robot.state.x, y: robot.state.y, v: Math.abs(robot.state.v) / 1000, zone: z?.name ?? '', moving: robot.state.status === 'moving', dist_human: distHuman, human: distHuman < 2, held: !!robot.params.holding, placed: !!robot.params.placed, arm_extended: !!robot.params.armExtended, docked: robot.state.status === 'charging' };
+      return { battery: robot.batteryLevel(), x: robot.state.x, y: robot.state.y, v: Math.abs(robot.state.v) / 1000, zone: z?.name ?? '', parts_here: partsIn(z), moving: robot.state.status === 'moving', dist_human: distHuman, human: distHuman < 2, held: !!robot.params.holding, placed: !!robot.params.placed, arm_extended: !!robot.params.armExtended, docked: robot.state.status === 'charging' };
     },
     events: () => { const e = pending.splice(0); if (arrivedLast) { arrivedLast = false; } return e; },
     actions: {
       goto: (ctx, args, node) => {
         const name = String(args.zone ?? args.target ?? ''); const z = zoneByName(name);
         if (!z) { ctx.bb.error = `zone ${name} not found`; return 'failure'; }
-        if (node.status !== 'running') { const [cx, cy] = z.centroid(); followPath(robot, [[robot.state.x, robot.state.y], [cx, cy]]); return 'running'; }
-        if (robot.state.path) return 'running';
+        if (node.status !== 'running') {
+          drive = null;
+          if (!gotoPlanner) {
+            // I8: footprint- and drive-aware plan on the station's collision world, simulated with the drive model;
+            // the simulated trajectory is played on the robot (no straight line through obstacles)
+            const c = z.centroid();
+            const nav = planAndFollow(station, robot, { x: c[0], y: c[1] });
+            if (!nav.ok) { ctx.bb.error = `no collision-free path to ${name}: ${nav.error ?? ''}`; ctx.log?.(String(ctx.bb.error)); return 'failure'; }
+            drive = { nav, t: 0 }; robot.state.path = null; robot.state.status = 'moving';
+            return 'running';
+          }
+          const path = gotoPath(station, robot, z.centroid()); if (!path) { ctx.bb.error = `no collision-free path to ${name}`; ctx.log?.(String(ctx.bb.error)); return 'failure'; } followPath(robot, path); return 'running';
+        }
+        if (drive || robot.state.path) return 'running';
         if (typeof args.arrive === 'string') pending.push(args.arrive);
         return z.contains(robot.state.x, robot.state.y) || Math.hypot(robot.state.x - z.centroid()[0], robot.state.y - z.centroid()[1]) < 600 ? 'success' : 'failure';
       },
-      halt: () => { robot.state.path = null; robot.state.v = 0; robot.state.omega = 0; robot.state.status = 'idle'; return 'success'; },
+      halt: () => { drive = null; robot.state.path = null; robot.state.v = 0; robot.state.omega = 0; robot.state.status = 'idle'; return 'success'; },
       wait: (ctx, args, node) => timed('wait', Number(args.seconds ?? 1), ctx, node),
       dock: (ctx, _a, node) => timed('dock', dur.dock, ctx, node, () => { robot.state.status = 'charging'; }),
       undock: () => { robot.state.status = 'idle'; return 'success'; },
-      reach: (ctx, _a, node) => timed('reach', dur.reach, ctx, node, () => { robot.params.armExtended = true; }),
-      stow: (ctx, _a, node) => timed('stow', dur.stow, ctx, node, () => { robot.params.armExtended = false; }),
-      grasp: (ctx, args, node) => timed('grasp', dur.grasp, ctx, node, () => { const p = Number(args.p ?? 1); robot.params.placed = false; robot.params.holding = Math.random() < p; if (robot.params.holding && typeof args.ok === 'string') pending.push(args.ok); else if (!robot.params.holding && typeof args.miss === 'string') pending.push(args.miss); }),
-      place: (ctx, args, node) => timed('place', dur.place, ctx, node, () => { robot.params.holding = false; robot.params.placed = true; const n = Number(ctx.bb.targets ?? 0); ctx.bb.targets = Math.max(0, n - 1); if (typeof args.put === 'string') pending.push(args.put); }),
+      reach: (ctx, a, node) => viaArm('reach', ctx, a, node, () => { robot.params.armExtended = true; }) ?? timed('reach', dur.reach, ctx, node, () => { robot.params.armExtended = true; }),
+      stow: (ctx, a, node) => viaArm('stow', ctx, a, node, () => { robot.params.armExtended = false; }) ?? timed('stow', dur.stow, ctx, node, () => { robot.params.armExtended = false; }),
+      grasp: (ctx, args, node) => {
+        // an arm program grasps for real: success only when a gripper of the robot holds an object afterwards (the
+        // program attaches the closest object within reach - nothing when the part is elsewhere)
+        const st = viaArm('grasp', ctx, args, node, () => undefined, () => undefined);
+        if (st !== null) {
+          if (st === 'running') return st;
+          const tools = [...robot.walk()].filter((t): t is Item & { attached: string[] } => t.type === ItemType.TOOL && Array.isArray((t as { attached?: unknown }).attached));
+          const holds = !tools.length || tools.some((t) => t.attached.length > 0);
+          if (st === 'success' && holds) { robot.params.placed = false; robot.params.holding = true; if (typeof args.ok === 'string') pending.push(args.ok); return 'success'; }
+          if (st === 'success') ctx.log?.('grasp: the program ended but the gripper holds nothing — failure');
+          robot.params.holding = false; if (typeof args.miss === 'string') pending.push(args.miss);
+          return 'failure';
+        }
+        return timed('grasp', dur.grasp, ctx, node, () => { const p = Number(args.p ?? 1); robot.params.placed = false; robot.params.holding = Math.random() < p; if (robot.params.holding && typeof args.ok === 'string') pending.push(args.ok); else if (!robot.params.holding && typeof args.miss === 'string') pending.push(args.miss); });
+      },
+      place: (ctx, args, node) => viaArm('place', ctx, args, node, () => { robot.params.holding = false; robot.params.placed = true; const n = Number(ctx.bb.targets ?? 0); ctx.bb.targets = Math.max(0, n - 1); if (typeof args.put === 'string') pending.push(args.put); }) ?? timed('place', dur.place, ctx, node, () => { robot.params.holding = false; robot.params.placed = true; const n = Number(ctx.bb.targets ?? 0); ctx.bb.targets = Math.max(0, n - 1); if (typeof args.put === 'string') pending.push(args.put); }),
       set: (ctx, args) => { for (const [k, v] of Object.entries(args)) if (k !== 'event' && k !== 'done') ctx.bb[k] = v; return 'success'; },
       event: (_c, args) => { const e = args.emit ?? args.name; if (typeof e === 'string') pending.push(e); return 'success'; },
       report: (ctx) => { ctx.bb.reported = true; return 'success'; },
       select_target: (ctx) => ((ctx.bb.targets as number) > 0 ? 'success' : 'failure'),
       refine_pose: (ctx, _a, node) => timed('refine', 1, ctx, node),
     },
-    halt: { goto: () => { robot.state.path = null; robot.state.v = 0; robot.state.status = 'idle'; } },
-    stepRobot: (dt) => { const vmax = robot.params.vmaxOverride as number | undefined; stepMobile(robot, dt, vmax ? { speed: vmax * 1000 } : {}); },
+    halt: { goto: () => { drive = null; robot.state.path = null; robot.state.v = 0; robot.state.status = 'idle'; } },
+    stepRobot: (dt) => {
+      if (drive) {
+        // play the simulated planAndFollow trajectory (I8) on the robot
+        drive.t += dt;
+        const p = drive.nav.sample(drive.t); const st = robot.state;
+        const v = Math.hypot(p.x - st.x, p.y - st.y) / Math.max(1e-9, dt);
+        st.omega = (((p.heading - st.theta + 540) % 360) - 180) / Math.max(1e-9, dt);
+        st.x = p.x; st.y = p.y; st.theta = p.heading; st.v = v; st.odometer += v * dt;
+        robot.syncPoseFromState();
+        robot.battery.levelWh = Math.max(0, robot.battery.levelWh - (powerDraw(robot) * dt) / 3600);
+        if (drive.t >= drive.nav.duration) { drive = null; st.v = 0; st.omega = 0; st.status = 'idle'; }
+        return;
+      }
+      const vmax = robot.params.vmaxOverride as number | undefined; stepMobile(robot, dt, vmax ? { speed: vmax * 1000 } : {});
+    },
   };
   return bindings;
 }
@@ -160,91 +271,163 @@ export function stationBindings(o: StationWorldOptions): WorldBindings & { stepR
 // Host actions: the studio's own programming artefacts as actions (robot programs, targets, component signals)
 // ---------------------------------------------------------------------------------------------
 
-/** What the app exposes to the control runtimes (implemented in ui/control_ui.ts over App). */
+/** What the app exposes to the control runtimes (built in ui/control_ui.ts over App, or headless in tests). */
 export interface StationHost {
   station: Station;
-  /** Start an arm program in the program simulator (one at a time). */
-  runProgram(p: Program): void;
-  programPlaying(): boolean;
-  stopProgram(): void;
-  /** Joint trajectory duration (s) for a MoveJ from the current joints to the target; null when unreachable. */
-  moveDuration(robot: Robot, target: Target, linear?: boolean): number | null;
-  /** Process-component signal (the world clock's signal table). */
-  setSignal(name: string, value: boolean | number): void;
+  /** Who runs programs (per-robot lanes, real outcomes) and owns the signal table — see ctl/host.ts. */
+  programs: ProgramBackend;
+  /** Motion planner for `move` (default: MoveJ / MoveL with the robot's motion parameters). */
+  planMove?(robot: Robot, target: Target, linear: boolean): { traj: Trajectory | null; error?: string };
+  log?(msg: string, level?: 'info' | 'warn' | 'error'): void;
+}
+
+/** Robot resources: one owner (action node) per robot, FIFO among the waiting nodes. Programs and moves share them. */
+export class RobotLocks {
+  readonly owner = new Map<string, string>(); private waiting = new Map<string, string[]>();
+  acquire(robotId: string, node: string): boolean {
+    const o = this.owner.get(robotId); if (o === node) return true;
+    let q = this.waiting.get(robotId); if (!q) { q = []; this.waiting.set(robotId, q); }
+    if (!o && (!q.length || q[0] === node)) { if (q[0] === node) q.shift(); this.owner.set(robotId, node); return true; }
+    if (!q.includes(node)) q.push(node);
+    return false;
+  }
+  release(node: string): void { for (const [r, o] of [...this.owner]) if (o === node) this.owner.delete(r); for (const q of this.waiting.values()) { const i = q.indexOf(node); if (i >= 0) q.splice(i, 1); } this.since.delete(node); }
+  /** When each waiting node first found its robot busy (sim time). */
+  private since = new Map<string, number>();
+  /**
+   * acquire() with the log lines of a contested robot: "<what> waits for <robot> (busy)" when the node first finds it
+   * busy, "<what> starts on <robot> after waiting N s" when it gets it — the transition / state / tree node that
+   * started the action is logged when it fires, the action itself only begins on a free robot.
+   */
+  acquireLogged(robotId: string, node: string, ctx: TickContext, what: string, robotName: string): boolean {
+    if (this.acquire(robotId, node)) {
+      const t0 = this.since.get(node);
+      if (t0 !== undefined) { this.since.delete(node); ctx.log?.(`${what} starts on ${robotName} after waiting ${(ctx.time - t0).toFixed(2)} s`); }
+      return true;
+    }
+    if (!this.since.has(node)) { this.since.set(node, ctx.time); ctx.log?.(`${what} waits for ${robotName} (busy)`); }
+    return false;
+  }
+}
+
+const parseValue = (v: unknown): unknown => (typeof v === 'number' || typeof v === 'boolean' ? v : v === 'false' ? false : v === 'true' ? true : typeof v === 'string' && v.trim() !== '' && Number.isFinite(Number(v)) ? Number(v) : v ?? true);
+/** `set` values: a string starting with `=` is an expression over the blackboard (`remaining = "=remaining - 1"`). */
+export function setValue(v: unknown, bb: Record<string, unknown>): unknown { if (typeof v === 'string' && v.startsWith('=')) return expr(v.slice(1)).eval(envOf(bb)); return v; }
+/** Signal name of a `signal` action: `component=` maps `name` to the component's `<name>Signal` field (stop → stopSignal), else `component.name`. */
+function signalName(st: Station, name: string, component: unknown): string {
+  if (typeof component !== 'string' || !component) return name;
+  const c = st.itemsOfType<Item>(ItemType.COMPONENT).find((i) => i.name === component) as unknown as { behaviour?: Record<string, unknown> } | undefined;
+  const field = c?.behaviour?.[`${name}Signal`];
+  return typeof field === 'string' && field ? field : `${component}.${name}`;
 }
 
 /**
- * Actions available to every model: `program name= [robot=]` (runs a Program item; waits while the simulator plays
- * another one), `move target= [robot=] [linear=true]` (moves an arm to a Target over the planned duration),
- * `signal name= value=` (sets a process signal used by the components), `wait seconds=`, `set key=value`,
- * `event emit=` (an uncontrollable event for the supervisor / executor).
+ * Actions available to every model:
+ *  - `program program= [robot=]` runs a Program item on its robot through the program backend; programs of different
+ *    robots run concurrently, a busy robot makes the action wait (FIFO). Fails when the program does not exist, does not
+ *    compile (the compiler message is logged) or is stopped.
+ *  - `move target= [robot=] [linear=true]` plays a planned MoveJ / MoveL to a Target; the robot is the explicit one, the
+ *    target's own robot link, its robot parent, or the only robot of the station (ambiguity is a failure).
+ *  - `signal signal= value= [component=]` writes the signal table; `wait seconds=`; `set key=value` (`=expr` evaluates);
+ *    `await expr=` succeeds when the expression over the blackboard (signals included) holds; `event emit=` raises an event;
+ *    `log message=`.
+ * The halt of an action stops only that action's own program / move and frees its robot.
  */
-export function hostBindings(host: StationHost): WorldBindings {
-  const st = host.station; const pending: string[] = [];
+export function hostBindings(host: StationHost): WorldBindings & { locks: RobotLocks } {
+  const st = host.station; const pending: string[] = []; const locks = new RobotLocks(); const carried = new Map<string, { tool: string; local: ReturnType<typeof invert> }>();
   const timers = new Map<string, number>();
-  const owner = { node: null as string | null }; const queue: string[] = []; // first come, first served for the single program simulator
   const find = <T extends Item>(type: ItemType, name: unknown): T | undefined => (typeof name === 'string' ? (st.itemsOfType<T>(type).find((i) => i.name === name) ?? st.itemsOfType<T>(type).find((i) => i.name.toLowerCase() === name.toLowerCase())) : undefined);
-  const robotOf = (args: Record<string, unknown>, fallback?: Item | null): Robot | null => (find<Robot>(ItemType.ROBOT, args.robot) ?? (fallback as Robot | null) ?? st.itemsOfType<Robot>(ItemType.ROBOT)[0] ?? null);
-  const moves = new Map<string, { robot: Robot; q0: number[]; q1: number[]; t0: number; dur: number }>();
+  const runs = new Map<string, { program: Program; robot: Robot | null; run: ProgramRunHandle | null }>();
+  const moves = new Map<string, { robot: Robot; tgt: Target; linear: boolean; traj: Trajectory | null; t0: number }>();
+  const fail = (ctx: TickContext, node: BTNode, msg: string): BTStatus => { ctx.log?.(msg); ctx.bb.error = msg; host.log?.(msg, 'warn'); locks.release(node.id); runs.delete(node.id); moves.delete(node.id); return 'failure'; };
+  const plan = host.planMove ?? planArmMove;
   return {
-    sense: () => ({ program_playing: host.programPlaying(), time_host: 0 }),
+    locks,
+    sense: () => { const env: Env = {}; for (const [k, v] of Object.entries(host.programs.signals.snapshot())) if (typeof v === 'number' || typeof v === 'boolean' || typeof v === 'string') env[k] = v; env.program_playing = host.programs.active().some((h) => h.status === 'running'); return env; },
     events: () => pending.splice(0),
+    step: (dt) => { host.programs.tick(dt); carryAttachedObjects(st, carried); },
     actions: {
       program: (ctx, args, node) => {
-        const p = find<Program>(ItemType.PROGRAM, args.name ?? args.program);
-        if (!p) { ctx.log?.(`program ${String(args.name)} not found`); return 'failure'; }
-        if (node.status !== 'running' || owner.node !== node.id) {
-          if (!queue.includes(node.id)) queue.push(node.id);
-          if (host.programPlaying() || queue[0] !== node.id) return 'running'; // another program is playing or queued earlier: wait for the simulator
-          queue.shift(); host.runProgram(p); owner.node = node.id; timers.set(node.id, ctx.time); return 'running';
+        if (node.status !== 'running' || !runs.has(node.id)) {
+          const name = args.program ?? args.name; const p = find<Program>(ItemType.PROGRAM, name);
+          if (!p) return fail(ctx, node, `program ${String(name)} not found`);
+          const own = p.robot(); const robot = own instanceof Robot ? own : (find<Robot>(ItemType.ROBOT, args.robot) ?? null);
+          if (own instanceof Robot && typeof args.robot === 'string' && args.robot && own.name !== args.robot) ctx.log?.(`program ${p.name} belongs to ${own.name}, not ${args.robot} — it runs on ${own.name}`);
+          runs.set(node.id, { program: p, robot, run: null });
         }
-        if (host.programPlaying() && ctx.time - (timers.get(node.id) ?? ctx.time) < 0.2) return 'running';
-        if (host.programPlaying()) return 'running';
-        owner.node = null; timers.delete(node.id); return 'success';
+        const s = runs.get(node.id)!;
+        if (!s.run) { if (s.robot && !locks.acquireLogged(s.robot.id, node.id, ctx, `program ${s.program.name}`, s.robot.name)) return 'running'; s.run = host.programs.start(s.program, { robot: s.robot }); }
+        const status = s.run.status;
+        if (status === 'queued' || status === 'running') return 'running';
+        if (status === 'done') { locks.release(node.id); runs.delete(node.id); return 'success'; }
+        return fail(ctx, node, `program ${s.program.name} ${status === 'error' ? `failed: ${s.run.error?.message ?? 'error'}` : status}`);
       },
       move: (ctx, args, node) => {
-        const tgt = find<Target>(ItemType.TARGET, args.target); if (!tgt) { ctx.log?.(`target ${String(args.target)} not found`); return 'failure'; }
-        if (node.status !== 'running') {
-          const robot = robotOf(args, (tgt.parent && (tgt.parent as Item).type === ItemType.ROBOT ? (tgt.parent as Item) : null)); if (!robot) { ctx.log?.('no robot for move'); return 'failure'; }
-          const dur = host.moveDuration(robot, tgt, args.linear === true); if (dur === null) { ctx.log?.(`${tgt.name} unreachable for ${robot.name}`); return 'failure'; }
-          const q1 = robot.jointsForTarget(tgt); if (!q1) return 'failure';
-          moves.set(node.id, { robot, q0: robot.joints(), q1, t0: ctx.time, dur: Math.max(dur, 0.05) }); return 'running';
+        if (node.status !== 'running' || !moves.has(node.id)) {
+          const tgt = find<Target>(ItemType.TARGET, args.target); if (!tgt) return fail(ctx, node, `target ${String(args.target)} not found`);
+          const { robot, why } = robotForTarget(st, tgt, args.robot); if (!robot) return fail(ctx, node, why);
+          moves.set(node.id, { robot, tgt, linear: args.linear === true || args.linear === 'true', traj: null, t0: 0 });
         }
-        const m = moves.get(node.id); if (!m) return 'success';
-        const s = Math.min(1, (ctx.time - m.t0) / m.dur); const sm = s * s * (3 - 2 * s);
-        m.robot.setJoints(m.q0.map((v, i) => v + (m.q1[i] - v) * sm));
-        if (s >= 1) { moves.delete(node.id); return 'success'; }
+        const m = moves.get(node.id)!;
+        if (!m.traj) {
+          if (!locks.acquireLogged(m.robot.id, node.id, ctx, `move to ${m.tgt.name}`, m.robot.name)) return 'running';
+          const r = plan(m.robot, m.tgt, m.linear); if (!r.traj) return fail(ctx, node, r.error ?? `cannot move ${m.robot.name} to ${m.tgt.name}`);
+          m.traj = r.traj; m.t0 = ctx.time;
+        }
+        const t = ctx.time - m.t0;
+        m.robot.setJoints(sampleAt(m.traj, Math.min(t, m.traj.duration)).joints);
+        if (t >= m.traj.duration - 1e-9) { locks.release(node.id); moves.delete(node.id); return 'success'; }
         return 'running';
       },
-      signal: (_ctx, args) => {
-        const v = args.value; host.setSignal(String(args.name), typeof v === 'number' || typeof v === 'boolean' ? v : v === 'false' ? false : v === 'true' ? true : Number.isFinite(Number(v)) ? Number(v) : true); return 'success';
-      },
-      wait: (ctx, args, node) => { const k = `w#${node.id}`; if (node.status !== 'running') timers.set(k, ctx.time); if (ctx.time - (timers.get(k) ?? ctx.time) >= Number(args.seconds ?? 1)) { timers.delete(k); return 'success'; } return 'running'; },
-      set: (ctx, args) => { for (const [k, v] of Object.entries(args)) if (k !== 'event' && k !== 'done' && k !== 'robot') ctx.bb[k] = v; return 'success'; },
+      signal: (_ctx, args) => { const name = String(args.signal ?? args.name); host.programs.signals.set(signalName(st, name, args.component), parseValue(args.value)); return 'success'; },
+      wait: (ctx, args, node) => { const k = `w#${node.id}`; if (node.status !== 'running') timers.set(k, ctx.time); if (ctx.time - (timers.get(k) ?? ctx.time) >= Number(args.seconds ?? 1) - 1e-9) { timers.delete(k); return 'success'; } return 'running'; },
+      set: (ctx, args) => { for (const [k, v] of Object.entries(args)) if (!['event', 'done', 'robot', 'fail', 'timeout'].includes(k)) ctx.bb[k] = setValue(v, ctx.bb); return 'success'; },
+      await: (ctx, args) => { const e = String(args.expr ?? args.await ?? args.condition ?? 'true'); try { return expr(e).bool(envOf(ctx.bb)) ? 'success' : 'running'; } catch (err) { ctx.log?.(`await ${e}: ${(err as Error).message}`); return 'failure'; } },
       event: (_c, args) => { const e = args.emit ?? args.name; if (typeof e === 'string') pending.push(e); return 'success'; },
+      log: (ctx, args) => { ctx.log?.(String(args.message ?? args.text ?? '')); return 'success'; },
+      report: (ctx) => { ctx.bb.reported = true; return 'success'; },
+      select_target: (ctx) => (Number(ctx.bb.targets ?? 0) > 0 ? 'success' : 'failure'),
     },
-    halt: { program: (_c, _a) => { void _a; if (owner.node) { host.stopProgram(); owner.node = null; } queue.length = 0; }, move: (_c, args) => { void args; } },
+    halt: {
+      program: (_c, _a, node) => { if (!node) return; const s = runs.get(node.id); if (s?.run) host.programs.stop(s.run); runs.delete(node.id); locks.release(node.id); },
+      move: (_c, _a, node) => { if (!node) return; moves.delete(node.id); locks.release(node.id); },
+      wait: (_c, _a, node) => { if (node) timers.delete(`w#${node.id}`); },
+    },
   };
 }
 
-/** Stand-in host for tests and headless scenarios: programs and moves take `durations` seconds, signals are recorded. */
-export function simulatedHost(opts: { programs?: Record<string, number>; moveSeconds?: number } = {}): WorldBindings & { signals: Record<string, unknown>; runs: string[]; playing: string | null } {
-  const timers = new Map<string, number>(); const pending: string[] = []; const queue: string[] = [];
-  const out = { signals: {} as Record<string, unknown>, runs: [] as string[], playing: null as string | null };
-  const timed = (key: string, seconds: number, ctx: TickContext, node: BTNode, onStart?: () => boolean, onDone?: () => void): BTStatus => { const k = `${key}#${node.id}`; if (!timers.has(k)) { if (onStart && !onStart()) return 'running'; timers.set(k, ctx.time); } if (ctx.time - timers.get(k)! >= seconds) { timers.delete(k); onDone?.(); return 'success'; } return 'running'; };
+/**
+ * Stand-in host for tests and headless scenarios: programs take `programs[name]` seconds on the lane of their robot
+ * (`robot=` argument; programs of different robots overlap, same robot → FIFO), moves take `moveSeconds`, signals are
+ * recorded. `log` keeps start / end times for timing assertions.
+ */
+export function simulatedHost(opts: { programs?: Record<string, number>; moveSeconds?: number; fail?: string[] } = {}): WorldBindings & { signals: Record<string, unknown>; runs: string[]; playing: string | null; log: Array<{ t: number; program: string; robot: string; event: 'start' | 'end' }> } {
+  const timers = new Map<string, number>(); const pending: string[] = []; const locks = new RobotLocks();
+  const out = { signals: {} as Record<string, unknown>, runs: [] as string[], playing: null as string | null, log: [] as Array<{ t: number; program: string; robot: string; event: 'start' | 'end' }> };
+  const started = new Map<string, number>();
+  const lane = (args: Record<string, unknown>, fallback: string) => (typeof args.robot === 'string' && args.robot ? args.robot : fallback);
+  const timedOnLane = (key: string, laneId: string, seconds: number, ctx: TickContext, node: BTNode, label: string, onDone?: () => void): BTStatus => {
+    const k = `${key}#${node.id}`;
+    if (!started.has(k)) { if (!locks.acquireLogged(laneId, node.id, ctx, label, laneId)) return 'running'; started.set(k, ctx.time); out.runs.push(label); out.playing = label; out.log.push({ t: ctx.time, program: label, robot: laneId, event: 'start' }); }
+    if (ctx.time - started.get(k)! >= seconds - 1e-9) { started.delete(k); locks.release(node.id); out.log.push({ t: ctx.time, program: label, robot: laneId, event: 'end' }); if (out.playing === label) out.playing = null; onDone?.(); return 'success'; }
+    return 'running';
+  };
   return {
     ...out,
-    sense: () => ({ program_playing: out.playing !== null }),
+    get playing() { return out.playing; },
+    sense: () => ({ program_playing: out.playing !== null, ...Object.fromEntries(Object.entries(out.signals).filter(([, v]) => typeof v !== 'object')) as Env }),
     events: () => pending.splice(0),
     actions: {
-      program: (ctx, args, node) => { const name = String(args.name); const d = opts.programs?.[name]; if (d === undefined) return 'failure'; return timed('prog', d, ctx, node, () => { if (!queue.includes(node.id)) queue.push(node.id); if (out.playing || queue[0] !== node.id) return false; queue.shift(); out.playing = `${name}#${node.id}`; out.runs.push(name); return true; }, () => { out.playing = null; }); },
-      move: (ctx, args, node) => timed('move', opts.moveSeconds ?? 1, ctx, node, undefined, () => { out.runs.push(`move ${String(args.target)}`); }),
-      signal: (_c, args) => { out.signals[String(args.name)] = args.value; return 'success'; },
-      wait: (ctx, args, node) => timed('wait', Number(args.seconds ?? 1), ctx, node),
-      set: (ctx, args) => { for (const [k, v] of Object.entries(args)) ctx.bb[k] = v; return 'success'; },
+      program: (ctx, args, node) => { const name = String(args.program ?? args.name); const d = opts.programs?.[name]; if (d === undefined) { ctx.log?.(`program ${name} not found`); return 'failure'; } if (opts.fail?.includes(name)) { ctx.log?.(`program ${name} failed`); return 'failure'; } return timedOnLane('prog', lane(args, `prog:${name}`), d, ctx, node, name); },
+      move: (ctx, args, node) => timedOnLane('move', lane(args, 'arm'), opts.moveSeconds ?? 1, ctx, node, `move ${String(args.target)}`),
+      signal: (_c, args) => { out.signals[String(args.signal ?? args.name)] = parseValue(args.value); return 'success'; },
+      wait: (ctx, args, node) => { const k = `wait#${node.id}`; if (node.status !== 'running') timers.set(k, ctx.time); if (ctx.time - (timers.get(k) ?? ctx.time) >= Number(args.seconds ?? 1) - 1e-9) { timers.delete(k); return 'success'; } return 'running'; },
+      set: (ctx, args) => { for (const [k, v] of Object.entries(args)) if (!['event', 'done', 'robot', 'fail', 'timeout'].includes(k)) ctx.bb[k] = setValue(v, ctx.bb); return 'success'; },
+      await: (ctx, args) => (expr(String(args.expr ?? args.await ?? 'true')).bool(envOf(ctx.bb)) ? 'success' : 'running'),
       event: (_c, args) => { const e = args.emit ?? args.name; if (typeof e === 'string') pending.push(e); return 'success'; },
+      log: (ctx, args) => { ctx.log?.(String(args.message ?? '')); return 'success'; },
     },
-    halt: { program: () => { out.playing = null; } },
+    halt: { program: (_c, _a, node) => { if (!node) return; for (const k of [...started.keys()]) if (k.endsWith(`#${node.id}`)) started.delete(k); locks.release(node.id); out.playing = null; }, move: (_c, _a, node) => { if (!node) return; for (const k of [...started.keys()]) if (k.endsWith(`#${node.id}`)) started.delete(k); locks.release(node.id); } },
   };
 }
 
@@ -262,7 +445,8 @@ export function simulatedBindings(init: Partial<SimWorldState> = {}, zones: Reco
   const zoneAt = () => Object.entries(zones).find(([, p]) => Math.hypot(p[0] - st.x, p[1] - st.y) < 0.5)?.[0] ?? '';
   return {
     state: st,
-    sense: () => ({ battery: st.battery, estop: st.estop, dist_human: st.humanDist, human: st.humanDist < 2, held: st.held, placed: st.placed, targets: st.targets, docked: st.docked, zone: st.zone, moving: st.moving, x: st.x, y: st.y, arm_extended: st.armExtended }),
+    // parts_here: the objects still waiting at the table (the abstract world keeps them there until they are delivered)
+    sense: () => ({ battery: st.battery, estop: st.estop, dist_human: st.humanDist, human: st.humanDist < 2, held: st.held, placed: st.placed, targets: st.targets, docked: st.docked, zone: st.zone, parts_here: st.zone === 'table' ? Math.max(0, st.targets - (st.held ? 1 : 0)) : 0, moving: st.moving, x: st.x, y: st.y, arm_extended: st.armExtended }),
     events: () => st.events.splice(0),
     step: (dt) => {
       if (target && !st.estop) { const dx = target[0] - st.x, dy = target[1] - st.y; const d = Math.hypot(dx, dy); const s = Math.min(d, speed * dt); if (d > 1e-6) { st.x += (dx / d) * s; st.y += (dy / d) * s; } st.moving = true; st.battery -= 0.002 * dt; if (d <= speed * dt) { target = null; st.moving = false; } }

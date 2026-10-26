@@ -1,0 +1,348 @@
+def MainProgram():
+  # Global parameters:
+  global speed_ms    = 0.250
+  global speed_rads  = 0.750
+  global accel_mss   = 1.200
+  global accel_radss = 1.200
+  global blend_radius_m = 0.001
+  global ref_frame = p[0,0,0,0,0,0]
+  
+  #
+  # TO REMOVE HEADER:
+  # Go to "Program" -> "Post-Processor Editor"
+  # Select "Universal Robots" 
+  # Set "INCLUDE_HEADER" to "False"
+  #
+  #--------------------------
+  # Add any default subprograms here
+  # For example, to drive a gripper as a program call:
+  # def Gripper_Open():
+  #   ...
+  # end
+  #
+  # Example to drive a spray gun:
+  def SprayOn(value):
+    # use the value as an output:
+    DO_SPRAY = 5
+    if value == 0:
+      set_standard_digital_out(DO_SPRAY, False)
+    else:
+      set_standard_digital_out(DO_SPRAY, True)
+    end
+  end
+
+  # Example to drive an extruder:
+  def Extruder(value):
+    # use the value as an output:
+    if value < 0:
+      # stop extruder
+    else:
+      # start extruder
+    end
+  end
+  
+  # Example to move an external axis
+  def MoveAxis(value):
+    # use the value as an output:
+    DO_AXIS_1 = 1
+    DI_AXIS_1 = 1
+    if value <= 0:
+      set_standard_digital_out(DO_AXIS_1, False)
+      
+      # Wait for digital input to change state
+      #while (get_standard_digital_in(DI_AXIS_1) != False):
+      #  sync()
+      #end
+    else:
+      set_standard_digital_out(DO_AXIS_1, True)
+      
+      # Wait for digital input to change state
+      #while (get_standard_digital_in(DI_AXIS_1) != True):
+      #  sync()
+      #end
+    end
+  end
+  #--------------------------
+  
+  # Subprogram Init
+  def Init():
+    OpenGripper1()
+    OpenGripper2()
+    CloseDoor1()
+    ReplaceObjects()
+    # show Part 4
+    # hide Part Done 4
+  end
+  
+  # Subprogram OpenGripper1
+  def OpenGripper1():
+    movej([0.872665, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000],accel_radss,speed_rads,0,0.001)
+  end
+  
+  # Subprogram OpenGripper2
+  def OpenGripper2():
+    movej([0.872665, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000],accel_radss,speed_rads,0,0.001)
+  end
+  
+  # Subprogram CloseDoor1
+  def CloseDoor1():
+    movej([0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000],accel_radss,speed_rads,0,0.001)
+  end
+  
+  # Subprogram ReplaceObjects
+  def ReplaceObjects():
+    # Replace objects Replace objects
+  end
+  
+  # Subprogram GoHome
+  def GoHome():
+    ref_frame = p[0.000000, 2.160000, 0.000000, 0.000000, 0.000000, 0.000000]
+    set_tcp(p[0.145000, 0.000000, 0.130000, 0.613943, 0.613943, 1.482190])
+    movej([-5.117829, -2.189690, 2.358987, -3.310890, -1.301317, 0.000000],accel_radss,speed_rads,0,0.001)
+  end
+  
+  # Subprogram Pick1
+  def Pick1():
+    ref_frame = p[-0.500000, -0.590000, 0.300000, 0.000000, 0.000000, 0.000000]
+    set_tcp(p[0.145000, 0.000000, 0.130000, 0.613943, 0.613943, 1.482190])
+    movej([-5.367551, -2.005139, 2.365131, -3.501602, -1.701036, -0.000000],accel_radss,speed_rads,0,0.001)
+    movel(pose_trans(ref_frame,p[0.192500, 0.192500, 0.115000, -2.221441, -0.000000, 2.221441]),accel_mss,speed_ms,0,0) # end trace
+    Gripper1PickInput()
+    movel(pose_trans(ref_frame,p[0.192500, 0.192500, 0.355000, -2.221441, 0.000000, 2.221441]),accel_mss,speed_ms,0,0.001)
+  end
+  
+  # Subprogram Gripper1PickInput
+  def Gripper1PickInput():
+    CloseGripper1()
+    # Attach to Gripper1
+    # Attach to Gripper1
+  end
+  
+  # Subprogram CloseGripper1
+  def CloseGripper1():
+    movej([0.698132, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000],accel_radss,speed_rads,0,0.001)
+  end
+  
+  # Subprogram PickLatheTransition
+  def PickLatheTransition():
+    ref_frame = p[0.000000, 2.160000, 0.000000, 0.000000, 0.000000, 0.000000]
+    set_tcp(p[0.145000, 0.000000, 0.130000, 0.613943, 0.613943, 1.482190])
+    movej([-4.104316, -2.189690, 2.358987, -3.310890, -1.301317, 0.000000],accel_radss,speed_rads,0,0.001)
+    movej([-1.752939, -2.189708, 2.359162, -3.311029, -1.301389, -0.000000],accel_radss,speed_rads,0,0.001)
+  end
+  
+  # Subprogram DropLathe
+  def DropLathe():
+    OpenDoor1()
+    ref_frame = p[-0.368677, 1.055220, 0.570866, -1.209200, 1.209200, -1.209200]
+    set_tcp(p[0.145000, 0.000000, 0.130000, 0.613943, 0.613943, 1.482190])
+    movej([-1.724677, -1.165719, 1.314446, -3.025528, -1.422199, 1.530673],accel_radss,speed_rads,0,0.001)
+    movel(pose_trans(ref_frame,p[-0.000185, 0.000102, 0.134878, -1.583515, 0.914243, 1.583515]),accel_mss,speed_ms,0,0) # end trace
+    OpenGripper1()
+    # Detach from Gripper1
+    # Detach from Gripper1
+    movej([-1.724677, -1.165719, 1.314446, -3.025528, -1.422199, 1.530673],accel_radss,speed_rads,0,0.001)
+    ref_frame = p[0.000000, 2.160000, 0.000000, 0.000000, 0.000000, 0.000000]
+    movej([-1.752939, -2.189708, 2.359162, -3.311029, -1.301389, -0.000000],accel_radss,speed_rads,0,0) # end trace
+    CloseDoor1()
+  end
+  
+  # Subprogram OpenDoor1
+  def OpenDoor1():
+    movej([12.217305, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000],accel_radss,speed_rads,0,0.001)
+  end
+  
+  # Subprogram LathePickTransition
+  def LathePickTransition():
+    ref_frame = p[0.000000, 2.160000, 0.000000, 0.000000, 0.000000, 0.000000]
+    set_tcp(p[0.145000, 0.000000, 0.130000, 0.613943, 0.613943, 1.482190])
+    movej([-4.104316, -2.189690, 2.358987, -3.310890, -1.301317, 0.000000],accel_radss,speed_rads,0,0.001)
+    movej([-5.117829, -2.189690, 2.358987, -3.310890, -1.301317, 0.000000],accel_radss,speed_rads,0,0.001)
+  end
+  
+  # Subprogram Pick2
+  def Pick2():
+    ref_frame = p[-0.500000, -0.590000, 0.300000, 0.000000, 0.000000, 0.000000]
+    set_tcp(p[0.145000, 0.000000, 0.130000, 0.613943, 0.613943, 1.482190])
+    movej([-5.266147, -1.874169, 2.288825, -3.556248, -1.802436, -0.000000],accel_radss,speed_rads,0,0.001)
+    movel(pose_trans(ref_frame,p[0.192500, 0.137500, 0.115000, -2.221441, -0.000000, 2.221441]),accel_mss,speed_ms,0,0) # end trace
+    Gripper1PickInput()
+    movel(pose_trans(ref_frame,p[0.192500, 0.137500, 0.355000, -2.221441, 0.000000, 2.221441]),accel_mss,speed_ms,0,0.001)
+  end
+  
+  # Subprogram Work1
+  def Work1():
+    sleep(10.000)
+    # show Part Done 1
+    # hide Part 1
+  end
+  
+  # Subprogram PickLathe
+  def PickLathe():
+    OpenDoor1()
+    ref_frame = p[-0.368677, 1.055220, 0.570866, -1.209200, 1.209200, -1.209200]
+    set_tcp(p[-0.145000, 0.000000, 0.130000, -0.613943, -0.613943, 1.482190])
+    movej([-1.705066, -1.358053, 1.582616, -2.315057, -1.503812, 1.454341],accel_radss,speed_rads,0,0.001)
+    movel(pose_trans(ref_frame,p[-0.000185, 0.000102, 0.134878, -2.081728, 0.274065, 2.081728]),accel_mss,speed_ms,0,0) # end trace
+    CloseGripper2()
+    # Attach to Gripper2
+    # Attach to Gripper2
+    movel(pose_trans(ref_frame,p[-0.000185, 0.000102, 0.301897, -2.081728, 0.274065, 2.081728]),accel_mss,speed_ms,0,0.001)
+  end
+  
+  # Subprogram CloseGripper2
+  def CloseGripper2():
+    movej([0.698132, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000],accel_radss,speed_rads,0,0.001)
+  end
+  
+  # Subprogram Drop1
+  def Drop1():
+    ref_frame = p[0.000000, 2.160000, 0.000000, 0.000000, 0.000000, 0.000000]
+    set_tcp(p[0.145000, 0.000000, 0.130000, 0.613943, 0.613943, 1.482190])
+    movej([-4.104316, -2.189690, 2.358987, -3.310890, -1.301317, 0.000000],accel_radss,speed_rads,0,0.001)
+    ref_frame = p[0.500000, -0.590000, 0.300000, 0.000000, 0.000000, 0.000000]
+    set_tcp(p[-0.145000, 0.000000, 0.130000, -0.613943, -0.613943, 1.482190])
+    movej([-4.142347, -1.589154, 2.057778, -3.610214, -1.355431, 0.000000],accel_radss,speed_rads,0,0.001)
+    movel(pose_trans(ref_frame,p[0.192500, 0.192500, 0.115000, 0.000000, 1.570796, 0.000000]),accel_mss,speed_ms,0,0) # end trace
+    Gripper2DropOutput()
+    movel(pose_trans(ref_frame,p[0.192500, 0.192500, 0.355000, 0.000000, 1.570796, 0.000000]),accel_mss,speed_ms,0,0.001)
+  end
+  
+  # Subprogram Gripper2DropOutput
+  def Gripper2DropOutput():
+    OpenGripper2()
+    # Detach from Gripper2
+    # Detach from Gripper2
+  end
+  
+  # Subprogram Pick3
+  def Pick3():
+    ref_frame = p[-0.500000, -0.590000, 0.300000, 0.000000, 0.000000, 0.000000]
+    set_tcp(p[0.145000, 0.000000, 0.130000, 0.613943, 0.613943, 1.482190])
+    movej([-5.192704, -1.758751, 2.206515, -3.589357, -1.875880, -0.000000],accel_radss,speed_rads,0,0.001)
+    movel(pose_trans(ref_frame,p[0.192500, 0.082500, 0.115000, -2.221441, -0.000000, 2.221441]),accel_mss,speed_ms,0,0) # end trace
+    Gripper1PickInput()
+    movel(pose_trans(ref_frame,p[0.192500, 0.082500, 0.355000, -2.221441, -0.000000, 2.221441]),accel_mss,speed_ms,0,0.001)
+  end
+  
+  # Subprogram Work2
+  def Work2():
+    sleep(10.000)
+    # show Part Done 2
+    # hide Part 2
+  end
+  
+  # Subprogram Drop2
+  def Drop2():
+    ref_frame = p[0.000000, 2.160000, 0.000000, 0.000000, 0.000000, 0.000000]
+    set_tcp(p[0.145000, 0.000000, 0.130000, 0.613943, 0.613943, 1.482190])
+    movej([-4.104316, -2.189690, 2.358987, -3.310890, -1.301317, 0.000000],accel_radss,speed_rads,0,0.001)
+    ref_frame = p[0.500000, -0.590000, 0.300000, 0.000000, 0.000000, 0.000000]
+    set_tcp(p[-0.145000, 0.000000, 0.130000, -0.613943, -0.613943, 1.482190])
+    movej([-4.197273, -1.528210, 1.995941, -3.609323, -1.300523, -0.000000],accel_radss,speed_rads,0,0.001)
+    movel(pose_trans(ref_frame,p[0.192500, 0.137500, 0.115000, 0.000000, 1.570796, 0.000000]),accel_mss,speed_ms,0,0) # end trace
+    Gripper2DropOutput()
+    movel(pose_trans(ref_frame,p[0.192500, 0.137500, 0.355000, 0.000000, 1.570796, 0.000000]),accel_mss,speed_ms,0,0.001)
+  end
+  
+  # Subprogram Pick4
+  def Pick4():
+    ref_frame = p[-0.500000, -0.590000, 0.300000, 0.000000, 0.000000, 0.000000]
+    set_tcp(p[0.145000, 0.000000, 0.130000, 0.613943, 0.613943, 1.482190])
+    movej([-5.136818, -1.654124, 2.118777, -3.606252, -1.931765, -0.000000],accel_radss,speed_rads,0,0.001)
+    movel(pose_trans(ref_frame,p[0.192500, 0.027500, 0.115000, -2.221441, -0.000000, 2.221441]),accel_mss,speed_ms,0,0) # end trace
+    Gripper1PickInput()
+    movel(pose_trans(ref_frame,p[0.192500, 0.027500, 0.355000, -2.221441, -0.000000, 2.221441]),accel_mss,speed_ms,0,0.001)
+  end
+  
+  # Subprogram Work3
+  def Work3():
+    sleep(10.000)
+    # show Part Done 3
+    # hide Part 3
+  end
+  
+  # Subprogram Drop3
+  def Drop3():
+    ref_frame = p[0.000000, 2.160000, 0.000000, 0.000000, 0.000000, 0.000000]
+    set_tcp(p[0.145000, 0.000000, 0.130000, 0.613943, 0.613943, 1.482190])
+    movej([-4.104316, -2.189690, 2.358987, -3.310890, -1.301317, 0.000000],accel_radss,speed_rads,0,0.001)
+    ref_frame = p[0.500000, -0.590000, 0.300000, 0.000000, 0.000000, 0.000000]
+    set_tcp(p[-0.145000, 0.000000, 0.130000, -0.613943, -0.613943, 1.482190])
+    movej([-4.243960, -1.464511, 1.926564, -3.603651, -1.253829, -0.000000],accel_radss,speed_rads,0,0.001)
+    movel(pose_trans(ref_frame,p[0.192500, 0.082500, 0.115000, 0.000000, 1.570796, 0.000000]),accel_mss,speed_ms,0,0) # end trace
+    Gripper2DropOutput()
+    movel(pose_trans(ref_frame,p[0.192500, 0.082500, 0.355000, 0.000000, 1.570796, 0.000000]),accel_mss,speed_ms,0,0.001)
+  end
+  
+  # Subprogram Work4
+  def Work4():
+    sleep(10.000)
+    # show Part Done 4
+    # hide Part 4
+  end
+  
+  # Subprogram Drop4
+  def Drop4():
+    ref_frame = p[0.000000, 2.160000, 0.000000, 0.000000, 0.000000, 0.000000]
+    set_tcp(p[0.145000, 0.000000, 0.130000, 0.613943, 0.613943, 1.482190])
+    movej([-4.104316, -2.189690, 2.358987, -3.310890, -1.301317, 0.000000],accel_radss,speed_rads,0,0.001)
+    ref_frame = p[0.500000, -0.590000, 0.300000, 0.000000, 0.000000, 0.000000]
+    set_tcp(p[-0.145000, 0.000000, 0.130000, -0.613943, -0.613943, 1.482190])
+    movej([-4.283858, -1.398770, 1.849927, -3.592760, -1.213929, -0.000000],accel_radss,speed_rads,0,0.001)
+    movel(pose_trans(ref_frame,p[0.192500, 0.027500, 0.115000, 0.000000, 1.570796, 0.000000]),accel_mss,speed_ms,0,0) # end trace
+    Gripper2DropOutput()
+    movel(pose_trans(ref_frame,p[0.192500, 0.027500, 0.355000, 0.000000, 1.570796, 0.000000]),accel_mss,speed_ms,0,0.001)
+  end
+  
+  
+  # Main program:
+  # Program generated by VerticalBot Studio for UR10e on 25/10/2026 12:00:00
+  # Using nominal kinematics.
+  ref_frame = p[0.000000, 2.160000, 0.000000, 0.000000, 0.000000, 0.000000]
+  set_tcp(p[0.145000, 0.000000, 0.130000, 0.613943, 0.613943, 1.482190])
+  Init()
+  GoHome()
+  Pick1()
+  PickLatheTransition()
+  DropLathe()
+  LathePickTransition()
+  Pick2()
+  PickLatheTransition()
+  Work1()
+  PickLathe()
+  DropLathe()
+  Drop1()
+  LathePickTransition()
+  Pick3()
+  PickLatheTransition()
+  Work2()
+  PickLathe()
+  DropLathe()
+  Drop2()
+  LathePickTransition()
+  Pick4()
+  PickLatheTransition()
+  Work3()
+  PickLathe()
+  DropLathe()
+  Drop3()
+  ref_frame = p[0.000000, 2.160000, 0.000000, 0.000000, 0.000000, 0.000000]
+  set_tcp(p[0.145000, 0.000000, 0.130000, 0.613943, 0.613943, 1.482190])
+  movej([-4.104316, -2.189690, 2.358987, -3.310890, -1.301317, 0.000000],accel_radss,speed_rads,0,0.001)
+  movej([-1.752939, -2.189708, 2.359162, -3.311029, -1.301389, -0.000000],accel_radss,speed_rads,0,0) # end trace
+  Work4()
+  ref_frame = p[0.000000, 2.160000, 0.000000, 0.000000, 0.000000, 0.000000]
+  set_tcp(p[0.145000, 0.000000, 0.130000, 0.613943, 0.613943, 1.482190])
+  movej([-1.752939, -2.189708, 2.359162, -3.311029, -1.301389, -0.000000],accel_radss,speed_rads,0,0) # end trace
+  PickLathe()
+  ref_frame = p[0.000000, 2.160000, 0.000000, 0.000000, 0.000000, 0.000000]
+  set_tcp(p[0.145000, 0.000000, 0.130000, 0.613943, 0.613943, 1.482190])
+  movej([-1.752939, -2.189708, 2.359162, -3.311029, -1.301389, -0.000000],accel_radss,speed_rads,0,0) # end trace
+  CloseDoor1()
+  Drop4()
+  GoHome()
+  # End of main program
+end
+
+MainProgram()

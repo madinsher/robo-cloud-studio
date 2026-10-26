@@ -16,7 +16,7 @@ beforeAll(async () => {
   server = net.createServer(broker.handle);
   await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
   port = (server.address() as net.AddressInfo).port;
-});
+}, 60000);   // importing aedes takes seconds on a loaded machine (the 10 s default hook timeout flaked)
 afterAll(async () => { broker.close(); (server as any).closeAllConnections?.(); await new Promise<void>((r) => server.close(() => r())); });
 
 describe('VDA 5050 over MQTT (aedes broker, mqtt.js client)', () => {

@@ -1,0 +1,2 @@
+warning: Using sorted() directly is deprecated. Use python.sorted() instead.
+warning: Using range() directly is deprecated. Use python.range() instead.

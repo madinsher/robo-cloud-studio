@@ -234,8 +234,9 @@ export interface VisionStackConfig {
   inputSize?: number;
   /** Server runtime: model name/path known to the studio server (`/vision/infer`). */
   serverModel?: string;
-  /** ROS 2 runtime: detection topic (vision_msgs/Detection2DArray) through rosbridge. */
+  /** ROS 2 runtime: detection topic through rosbridge and its type (default vision_msgs/msg/Detection2DArray; yolo_ros publishes yolo_msgs/msg/DetectionArray). */
   rosTopic?: string;
+  rosTopicType?: 'vision_msgs/msg/Detection2DArray' | 'yolo_msgs/msg/DetectionArray';
   vlm?: VlmEndpoint;
   vla?: VlaEndpoint;
   /** Camera pose in the robot flange (eye-in-hand) or robot base (eye-to-hand) frame, 16 values column-major (mm). */
@@ -243,6 +244,11 @@ export interface VisionStackConfig {
   handEyeMode?: 'eye_in_hand' | 'eye_to_hand';
   /** Prior object size (mm) for mono position estimation. */
   objectSizeMm?: number;
+  /** Object models per class: box size (mm) used by the depth localisation (truncated faces, centroid) on real runtimes. */
+  objectDims?: Record<string, [number, number, number]>;
+  /** Approach distance above the grasp (mm, default 100) and TCP standoff from the grasp face (mm, default 2). */
+  approachMm?: number;
+  graspStandoffMm?: number;
   /** Working distance (m) used for the error budget. */
   workingDistance: number;
   /** Webhook: POST the JSON summary of every run to this URL (custom nodes without ROS). */

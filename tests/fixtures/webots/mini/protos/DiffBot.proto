@@ -1,0 +1,86 @@
+#VRML_SIM R2025a utf8
+# Synthetic differential robot for the importer tests: two driven wheels and a caster, a pan/tilt head with a camera
+# (pan stored at position 0.5 rad), a prismatic lift stored at 0.02 m, a passive hinge, a Lidar and a GPS.
+
+PROTO DiffBot [
+  field SFVec3f    translation 0 0 0
+  field SFRotation rotation    0 0 1 0
+  field SFString   name        "diffbot"
+  field SFString   controller  "<extern>"
+]
+{
+  Robot {
+    translation IS translation
+    rotation IS rotation
+    name IS name
+    controller IS controller
+    children [
+      Pose { translation 0 0 0.15 children [ Shape { appearance PBRAppearance { baseColor 0.2 0.2 0.8 } geometry Box { size 0.4 0.3 0.2 } } ] }
+      HingeJoint {
+        jointParameters HingeJointParameters { axis 0 1 0 anchor 0 0.18 0.05 }
+        device [ RotationalMotor { name "left_wheel_motor" maxVelocity 10 } PositionSensor { name "left_wheel_sensor" } ]
+        endPoint Solid {
+          translation 0 0.18 0.05
+          rotation 1 0 0 1.5707963267948966
+          name "left_wheel"
+          children [ DEF WHEEL_SHAPE Shape { geometry Cylinder { radius 0.05 height 0.02 } } ]
+          boundingObject USE WHEEL_SHAPE
+          physics Physics { mass 0.3 }
+        }
+      }
+      HingeJoint {
+        jointParameters HingeJointParameters { axis 0 1 0 anchor 0 -0.18 0.05 }
+        device [ RotationalMotor { name "right_wheel_motor" maxVelocity 10 } ]
+        endPoint Solid {
+          translation 0 -0.18 0.05
+          rotation 1 0 0 1.5707963267948966
+          name "right_wheel"
+          children [ USE WHEEL_SHAPE ]
+          boundingObject USE WHEEL_SHAPE
+        }
+      }
+      Solid {
+        translation -0.15 0 0.02
+        name "caster"
+        children [ Shape { geometry Sphere { radius 0.02 } } ]
+        boundingObject Sphere { radius 0.02 }
+      }
+      Lidar { translation 0.1 0 0.3 name "lidar" horizontalResolution 360 fieldOfView 6.2832 numberOfLayers 1 minRange 0.1 maxRange 5 }
+      GPS { name "gps" }
+      SliderJoint {
+        jointParameters JointParameters { axis 0 0 1 position 0.02 }
+        device [ LinearMotor { name "lift" maxVelocity 0.2 maxPosition 0.1 } ]
+        endPoint Solid { translation -0.1 0 0.27 name "mast" children [ Shape { geometry Box { size 0.02 0.02 0.1 } } ] }
+      }
+      HingeJoint {
+        jointParameters HingeJointParameters { axis 0 0 1 anchor 0.1 0 0.25 position 0.5 }
+        device [ RotationalMotor { name "pan" minPosition -1 maxPosition 1 maxVelocity 2 } ]
+        endPoint Solid {
+          translation 0.1 0 0.25
+          rotation 0 0 1 0.5
+          name "neck"
+          children [
+            Pose { translation 0.05 0 0 children [ Shape { geometry Box { size 0.02 0.02 0.02 } } ] }
+            HingeJoint {
+              jointParameters HingeJointParameters { axis 0 1 0 anchor 0 0 0.05 minStop -0.5 maxStop 0.7 }
+              device [ RotationalMotor { name "tilt" } ]
+              endPoint Solid {
+                translation 0 0 0.05
+                name "head"
+                children [
+                  Camera { translation 0.05 0 0.02 name "cam" width 320 height 240 fieldOfView 1.2 near 0.05 far 20 }
+                  HingeJoint {
+                    jointParameters HingeJointParameters { axis 1 0 0 }
+                    endPoint Solid { translation 0 0.03 0 name "flap" children [ Shape { geometry Box { size 0.01 0.01 0.01 } } ] }
+                  }
+                ]
+                boundingObject Box { size 0.06 0.06 0.06 }
+              }
+            }
+          ]
+        }
+      }
+    ]
+    boundingObject Pose { translation 0 0 0.15 children [ Box { size 0.4 0.3 0.2 } ] }
+  }
+}

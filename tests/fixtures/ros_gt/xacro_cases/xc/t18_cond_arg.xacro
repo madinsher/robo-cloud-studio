@@ -1,0 +1,1 @@
+<robot name="t" xmlns:xacro="http://www.ros.org/wiki/xacro"><xacro:arg name="mode" default="b"/><link name="base"/><xacro:if value="${'$(arg mode)' == 'b'}"><link name="mode_b"/></xacro:if></robot>

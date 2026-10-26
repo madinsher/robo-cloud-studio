@@ -1,7 +1,7 @@
 import { Item, ItemType, SerializedItem, DeserializeContext, registerItemType, GeometryRef } from '../core/items/item';
 import { Mat4, transl, rotz, mul, DEG, RAD } from '../core/math/pose';
 
-export type DriveType = 'differential' | 'ackermann' | 'omni' | 'tracked' | 'legged';
+export type DriveType = 'differential' | 'ackermann' | 'omni' | 'tracked' | 'legged' | 'aerial';
 
 export interface MobileKinematics {
   drive: DriveType;
@@ -19,6 +19,23 @@ export interface MobileKinematics {
   footprint: [number, number, number];
   /** Minimum turning radius (mm) — 0 for differential/omni. */
   minTurnRadius: number;
+  /** Ackermann steering-rate limit (deg/s). */
+  maxSteerRate?: number;
+  /**
+   * Ackermann: x (mm, body frame) of the rear axle, the reference point of the bicycle model (no lateral velocity
+   * there; the turning radius limit and path curvature hold there). Default −wheelBase/2: axles symmetric about the
+   * item origin (the Webots UTP-G proto origin is the wheelbase midpoint). The steered axle is at rearAxle + wheelBase.
+   */
+  rearAxle?: number;
+  /** Tracked / skid steer: longitudinal track slip (0-1) and ICR expansion (effective track = track·(1+turnSlip)). */
+  slip?: number;
+  turnSlip?: number;
+  /** Holonomic lateral speed limit (mm/s) for omni / legged / aerial (default: maxSpeed, legged 0.4·maxSpeed). */
+  maxLateralSpeed?: number;
+  /** Aerial: climb rate (mm/s), altitude ceiling and cruise altitude (mm above the parent ground plane). */
+  maxClimbRate?: number;
+  maxAltitude?: number;
+  cruiseAltitude?: number;
 }
 
 export interface BatteryModel {
@@ -31,6 +48,12 @@ export interface BatteryModel {
   chargeW: number;
   /** Threshold (0-1) below which the fleet manager sends the robot to charge. */
   lowThreshold: number;
+  /** Aerial: hover power (W) while airborne and climb power per m/s (W). */
+  hoverW?: number;
+  climbPerMps?: number;
+  /** Extra draw of mounted equipment (W) and drive-cost factor (1 + W_eq/W_max, MURKA energy model) — set by the equipment model. */
+  equipmentW?: number;
+  driveFactor?: number;
 }
 
 export interface MobileState {
@@ -40,9 +63,16 @@ export interface MobileState {
   v: number; // mm/s
   omega: number; // deg/s
   steer: number; // deg (ackermann)
+  /** Body-frame lateral velocity (mm/s, holonomic drives / skid), altitude and climb rate (aerial). */
+  vy?: number;
+  z?: number;
+  vz?: number;
+  /** Altitude the aerial controller holds (mm). */
+  zTarget?: number;
   status: 'idle' | 'moving' | 'working' | 'charging' | 'error' | 'waiting';
   odometer: number; // mm
-  /** Current path being followed (points in parent frame) and progress index. */
+  /** Current path being followed (points in parent frame) and progress index. Points are [x, y] or pose points
+   *  [x, y, headingDeg, dir] with dir = 1 forward, -1 reverse, 0 rotate in place (see controller.followPath). */
   path: number[][] | null;
   pathIndex: number;
   taskId: string | null;
@@ -54,6 +84,8 @@ export class MobileRobot extends Item {
   battery: BatteryModel = { capacityWh: 2000, levelWh: 2000, idleW: 60, drivePerMps: 400, chargeW: 1500, lowThreshold: 0.25 };
   state: MobileState = { x: 0, y: 0, theta: 0, v: 0, omega: 0, steer: 0, status: 'idle', odometer: 0, path: null, pathIndex: 0, taskId: null };
   geometry: GeometryRef[] = [];
+  /** Collision geometry declared by the source (Webots boundingObject): used by collision checks instead of `geometry`. */
+  colliders?: GeometryRef[];
   /** Sensors: lidar/camera/gnss. */
   sensors: Array<{ kind: 'lidar2d' | 'lidar3d' | 'camera' | 'gnss' | 'imu'; pose: number[]; range?: number; fov?: number }> = [];
   /** Capabilities used by the fleet allocator (e.g. 'harvest', 'spray', 'transport', 'mow'). */
@@ -64,6 +96,11 @@ export class MobileRobot extends Item {
   fleetId: string | null = null;
   /** Home / charging position. */
   home: { x: number; y: number; theta: number } | null = null;
+  /** Consumable / capacity resources used by process models: spray tank (L), water (L), fruit bin (kg), cargo (kg). */
+  resources: Record<string, { capacity: number; level: number; unit: string }> = {};
+  /** Mounted modular equipment (ids of the agri equipment catalogue) and the capabilities of the bare platform. */
+  equipment: string[] = [];
+  baseCapabilities: string[] | null = null;
 
   constructor(name = 'Mobile robot', id?: string) {
     super(ItemType.MOBILE_ROBOT, name, id);
@@ -72,7 +109,7 @@ export class MobileRobot extends Item {
 
   /** Sync the item pose from the 2D state (pose on the ground plane, z from current pose). */
   syncPoseFromState(): void {
-    const z = this._pose[14];
+    const z = this.kin.drive === 'aerial' ? this.state.z ?? this._pose[14] : this._pose[14];
     this._pose = mul(transl(this.state.x, this.state.y, z), rotz(this.state.theta * DEG));
     this.notify('pose');
   }
@@ -82,6 +119,7 @@ export class MobileRobot extends Item {
     this.state.x = this._pose[12];
     this.state.y = this._pose[13];
     this.state.theta = Math.atan2(this._pose[1], this._pose[0]) * RAD;
+    if (this.kin.drive === 'aerial') this.state.z = this._pose[14];
   }
 
   override setPose(m: Mat4): this {
@@ -100,19 +138,27 @@ export class MobileRobot extends Item {
   }
 
   protected override serializeExtra() {
-    return { kin: this.kin, battery: this.battery, state: this.state, geometry: this.geometry, sensors: this.sensors, capabilities: this.capabilities, payloadKg: this.payloadKg, rosNamespace: this.rosNamespace, fleetId: this.fleetId, home: this.home };
+    return { kin: this.kin, battery: this.battery, state: this.state, geometry: this.geometry, ...(this.colliders ? { colliders: this.colliders } : {}), sensors: this.sensors, capabilities: this.capabilities, payloadKg: this.payloadKg, rosNamespace: this.rosNamespace, fleetId: this.fleetId, home: this.home, resources: this.resources, equipment: this.equipment, baseCapabilities: this.baseCapabilities };
   }
   override deserializeExtra(d: SerializedItem, _ctx: DeserializeContext) {
     this.kin = { ...this.kin, ...((d.kin as any) ?? {}) };
     this.battery = { ...this.battery, ...((d.battery as any) ?? {}) };
-    this.state = { ...this.state, ...((d.state as any) ?? {}), path: null, pathIndex: 0 };
+    // the path being followed and its progress are part of the runtime state: a station saved mid-mission resumes it
+    const ds = (d.state as any) ?? {};
+    const path = Array.isArray(ds.path) && ds.path.length && ds.path.every((p: unknown) => Array.isArray(p) && p.every((v) => typeof v === 'number')) ? (ds.path as number[][]) : null;
+    this.state = { ...this.state, ...ds, path, pathIndex: path ? Math.max(0, Math.min(path.length - 1, ds.pathIndex | 0)) : 0 };
     this.geometry = (d.geometry as GeometryRef[]) ?? [];
+    // boundingObject colliders survive undo snapshots and .vbstation files (else the visual meshes would be used)
+    this.colliders = Array.isArray(d.colliders) ? (d.colliders as GeometryRef[]) : undefined;
     this.sensors = (d.sensors as any) ?? [];
     this.capabilities = (d.capabilities as string[]) ?? ['transport'];
     this.payloadKg = (d.payloadKg as number) ?? 100;
     this.rosNamespace = (d.rosNamespace as string) ?? '';
     this.fleetId = (d.fleetId as string | null) ?? null;
     this.home = (d.home as any) ?? null;
+    this.resources = (d.resources as any) ?? {};
+    this.equipment = (d.equipment as string[]) ?? [];
+    this.baseCapabilities = (d.baseCapabilities as string[] | null) ?? null;
     this.syncStateFromPose();
   }
 }
@@ -231,7 +277,9 @@ function unrle(r: number[], size: number): Uint8Array {
   return out;
 }
 
-export type ZoneKind = 'work' | 'nogo' | 'charging' | 'loading' | 'unloading' | 'parking' | 'speed_limit' | 'headland' | 'gnss_denied';
+/** Zone kinds: `nogo` is never entered by planned paths, `speed_limit` caps the speed inside, `lane` is a one-way-at-a-time
+ *  traffic segment (at most `capacity` robots inside), `depot` is an equipment depot (reconfiguration slots = capacity). */
+export type ZoneKind = 'work' | 'nogo' | 'charging' | 'loading' | 'unloading' | 'parking' | 'speed_limit' | 'headland' | 'gnss_denied' | 'lane' | 'depot';
 
 /** Polygonal zone on the ground plane (points relative to this item, mm). */
 export class ZoneItem extends Item {
@@ -251,6 +299,11 @@ export class ZoneItem extends Item {
     }
     return inside;
   }
+  /** Polygon in the station frame. */
+  worldPolygon(): number[][] {
+    const a = this.poseAbs();
+    return this.polygon.map((p) => [a[0] * p[0] + a[4] * p[1] + a[12], a[1] * p[0] + a[5] * p[1] + a[13]]);
+  }
   centroid(): [number, number] {
     if (!this.polygon.length) return [0, 0];
     let sx = 0, sy = 0;
@@ -268,3 +321,6 @@ export class ZoneItem extends Item {
 registerItemType(ItemType.MOBILE_ROBOT, (n, id) => new MobileRobot(n, id));
 registerItemType(ItemType.MAP, (n, id) => new MapItem(n, id));
 registerItemType(ItemType.ZONE, (n, id) => new ZoneItem(n, id));
+
+// Navigate / Follow path instructions drive the base through the mobile planner (contract I2)
+import './program_motion';

@@ -1,0 +1,14 @@
+{
+ "ok": true,
+ "error": null,
+ "log": "",
+ "files": [
+  "M_SplitTest.jbi",
+  "SplitTest.jbi",
+  "SplitTest2.jbi",
+  "SplitTest3.jbi",
+  "SplitTest4.jbi",
+  "SplitTest5.jbi",
+  "SplitTest6.jbi"
+ ]
+}

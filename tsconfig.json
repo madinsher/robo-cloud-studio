@@ -16,5 +16,6 @@
     "types": ["node", "vite/client"],
     "paths": { "@/*": ["./src/*"] }
   },
-  "include": ["src", "tests", "server"]
+  "include": ["src", "tests", "server"],
+  "exclude": ["tests/_probe"]
 }

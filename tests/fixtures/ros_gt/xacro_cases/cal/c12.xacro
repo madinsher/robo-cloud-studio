@@ -1,0 +1,4 @@
+<?xml version="1.0"?>
+<robot name="r" xmlns:xacro="http://www.ros.org/wiki/xacro">
+<xacro:property name="outerp" value="11"/><xacro:include filename="sub/inc_see.xacro" ns="ns2"/><v s="${ns2.seen}"/>
+</robot>

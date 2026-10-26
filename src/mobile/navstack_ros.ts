@@ -7,22 +7,30 @@
 import { zipSync, strToU8 } from 'fflate';
 import type { MobileRobot } from './items';
 import { NavStackConfig, LOCALIZATION_METHODS, NAVIGATION_METHODS, LocalizationMethod, NavigationMethod, SensorKind } from './navstack';
+import { toRosYaml } from '../ros/yaml';
 
 export interface RosNavPackage { name: string; files: Record<string, string>; packages: string[]; notes: string[] }
 
-const yaml = (obj: any, indent = 0): string => {
-  const pad = '  '.repeat(indent);
-  if (Array.isArray(obj)) return obj.map((v) => (typeof v === 'object' && v !== null ? `${pad}-\n${yaml(v, indent + 1)}` : `${pad}- ${fmt(v)}`)).join('\n');
-  return Object.entries(obj).map(([k, v]) => (typeof v === 'object' && v !== null && !Array.isArray(v) ? `${pad}${k}:\n${yaml(v, indent + 1)}` : Array.isArray(v) ? (v.length && typeof v[0] === 'object' ? `${pad}${k}:\n${yaml(v, indent + 1)}` : `${pad}${k}: [${v.map(fmt).join(', ')}]`) : `${pad}${k}: ${fmt(v)}`)).join('\n');
-};
-const fmt = (v: any): string => (typeof v === 'string' ? (/^[A-Za-z0-9_./:-]+$/.test(v) && !/^(true|false|null)$/.test(v) ? v : JSON.stringify(v)) : String(v));
+/**
+ * Integer-typed parameters of the nodes configured here (Nav2 Humble/Jazzy, slam_toolbox, AMCL, FAST-LIO, LIO-SAM,
+ * OpenVINS, ntrip_client). Every other number is written as a double: rcl/rclcpp reject `20` for a double parameter
+ * and mixed int/double sequences (`[1.5, 0, 1.57]`) — the reason the old writer's packages crashed at startup.
+ */
+const INT_PARAMS = ['bt_loop_duration', 'default_server_timeout', 'wait_for_service_timeout', 'time_steps', 'batch_size', 'iteration_count', 'vx_samples', 'vy_samples', 'vtheta_samples',
+  'max_iterations', 'max_on_approach_iterations', 'angle_quantization_bins', 'downsample_factor', 'width', 'height', 'max_its', 'loop_rate', 'waypoint_pause_duration',
+  'max_particles', 'min_particles', 'resample_interval', 'port', 'lidar_type', 'scan_line', 'N_SCAN', 'Horizon_SCAN', 'downsampleRate', 'point_filter_num', 'id', 'min_anchors',
+  'max_cameras', 'max_clones', 'max_slam', 'max_msckf', 'num_pts', 'fast_threshold', 'grid_x', 'grid_y', 'min_px_dist', 'max_retries', 'min_points', 'throttle_scans', 'scan_buffer_size'];
+const yaml = (obj: any): string => toRosYaml(obj, { intKeys: INT_PARAMS });
 const M = 0.001;
+/** pluginlib class type (`pkg::Class`): Jazzy dropped the `pkg/Class` lookup names, every distro accepts the type. */
+const pluginType = (s: string) => s.replace(/^([\w]+)\/(\w+)$/, '$1::$2');
 
 export function generateRosNavPackage(robot: MobileRobot, cfg: NavStackConfig, opts: { packageName?: string } = {}): RosNavPackage {
   const loc = LOCALIZATION_METHODS.find((m) => m.id === cfg.localization)!;
   const nav = NAVIGATION_METHODS.find((n) => n.id === cfg.navigation)!;
   const name = (opts.packageName ?? `${robot.name}_nav`).toLowerCase().replace(/[^a-z0-9_]+/g, '_');
-  const ns = robot.rosNamespace || '';
+  // absolute topic prefix ('' or '/name'): every topic below is absolute, so nodes and parameter files agree
+  const ns = robot.rosNamespace ? `/${robot.rosNamespace.replace(/^\/+|\/+$/g, '')}` : '';
   const k = robot.kin;
   const files: Record<string, string> = {};
   const packages = new Set<string>(['navigation2', 'nav2_bringup', 'robot_localization', 'tf2_ros', 'ros2_control']);
@@ -36,33 +44,42 @@ export function generateRosNavPackage(robot: MobileRobot, cfg: NavStackConfig, o
   const globalFrame = loc.global || loc.family === 'lio' || loc.family === 'lidar3d_slam' ? 'map' : 'odom';
 
   // ---------------- Nav2 -----------------------------------------------------------------------
-  const controllerPlugin = nav.controller.split('/').pop()?.split('::').pop() ?? 'FollowPath';
-  const controller: any = nav.controller.includes('RegulatedPurePursuit') ? {
-    plugin: nav.controller, desired_linear_vel: +(k.maxSpeed * M).toFixed(2), lookahead_dist: +(Math.max(0.6, k.wheelBase * 1.2 * M)).toFixed(2), min_lookahead_dist: 0.4, max_lookahead_dist: +(Math.max(1.5, k.wheelBase * 3 * M)).toFixed(2), lookahead_time: 1.5, use_velocity_scaled_lookahead_dist: true, rotate_to_heading_angular_vel: +(k.maxYawRate * Math.PI / 180).toFixed(2), transform_tolerance: 0.2, use_regulated_linear_velocity_scaling: true, use_cost_regulated_linear_velocity_scaling: true, regulated_linear_scaling_min_radius: +(Math.max(0.9, rMin)).toFixed(2), regulated_linear_scaling_min_speed: 0.25, use_rotate_to_heading: !ackermann, allow_reversing: ackermann, max_robot_pose_search_dist: 10.0, ...(ackermann ? { min_turning_radius: +rMin.toFixed(2) } : {}),
-  } : nav.controller.includes('MPPI') ? {
-    plugin: nav.controller, time_steps: 56, model_dt: 0.05, batch_size: 2000, vx_std: 0.2, vy_std: holonomic ? 0.2 : 0.0, wz_std: 0.4, vx_max: +(k.maxSpeed * M).toFixed(2), vx_min: +(-k.maxReverseSpeed * M).toFixed(2), vy_max: holonomic ? +(k.maxSpeed * M).toFixed(2) : 0.0, wz_max: +(k.maxYawRate * Math.PI / 180).toFixed(2), motion_model: holonomic ? 'Omni' : ackermann ? 'Ackermann' : 'DiffDrive', ...(ackermann ? { AckermannConstraints: { min_turning_r: +rMin.toFixed(2) } } : {}), critics: ['ConstraintCritic', 'ObstaclesCritic', 'GoalCritic', 'GoalAngleCritic', 'PathAlignCritic', 'PathFollowCritic', 'PathAngleCritic', 'PreferForwardCritic'],
+  // catalogue entries without a Nav2 plugin (studio row follower, line follower, ...) run Nav2 with RPP + NavFn / Smac
+  const isPlugin = (x: string) => /^\w+(::|\/)\w+$/.test(x);
+  const ctrlClass = isPlugin(nav.controller) ? nav.controller : 'nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController';
+  const planClass = isPlugin(nav.planner) ? nav.planner : ackermann ? 'nav2_smac_planner::SmacPlannerHybrid' : 'nav2_navfn_planner::NavfnPlanner';
+  if (ctrlClass !== nav.controller || planClass !== nav.planner) notes.push(`${nav.name}: "${nav.controller}" / "${nav.planner}" have no Nav2 plugin; the package runs Nav2 with ${ctrlClass.split('::').pop()} + ${planClass.split('::').pop()} — replace them with your implementation.`);
+  const controllerPlugin = ctrlClass.split('/').pop()?.split('::').pop() ?? 'FollowPath';
+  const controller: any = ctrlClass.includes('RegulatedPurePursuit') ? {
+    plugin: pluginType(ctrlClass), desired_linear_vel: +(k.maxSpeed * M).toFixed(2), lookahead_dist: +(Math.max(0.6, k.wheelBase * 1.2 * M)).toFixed(2), min_lookahead_dist: 0.4, max_lookahead_dist: +(Math.max(1.5, k.wheelBase * 3 * M)).toFixed(2), lookahead_time: 1.5, use_velocity_scaled_lookahead_dist: true, rotate_to_heading_angular_vel: +(k.maxYawRate * Math.PI / 180).toFixed(2), transform_tolerance: 0.2, use_regulated_linear_velocity_scaling: true, use_cost_regulated_linear_velocity_scaling: true, regulated_linear_scaling_min_radius: +(Math.max(0.9, rMin)).toFixed(2), regulated_linear_scaling_min_speed: 0.25, use_rotate_to_heading: !ackermann, allow_reversing: ackermann, max_robot_pose_search_dist: 10.0, ...(ackermann ? { min_turning_radius: +rMin.toFixed(2) } : {}),
+  } : ctrlClass.includes('MPPI') ? {
+    plugin: pluginType(ctrlClass), time_steps: 56, model_dt: 0.05, batch_size: 2000, vx_std: 0.2, vy_std: holonomic ? 0.2 : 0.0, wz_std: 0.4, vx_max: +(k.maxSpeed * M).toFixed(2), vx_min: +(-k.maxReverseSpeed * M).toFixed(2), vy_max: holonomic ? +(k.maxSpeed * M).toFixed(2) : 0.0, wz_max: +(k.maxYawRate * Math.PI / 180).toFixed(2), motion_model: holonomic ? 'Omni' : ackermann ? 'Ackermann' : 'DiffDrive', ...(ackermann ? { AckermannConstraints: { min_turning_r: +rMin.toFixed(2) } } : {}), critics: ['ConstraintCritic', 'ObstaclesCritic', 'GoalCritic', 'GoalAngleCritic', 'PathAlignCritic', 'PathFollowCritic', 'PathAngleCritic', 'PreferForwardCritic'],
   } : {
-    plugin: nav.controller, min_vel_x: 0.0, max_vel_x: +(k.maxSpeed * M).toFixed(2), max_vel_theta: +(k.maxYawRate * Math.PI / 180).toFixed(2), acc_lim_x: +(k.maxAccel * M).toFixed(2), acc_lim_theta: 3.2, vx_samples: 20, vtheta_samples: 20, sim_time: 1.7, critics: ['RotateToGoal', 'Oscillation', 'BaseObstacle', 'GoalAlign', 'PathAlign', 'PathDist', 'GoalDist'],
+    plugin: pluginType(ctrlClass), min_vel_x: 0.0, max_vel_x: +(k.maxSpeed * M).toFixed(2), max_vel_theta: +(k.maxYawRate * Math.PI / 180).toFixed(2), acc_lim_x: +(k.maxAccel * M).toFixed(2), acc_lim_theta: 3.2, vx_samples: 20, vtheta_samples: 20, sim_time: 1.7, critics: ['RotateToGoal', 'Oscillation', 'BaseObstacle', 'GoalAlign', 'PathAlign', 'PathDist', 'GoalDist'],
   };
-  const planner: any = nav.planner.includes('SmacPlannerHybrid') ? { plugin: nav.planner, tolerance: 0.25, downsample_costmap: false, allow_unknown: true, max_iterations: 1000000, max_planning_time: 5.0, motion_model_for_search: ackermann ? 'REEDS_SHEPP' : 'DUBIN', angle_quantization_bins: 72, minimum_turning_radius: +(Math.max(0.4, rMin)).toFixed(2), reverse_penalty: ackermann ? 2.0 : 100.0, change_penalty: 0.0, non_straight_penalty: 1.2, cost_penalty: 2.0, smooth_path: true }
-    : nav.planner.includes('SmacPlanner2D') ? { plugin: nav.planner, tolerance: 0.125, downsample_costmap: false, allow_unknown: true, max_iterations: 1000000, max_planning_time: 2.0 }
-    : { plugin: 'nav2_navfn_planner/NavfnPlanner', tolerance: 0.5, use_astar: false, allow_unknown: true };
+  const planner: any = planClass.includes('SmacPlannerHybrid') ? { plugin: pluginType(planClass), tolerance: 0.25, downsample_costmap: false, allow_unknown: true, max_iterations: 1000000, max_planning_time: 5.0, motion_model_for_search: ackermann ? 'REEDS_SHEPP' : 'DUBIN', angle_quantization_bins: 72, minimum_turning_radius: +(Math.max(0.4, rMin)).toFixed(2), reverse_penalty: ackermann ? 2.0 : 100.0, change_penalty: 0.0, non_straight_penalty: 1.2, cost_penalty: 2.0, smooth_path: true }
+    : planClass.includes('SmacPlanner2D') ? { plugin: pluginType(planClass), tolerance: 0.125, downsample_costmap: false, allow_unknown: true, max_iterations: 1000000, max_planning_time: 2.0 }
+    : { plugin: 'nav2_navfn_planner::NavfnPlanner', tolerance: 0.5, use_astar: false, allow_unknown: true };
   const costmapCommon = (rolling: boolean) => ({ update_frequency: rolling ? 5.0 : 1.0, publish_frequency: rolling ? 2.0 : 1.0, global_frame: rolling ? 'odom' : globalFrame, robot_base_frame: 'base_link', footprint, footprint_padding: 0.05, resolution: 0.05, ...(rolling ? { rolling_window: true, width: 8, height: 8 } : {}), plugins: [rolling ? 'obstacle_layer' : 'static_layer', ...(rolling ? [] : ['obstacle_layer']), 'inflation_layer'],
     static_layer: { plugin: 'nav2_costmap_2d::StaticLayer', map_subscribe_transient_local: true },
     obstacle_layer: { plugin: 'nav2_costmap_2d::ObstacleLayer', enabled: true, observation_sources: obstacleSources.join(' ') || 'scan',
       ...(obstacleSources.includes('scan') || !obstacleSources.length ? { scan: { topic: `${ns}/scan`, max_obstacle_height: 2.0, clearing: true, marking: true, data_type: 'LaserScan', raytrace_max_range: 12.0, obstacle_max_range: 10.0 } } : {}),
       ...(obstacleSources.includes('points') ? { points: { topic: `${ns}/points`, max_obstacle_height: 2.0, min_obstacle_height: 0.15, clearing: true, marking: true, data_type: 'PointCloud2', raytrace_max_range: 20.0, obstacle_max_range: 15.0 } } : {}),
       ...(obstacleSources.includes('depth') ? { depth: { topic: `${ns}/camera/depth/points`, max_obstacle_height: 1.8, min_obstacle_height: 0.1, clearing: true, marking: true, data_type: 'PointCloud2', raytrace_max_range: 5.0, obstacle_max_range: 4.0 } } : {}) },
-    inflation_layer: { plugin: 'nav2_costmap_2d::InflationLayer', cost_scaling_factor: 3.0, inflation_radius: +(Math.max(0.55, k.footprint[1] * 0.75 * M)).toFixed(2) } });
+    inflation_layer: { plugin: 'nav2_costmap_2d::InflationLayer', cost_scaling_factor: 3.0, inflation_radius: Math.ceil(Math.max(0.55, Math.hypot(k.footprint[0] / 2, k.footprint[1] / 2) * M + 0.1) * 100) / 100 } });
   const nav2 = {
-    bt_navigator: { ros__parameters: { global_frame: globalFrame, robot_base_frame: 'base_link', odom_topic: `${ns}/odom`, bt_loop_duration: 10, default_server_timeout: 20 } },
-    controller_server: { ros__parameters: { controller_frequency: 20.0, min_x_velocity_threshold: 0.001, min_theta_velocity_threshold: 0.001, progress_checker_plugin: 'progress_checker', goal_checker_plugins: ['general_goal_checker'], controller_plugins: ['FollowPath'], progress_checker: { plugin: 'nav2_controller::SimpleProgressChecker', required_movement_radius: 0.5, movement_time_allowance: 10.0 }, general_goal_checker: { plugin: 'nav2_controller::SimpleGoalChecker', xy_goal_tolerance: 0.15, yaw_goal_tolerance: 0.15 }, FollowPath: controller } },
+    bt_navigator: { ros__parameters: { global_frame: globalFrame, robot_base_frame: 'base_link', odom_topic: '/odometry/local', bt_loop_duration: 10, default_server_timeout: 20, wait_for_service_timeout: 1000, navigators: ['navigate_to_pose', 'navigate_through_poses'], navigate_to_pose: { plugin: 'nav2_bt_navigator::NavigateToPoseNavigator' }, navigate_through_poses: { plugin: 'nav2_bt_navigator::NavigateThroughPosesNavigator' } } },
+    controller_server: { ros__parameters: { controller_frequency: 20.0, min_x_velocity_threshold: 0.001, min_theta_velocity_threshold: 0.001, progress_checker_plugin: 'progress_checker', progress_checker_plugins: ['progress_checker'], goal_checker_plugins: ['general_goal_checker'], controller_plugins: ['FollowPath'], progress_checker: { plugin: 'nav2_controller::SimpleProgressChecker', required_movement_radius: 0.5, movement_time_allowance: 10.0 }, general_goal_checker: { plugin: 'nav2_controller::SimpleGoalChecker', xy_goal_tolerance: 0.15, yaw_goal_tolerance: 0.15 }, FollowPath: controller } },
     planner_server: { ros__parameters: { expected_planner_frequency: 1.0, planner_plugins: ['GridBased'], GridBased: planner } },
     local_costmap: { local_costmap: { ros__parameters: costmapCommon(true) } },
     global_costmap: { global_costmap: { ros__parameters: costmapCommon(false) } },
     smoother_server: { ros__parameters: { smoother_plugins: ['simple_smoother'], simple_smoother: { plugin: 'nav2_smoother::SimpleSmoother', tolerance: 1.0e-10, max_its: 1000 } } },
-    behavior_server: { ros__parameters: { behavior_plugins: ['spin', 'backup', 'drive_on_heading', 'wait'], spin: { plugin: 'nav2_behaviors/Spin' }, backup: { plugin: 'nav2_behaviors/BackUp' }, drive_on_heading: { plugin: 'nav2_behaviors/DriveOnHeading' }, wait: { plugin: 'nav2_behaviors/Wait' }, global_frame: 'odom', robot_base_frame: 'base_link', max_rotational_vel: +(k.maxYawRate * Math.PI / 180).toFixed(2), min_rotational_vel: 0.2, rotational_acc_lim: 1.0 } },
-    velocity_smoother: { ros__parameters: { smoothing_frequency: 20.0, feedback: 'OPEN_LOOP', max_velocity: [+(k.maxSpeed * M).toFixed(2), holonomic ? +(k.maxSpeed * M).toFixed(2) : 0.0, +(k.maxYawRate * Math.PI / 180).toFixed(2)], min_velocity: [+(-k.maxReverseSpeed * M).toFixed(2), holonomic ? +(-k.maxSpeed * M).toFixed(2) : 0.0, +(-k.maxYawRate * Math.PI / 180).toFixed(2)], max_accel: [+(k.maxAccel * M).toFixed(2), holonomic ? +(k.maxAccel * M).toFixed(2) : 0.0, 3.2], max_decel: [-(+(k.maxAccel * M).toFixed(2)), holonomic ? -(+(k.maxAccel * M).toFixed(2)) : 0.0, -3.2] } },
+    behavior_server: { ros__parameters: { behavior_plugins: ['spin', 'backup', 'drive_on_heading', 'wait'], spin: { plugin: 'nav2_behaviors::Spin' }, backup: { plugin: 'nav2_behaviors::BackUp' }, drive_on_heading: { plugin: 'nav2_behaviors::DriveOnHeading' }, wait: { plugin: 'nav2_behaviors::Wait' }, global_frame: 'odom', robot_base_frame: 'base_link', max_rotational_vel: +(k.maxYawRate * Math.PI / 180).toFixed(2), min_rotational_vel: 0.2, rotational_acc_lim: 1.0 } },
+    velocity_smoother: { ros__parameters: { smoothing_frequency: 20.0, feedback: 'OPEN_LOOP', max_velocity: [+(k.maxSpeed * M).toFixed(2), holonomic ? +(k.maxSpeed * M).toFixed(2) : 0.0, +(k.maxYawRate * Math.PI / 180).toFixed(2)], min_velocity: [+(-k.maxReverseSpeed * M).toFixed(2), holonomic ? +(-k.maxSpeed * M).toFixed(2) : 0.0, +(-k.maxYawRate * Math.PI / 180).toFixed(2)], max_accel: [+(k.maxAccel * M).toFixed(2), holonomic ? +(k.maxAccel * M).toFixed(2) : 0.0, 3.2], max_decel: [-(+(k.maxAccel * M).toFixed(2)), holonomic ? -(+(k.maxAccel * M).toFixed(2)) : 0.0, -3.2], odom_topic: '/odometry/local' } },
+    // Jazzy navigation_launch.py also starts these lifecycle nodes; without parameters collision_monitor / docking_server abort
+    collision_monitor: { ros__parameters: { base_frame_id: 'base_link', odom_frame_id: 'odom', cmd_vel_in_topic: 'cmd_vel_smoothed', cmd_vel_out_topic: 'cmd_vel', state_topic: 'collision_monitor_state', transform_tolerance: 0.2, source_timeout: 1.0, base_shift_correction: true, stop_pub_timeout: 2.0, polygons: ['FootprintApproach'], FootprintApproach: { type: 'polygon', action_type: 'approach', footprint_topic: '/local_costmap/published_footprint', time_before_collision: 1.2, simulation_time_step: 0.1, min_points: 6, visualize: false, enabled: true }, observation_sources: [obstacleSources.includes('points') ? 'points' : 'scan'], scan: { type: 'scan', topic: `${ns}/scan`, min_height: 0.15, max_height: 2.0, enabled: true }, points: { type: 'pointcloud', topic: `${ns}/points`, min_height: 0.15, max_height: 2.0, enabled: true } } },
+    docking_server: { ros__parameters: { controller_frequency: 50.0, initial_perception_timeout: 5.0, wait_charge_timeout: 5.0, dock_approach_timeout: 30.0, undock_linear_tolerance: 0.05, undock_angular_tolerance: 0.1, max_retries: 3, base_frame: 'base_link', fixed_frame: 'odom', dock_backwards: false, dock_prestaging_tolerance: 0.5, dock_plugins: ['simple_charging_dock'], simple_charging_dock: { plugin: 'opennav_docking::SimpleChargingDock', docking_threshold: 0.05, staging_x_offset: -0.7, use_external_detection_pose: true, use_battery_status: false, use_stall_detection: false } } },
+    route_server: { ros__parameters: { boundary_radius_to_achieve_node: 1.0, radius_to_achieve_node: 2.0, smooth_corners: true, operations: ['AdjustSpeedLimit', 'ReroutingService'], ReroutingService: { plugin: 'nav2_route::ReroutingService' }, AdjustSpeedLimit: { plugin: 'nav2_route::AdjustSpeedLimit' }, edge_cost_functions: ['DistanceScorer'], DistanceScorer: { plugin: 'nav2_route::DistanceScorer' } } },
     ...(nav.id === 'gnss_waypoints' || nav.id === 'row_following' ? { waypoint_follower: { ros__parameters: { loop_rate: 20, stop_on_failure: false, waypoint_task_executor_plugin: 'wait_at_waypoint', wait_at_waypoint: { plugin: 'nav2_waypoint_follower::WaitAtWaypoint', enabled: true, waypoint_pause_duration: 200 } } } } : {}),
   };
   files[`config/nav2_params.yaml`] = `# Nav2 parameters generated by VerticalBot Studio for ${robot.name}\n# platform: ${cfg.platform}, environment: ${cfg.environment}, drive: ${k.drive}, stack: ${loc.name} + ${nav.name}\n${yaml(nav2)}\n`;
@@ -74,7 +91,9 @@ export function generateRosNavPackage(robot: MobileRobot, cfg: NavStackConfig, o
   if (has('wheel_odom')) { ekf[`odom${i}`] = `${ns}/wheel/odom`; ekf[`odom${i}_config`] = [false, false, false, false, false, false, true, true, false, false, false, true, false, false, false]; ekf[`odom${i}_differential`] = false; ekfInputs.push('wheel odometry (vx, vy, vyaw)'); i++; }
   if (has('imu')) { ekf.imu0 = `${ns}/imu/data`; ekf.imu0_config = [false, false, false, false, false, true, false, false, false, false, false, true, true, false, false]; ekf.imu0_differential = false; ekf.imu0_remove_gravitational_acceleration = true; ekfInputs.push('IMU (yaw, yaw rate, ax)'); }
   const slamFiles: Record<string, string> = {};
-  switch (loc.id) {
+  // hybrid stacks run the LiDAR- / visual-inertial odometry next to RTK (fused into the EKFs below)
+  const slamId = loc.id === 'hybrid_rtk_lio' ? 'fast_lio2' : loc.id === 'hybrid_rtk_vio' ? 'openvins' : loc.id;
+  switch (slamId) {
     case 'slam_toolbox_2d':
       slamFiles['config/slam_toolbox.yaml'] = yaml({ slam_toolbox: { ros__parameters: { solver_plugin: 'solver_plugins::CeresSolver', odom_frame: 'odom', map_frame: 'map', base_frame: 'base_link', scan_topic: `${ns}/scan`, mode: 'mapping', use_scan_matching: true, minimum_travel_distance: 0.3, minimum_travel_heading: 0.3, resolution: 0.05, max_laser_range: 20.0, do_loop_closing: true, loop_search_maximum_distance: 5.0, transform_publish_period: 0.02 } } });
       slamFiles['config/amcl.yaml'] = yaml({ amcl: { ros__parameters: { base_frame_id: 'base_link', odom_frame_id: 'odom', global_frame_id: 'map', scan_topic: `${ns}/scan`, robot_model_type: holonomic ? 'nav2_amcl::OmniMotionModel' : 'nav2_amcl::DifferentialMotionModel', max_particles: 3000, min_particles: 500, update_min_d: 0.2, update_min_a: 0.2, laser_max_range: 20.0, set_initial_pose: true } } });
@@ -105,7 +124,7 @@ export function generateRosNavPackage(robot: MobileRobot, cfg: NavStackConfig, o
     case 'vins_fusion':
       slamFiles['config/vins_fusion.yaml'] = `%YAML:1.0\nimu: 1\nnum_of_cam: ${has('stereo_camera') ? 2 : 1}\nimu_topic: "${ns}/imu/data"\nimage0_topic: "${ns}/camera/left/image_raw"\n${has('stereo_camera') ? `image1_topic: "${ns}/camera/right/image_raw"\n` : ''}output_path: "/tmp/vins"\ncam0_calib: "cam0.yaml"\n${has('stereo_camera') ? 'cam1_calib: "cam1.yaml"\n' : ''}image_width: 752\nimage_height: 480\nestimate_extrinsic: 1\nmultiple_thread: 1\nmax_cnt: 150\nmin_dist: 30\nfreq: 10\nF_threshold: 1.0\nshow_track: 0\nflow_back: 1\nmax_solver_time: 0.04\nmax_num_iterations: 8\nkeyframe_parallax: 10.0\nacc_n: 0.1\ngyr_n: 0.01\nacc_w: 0.001\ngyr_w: 0.0001\ng_norm: 9.805\nestimate_td: 1\ntd: 0.0\nload_previous_pose_graph: 0\npose_graph_save_path: "/tmp/vins/pose_graph/"\nsave_image: 0\n`;
       packages.add('VINS-Fusion (build from source)'); if (has('gnss') || has('gnss_rtk')) notes.push('Run the VINS-Fusion global_fusion node to fuse GPS into the pose graph.'); break;
-    case 'gnss_rtk': case 'gnss_ins': case 'hybrid_rtk_lio': case 'hybrid_rtk_vio':
+    case 'gnss_rtk': case 'gnss_ins':
       break;
     case 'uwb': case 'hybrid_uwb_lidar':
       slamFiles['config/uwb_anchors.yaml'] = yaml({ uwb_localization: { ros__parameters: { anchors: [{ id: 1, x: 0.0, y: 0.0, z: 2.5 }, { id: 2, x: 20.0, y: 0.0, z: 2.5 }, { id: 3, x: 20.0, y: 30.0, z: 2.5 }, { id: 4, x: 0.0, y: 30.0, z: 2.5 }], tag_topic: `${ns}/uwb/ranges`, frame_id: 'map', min_anchors: 3 } } });
@@ -115,12 +134,22 @@ export function generateRosNavPackage(robot: MobileRobot, cfg: NavStackConfig, o
       notes.push(`${loc.name}: localization is provided by the vehicle controller / infrastructure; Nav2 is configured for lane following with obstacle stop only.`); break;
   }
   Object.assign(files, slamFiles);
+  if (loc.id === 'hybrid_rtk_lio' || loc.id === 'hybrid_rtk_vio') {
+    const li = Object.keys(ekf).filter((x) => /^odom\d+$/.test(x)).length;
+    ekf[`odom${li}`] = loc.id === 'hybrid_rtk_lio' ? '/Odometry' : '/ov_msckf/odomimu';
+    ekf[`odom${li}_config`] = [true, true, false, false, false, true, false, false, false, false, false, false, false, false, false];
+    ekf[`odom${li}_differential`] = true;
+    ekfInputs.push(loc.id === 'hybrid_rtk_lio' ? 'FAST-LIO2 odometry (differential x, y, yaw)' : 'OpenVINS odometry (differential x, y, yaw)');
+  }
   // GNSS
   if (loc.requires.includes('gnss_rtk') || loc.requires.includes('gnss')) {
     files['config/navsat_transform.yaml'] = yaml({ navsat_transform: { ros__parameters: { frequency: 30.0, delay: 3.0, magnetic_declination_radians: 0.0, yaw_offset: 0.0, zero_altitude: true, broadcast_cartesian_transform: true, publish_filtered_gps: true, use_odometry_yaw: !has('imu'), wait_for_datum: false } } });
     if (loc.requires.includes('gnss_rtk')) { files['config/ntrip.yaml'] = yaml({ ntrip_client: { ros__parameters: { host: 'rtk.example.com', port: 2101, mountpoint: 'RTCM3_MSM', username: 'user', password: 'pass', authenticate: true, ssl: false, rtcm_topic: `${ns}/rtcm` } } }); packages.add('ntrip-client'); }
-    ekf.odom1 = `${ns}/odometry/gps`; ekf.odom1_config = [true, true, false, false, false, false, false, false, false, false, false, false, false, false, false]; ekfInputs.push('GNSS (x, y from navsat_transform)');
-    const ekfMap = { ...ekf, world_frame: 'map' };
+    // robot_localization reads odom0, odom1, ... and stops at the first missing index: inputs are numbered densely;
+    // GNSS only goes into the map-frame EKF (the odom EKF must stay continuous)
+    const ekfMap: any = { ...ekf, world_frame: 'map' };
+    const gi = Object.keys(ekf).filter((x) => /^odom\d+$/.test(x)).length;
+    ekfMap[`odom${gi}`] = '/odometry/gps'; ekfMap[`odom${gi}_config`] = [true, true, false, false, false, false, false, false, false, false, false, false, false, false, false]; ekfMap[`odom${gi}_differential`] = false; ekfInputs.push('GNSS (x, y from navsat_transform, map EKF)');
     files['config/ekf_map.yaml'] = yaml({ ekf_filter_node_map: { ros__parameters: ekfMap } });
     packages.add('robot-localization');
     notes.push('Dual EKF: ekf_odom (continuous, wheel+IMU) and ekf_map (with GNSS) as in the robot_localization navsat example; RTK corrections via ntrip_client.');
@@ -128,18 +157,40 @@ export function generateRosNavPackage(robot: MobileRobot, cfg: NavStackConfig, o
   files['config/ekf_odom.yaml'] = yaml({ ekf_filter_node_odom: { ros__parameters: ekf } });
 
   // ---------------- launch + docs ---------------------------------------------------------------
-  const slamLaunch = loc.id === 'slam_toolbox_2d' ? `Node(package='slam_toolbox', executable='async_slam_toolbox_node', name='slam_toolbox', parameters=[cfg('slam_toolbox.yaml')], output='screen')`
-    : loc.id === 'cartographer_2d' ? `Node(package='cartographer_ros', executable='cartographer_node', arguments=['-configuration_directory', os.path.join(pkg, 'config'), '-configuration_basename', 'cartographer_2d.lua'], output='screen'),\n        Node(package='cartographer_ros', executable='cartographer_occupancy_grid_node', parameters=[{'resolution': 0.05}])`
-    : loc.id === 'lio_sam' ? `IncludeLaunchDescription(PythonLaunchDescriptionSource(os.path.join(get_package_share_directory('lio_sam'), 'launch', 'run.launch.py')), launch_arguments={'params_file': cfg('lio_sam.yaml')}.items())`
-    : loc.id === 'fast_lio2' ? `Node(package='fast_lio', executable='fastlio_mapping', parameters=[cfg('fast_lio.yaml')], output='screen')`
-    : loc.id === 'kiss_icp' ? `Node(package='kiss_icp', executable='odometry_node', parameters=[cfg('kiss_icp.yaml')], output='screen')`
-    : loc.id === 'rtabmap_rgbd' ? `Node(package='rtabmap_slam', executable='rtabmap', parameters=[cfg('rtabmap.yaml')], output='screen')`
-    : loc.id.startsWith('orb_slam3') ? `Node(package='orb_slam3_ros2', executable='${loc.id === 'orb_slam3_vi' ? 'mono-inertial' : 'mono'}', arguments=[vocab, cfg('orb_slam3.yaml')], output='screen')`
-    : loc.id === 'openvins' ? `Node(package='ov_msckf', executable='run_subscribe_msckf', parameters=[{'config_path': cfg('openvins_estimator.yaml')}], output='screen')`
-    : loc.id === 'vins_fusion' ? `Node(package='vins', executable='vins_node', arguments=[cfg('vins_fusion.yaml')], output='screen')`
-    : loc.id.includes('uwb') ? `Node(package='uwb_localization', executable='uwb_localization_node', parameters=[cfg('uwb_anchors.yaml')], output='screen')`
-    : `# ${loc.name}: localization from the vehicle controller / infrastructure`;
-  files['launch/bringup.launch.py'] = `"""Bringup for ${robot.name}: ${loc.name} + ${nav.name}. Generated by VerticalBot Studio."""\nimport os\nfrom ament_index_python.packages import get_package_share_directory\nfrom launch import LaunchDescription\nfrom launch.actions import IncludeLaunchDescription\nfrom launch.launch_description_sources import PythonLaunchDescriptionSource\nfrom launch_ros.actions import Node\n\n\ndef generate_launch_description():\n    pkg = get_package_share_directory('${name}')\n    cfg = lambda f: os.path.join(pkg, 'config', f)\n    vocab = os.path.expanduser('~/ORB_SLAM3/Vocabulary/ORBvoc.txt')\n    nodes = [\n        Node(package='robot_localization', executable='ekf_node', name='ekf_filter_node_odom', parameters=[cfg('ekf_odom.yaml')], remappings=[('odometry/filtered', 'odometry/local')]),\n${files['config/ekf_map.yaml'] ? "        Node(package='robot_localization', executable='ekf_node', name='ekf_filter_node_map', parameters=[cfg('ekf_map.yaml')], remappings=[('odometry/filtered', 'odometry/global')]),\n        Node(package='robot_localization', executable='navsat_transform_node', parameters=[cfg('navsat_transform.yaml')], remappings=[('imu', '${ns}/imu/data'), ('gps/fix', '${ns}/gps/fix'), ('odometry/filtered', 'odometry/global')]),\n" : ''}${files['config/ntrip.yaml'] ? "        Node(package='ntrip_client', executable='ntrip_ros.py', parameters=[cfg('ntrip.yaml')]),\n" : ''}        ${slamLaunch},\n        IncludeLaunchDescription(PythonLaunchDescriptionSource(os.path.join(get_package_share_directory('nav2_bringup'), 'launch', 'navigation_launch.py')), launch_arguments={'params_file': cfg('nav2_params.yaml'), 'use_sim_time': 'false'}.items()),\n    ]\n    return LaunchDescription(nodes)\n`;
+  /** One launch action per node; source-built / optional packages are skipped with a log message when not installed. */
+  const slamAction: [string, string] | null = slamId === 'slam_toolbox_2d' ? ['slam_toolbox', `IncludeLaunchDescription(PythonLaunchDescriptionSource(os.path.join(get_package_share_directory('slam_toolbox'), 'launch', 'online_async_launch.py')), launch_arguments={'slam_params_file': cfg('slam_toolbox.yaml'), 'use_sim_time': use_sim_time}.items())`]
+    : slamId === 'cartographer_2d' ? ['cartographer_ros', `GroupAction([Node(package='cartographer_ros', executable='cartographer_node', arguments=['-configuration_directory', os.path.join(pkg, 'config'), '-configuration_basename', 'cartographer_2d.lua'], parameters=[{'use_sim_time': use_sim_time}], output='screen'), Node(package='cartographer_ros', executable='cartographer_occupancy_grid_node', parameters=[{'resolution': 0.05, 'use_sim_time': use_sim_time}])])`]
+    : slamId === 'lio_sam' ? ['lio_sam', `IncludeLaunchDescription(PythonLaunchDescriptionSource(os.path.join(get_package_share_directory('lio_sam'), 'launch', 'run.launch.py')), launch_arguments={'params_file': cfg('lio_sam.yaml')}.items())`]
+    : slamId === 'fast_lio2' ? ['fast_lio', `Node(package='fast_lio', executable='fastlio_mapping', parameters=[cfg('fast_lio.yaml'), {'use_sim_time': use_sim_time}], output='screen')`]
+    : slamId === 'kiss_icp' ? ['kiss_icp', `Node(package='kiss_icp', executable='kiss_icp_node', name='odometry_node', parameters=[cfg('kiss_icp.yaml'), {'use_sim_time': use_sim_time}], remappings=[('pointcloud_topic', '${ns}/points')], output='screen')`]
+    : slamId === 'rtabmap_rgbd' ? ['rtabmap_slam', `Node(package='rtabmap_slam', executable='rtabmap', parameters=[cfg('rtabmap.yaml'), {'use_sim_time': use_sim_time}], output='screen')`]
+    : slamId.startsWith('orb_slam3') ? ['orb_slam3_ros2', `Node(package='orb_slam3_ros2', executable='${slamId === 'orb_slam3_vi' ? 'mono-inertial' : 'mono'}', arguments=[vocab, cfg('orb_slam3.yaml')], output='screen')`]
+    : slamId === 'openvins' ? ['ov_msckf', `Node(package='ov_msckf', executable='run_subscribe_msckf', parameters=[{'config_path': cfg('openvins_estimator.yaml'), 'use_sim_time': use_sim_time}], output='screen')`]
+    : slamId === 'vins_fusion' ? ['vins', `Node(package='vins', executable='vins_node', arguments=[cfg('vins_fusion.yaml')], output='screen')`]
+    : slamId.includes('uwb') ? ['uwb_localization', `Node(package='uwb_localization', executable='uwb_localization_node', parameters=[cfg('uwb_anchors.yaml')], output='screen')`]
+    : null;
+  const actions: string[] = [
+    `opt('robot_localization', lambda: Node(package='robot_localization', executable='ekf_node', name='ekf_filter_node_odom', parameters=[cfg('ekf_odom.yaml'), {'use_sim_time': use_sim_time}], remappings=[('odometry/filtered', '/odometry/local')]))`,
+  ];
+  if (files['config/ekf_map.yaml']) {
+    actions.push(`opt('robot_localization', lambda: Node(package='robot_localization', executable='ekf_node', name='ekf_filter_node_map', parameters=[cfg('ekf_map.yaml'), {'use_sim_time': use_sim_time}], remappings=[('odometry/filtered', '/odometry/global')]))`);
+    actions.push(`opt('robot_localization', lambda: Node(package='robot_localization', executable='navsat_transform_node', name='navsat_transform', parameters=[cfg('navsat_transform.yaml'), {'use_sim_time': use_sim_time}], remappings=[('imu', '${ns}/imu/data'), ('gps/fix', '${ns}/gps/fix'), ('gps/filtered', '${ns}/gps/filtered'), ('odometry/gps', '/odometry/gps'), ('odometry/filtered', '/odometry/global')]))`);
+  }
+  if (files['config/ntrip.yaml']) actions.push(`opt('ntrip_client', lambda: Node(package='ntrip_client', executable='ntrip_ros.py', name='ntrip_client', parameters=[cfg('ntrip.yaml')]))`);
+  if (slamAction) actions.push(`opt('${slamAction[0]}', lambda: ${slamAction[1]})`);
+  else actions.push(`[LogInfo(msg='${loc.name}: localization from the vehicle controller / infrastructure')]`);
+  actions.push(`opt('nav2_bringup', lambda: IncludeLaunchDescription(PythonLaunchDescriptionSource(os.path.join(get_package_share_directory('nav2_bringup'), 'launch', 'navigation_launch.py')), launch_arguments={'params_file': cfg('nav2_params.yaml'), 'use_sim_time': use_sim_time, 'autostart': 'true'}.items()))`);
+  files['launch/bringup.launch.py'] = [
+    `"""Bringup for ${robot.name}: ${loc.name} + ${nav.name}. Generated by VerticalBot Studio."""`,
+    'import os', 'from ament_index_python.packages import get_package_share_directory, PackageNotFoundError', 'from launch import LaunchDescription',
+    'from launch.actions import DeclareLaunchArgument, GroupAction, IncludeLaunchDescription, LogInfo', 'from launch.launch_description_sources import PythonLaunchDescriptionSource',
+    'from launch.substitutions import LaunchConfiguration', 'from launch_ros.actions import Node', '', '',
+    'def opt(package, make):', '    """The action when `package` is installed, else a log line (source-built SLAM / RTK packages are optional)."""', '    try:',
+    '        get_package_share_directory(package)', '    except PackageNotFoundError:', `        return [LogInfo(msg=f"package '{package}' is not installed: skipped (see README)")]`, '    return [make()]', '', '',
+    'def generate_launch_description():', `    pkg = get_package_share_directory('${name}')`, "    cfg = lambda f: os.path.join(pkg, 'config', f)", "    vocab = os.path.expanduser('~/ORB_SLAM3/Vocabulary/ORBvoc.txt')",
+    "    use_sim_time = LaunchConfiguration('use_sim_time')", "    actions = [DeclareLaunchArgument('use_sim_time', default_value='false')]",
+    ...actions.map((x) => `    actions += ${x}`), '    return LaunchDescription(actions)', '',
+  ].join('\n');
   files['package.xml'] = `<?xml version="1.0"?>\n<package format="3">\n  <name>${name}</name>\n  <version>0.1.0</version>\n  <description>Navigation stack for ${robot.name}: ${loc.name} + ${nav.name} (generated by VerticalBot Studio)</description>\n  <maintainer email="user@example.com">VerticalBot Studio</maintainer>\n  <license>Apache-2.0</license>\n  <buildtool_depend>ament_cmake</buildtool_depend>\n  <exec_depend>navigation2</exec_depend>\n  <exec_depend>nav2_bringup</exec_depend>\n  <exec_depend>robot_localization</exec_depend>\n  <export><build_type>ament_cmake</build_type></export>\n</package>\n`;
   files['CMakeLists.txt'] = `cmake_minimum_required(VERSION 3.8)\nproject(${name})\nfind_package(ament_cmake REQUIRED)\ninstall(DIRECTORY config launch DESTINATION share/\${PROJECT_NAME})\nament_package()\n`;
   files['README.md'] = `# ${name}\n\nNavigation & localization stack for **${robot.name}** generated by VerticalBot Studio.\n\n| | |\n|---|---|\n| Platform | ${cfg.platform} (${k.drive}, ${(k.footprint[0] * M).toFixed(2)} × ${(k.footprint[1] * M).toFixed(2)} m, ${(k.maxSpeed * M).toFixed(2)} m/s) |\n| Environment | ${cfg.environment} |\n| Localization | ${loc.name} — ${loc.notes} |\n| Navigation | ${nav.name} — ${nav.notes} |\n| Sensors | ${cfg.sensors.join(', ')} |\n| EKF inputs | ${ekfInputs.join('; ') || 'none'} |\n\n## Install\n\n\`\`\`bash\nsudo apt install ${[...packages].filter((p) => !p.includes('source')).map((p) => `ros-$ROS_DISTRO-${p.replace(/_/g, '-')}`).join(' ')}\n# from source: ${[...packages].filter((p) => p.includes('source')).join(', ') || '—'}\ncolcon build --packages-select ${name}\nros2 launch ${name} bringup.launch.py\n\`\`\`\n\n## Frames and topics\n\n\`map → odom → base_link\`; sensors on \`${ns || ''}/scan\`, \`${ns || ''}/points\`, \`${ns || ''}/imu/data\`, \`${ns || ''}/wheel/odom\`, \`${ns || ''}/gps/fix\` — remap to your drivers.\n\n## Notes\n\n${notes.map((n) => `- ${n}`).join('\n') || '- none'}\n- Software behind the choice: ${loc.software.join(', ')}; ${nav.software.join(', ')}.\n- Tune costmap inflation, controller lookahead and speeds on the vehicle; values here follow the studio model.\n`;

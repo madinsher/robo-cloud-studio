@@ -72,33 +72,44 @@ browser "host" session when one is connected, otherwise executes against a headl
 
 ## Robot library and project import
 
-RoboDK's online library (`.robot` files) and stations (`.rdk`) are proprietary binary containers. The studio offers
-three import paths, tried in this order when a file is dropped:
+RoboDK files (`.rdk` stations, `.robot`, `.tool`, `.sld`) are decoded natively (`src/io/robodk/`, format in
+[robodk-file-format.md](robodk-file-format.md)). Every file of `C:/RoboDK/Library` is compared with what RoboDK 5.9.4
+itself reports for it (`tests/robodk_gt.test.ts`, ground truth in `tests/fixtures/robodk_gt`, per-file results in
+[robodk-library-compat.md](robodk-library-compat.md)): item tree and absolute poses, robot DOF / limits / current and
+home joints / FK (worst 0.0009 mm over 111 robots, synchronised rails / turntables / gantries included) / active tool
+and frame, tool TCPs, targets, programs (robot, every instruction with its target / inline pose), Python programs,
+machining links. A station RoboDK wrote through its API (`tests/fixtures/robodk_gt/synthetic`) pins IO, waits,
+"Stop", rounding, joint speeds, every call variant and Cyrillic names.
 
 | Path | Needs | Fidelity |
 |---|---|---|
-| `POST /convert/rdk` on the studio server → `python/rdk2vbs.py` opens the file in a hidden RoboDK instance and exports it with `rdk_export.py` | RoboDK installed next to the server, `STUDIO_ROBODK_PYTHON` pointing at a Python with the `robodk` package | lossless: items, poses, robot kinematics (DH), tools, targets, programs, meshes |
-| `rdk_export.py` run inside RoboDK (Tools › Run script) | RoboDK on the user's machine | lossless, manual |
-| Best-effort binary scan (`src/io/robodk/rdk_container.ts`) | nothing | names, poses and embedded meshes recovered heuristically; kinematics matched by name to the library |
+| Native reader (`importRdkBestEffort` → `importRobodkBinary`), used when a file is opened | nothing | RoboDK's tree, kinematics, link meshes, targets, programs by item reference, Python programs (source), folders, curves / points, station parameters, collision map; `report.dropped` lists what is not reproduced |
+| `POST /convert/rdk` on the studio server → `python/rdk2vbs.py`: a new hidden RoboDK on a free port (21500+) re-saves the file; the studio decodes it and cross-checks it with RoboDK's API listing (`importRdkExport`) | RoboDK installed next to the server | same as the native reader, for files written by other RoboDK versions |
+| `python/rdk_export.py` run inside RoboDK (Tools › Run script) | RoboDK on the user's machine | same (embeds the re-saved station) plus the API walk |
 
-For the *robot library* itself no RoboDK is needed: the online library (`Add › Robot from online library`) provides the
-same industrial robots from the open ROS-Industrial / vendor URDF packages, with exact kinematics and meshes — see
-`docs/file-formats.md`.
+For the *robot library* itself no RoboDK is needed: `.robot` files decode directly, and the online library
+(`Add › Robot from online library`) provides industrial robots from the open ROS-Industrial / vendor URDF packages.
 
-### What the RoboDK conversion carries
+### What the import carries
 
-`rdk_export.py` (run inside RoboDK, or automatically through `rdk2vbs.py`) writes: frames; robots (pose, joints,
-limits, DH when exposed, active frame/tool); tools (TCP, mesh); targets (pose, joints, joint/cartesian flag) under
-their frames; objects (STL, plus curves and points via `GetPoints`); programs (instruction list incl. speed, frame
-and tool changes, pauses, IO, code, comments, program frame/tool, **and** the simulated joint path from
-`InstructionListJoints`, stored as `params.jointsList`); machining projects (robot / part / generated program
-links, update ratio); Python programs (source when available). The importer (`src/io/robodk/rdk_import.ts`)
-rebuilds instructions, links machining items and regenerates curve/point-follow programs when RoboDK's generated
-program was not exported.
+Robots: kinematics from the robot table (`chainFromRobodk`: brand joint senses, Fanuc / Comau J2-J3 coupling, base
+offset in the kinematics, flange offset, deltas, grippers), every link mesh (merged per colour), home and current
+joints, default speeds, post processor id, synchronised external axes (`robot.externalAxes`, `params.syncAxes` with
+carrier / positioner roles and joint indices). Programs: robot by stored reference, Set Ref / Set Tool (lost links
+resolved from the pose stored in the instruction), MoveJ / MoveL / MoveC with targets or inline joints + pose
+(external axes included), speeds and accelerations, rounding, pauses, IO set / wait, events (attach / detach / show /
+hide / replace objects), calls, `Run` = thread, calls to routines and Python programs = code calls (`SetRPM(70)`).
+Python programs: `ItemType.PROGRAM_PYTHON` with `params.pythonCode` (exact source). Machining projects: links to
+robot, frame, tool, part, generated program and the NC / APT input file. Not reproduced (listed per file): machining
+settings, Comau parallelogram rods / delta rods / 4-bar gripper links (drawn rigid; KUKA / ABB / Fanuc counterbalances
+follow J2 like RoboDK), camera and notes contents. Simulation parity with RoboDK 5.9.4 (validity, Item.Update() cycle
+time, joints, collisions) is checked program by program on the whole Library: docs/robodk-library-sim.md.
 
 ### RoboDK post processors
 
-The studio runs RoboDK's own post processors: `Program › Import RoboDK post processors (.py)` (select the files
-from `C:/RoboDK/Posts`). They execute in Pyodide with the official `robodk.robomath`/`robofileio` and a headless
-`robodialogs`; the compiled program drives `ProgStart/MoveJ/MoveL/MoveC/setFrame/setTool/Pause/setDO/waitDI/RunCode/RunMessage/ProgFinish`.
+The built-in posts reproduce 27 RoboDK posts token for token (`tests/posts_gt.test.ts`, docs/posts.md). RoboDK's own
+posts: compiled ones (`libspp`, most of `C:/RoboDK/Posts`) run on the studio server with RoboDK's embedded Python
+(`server/posts_native.ts`, `POST /posts/native/run`); source posts also run in the browser (Pyodide, official
+`robodk.robomath`/`robofileio`, headless `robodialogs`); the compiled program drives
+`ProgStart/MoveJ/MoveL/MoveC/setFrame/setTool/Pause/setDO/waitDI/RunCode/RunMessage/ProgFinish/ProgSave`.
 On the server the same happens with the system Python (`python/post_shim.py`).

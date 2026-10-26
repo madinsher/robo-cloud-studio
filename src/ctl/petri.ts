@@ -23,6 +23,12 @@ export interface TransitionSpec {
   immediate?: boolean;
   weight?: number;
   priority?: number;
+  /** Executor: concurrent firings allowed (default 1 = single-server semantics). */
+  servers?: number;
+  /** Executor: guard over the blackboard / station signals (interpreted net); analysis treats it as non-deterministic. */
+  guard?: string;
+  /** Executor: input transition fired only when this event occurs (world / sensor / emitted by an action). */
+  on?: string;
 }
 export interface ArcSpec { from: string; to: string; weight?: number; inhibitor?: boolean }
 export interface PetriNetSpec { name: string; places: PlaceSpec[]; transitions: TransitionSpec[]; arcs: ArcSpec[] }
@@ -72,8 +78,12 @@ export class PetriNet {
   placeOut(p: number): number[] { return this.transitions.map((_, j) => (this.pre[j][p] > 0 ? j : -1)).filter((j) => j >= 0); }
   placeIn(p: number): number[] { return this.transitions.map((_, j) => (this.post[j][p] > 0 ? j : -1)).filter((j) => j >= 0); }
 
+  /** Marking enables t: enough input tokens, inhibitor places below threshold, and no output place exceeds its `capacity` after firing (finite-capacity net, strict rule). */
   isEnabled(m: Marking, t: number): boolean {
-    for (let i = 0; i < m.length; i++) { if (m[i] < this.pre[t][i]) return false; if (this.inhibitor[t][i] && m[i] >= this.inhibitor[t][i]) return false; }
+    for (let i = 0; i < m.length; i++) {
+      if (m[i] < this.pre[t][i]) return false; if (this.inhibitor[t][i] && m[i] >= this.inhibitor[t][i]) return false;
+      const cap = this.places[i].capacity; if (cap !== undefined && this.post[t][i] > 0 && m[i] - this.pre[t][i] + this.post[t][i] > cap) return false;
+    }
     return true;
   }
   /** Enabled transitions; immediate ones (highest priority) pre-empt timed ones when `gspn`. */

@@ -1,0 +1,2 @@
+MoveLin(179.693, 120.163, 73.556, -146.156, 25.288, -102.118)
+// Setting Digital Outputs is not implemented (7=1)

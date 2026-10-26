@@ -5,6 +5,8 @@
 import { Item, ItemType, SceneObject, SerializedItem, DeserializeContext, registerItemType, Station, GeometryRef } from '../core/items/item';
 import { Mat4, transl, multiply, identity, rotz, DEG, invert } from '../core/math/pose';
 import { EventBus } from '../core/events';
+import { StationRuntime } from '../core/motion/runtime';
+import { Robot } from '../core/items/robot';
 
 export type BehaviourType = 'feeder' | 'conveyor' | 'process' | 'sink' | 'buffer' | 'signal' | 'transfer' | 'sensor' | 'human';
 
@@ -54,6 +56,8 @@ export interface BufferBehaviour extends BehaviourBase {
   next: string | null;
   /** Grid arrangement for stacked products (columns, rows, layers, pitch). */
   grid?: { cols: number; rows: number; layers: number; pitch: [number, number, number] };
+  /** Hold the products until the buffer is full, then pass them all on (a pallet shipped when complete). */
+  releaseWhenFull?: boolean;
 }
 export interface TransferBehaviour extends BehaviourBase {
   type: 'transfer';
@@ -63,6 +67,13 @@ export interface TransferBehaviour extends BehaviourBase {
   from: string | null;
   next: string | null;
   cycleTime: number;
+  /**
+   * Robot motion of a pick & place cell (joint targets, deg): the robot of `robotId` moves pickAbove → pick (grasp:
+   * the product rides on the tool) → pickAbove → placeAbove[k] → place[k] (release into `next` at its slot k) →
+   * placeAbove[k] → pickAbove, linear in joint space, the cycle split by `phases` (fractions of cycleTime). Without it the
+   * transfer is a timed black box.
+   */
+  motion?: { home: number[]; pickAbove: number[]; pick: number[]; placeAbove: number[][]; place: number[][]; phases?: number[] };
 }
 export interface SensorBehaviour extends BehaviourBase {
   type: 'sensor';
@@ -147,11 +158,30 @@ export interface ProcessEvents extends Record<string, unknown> {
   signal: { name: string; value: boolean | number };
 }
 
+/**
+ * Process-component signals live in the station's single signal table (StationRuntime.signals, contract I1): robot
+ * programs can wait on a conveyor sensor or stop a conveyor, control models see the same values. This Map view keeps
+ * the old `signals.get / set / entries` API of the process simulator.
+ */
+class SignalTableView extends Map<string, boolean | number> {
+  constructor(private readonly table: () => { get(n: string): unknown; set(n: string, v: any): void; has(n: string): boolean; snapshot(): Record<string, unknown> }) { super(); }
+  override get(k: string): boolean | number | undefined { return this.table().get(k) as boolean | number | undefined; }
+  override set(k: string, v: boolean | number): this { this.table()?.set(k, v); return this; }
+  override has(k: string): boolean { return this.table().has(k); }
+  override get size(): number { return Object.keys(this.table().snapshot()).length; }
+  override entries(): MapIterator<[string, boolean | number]> { return (Object.entries(this.table().snapshot()) as Array<[string, boolean | number]>)[Symbol.iterator]() as MapIterator<[string, boolean | number]>; }
+  override keys(): MapIterator<string> { return Object.keys(this.table().snapshot())[Symbol.iterator]() as MapIterator<string>; }
+  override values(): MapIterator<boolean | number> { return (Object.values(this.table().snapshot()) as Array<boolean | number>)[Symbol.iterator]() as MapIterator<boolean | number>; }
+  override forEach(cb: (v: boolean | number, k: string, m: Map<string, boolean | number>) => void): void { for (const [k, v] of this.entries()) cb(v, k, this); }
+  override [Symbol.iterator](): MapIterator<[string, boolean | number]> { return this.entries(); }
+}
+
 /** Discrete-time process flow simulator for Component behaviours. */
 export class ProcessSimulator {
   readonly events = new EventBus<ProcessEvents>();
   time = 0;
-  signals = new Map<string, boolean | number>();
+  /** Signals of the station's runtime signal table (shared with robot programs and control models). */
+  signals: Map<string, boolean | number> = new SignalTableView(() => StationRuntime.of(this.station).signals);
   products = new Map<string, ProductState>();
   private productsFolder: Item | null = null;
   private rng = mulberry32(42);
@@ -172,6 +202,50 @@ export class ProcessSimulator {
       c.runtime = {};
       if (c.behaviour.type === 'feeder') c.behaviour.created = 0;
       if (c.behaviour.type === 'sink') c.behaviour.count = 0;
+      if (c.behaviour.type === 'transfer' && c.behaviour.motion && c.behaviour.robotId) (this.station.findById(c.behaviour.robotId) as Robot | null)?.setJoints(c.behaviour.motion.home);
+    }
+  }
+
+  /** Robot of a pick & place transfer with motion: joints along the cycle; the held product follows the tool. */
+  private stepTransferMotion(c: Component, b: TransferBehaviour, next: Component | null, dt: number): void {
+    const m = b.motion!;
+    const robot = b.robotId ? (this.station.findById(b.robotId) as Robot | null) : null;
+    if (!robot) return;
+    const R = c.runtime;
+    const ph = m.phases ?? [0.15, 0.25, 0.45, 0.6];
+    const tRet = b.cycleTime * (1 - ph[3]);
+    const lerp = (a: number[], z: number[], f: number) => a.map((q, i) => q + (z[i] - q) * Math.max(0, Math.min(1, f)));
+    const seg = (u: number, a: number, z: number) => (u - a) / Math.max(1e-9, z - a);
+    const pid = c.products[0];
+    if (R.cycle === undefined) {
+      // after the release: up from the slot, then back above the pick point (the rest of the cycle)
+      if (R.ret !== undefined) {
+        R.ret += dt;
+        const f = R.ret / Math.max(0.1, tRet), kk = R.retSlot ?? 0;
+        robot.setJoints(f < 0.3 ? lerp(m.place[kk], m.placeAbove[kk], f / 0.3) : lerp(m.placeAbove[kk], m.pickAbove, (f - 0.3) / 0.7));
+        if (R.ret >= tRet) R.ret = undefined;
+      }
+      if (!pid) return;
+      if (R.ret !== undefined) return; // the next pick starts when the robot is back above the pick point
+      R.cycle = 0; R.slot = next ? next.products.length : 0;
+    }
+    R.cycle += dt;
+    const u = R.cycle / b.cycleTime, k = Math.min(R.slot ?? 0, m.place.length - 1);
+    let q: number[];
+    if (u < ph[0]) q = lerp(m.pickAbove, m.pick, seg(u, 0, ph[0]));
+    else if (u < ph[1]) q = lerp(m.pick, m.pickAbove, seg(u, ph[0], ph[1]));
+    else if (u < ph[2]) q = lerp(m.pickAbove, m.placeAbove[k], seg(u, ph[1], ph[2]));
+    else if (u < ph[3]) q = lerp(m.placeAbove[k], m.place[k], seg(u, ph[2], ph[3]));
+    else q = m.place[k];
+    robot.setJoints(q);
+    const prod = pid ? (this.station.findById(pid) as SceneObject | null) : null;
+    const tcp = robot.poseTCPAbs();
+    if (prod && u >= ph[0] && !R.grip) { R.grip = Array.from(multiply(invert(tcp), prod.poseAbs())); this.setSignal(`${c.name}.gripper`, true); }
+    if (prod && R.grip) prod.setPoseAbs(multiply(tcp, Float64Array.from(R.grip)));
+    if (prod && u >= ph[3] && next && this.canAccept(next)) {
+      this.transfer(prod, c, next);
+      this.setSignal(`${c.name}.gripper`, false);
+      R.grip = undefined; R.cycle = undefined; R.ret = 0; R.retSlot = k;
     }
   }
 
@@ -236,6 +310,8 @@ export class ProcessSimulator {
       product.setPoseAbs(multiply(holder.poseAbs(), transl(col * pitch[0], row * pitch[1], layer * pitch[2])));
     } else if (b.type === 'sink') {
       /* consumed below */
+    } else if (b.type === 'transfer' && b.motion) {
+      /* stays where it was picked until the gripper closes (stepTransferMotion) */
     } else product.setPoseAbs(multiply(holder.poseAbs(), transl(0, 0, b.type === 'process' ? b.productHeight ?? 0 : 0)));
   }
 
@@ -321,6 +397,7 @@ export class ProcessSimulator {
         }
         case 'buffer': {
           const next = this.nextOf(c);
+          if (b.releaseWhenFull) { if (c.products.length >= b.capacity) c.runtime.draining = true; else if (!c.products.length) c.runtime.draining = false; if (!c.runtime.draining) break; }
           if (next && c.products.length && this.canAccept(next)) {
             const pid = c.products[0];
             const prod = this.station.findById(pid) as SceneObject | null;
@@ -332,6 +409,13 @@ export class ProcessSimulator {
         case 'transfer':
         case 'human': {
           const next = this.nextOf(c);
+          if (b.type === 'transfer' && b.motion) {
+            const from = b.from ? (this.station.findById(b.from) as Component | null) : null;
+            if (c.products.length === 0 && from && from.products.length) { const pid0 = from.products[0]; const ps0 = this.products.get(pid0)!; const prod0 = this.station.findById(pid0) as SceneObject | null; if (prod0 && (from.behaviour.type !== 'conveyor' || ps0.progress >= from.conveyorLength() - 1e-6)) this.transfer(prod0, from, c); }
+            this.stepTransferMotion(c, b, next, dt);
+            if (c.products.length) c.stats.busyTime += dt; else c.stats.idleTime += dt;
+            break;
+          }
           const from = b.type === 'transfer' && b.from ? (this.station.findById(b.from) as Component | null) : null;
           if (c.products.length === 0 && from && from.products.length) {
             const pid = from.products[0];

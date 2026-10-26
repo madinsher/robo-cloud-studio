@@ -1,0 +1,130 @@
+// Ground-truth INPUT generator for tests/posts_gt.test.ts (run on demand, needs C:/RoboDK/Library):
+//   POSTS_GT_GEN=1|feature|lib npx vitest run tests/posts_gt_gen.test.ts      -> tests/fixtures/posts_gt/cases/<case>/job.json
+//   C:/RoboDK/Python-Embedded/python.exe tests/fixtures/posts_gt/gen_gt.py  -> RoboDK's own post output per case
+// The feature program exercises every instruction kind on real Library robots; Library cases are real RoboDK station
+// programs compiled by compileForPost (the events are frozen in job.json, so the post comparison is independent of
+// later importer / kinematics changes).
+import { it } from 'vitest';
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import path from 'node:path';
+import { importRdkBestEffort } from '../src/io/robodk/rdk_container';
+import { AssetStore } from '../src/scene/assets';
+import { Robot } from '../src/core/items/robot';
+import { Program } from '../src/core/items/program';
+import { ItemType, Frame, Tool, Target } from '../src/core/items/item';
+import { compileForPost } from '../src/posts/index';
+import { toPostJob, eventFromJSON, eventToJSON } from '../src/posts/job';
+import { rdkPrecisionEvents } from '../src/posts/robopost';
+import { multiply, xyzrpwToPose, invert } from '../src/core/math/pose';
+
+const LIB = 'C:/RoboDK/Library';
+const OUT = path.resolve(__dirname, 'fixtures/posts_gt/cases');
+const GEN = !!process.env.POSTS_GT_GEN && existsSync(LIB);
+
+/** robot file, start joints, RoboDK posts to run on the feature program */
+const FEATURE: Array<[string, number[], string[]]> = [
+  ['KUKA-KR-6-R900-sixx.robot', [10, -80, 100, 20, 40, -30], ['KUKA_KRC2', 'KUKA_KRC4']],
+  ['ABB-IRB-120-3-0-6.robot', [-10, 10, 20, 30, 40, -50], ['ABB_RAPID_IRC5', 'ABB_RAPID_S4C', 'ABB_RAPID_OmniCore']],
+  ['Fanuc-LR-Mate-200iD.robot', [-20, 10, -20, 30, -40, 50], ['Fanuc_RJ3', 'Fanuc_R30i']],
+  ['UR5e.robot', [-30, -100, 90, -80, -90, 20], ['Universal_Robots', 'Universal_Robots_URP']],
+  ['Motoman-GP8.robot', [10, 20, -10, 30, -45, 60], ['Motoman', 'Motoman_Cartesian']],
+  ['Staubli-RX160.robot', [10, 20, 90, 30, 45, 60], ['Staubli_VAL3']],
+  ['Kawasaki-BA006L.robot', [10, 20, -60, 30, 45, 60], ['Kawasaki']],
+  ['Comau-Smart5-NJ-165-3-4-SH.robot', [10, -10, -80, 30, 45, 60], ['Comau_C5G']],
+  ['Mecademic-Meca500-R3.robot', [10, 10, 10, 30, 45, 60], ['Mecademic']],
+  ['Denso-Cobotta.robot', [10, 20, 90, 30, 45, 60], ['Denso_RC8', 'Epson_RC', 'Dobot_V3', 'JAKA', 'Kinova', 'Mitsubishi', 'Nachi_AX_FD', 'Elite_Robots_EC_V3', 'HCR', 'AUBO', 'CSV']],
+  ['Doosan-M1013.robot', [10, 20, 90, 30, 45, 60], ['Doosan_Robotics']],
+  ['Omron-TM12.robot', [10, -20, 90, 30, 45, 60], ['Techman_TMscript', 'Omron']],
+];
+
+/** Library station programs (station file, program names); each program is posted with the post RoboDK assigns to its
+ * robot (robot.postProcessor read from the .rdk). Programs are small (<= 300 instructions) to keep the fixtures light. */
+const LIBRARY: Array<[string, string[]]> = [
+  ['Example-01.a-Robot Painting - Universal Robots.rdk', ['MainProg', 'ApproachMove', 'PaintTop', 'Retract']],
+  ['Example-01.b-Robot Drilling - KUKA.rdk', ['DrillingPart']],
+  ['Example-01.c-Robot Drilling duplicate part - KUKA.rdk', ['MainProgram', 'DrillProgram1', 'GoHome']],
+  ['Example-01.d-Robot Inspection 3 stations - KUKA.rdk', ['MainProgramA', 'InspectA']],
+  ['Example-02.h-Robot Machining - Plastic Deburring - ABB.rdk', ['MainProgram', 'PickIn1', 'DropOut1', 'GoHome']],
+  ['Example-02.i-Wood engraving - Remote TCP - Motoman.rdk', ['Main Program', 'Square', 'TakePart1']],
+  ['Example-03.c-Painting curve - KUKA.rdk', ['Path1']],
+  ['Example-03.h-Arc Welding - ABB.rdk', ['MainProgram', 'Weld1']],
+  ['Example-03.i-Spot Welding with a KUKA robot and HMDTech weld gun.rdk', ['Main', 'WeldPair1']],
+  ['Example-03.j-Pump Impeller laser cutting.rdk', ['Pick EarCup 1', 'Drop EarCup 1']],
+  ['Example-03.b-Welding Station - Fanuc.rdk', ['Weld', 'Go_Home']],
+  ['Example-03.g-Glue Dispensing Car Windshield - Fanuc.rdk', ['Dispensing', 'Pick Windshield 1']],
+  ['Example-05.a-Car Rim with a turntable - Kawasaki.rdk', ['MainProgram', 'Rim']],
+  ['Example-05.b-Glazing with a turntable - ABB.rdk', ['Main', 'TopSurf']],
+  ['Example-05.e-Manufacturing with 2 robots.rdk', ['Main_Program', 'Home_Motoman', 'Chamfer']],
+  ['Example-06.a-Pick and place - Mecademic.rdk', ['ProgramTest']],
+  ['Example-06.e-Conveyor with 2 UR robots.rdk', ['StartSimulation', 'FeedConveyor', 'TakeConveyor']],
+  ['Example-06.f-Pick and Place CNC and Dual RobotiQ Gripper-UR10.rdk', ['MainProgram', 'Pick 1', 'Drop 1']],
+  ['Example-07.c-Script Curve Follow Custom.rdk', ['Section1']],
+  ['Example-09.c-PRM Automated Collision Avoidance - Comau.rdk', ['MainProgram', 'T1toT2']],
+];
+/** RoboDK post names whose post file is stale in RoboDK 5.9 (Fanuc_R30iA.py loads a missing v310 module): use the current one. */
+const RDK_POST: Record<string, string> = { Fanuc_R30iA: 'Fanuc_R30i' };
+
+const load = async (file: string) => {
+  const buf = readFileSync(path.join(LIB, file));
+  return (await importRdkBestEffort(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength), file, new AssetStore())).station;
+};
+const write = (name: string, job: any) => {
+  const dir = path.join(OUT, name);
+  mkdirSync(dir, { recursive: true });
+  // the numbers RoboDK's posts receive (6 significant digits, PosePP poses), so that RoboDK's posts and the studio's
+  // reconstruct the same matrices (src/posts/robopost.ts rdkPrecisionEvents)
+  const conv = (evs: any[]) => rdkPrecisionEvents(evs.map(eventFromJSON)).map((e) => { const o = eventToJSON(e); if (o.jointTarget && (o.kind === 'moveJ' || o.kind === 'moveL')) o.pose = null; return o; });
+  job.events = conv(job.events);
+  for (const s of job.subprograms ?? []) s.events = conv(s.events);
+  job.rdk_rounded = true;
+  writeFileSync(path.join(dir, 'job.json'), JSON.stringify(job, (_k, v) => (typeof v === 'number' ? +v.toPrecision(15) : v)));
+};
+const HEADER = (robot: string) => [`Program generated by VerticalBot Studio for ${robot} on 25/10/2026 12:00:00`, 'Using nominal kinematics.'];
+const safe = (s: string) => s.replace(/[^A-Za-z0-9]+/g, '_').replace(/^_|_$/g, '').slice(0, 48);
+
+it.skipIf(!GEN || process.env.POSTS_GT_GEN === 'lib')('posts GT: feature program jobs', async () => {
+  for (const [file, q, posts] of FEATURE) {
+    const station = await load(file);
+    const robot = station.itemsOfType<Robot>(ItemType.ROBOT)[0];
+    robot.setJoints(q);
+    const frame = new Frame('Frame 2');
+    frame.setPose(multiply(robot.poseAbs(), xyzrpwToPose(100, -50, 20, 0, 0, 30)));
+    station.addChild(frame);
+    const tool = new Tool('Tool 1');
+    tool.setPoseTool(xyzrpwToPose(10, 0, 120, 0, 15, 0));
+    robot.addChild(tool);
+    robot.setTool(tool);
+    const inFrame = (qq: number[]) => multiply(invert(frame.poseAbs()), multiply(robot.poseAbs(), robot.solveFK(qq, tool.poseTool())));
+    const mk = (name: string, qq: number[], joint = false) => { const t = new Target(name); frame.addChild(t); t.setPose(inFrame(qq)); t.joints = qq.slice(); t.robotId = robot.id; if (joint) t.isJointTarget = true; return t; };
+    const dq = (d: number[]) => q.map((v, i) => v + (d[i] ?? 0));
+    const tHome = mk('Home', q, true), tA = mk('Approach_A', dq([8, 4])), tVia = mk('CircVia', dq([4, 0, 5])), tEnd = mk('CircEnd', dq([-6, 3]));
+    const sub = new Program('SubPick'); sub.setRobot(robot); station.addChild(sub);
+    sub.addMoveL(tA); sub.setDO('7', true);
+    const p = new Program('FeatureTest'); p.setRobot(robot); station.addChild(p);
+    p.setFrame(frame); p.setTool(tool); p.setSpeed(300, 90, 1500, 400); p.setRounding(5);
+    p.addMoveJ(tHome); p.addMoveL(tA); p.addMoveC(tVia, tEnd); p.addMoveL(tA, { speed: 50, rounding: 0 });
+    p.setRounding(-1); p.addMoveL(tVia);
+    p.setDO('3', true); p.setDO('DO_GRIP', false); p.waitDI('5', true); p.waitDI('DI_PART', true, 2000);
+    p.pause(500); p.comment('a comment line'); p.showMessage('Hello operator');
+    p.runInstruction('MyFunc', true); p.runInstruction('SetRPM(5000)', true); p.runInstruction('RAW_CODE_LINE', false);
+    p.callProgram(sub); p.setSpeed(undefined as any, 45); p.setTool(tool); p.event('attach'); p.addMoveJ(tHome); p.pause(-1);
+    const c = compileForPost(station, p);
+    write(`feature_${safe(file.replace(/\.robot$/, ''))}`, toPostJob(c, { posts, header_comments: HEADER(c.robotName) }));
+  }
+}, 600_000);
+
+it.skipIf(!GEN || process.env.POSTS_GT_GEN === 'feature')('posts GT: Library program jobs', async () => {
+  for (const [file, names] of LIBRARY) {
+    if (!existsSync(path.join(LIB, file))) continue;
+    const station = await load(file);
+    for (const name of names) {
+      const pr = station.itemsOfType<Program>(ItemType.PROGRAM).find((x) => x.name === name);
+      const robot = pr?.robot();
+      if (!pr || !(robot instanceof Robot)) continue;
+      const post = RDK_POST[robot.postProcessor] ?? robot.postProcessor;
+      if (!post || post === 'Generic') continue;
+      const c = compileForPost(station, pr);
+      write(`lib_${safe(file.replace(/\.rdk$/, ''))}__${safe(pr.name)}`, toPostJob(c, { posts: [post], header_comments: HEADER(c.robotName) }));
+    }
+  }
+}, 900_000);

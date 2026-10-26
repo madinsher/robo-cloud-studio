@@ -1,0 +1,11 @@
+{
+ "ok": true,
+ "error": null,
+ "log": "",
+ "files": [
+  "SplitTest.prg",
+  "SplitTest_0.prg",
+  "SplitTest_1.prg",
+  "SplitTest_2.prg"
+ ]
+}

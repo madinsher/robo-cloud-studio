@@ -1,0 +1,11 @@
+{
+ "ok": true,
+ "error": null,
+ "log": "",
+ "files": [
+  "SplitTest.mod",
+  "SplitTest_0.mod",
+  "SplitTest_1.mod",
+  "SplitTest_2.mod"
+ ]
+}

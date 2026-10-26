@@ -8,7 +8,7 @@ import { FieldItem, MissionItem, CropRow, cropParams, CropType, CROP_PRESETS, Mi
 import { generateOrchard, buildFieldMap, rectPolygon, makeHeadlandZones, makeCanopyZones } from '../agri/orchard';
 import { planMission, generateHarvestProgram } from '../agri/missions';
 import { Component, makeConveyor, makeFeeder, makeProcess, makeSink, makeBuffer } from '../vc/component';
-import { dialog, MenuEntry, toast, downloadText, h, pickFiles } from './dom';
+import { dialog, MenuEntry, toast, downloadText, downloadBlob, h, pickFiles, pickFolder } from './dom';
 import { transl, mul, rotz, DEG, poseToXyzrpw, xyzrpwToPose, multiply, invert, getPos } from '../core/math/pose';
 import { ROBOT_LIBRARY } from '../core/items/library';
 import { ONLINE_ROBOT_LIBRARY, ONLINE_REPOS } from '../io/library/online_library';
@@ -62,9 +62,11 @@ export function itemContextMenu(app: App, item: Item): MenuEntry[] {
   if (item instanceof Tool && item.parent instanceof Robot) add({ label: 'Set as active tool', action: () => app.cmd(() => (item.parent as Robot).setTool(item)) });
   if (item instanceof Program) {
     add({ label: 'Run', action: () => app.runProgram(item) });
-    add({ label: 'Validate', action: () => { const r = app.sim.compile(item); toast(r.ok ? `OK: ${r.duration.toFixed(1)} s, ${(r.distance / 1000).toFixed(2)} m` : r.problems.map((p) => p.message).join('; '), r.ok ? 'ok' : 'error', 6000); } });
+    add({ label: 'Validate', action: () => { const r = app.validateProgram(item)!; toast(r.ok ? `OK: ${r.duration.toFixed(1)} s, ${(r.distance / 1000).toFixed(2)} m` : r.problems.map((p) => p.message).join('; '), r.ok ? 'ok' : 'error', 6000); } });
     add({ label: 'Export (post processor)…', action: () => exportDialog(app, item) });
   }
+  // RoboDK station Python program: Run = double-click in RoboDK (Pyodide in the browser, the server's CPython when connected)
+  if (item.type === ItemType.PROGRAM_PYTHON) add({ label: 'Run Python program', action: () => app.runProgram(item) });
   if (item instanceof FieldItem) {
     add({ label: 'Regenerate rows…', action: () => orchardDialog(app, item) });
     add({ label: 'Build navigation map', action: () => app.cmd(() => { app.station.addChild(buildFieldMap(item)); makeHeadlandZones(item); makeCanopyZones(item); }) });
@@ -236,6 +238,12 @@ export async function missionDialog(app: App): Promise<void> {
     { key: 'rows', label: 'Rows (e.g. 1-5,8; empty = all)', type: 'text', value: '' },
     { key: 'speed', label: 'Work speed (m/s)', type: 'number', value: 0.5, step: 0.1 },
     { key: 'bothSides', label: 'Work both sides of each row', type: 'checkbox', value: true },
+    // process settings (src/agri/process.ts; 0 / none = the process default)
+    { key: 'followUp', label: 'Follow-up task where problems are found (scout)', type: 'select', value: '', options: [{ value: '', label: 'none' }, ...types.filter((t) => t !== 'scout' && t !== 'transport').map((t) => ({ value: t, label: t }))] },
+    { key: 'tankL', label: 'Tank (L, spray / irrigate; 0 = default)', type: 'number', value: 0 },
+    { key: 'doseLPerM3', label: 'Dose (L per m³ of canopy; 0 = default 0.07)', type: 'number', value: 0, step: 0.01 },
+    { key: 'keepFruitPerPlant', label: 'Fruit kept per plant (thin; 0 = default)', type: 'number', value: 0 },
+    { key: 'binCapacityKg', label: 'Bin capacity (kg, harvest; 0 = default 400)', type: 'number', value: 0 },
     { key: 'plan', label: 'Plan now (create fleet tasks)', type: 'checkbox', value: true },
   ]);
   if (!r) return;
@@ -249,6 +257,8 @@ export async function missionDialog(app: App): Promise<void> {
     m.fleetId = r.fleet || null;
     m.rowIds = sel.map((x) => x.id);
     m.settings = { workSpeed: r.speed * 1000, bothSides: r.bothSides, sideOffset: field.crop.rowSpacing / 2, secondsPerFruit: 6 };
+    if (r.followUp) m.settings.followUp = r.followUp;
+    for (const k of ['tankL', 'doseLPerM3', 'keepFruitPerPlant', 'binCapacityKg'] as const) if (Number(r[k]) > 0) m.settings[k] = Number(r[k]);
     return m;
   });
   if (r.plan && r.fleet) runMissionPlan(app, mission);
@@ -299,15 +309,33 @@ export async function mapDialog(app: App): Promise<void> {
   });
 }
 
+/** Zone kinds offered by the zone dialog (ZoneKind in src/mobile/items.ts). */
+export const ZONE_KINDS: Array<[string, string]> = [
+  ['work', 'work'], ['nogo', 'nogo'], ['charging', 'charging'], ['loading', 'loading'], ['unloading', 'unloading'], ['parking', 'parking'],
+  ['speed_limit', 'speed_limit'], ['headland', 'headland'], ['gnss_denied', 'gnss_denied (canopy / indoor: no satellite fix)'],
+  ['lane', 'lane (single-lane traffic segment: at most capacity robots inside)'], ['depot', 'depot (equipment swap: capacity = slots)'],
+];
+
 export async function zoneDialog(app: App): Promise<void> {
   const r = await dialog<any>('Create zone', [
     { key: 'name', label: 'Name', type: 'text', value: 'Zone' },
-    { key: 'kind', label: 'Kind', type: 'select', value: 'charging', options: ['work', 'nogo', 'charging', 'loading', 'unloading', 'parking', 'speed_limit', 'headland', 'gnss_denied'].map((k) => ({ value: k, label: k === 'gnss_denied' ? 'gnss_denied (canopy / indoor: no satellite fix)' : k })) },
+    { key: 'kind', label: 'Kind', type: 'select', value: 'charging', options: ZONE_KINDS.map(([k, label]) => ({ value: k, label })) },
     { key: 'w', label: 'Width (m)', type: 'number', value: 4 },
     { key: 'h', label: 'Length (m)', type: 'number', value: 4 },
+    { key: 'capacity', label: 'Capacity (robots inside a lane / depot slots)', type: 'number', value: 1 },
+    { key: 'speed', label: 'Speed limit (m/s, speed_limit zones)', type: 'number', value: 0.5 },
+    { key: 'reconfig', label: 'Reconfiguration time per swap (s, depot)', type: 'number', value: 180 },
   ]);
   if (!r) return;
-  app.cmd(() => { const z = app.station.addChild(new ZoneItem(r.name)); z.kind = r.kind; z.polygon = rectPolygon(r.w * 1000, r.h * 1000, -r.w * 500, -r.h * 500); app.select(z); });
+  app.cmd(() => {
+    const z = app.station.addChild(new ZoneItem(r.name));
+    z.kind = r.kind;
+    z.polygon = rectPolygon(r.w * 1000, r.h * 1000, -r.w * 500, -r.h * 500);
+    if (r.kind === 'lane' || r.kind === 'depot') z.capacity = Math.max(1, Math.round(Number(r.capacity) || 1));
+    if (r.kind === 'speed_limit') z.speedLimit = Math.max(0, Number(r.speed) || 0) * 1000;
+    if (r.kind === 'depot') z.setParam('reconfigSeconds', Math.max(0, Number(r.reconfig) || 0));
+    app.select(z);
+  });
 }
 
 export async function componentDialog(app: App): Promise<void> {
@@ -475,19 +503,92 @@ export async function exportDialog(app: App, program: Program | null = app.activ
       toast(`Python post ${files[0].name} generated ${out.length} file(s)`, 'ok');
     } catch (e: any) { preview.textContent = `Python post failed: ${e.message ?? e}`; }
   } }, 'Run a RoboDK Python post (.py)…');
-  const body = h('div', null, h('div', { class: 'btn-row' }, pyBtn, h('span', { class: 'hint' }, 'Load any RoboDK post processor file (class RobotPost) and run it in the browser.')), preview);
-  const update = (v: Record<string, any>) => { const files = app.exportProgram(v.post, program); preview.textContent = files.map((f) => `# ---- ${f.name} ----\n${f.content}`).join('\n').slice(0, 20000); };
-  update({ post: posts.some((p) => p.id === def) ? def : 'Generic' });
+  // compiler problems and the post's own warnings (unreachable targets, truncated names, split programs, ...)
+  const problemsEl = h('ul', { class: 'problems export-problems' });
+  const body = h('div', null, h('div', { class: 'btn-row' }, pyBtn, h('span', { class: 'hint' }, 'Load any RoboDK post processor file (class RobotPost) and run it in the browser.')), problemsEl, preview);
+  const showProblems = (problems: string[]) => {
+    problemsEl.replaceChildren(...problems.slice(0, 50).map((pr) => h('li', { class: 'warn' }, pr)));
+    if (problems.length > 50) problemsEl.appendChild(h('li', { class: 'warn' }, `… ${problems.length - 50} more`));
+  };
+  // asynchronous generation (Python posts in Pyodide, RoboDK's native posts on the studio server): only the latest request is shown
+  let seq = 0;
+  const update = async (v: Record<string, any>) => {
+    const my = ++seq;
+    preview.textContent = 'Generating…';
+    try {
+      const { files, problems } = app.isAsyncPost(v.post) ? await app.exportProgramAsync(v.post, program) : app.exportProgramChecked(v.post, program);
+      if (my !== seq) return;
+      showProblems(problems);
+      preview.textContent = files.map((f) => `# ---- ${f.name} ----\n${f.encoding === 'base64' ? `(binary, ${Math.round((f.content.length * 3) / 4)} bytes)` : f.content}`).join('\n').slice(0, 20000);
+    } catch (e: any) { if (my === seq) { showProblems([]); preview.textContent = `Post processor failed: ${e?.message ?? e}`; } }
+  };
+  // the robot's post by id or by one of its RoboDK aliases ("Fanuc_R30i" -> Fanuc_R30iA)
+  const initial = posts.find((p) => p.id === def || ((p as { aliases?: string[] }).aliases ?? []).some((a) => a.toLowerCase() === String(def).toLowerCase()))?.id ?? 'Generic';
+  void update({ post: initial });
   const r = await dialog<{ post: string }>(`Export ${program.name}`, [
-    { key: 'post', label: 'Post processor', type: 'select', value: posts.some((p) => p.id === def) ? def : 'Generic', options: posts.map((p) => ({ value: p.id, label: `${p.name} (.${p.extension})` })) },
-  ], { width: 760, okLabel: 'Download', body, onChange: update });
+    { key: 'post', label: 'Post processor', type: 'select', value: initial, options: posts.map((p) => ({ value: p.id, label: `${p.name} (.${p.extension})` })) },
+  ], { width: 760, okLabel: 'Download', body, onChange: (v) => { void update(v); } });
   if (!r) return;
-  for (const f of app.exportProgram(r.post, program)) downloadText(f.name, f.content, f.mime);
+  try {
+    const { files, problems } = app.isAsyncPost(r.post) ? await app.exportProgramAsync(r.post, program) : app.exportProgramChecked(r.post, program);
+    for (const f of files) {
+      if (f.encoding === 'base64') downloadBlob(f.name, new Blob([Uint8Array.from(atob(f.content), (c) => c.charCodeAt(0))], { type: f.mime ?? 'application/octet-stream' }));
+      else downloadText(f.name, f.content, f.mime);
+    }
+    if (problems.length) toast(`${program.name}: ${problems.length} problem(s) — ${problems.slice(0, 2).join('; ')}`, 'warn', 8000);
+  } catch (e: any) { toast(`Post processor failed: ${e?.message ?? e}`, 'error', 8000); }
 }
 
 export async function importDialog(app: App): Promise<void> {
-  const files = await pickFiles('.vbstation,.json,.geojson,.urdf,.xacro,.stl,.obj,.step,.stp,.iges,.igs,.brep,.dh,.rdk,.robot,.tool,.sld,.src,.mod,.prg,.ls,.script,.csv,.txt,.nc,.gcode,.ngc,.tap,.pcd,.ply,.glb,.gltf,.dae,.zip,.vcmx,.vcm', true);
+  const files = await pickFiles('.vbstation,.json,.geojson,.urdf,.xacro,.stl,.obj,.step,.stp,.iges,.igs,.brep,.dh,.rdk,.robot,.tool,.sld,.src,.mod,.prg,.ls,.script,.csv,.txt,.nc,.gcode,.ngc,.tap,.pcd,.ply,.glb,.gltf,.dae,.zip,.vcmx,.vcm,.wbt,.proto', true);
   if (files.length) await app.openFiles(files);
+}
+
+/** Open a folder: a ROS package (package.xml, urdf/, meshes/) or a Webots project (worlds/*.wbt, protos/). */
+export async function importFolderDialog(app: App): Promise<void> {
+  const files = await pickFolder();
+  if (files.length) await app.openFiles(files);
+}
+
+/** `k:=v k2:=v2` (or `k=v`, one per line or space separated) -> args. */
+export function parseXacroArgs(s: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const m of String(s ?? '').matchAll(/([\w./-]+)\s*:?=\s*("[^"]*"|'[^']*'|[^\s]*)/g)) out[m[1]] = m[2].replace(/^["']|["']$/g, '');
+  return out;
+}
+
+/**
+ * Import choices of App.openProjects as dialogs: the world of a folder with several .wbt files, Webots world vs ROS
+ * description for packages that ship both, and the ROS description entry point with its xacro args (launch defaults
+ * prefilled; e.g. robot_name:=utp_a_02 slot_front:=lidar2d for murca_description, name:=ur5e for ur_description).
+ */
+export function importChoiceDialogs(): NonNullable<App['importUi']> {
+  return {
+    chooseWorld: async (worlds, def) => {
+      const r = await dialog<{ w: string }>('Open Webots world', [{ key: 'w', label: `${worlds.length} worlds in the folder`, type: 'select', value: def, options: worlds.map((w) => ({ value: w, label: w })) }], { okLabel: 'Open' });
+      return r?.w ?? null;
+    },
+    chooseKind: async (choices) => {
+      const r = await dialog<{ k: 'webots' | 'ros' }>('Open folder', [{ key: 'k', label: 'This folder holds both', type: 'select', value: choices[0].value, options: choices.map((c) => ({ value: c.value, label: c.label })) }], { okLabel: 'Open' });
+      return r?.k ?? null;
+    },
+    rosOptions: async ({ entries, imported, errors }) => {
+      if (!entries.length) return null;
+      const label = (e: { file: string; args: Record<string, string>; source: string }) => `${e.file}${e.source !== 'top-level' ? ` (${e.source.split('/').pop()})` : ''}`;
+      const first = entries[0];
+      const fmt = (a: Record<string, string>) => Object.entries(a).map(([k, v]) => `${k}:=${v}`).join(' ');
+      const body = h('div', null,
+        h('p', { class: 'hint' }, imported.length ? `Imported with the defaults: ${imported.join(', ')}. Pick another description or change its xacro arguments to import a variant.` : 'No robot was imported with the defaults.'),
+        ...errors.slice(0, 4).map((e) => h('p', { class: 'hint warn' }, e)));
+      const r = await dialog<{ entry: string; all: boolean; args: string }>('ROS robot description', [
+        { key: 'entry', label: 'Robot description (URDF / xacro entry point)', type: 'select', value: first.file, options: entries.map((e) => ({ value: e.file, label: label(e) })) },
+        { key: 'all', label: 'Import every description of the package', type: 'checkbox', value: false },
+        { key: 'args', label: 'xacro arguments (name:=value, space separated)', type: 'text', value: fmt(first.args), hint: 'Launch file defaults are prefilled; ROS needs every argument the xacro uses without a default.' },
+      ], { okLabel: 'Import', body });
+      if (!r) return null;
+      return { entries: r.all ? entries.map((e) => e.file) : [r.entry], args: parseXacroArgs(r.args) };
+    },
+  };
 }
 
 export async function robotParametersDialog(app: App, robot: Robot): Promise<void> {

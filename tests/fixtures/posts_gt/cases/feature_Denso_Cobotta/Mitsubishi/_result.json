@@ -1,0 +1,9 @@
+{
+ "ok": true,
+ "error": null,
+ "log": "setSpeedJoints not defined\nsetAccelerationJoints not defined\nsetSpeedJoints not defined\n",
+ "files": [
+  "FEATURETEST.prg",
+  "SUBPICK.prg"
+ ]
+}

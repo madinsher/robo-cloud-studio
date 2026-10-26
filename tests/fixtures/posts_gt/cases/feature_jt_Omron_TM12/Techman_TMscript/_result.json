@@ -1,0 +1,8 @@
+{
+ "ok": true,
+ "error": null,
+ "log": "Linear movement using joint targets is not supported. Change the target type to cartesian or use a joint movement.\nLinear movement using joint targets is not supported. Change the target type to cartesian or use a joint movement.\nLinear movement using joint targets is not supported. Change the target type to cartesian or use a joint movement.\nLinear movement using joint targets is not supported. Change the target type to cartesian or use a joint movement.\n",
+ "files": [
+  "JointTargets.scpt"
+ ]
+}

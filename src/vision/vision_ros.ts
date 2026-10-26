@@ -3,10 +3,53 @@
  * (yolo_ros / Isaac ROS / ultralytics node), tracker, depth → 3D positions, static hand-eye TF, point-cloud
  * pipeline node (Open3D), VLM and VLA bridge nodes with the endpoints configured in the studio, README.
  */
-import { zipSync, strToU8 } from 'fflate';
-import type { Camera as CameraItem } from '../core/items/item';
-import { poseToXyzrpw, fromArray } from '../core/math/pose';
+import { zipSync, strToU8, Zippable } from 'fflate';
+import type { Camera as CameraItem, Item } from '../core/items/item';
+import { ItemType } from '../core/items/item';
+import { Robot } from '../core/items/robot';
+import { Mat4, fromArray, multiply, invert, rotx, rotz } from '../core/math/pose';
 import { VisionStackConfig, VISION_SENSORS, COMPUTE_TARGETS, VISION_MODELS, VisionSensor, TASK_LABELS } from './stack';
+import { cameraIntrinsics } from './camera_model';
+import { toRosYaml } from '../ros/yaml';
+
+// ---------------------------------------------------------------------------------------------
+// Frames: the studio camera item IS the optical frame (+Z forward, +X right, +Y down). ROS (REP 103 / 105):
+// camera_link is the body frame (+X forward, +Y left, +Z up), camera_optical_frame = camera_link · R_lo with the
+// static TF "--roll -π/2 --yaw -π/2" (R_lo = Rz(−90°)·Rx(−90°)).
+// ---------------------------------------------------------------------------------------------
+
+/** camera_link → camera_optical_frame rotation (what `static_transform_publisher --roll -1.5708 --yaw -1.5708` builds). */
+export const LINK_TO_OPTICAL: Mat4 = multiply(rotz(-Math.PI / 2), rotx(-Math.PI / 2));
+/** Body-frame pose (camera_link) from the studio optical pose. */
+export function opticalToLink(optical: Mat4): Mat4 { return multiply(optical, invert(LINK_TO_OPTICAL)); }
+/** ROS roll/pitch/yaw (rad) of a rotation: R = Rz(yaw)·Ry(pitch)·Rx(roll) (tf2 / URDF / static_transform_publisher). */
+export function rosRpy(m: ArrayLike<number>): [number, number, number] {
+  const r20 = m[2], r21 = m[6], r22 = m[10], r10 = m[1], r00 = m[0];
+  const pitch = Math.asin(Math.max(-1, Math.min(1, -r20)));
+  if (Math.abs(r20) > 0.999999) { const yaw = Math.atan2(-m[4], m[5]); return [0, pitch, yaw]; }
+  return [Math.atan2(r21, r22), pitch, Math.atan2(r10, r00)];
+}
+function rootOf(it: Item): Item { let r = it; while (r.parent) r = r.parent; return r; }
+function robotAbove(it: Item): Robot | null { for (let p = it.parent; p; p = p.parent) if (p instanceof Robot) return p; return null; }
+
+/**
+ * Hand-eye transform of the camera for the exported package: camera_link pose (mm) in `tool0` (eye-in-hand, the robot
+ * flange) or `base_link` (eye-to-hand, the first robot of the station; `world` when there is none). `cfg.handEye`
+ * (optical pose in that parent, from a calibration) wins over the scene.
+ */
+export function handEyeLink(cam: CameraItem, cfg: VisionStackConfig): { parent: string; link: Mat4; optical: Mat4 } {
+  let parent: string, optical: Mat4;
+  if (cfg.handEyeMode === 'eye_to_hand') {
+    const robot = (rootOf(cam).walk ? [...rootOf(cam).walk()].find((x) => x instanceof Robot) : undefined) as Robot | undefined;
+    parent = robot ? 'base_link' : 'world';
+    optical = cfg.handEye?.length === 16 ? fromArray(cfg.handEye) : robot ? multiply(invert(robot.poseAbs()), cam.poseAbs()) : cam.poseAbs();
+  } else {
+    const robot = robotAbove(cam);
+    parent = 'tool0';
+    optical = cfg.handEye?.length === 16 ? fromArray(cfg.handEye) : robot ? multiply(invert(multiply(robot.poseAbs(), robot.fk().flange)), cam.poseAbs()) : cam.pose();
+  }
+  return { parent, link: opticalToLink(optical), optical };
+}
 
 export interface RosVisionPackage { name: string; files: Record<string, string>; packages: string[]; notes: string[] }
 
@@ -28,7 +71,10 @@ const DRIVER_LAUNCH: Record<string, (s: VisionSensor, ns: string) => { pkg: stri
   prophesee_evk: () => ({ pkg: 'metavision_driver', node: 'driver_node', params: { serial: '' }, topics: { image: 'event_camera/events', info: '' } }),
 };
 
-const yaml = (o: Record<string, unknown>, ind = 0): string => Object.entries(o).map(([k, v]) => v && typeof v === 'object' && !Array.isArray(v) ? `${' '.repeat(ind)}${k}:\n${yaml(v as Record<string, unknown>, ind + 2)}` : `${' '.repeat(ind)}${k}: ${Array.isArray(v) ? JSON.stringify(v) : typeof v === 'string' ? JSON.stringify(v) : v}`).join('\n');
+/** Integer ROS parameters of the generated configs (everything else numeric is a double, as the nodes declare). */
+export const VISION_INT_PARAMS = ['imgsz_width', 'imgsz_height', 'image_reliability', 'max_det', 'track_buffer', 'depth_image_units_divisor', 'depth_image_reliability', 'depth_info_reliability', 'min_points'];
+/** Typed ROS 2 parameter YAML (src/ros/yaml.ts): doubles always with a '.', the integer parameters as integers. */
+const yaml = (o: Record<string, unknown>): string => toRosYaml(o, { intKeys: VISION_INT_PARAMS }).trimEnd();
 
 export function generateRosVisionPackage(cam: CameraItem, cfg: VisionStackConfig, opts: { packageName?: string; namespace?: string } = {}): RosVisionPackage {
   const s = VISION_SENSORS.find((x) => x.id === cfg.sensor) ?? VISION_SENSORS[0];
@@ -47,9 +93,11 @@ export function generateRosVisionPackage(cam: CameraItem, cfg: VisionStackConfig
   const yoloTask = models.segment ? 'segment' : models.keypoints ? 'pose' : 'detect';
   const hasDepth = !!drv.topics.depth;
   const isLidar = s.modality === 'lidar3d';
-  // hand-eye static transform
-  const he = cfg.handEye && cfg.handEye.length === 16 ? poseToXyzrpw(fromArray(cfg.handEye)) : poseToXyzrpw(cam.pose());
-  const parentFrame = cfg.handEyeMode === 'eye_to_hand' ? 'base_link' : 'tool0';
+  // hand-eye static transform: parent → camera_link (body frame), ROS rpy in degrees for the writers below
+  const hel = handEyeLink(cam, cfg);
+  const rpy = rosRpy(hel.link);
+  const he = [hel.link[12], hel.link[13], hel.link[14], ...rpy.map((r) => (r * 180) / Math.PI)];
+  const parentFrame = hel.parent;
   const M = (v: number) => (v / 1000).toFixed(4), R = (d: number) => ((d * Math.PI) / 180).toFixed(5);
 
   files['config/detector.yaml'] = `# ${det?.name ?? 'detector'} — ${TASK_LABELS[yoloTask === 'pose' ? 'keypoints' : yoloTask]}\n` + yaml({ yolo_node: { ros__parameters: { model: cfg.modelUrl ? cfg.modelUrl.split('/').pop() : `${det?.id ?? 'yolov8n'}${tensorrt ? '.engine' : '.pt'}`, model_type: det?.family === 'detr' ? 'RTDETR' : det?.id === 'yolo_world' ? 'World' : 'YOLO', task: yoloTask, device, threshold: cfg.confidence, iou: cfg.iou, imgsz_width: cfg.inputSize ?? 640, imgsz_height: cfg.inputSize ?? 640, half: tensorrt, input_image_topic: drv.topics.image, image_reliability: 2, classes: cfg.classes, enable: true } } });
@@ -73,55 +121,175 @@ export function generateRosVisionPackage(cam: CameraItem, cfg: VisionStackConfig
     packages.add('moveit_servo');
     notes.push('vla_bridge.py publishes TwistStamped deltas for moveit_servo (or your own Cartesian controller) at rate_hz — keep the safety stop wired');
   }
-  files['launch/perception.launch.py'] = LAUNCH_PY(name, drv, s, !!det, hasDepth, isLidar, cfg, parentFrame, ns, he);
+  files['launch/perception.launch.py'] = LAUNCH_PY(name, drv, s, !!det, hasDepth, isLidar, cfg, parentFrame, ns, he, studioCameraTopics(cam));
+  if (det) packages.add('yolo_ros');
+  for (const p of ['launch', 'launch_ros', 'ament_index_python']) packages.add(p);
   files['package.xml'] = `<?xml version="1.0"?>\n<package format="3">\n  <name>${name}</name>\n  <version>0.1.0</version>\n  <description>Perception stack generated by VerticalBot Studio for ${cam.name}: ${s.name} on ${c.name}; ${Object.values(models).map((m) => m.name).join(', ')}</description>\n  <maintainer email="robotics@example.com">VerticalBot</maintainer>\n  <license>Apache-2.0</license>\n${[...packages].map((p) => `  <exec_depend>${p}</exec_depend>`).join('\n')}\n  <export><build_type>ament_python</build_type></export>\n</package>\n`;
-  files['setup.py'] = `from setuptools import setup\nimport glob\npackage_name = '${name}'\nsetup(name=package_name, version='0.1.0', packages=[], data_files=[('share/ament_index/resource_index/packages', ['resource/' + package_name]), ('share/' + package_name, ['package.xml']), ('share/' + package_name + '/launch', glob.glob('launch/*.py')), ('share/' + package_name + '/config', glob.glob('config/*.yaml')), ('lib/' + package_name, glob.glob('scripts/*.py'))], install_requires=['setuptools'], zip_safe=True)\n`;
+  // python nodes: a real ament_python package (module + console_scripts), so `ros2 run` / launch find the
+  // executables without relying on file modes; scripts/ keeps runnable copies (exec bit set in the zip)
+  const nodes = Object.keys(files).filter((f) => /^scripts\/.+\.py$/.test(f)).map((f) => f.slice(8, -3));
+  for (const n of nodes) files[`${name}/${n}.py`] = files[`scripts/${n}.py`];
+  files[`${name}/__init__.py`] = '';
+  files['setup.cfg'] = `[develop]\nscript_dir=$base/lib/${name}\n[install]\ninstall_scripts=$base/lib/${name}\n`;
+  files['setup.py'] = `from setuptools import setup\nimport glob\npackage_name = '${name}'\nsetup(name=package_name, version='0.1.0', packages=[package_name], data_files=[('share/ament_index/resource_index/packages', ['resource/' + package_name]), ('share/' + package_name, ['package.xml']), ('share/' + package_name + '/launch', glob.glob('launch/*.py')), ('share/' + package_name + '/config', glob.glob('config/*.yaml'))], install_requires=['setuptools'], zip_safe=True, entry_points={'console_scripts': [${nodes.map((n) => `'${n} = ${name}.${n}:main'`).join(', ')}]})\n`;
   files[`resource/${name}`] = '';
   files['README.md'] = README(name, cam, cfg, s, c, models, drv, notes);
   return { name, files, packages: [...packages], notes };
 }
 
+/** Zip with Unix modes: scripts 0755, everything else 0644 (unzip / colcon keep them). */
 export function rosVisionPackageZip(pkg: RosVisionPackage): Uint8Array {
-  const entries: Record<string, Uint8Array> = {};
-  for (const [p, c] of Object.entries(pkg.files)) entries[`${pkg.name}/${p}`] = strToU8(c);
+  const entries: Zippable = {};
+  for (const [p, c] of Object.entries(pkg.files)) entries[`${pkg.name}/${p}`] = [strToU8(c), { os: 3, attrs: ((/^scripts\/.+\.py$/.test(p) ? 0o100755 : 0o100644) << 16) >>> 0 }];
   return zipSync(entries, { level: 6 });
 }
 
-function LAUNCH_PY(name: string, drv: ReturnType<(typeof DRIVER_LAUNCH)[string]>, s: VisionSensor, hasDet: boolean, hasDepth: boolean, isLidar: boolean, cfg: VisionStackConfig, parentFrame: string, ns: string, he: number[]): string {
+// ---------------------------------------------------------------------------------------------
+// Studio camera → ROS 2 messages (rosbridge JSON): Image, CameraInfo with the render K, 32FC1 depth, TF
+// ---------------------------------------------------------------------------------------------
+
+export interface RosPublisherLike { publish(topic: string, type: string, msg: any): void }
+const header = (frame: string, t: number) => ({ stamp: { sec: Math.floor(t), nanosec: Math.round((t - Math.floor(t)) * 1e9) % 1000000000 }, frame_id: frame });
+function b64(u8: Uint8Array): string {
+  const B = (globalThis as any).Buffer;
+  if (B) return B.from(u8.buffer, u8.byteOffset, u8.byteLength).toString('base64');
+  let s = ''; for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode(...u8.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+/**
+ * sensor_msgs/CameraInfo with the same K the studio renders with (plumb_bob, no distortion). ROS puts pixel centres at
+ * integer coordinates while the studio model (and OpenGL) puts them at +0.5, so the published principal point is
+ * (W/2 − 0.5, H/2 − 0.5): u = fx·x/z + cx lands exactly on the rendered pixel. (webots_ros2 publishes W/2, H/2.)
+ */
+export function cameraInfoMsg(cam: CameraItem, frameId: string, timeS = 0, width = cam.width, height = cam.height) {
+  const K = cameraIntrinsics(cam, width, height);
+  const cx = K.cx - 0.5, cy = K.cy - 0.5;
+  return { header: header(frameId, timeS), height, width, distortion_model: 'plumb_bob', d: [0, 0, 0, 0, 0], k: [K.fx, 0, cx, 0, K.fy, cy, 0, 0, 1], r: [1, 0, 0, 0, 1, 0, 0, 0, 1], p: [K.fx, 0, cx, 0, 0, K.fy, cy, 0, 0, 0, 1, 0], binning_x: 0, binning_y: 0, roi: { x_offset: 0, y_offset: 0, height: 0, width: 0, do_rectify: false } };
+}
+/** sensor_msgs/Image from RGBA pixels (row 0 = top); `data` is base64 (rosbridge uint8[]). */
+export function imageMsg(rgba: Uint8Array | Uint8ClampedArray, width: number, height: number, frameId: string, timeS = 0, encoding: 'rgb8' | 'bgr8' | 'rgba8' | 'bgra8' = 'rgb8') {
+  const ch = encoding.length === 5 ? 4 : 3, bgr = encoding.startsWith('bgr');
+  const out = new Uint8Array(width * height * ch);
+  for (let i = 0; i < width * height; i++) { const s = i * 4, d = i * ch; out[d] = rgba[s + (bgr ? 2 : 0)]; out[d + 1] = rgba[s + 1]; out[d + 2] = rgba[s + (bgr ? 0 : 2)]; if (ch === 4) out[d + 3] = rgba[s + 3]; }
+  return { header: header(frameId, timeS), height, width, encoding, is_bigendian: 0, step: width * ch, data: b64(out) };
+}
+/** sensor_msgs/Image 32FC1 depth in metres (REP 118: NaN = no measurement) from depth in mm along the optical Z. */
+export function depthImageMsg(depthMm: Float32Array, width: number, height: number, frameId: string, timeS = 0) {
+  const f = new Float32Array(width * height);
+  for (let i = 0; i < f.length; i++) f[i] = depthMm[i] > 0 ? depthMm[i] / 1000 : NaN;
+  const u8 = new Uint8Array(f.buffer);
+  const le = new Uint8Array(new Uint16Array([1]).buffer)[0] === 1;
+  if (!le) for (let i = 0; i < u8.length; i += 4) { const a = u8[i], b = u8[i + 1]; u8[i] = u8[i + 3]; u8[i + 1] = u8[i + 2]; u8[i + 2] = b; u8[i + 3] = a; }
+  return { header: header(frameId, timeS), height, width, encoding: '32FC1', is_bigendian: 0, step: width * 4, data: b64(u8) };
+}
+const tfOf = (m: Mat4, parent: string, child: string, t: number) => {
+  // quaternion from the rotation matrix
+  const tr = m[0] + m[5] + m[10]; let qw: number, qx: number, qy: number, qz: number;
+  if (tr > 0) { const s = Math.sqrt(tr + 1) * 2; qw = s / 4; qx = (m[6] - m[9]) / s; qy = (m[8] - m[2]) / s; qz = (m[1] - m[4]) / s; }
+  else if (m[0] > m[5] && m[0] > m[10]) { const s = Math.sqrt(1 + m[0] - m[5] - m[10]) * 2; qw = (m[6] - m[9]) / s; qx = s / 4; qy = (m[4] + m[1]) / s; qz = (m[8] + m[2]) / s; }
+  else if (m[5] > m[10]) { const s = Math.sqrt(1 + m[5] - m[0] - m[10]) * 2; qw = (m[8] - m[2]) / s; qx = (m[4] + m[1]) / s; qy = s / 4; qz = (m[9] + m[6]) / s; }
+  else { const s = Math.sqrt(1 + m[10] - m[0] - m[5]) * 2; qw = (m[1] - m[4]) / s; qx = (m[8] + m[2]) / s; qy = (m[9] + m[6]) / s; qz = s / 4; }
+  return { header: header(parent, t), child_frame_id: child, transform: { translation: { x: m[12] / 1000, y: m[13] / 1000, z: m[14] / 1000 }, rotation: { x: qx, y: qy, z: qz, w: qw } } };
+};
+/** tf2_msgs/TFMessage: world → <cam>_link (body) and <cam>_link → <cam>_optical_frame from the studio camera pose. */
+export function cameraTfMsg(cam: CameraItem, opts: { worldFrame?: string; prefix?: string; timeS?: number } = {}) {
+  const pre = opts.prefix ?? cam.name.toLowerCase().replace(/[^a-z0-9]+/g, '_');
+  const t = opts.timeS ?? 0;
+  return { transforms: [tfOf(opticalToLink(cam.poseAbs()), opts.worldFrame ?? 'map', `${pre}_link`, t), tfOf(LINK_TO_OPTICAL, `${pre}_link`, `${pre}_optical_frame`, t)] };
+}
+export interface CameraTopics { image?: string; info?: string; depth?: string; depthInfo?: string; tf?: string }
+/** Topic prefix of a camera in the studio: `<cam>` (lower-case, `_` for other characters). */
+export const cameraTopicName = (cam: CameraItem) => cam.name.toLowerCase().replace(/[^a-z0-9]+/g, '_');
+/** ROS namespace the studio publishes a camera under: the namespace of the mobile robot carrying it ('' when fixed). */
+export function cameraNamespace(cam: CameraItem): string {
+  for (let p = cam.parent; p; p = p.parent) { const n = (p as { rosNamespace?: string }).rosNamespace; if (p.type === ItemType.MOBILE_ROBOT && n) return `/${n.replace(/^\/+|\/+$/g, '')}`; }
+  return '';
+}
+/** The topics the studio publishes a camera on (RosTwin `sim` mode, Vision tab "Publish to ROS 2"): publishCameraFrame defaults. */
+export function studioCameraTopics(cam: CameraItem, namespace = cameraNamespace(cam)): { image: string; info: string; depth: string; depthInfo: string; frame: string } {
+  const base = `${namespace.replace(/\/$/, '')}/${cameraTopicName(cam)}`;
+  return { image: `${base}/image_raw`, info: `${base}/camera_info`, depth: `${base}/depth/image_raw`, depthInfo: `${base}/depth/camera_info`, frame: `${cameraTopicName(cam)}_optical_frame` };
+}
+/**
+ * Publish one camera frame: color Image (`encoding`, MURKA uses bgra8), CameraInfo (render K), 32FC1 depth with its
+ * CameraInfo, and the camera TF. Topics default to `<ns>/<cam>/image_raw`, `/camera_info`, `/depth/image_raw`.
+ */
+export function publishCameraFrame(ros: RosPublisherLike, cam: CameraItem, frame: { rgba?: Uint8Array | Uint8ClampedArray; depth?: Float32Array; width?: number; height?: number; timeS?: number }, opts: { namespace?: string; topics?: CameraTopics; encoding?: 'rgb8' | 'bgr8' | 'rgba8' | 'bgra8'; worldFrame?: string; tf?: boolean } = {}): string[] {
+  const pre = cameraTopicName(cam);
+  const st = studioCameraTopics(cam, opts.namespace ?? '');
+  const tp = { image: st.image, info: st.info, depth: st.depth, depthInfo: st.depthInfo, tf: '/tf', ...(opts.topics ?? {}) };
+  const w = frame.width ?? cam.width, h = frame.height ?? cam.height, t = frame.timeS ?? 0, optical = `${pre}_optical_frame`;
+  const out: string[] = [];
+  if (frame.rgba) { ros.publish(tp.image, 'sensor_msgs/msg/Image', imageMsg(frame.rgba, w, h, optical, t, opts.encoding ?? 'rgb8')); out.push(tp.image); }
+  ros.publish(tp.info, 'sensor_msgs/msg/CameraInfo', cameraInfoMsg(cam, optical, t, w, h)); out.push(tp.info);
+  if (frame.depth) { ros.publish(tp.depth, 'sensor_msgs/msg/Image', depthImageMsg(frame.depth, w, h, optical, t)); ros.publish(tp.depthInfo, 'sensor_msgs/msg/CameraInfo', cameraInfoMsg(cam, optical, t, w, h)); out.push(tp.depth, tp.depthInfo); }
+  if (opts.tf !== false) { ros.publish(tp.tf, 'tf2_msgs/msg/TFMessage', cameraTfMsg(cam, { worldFrame: opts.worldFrame, prefix: pre, timeS: t })); out.push(tp.tf); }
+  return out;
+}
+
+function LAUNCH_PY(name: string, drv: ReturnType<(typeof DRIVER_LAUNCH)[string]>, s: VisionSensor, hasDet: boolean, hasDepth: boolean, isLidar: boolean, cfg: VisionStackConfig, parentFrame: string, ns: string, he: number[], studio: { image: string; info: string; depth: string; depthInfo: string; frame: string }): string {
   const M = (v: number) => (v / 1000).toFixed(4), R = (d: number) => ((d * Math.PI) / 180).toFixed(5);
   const driverIsLaunch = drv.node.endsWith('.py');
+  const q = (v: string | undefined) => `'${v ?? ''}'`;
+  const imgParam = drv.topics.image || 'image_raw';
   return `# Generated by VerticalBot Studio — perception bring-up for ${s.name}
+#   ros2 launch ${name} perception.launch.py                 # the real sensor (driver ${drv.pkg})
+#   ros2 launch ${name} perception.launch.py source:=studio  # the studio's simulated camera (Connect > ROS 2, sim mode)
+# Packages that are not installed (driver, yolo_ros) are skipped with a log line instead of failing the launch.
 import os
-from ament_index_python.packages import get_package_share_directory
+from ament_index_python.packages import get_package_share_directory, PackageNotFoundError
 from launch import LaunchDescription
-from launch.actions import IncludeLaunchDescription
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, LogInfo, OpaqueFunction
 from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
-def generate_launch_description():
+# camera streams: the driver's topics, or the ones the studio publishes for this camera
+TOPICS = {
+    'driver': {'image': ${q(drv.topics.image)}, 'info': ${q(drv.topics.info)}, 'depth': ${q(drv.topics.depth)}, 'depth_info': ${q(drv.topics.info)}},
+    'studio': {'image': ${q(studio.image)}, 'info': ${q(studio.info)}, 'depth': ${q(studio.depth)}, 'depth_info': ${q(studio.depthInfo)}},
+}
+
+
+def opt(package, make):
+    """The action when \`package\` is installed, else a log line (see README for the install commands)."""
+    try:
+        get_package_share_directory(package)
+    except PackageNotFoundError:
+        return [LogInfo(msg=f"package '{package}' is not installed: skipped (see README)")]
+    return [make()]
+
+
+def launch_setup(context, *args, **kwargs):
+    source = LaunchConfiguration('source').perform(context)
+    T = TOPICS.get(source, TOPICS['driver'])
     share = get_package_share_directory('${name}')
     cfg = lambda f: os.path.join(share, 'config', f)
-    nodes = []
-    # 1. sensor driver (${drv.pkg})
-${driverIsLaunch ? `    try:
-        drv_share = get_package_share_directory('${drv.pkg}')
-        nodes.append(IncludeLaunchDescription(PythonLaunchDescriptionSource(os.path.join(drv_share, 'launch', '${drv.node}')), launch_arguments={${Object.entries(drv.params).filter(([, v]) => typeof v !== 'object').map(([k, v]) => `'${k}': '${v}'`).join(', ')}}.items()))
-    except Exception as e:  # driver package not installed
-        print('driver ${drv.pkg} not found:', e)` : `    nodes.append(Node(package='${drv.pkg}', executable='${drv.node}', name='camera', namespace='${ns.replace(/\/$/, '')}', parameters=[${JSON.stringify(drv.params).replace(/"/g, "'")}]))`}
-    # 2. static hand-eye transform (${cfg.handEyeMode ?? 'eye_in_hand'}): ${parentFrame} -> camera_link
-    nodes.append(Node(package='tf2_ros', executable='static_transform_publisher', name='hand_eye_tf', arguments=['--x', '${M(he[0])}', '--y', '${M(he[1])}', '--z', '${M(he[2])}', '--roll', '${R(he[3])}', '--pitch', '${R(he[4])}', '--yaw', '${R(he[5])}', '--frame-id', '${parentFrame}', '--child-frame-id', '${ns}camera_link']))
-    nodes.append(Node(package='tf2_ros', executable='static_transform_publisher', name='optical_tf', arguments=['--roll', '-1.5708', '--pitch', '0', '--yaw', '-1.5708', '--frame-id', '${ns}camera_link', '--child-frame-id', '${ns}camera_optical_frame']))
+    nodes = [LogInfo(msg=f"perception source: {source} (image {T['image']}${hasDepth ? ", depth {T['depth']}" : ''})")]
+    if source == 'driver':
+        # 1. sensor driver (${drv.pkg})
+${driverIsLaunch ? `        nodes += opt('${drv.pkg}', lambda: IncludeLaunchDescription(PythonLaunchDescriptionSource(os.path.join(get_package_share_directory('${drv.pkg}'), 'launch', '${drv.node}')), launch_arguments={${Object.entries(drv.params).filter(([, v]) => typeof v !== 'object').map(([k, v]) => `'${k}': '${v}'`).join(', ')}}.items()))` : `        nodes += opt('${drv.pkg}', lambda: Node(package='${drv.pkg}', executable='${drv.node}', name='camera', namespace='${ns.replace(/\/$/, '')}', parameters=[${JSON.stringify(drv.params).replace(/"/g, "'")}]))`}
+        # 2. static hand-eye transform (${cfg.handEyeMode ?? 'eye_in_hand'}): ${parentFrame} -> camera_link (the studio publishes its own camera TF)
+        nodes.append(Node(package='tf2_ros', executable='static_transform_publisher', name='hand_eye_tf', arguments=['--x', '${M(he[0])}', '--y', '${M(he[1])}', '--z', '${M(he[2])}', '--roll', '${R(he[3])}', '--pitch', '${R(he[4])}', '--yaw', '${R(he[5])}', '--frame-id', '${parentFrame}', '--child-frame-id', '${ns}camera_link']))
+        nodes.append(Node(package='tf2_ros', executable='static_transform_publisher', name='optical_tf', arguments=['--roll', '-1.5708', '--pitch', '0', '--yaw', '-1.5708', '--frame-id', '${ns}camera_link', '--child-frame-id', '${ns}camera_optical_frame']))
 ${hasDet ? `    # 3. detector + tracker (yolo_ros: https://github.com/mgonzs13/yolo_ros)
-    nodes.append(Node(package='yolo_ros', executable='yolo_node', name='yolo_node', parameters=[cfg('detector.yaml')], remappings=[('image_raw', '${drv.topics.image}')]))
-    nodes.append(Node(package='yolo_ros', executable='tracking_node', name='tracking_node', parameters=[cfg('tracker.yaml')], remappings=[('image_raw', '${drv.topics.image}')]))
-${hasDepth ? `    # 4. 2D detections + depth -> 3D poses (vision_msgs/Detection3DArray in base_link)
-    nodes.append(Node(package='yolo_ros', executable='detect_3d_node', name='detect_3d_node', parameters=[cfg('detect_3d.yaml')], remappings=[('depth_image', '${drv.topics.depth}'), ('depth_info', '${drv.topics.info}')]))
-` : ''}    nodes.append(Node(package='yolo_ros', executable='debug_node', name='debug_node', remappings=[('image_raw', '${drv.topics.image}')]))
+    nodes += opt('yolo_ros', lambda: Node(package='yolo_ros', executable='yolo_node', name='yolo_node', parameters=[cfg('detector.yaml'), {'input_image_topic': T['image']}], remappings=[('image_raw', T['image'])]))
+    nodes += opt('yolo_ros', lambda: Node(package='yolo_ros', executable='tracking_node', name='tracking_node', parameters=[cfg('tracker.yaml')], remappings=[('image_raw', T['image'])]))
+${hasDepth ? `    # 4. 2D detections + depth -> 3D poses (vision_msgs/Detection3DArray in base_link; the studio camera TF hangs from map)
+    nodes += opt('yolo_ros', lambda: Node(package='yolo_ros', executable='detect_3d_node', name='detect_3d_node', parameters=[cfg('detect_3d.yaml'), {'depth_image_topic': T['depth'], 'depth_info_topic': T['depth_info']}] + ([{'target_frame': 'map'}] if source == 'studio' else []), remappings=[('depth_image', T['depth']), ('depth_info', T['depth_info'])]))
+` : ''}    nodes += opt('yolo_ros', lambda: Node(package='yolo_ros', executable='debug_node', name='debug_node', remappings=[('image_raw', T['image'])]))
 ` : ''}${isLidar || cfg.tasks.some((t) => t === 'cloud_detect' || t === 'cloud_segment') ? `    # point-cloud pipeline: voxel -> ground -> clusters -> Detection3DArray + rows
-    nodes.append(Node(package='${name}', executable='cloud_pipeline.py', name='cloud_pipeline', parameters=[cfg('cloud_pipeline.yaml')]))
-` : ''}${cfg.tasks.includes('vlm_query') || cfg.runtime === 'vlm' ? `    nodes.append(Node(package='${name}', executable='vlm_bridge.py', name='vlm_bridge', parameters=[cfg('vlm.yaml')]))
-` : ''}${cfg.tasks.includes('vla_policy') ? `    nodes.append(Node(package='${name}', executable='vla_bridge.py', name='vla_bridge', parameters=[cfg('vla.yaml')]))
-` : ''}    return LaunchDescription(nodes)
+    nodes.append(Node(package='${name}', executable='cloud_pipeline', name='cloud_pipeline', parameters=[cfg('cloud_pipeline.yaml')]))
+` : ''}${cfg.tasks.includes('vlm_query') || cfg.runtime === 'vlm' ? `    nodes.append(Node(package='${name}', executable='vlm_bridge', name='vlm_bridge', parameters=[cfg('vlm.yaml')], remappings=[('${imgParam}', T['image'])]))
+` : ''}${cfg.tasks.includes('vla_policy') ? `    nodes.append(Node(package='${name}', executable='vla_bridge', name='vla_bridge', parameters=[cfg('vla.yaml')], remappings=[('${imgParam}', T['image'])]))
+` : ''}    return nodes
+
+
+def generate_launch_description():
+    return LaunchDescription([
+        DeclareLaunchArgument('source', default_value='driver', choices=['driver', 'studio'], description='driver: the real sensor; studio: the camera simulated by VerticalBot Studio (${studio.image})'),
+        OpaqueFunction(function=launch_setup),
+    ])
 `;
 }
 
@@ -399,13 +567,18 @@ cd ~/ros2_ws/src && git clone https://github.com/mgonzs13/yolo_ros.git && pip3 i
 # models: export from Ultralytics -> put next to the launch or give an absolute path in config/detector.yaml
 yolo export model=${models.detect?.id ?? 'yolov8n'}.pt format=${c.runtimes.includes('tensorrt') ? 'engine half=True' : 'onnx'}
 cd ~/ros2_ws && colcon build --symlink-install && source install/setup.bash
-ros2 launch ${name} perception.launch.py
+ros2 launch ${name} perception.launch.py                 # real sensor
+ros2 launch ${name} perception.launch.py source:=studio  # the studio's simulated ${cam.name} (Connect › ROS 2, sim mode)
 \`\`\`
+
+Packages that are not installed (the driver, yolo_ros) are skipped with a log line, so the launch also starts on a
+stock ROS 2 install (static TFs only) and tells you what is missing.
 
 ## Topics
 
-- \`${drv.topics.image || drv.topics.cloud}\` — sensor
-- \`/yolo/detections\` (vision_msgs/Detection2DArray), \`/yolo/tracking\` (with ids), \`/yolo/detections_3d\` (Detection3DArray in base_link)${cfg.tasks.some((t) => t === 'cloud_detect' || t === 'cloud_segment') ? '\n- `/cloud/detections`, `/cloud/ground`, `/cloud/objects`, `/cloud/rows`' : ''}${cfg.tasks.includes('vlm_query') ? '\n- `/vlm_bridge/answer`, `/vlm_bridge/detections`; ask with `ros2 topic pub /vlm_bridge/question std_msgs/String "{data: how many ripe apples?}"`' : ''}${cfg.tasks.includes('vla_policy') ? '\n- `/vla_bridge/instruction` (start), `/vla_bridge/enable` — publishes `TwistStamped` for moveit_servo' : ''}
+- \`${drv.topics.image || drv.topics.cloud}\`${drv.topics.depth ? ` + \`${drv.topics.depth}\`` : ''} — sensor (\`source:=driver\`)
+- \`${studioCameraTopics(cam).image}\`, \`${studioCameraTopics(cam).info}\`${drv.topics.depth ? `, \`${studioCameraTopics(cam).depth}\`` : ''} — the studio camera (\`source:=studio\`)
+- \`/yolo/detections\` (yolo_msgs/DetectionArray), \`/yolo/tracking\` (with ids), \`/yolo/detections_3d\` (3D boxes in base_link) — the studio reads them directly (Vision stack › runtime ros2, topic type yolo_msgs/msg/DetectionArray) or as vision_msgs/Detection2DArray${cfg.tasks.some((t) => t === 'cloud_detect' || t === 'cloud_segment') ? '\n- `/cloud/detections`, `/cloud/ground`, `/cloud/objects`, `/cloud/rows`' : ''}${cfg.tasks.includes('vlm_query') ? '\n- `/vlm_bridge/answer`, `/vlm_bridge/detections`; ask with `ros2 topic pub /vlm_bridge/question std_msgs/String "{data: how many ripe apples?}"`' : ''}${cfg.tasks.includes('vla_policy') ? '\n- `/vla_bridge/instruction` (start), `/vla_bridge/enable` — publishes `TwistStamped` for moveit_servo' : ''}
 
 ## Hand-eye
 

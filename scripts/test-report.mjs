@@ -9,8 +9,10 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
+// fileURLToPath: on Windows URL.pathname is /C:/..., which path.resolve turns into C:\C:\...
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const read = (p) => { try { return JSON.parse(fs.readFileSync(path.join(root, p), 'utf8')); } catch { return null; } };
 const cov = read('coverage/coverage-summary.json');
 const unit = read('coverage/unit-results.json');
@@ -23,7 +25,7 @@ out.push(`Generated ${new Date().toISOString().slice(0, 10)}`, '');
 
 // --- summary ------------------------------------------------------------------------------------------------------
 out.push('### Summary', '', '| Layer | Result |', '|---|---|');
-if (unit) out.push(`| Unit, integration and A/B tests (vitest, node + jsdom) | ${unit.numPassedTests}/${unit.numTotalTests - (unit.numPendingTests ?? 0)} tests pass in ${unit.testResults.length} files${unit.numPendingTests ? ` (${unit.numPendingTests} network tests skipped offline)` : ''}${unit.numFailedTests ? ` — **${unit.numFailedTests} failing**` : ''} |`);
+if (unit) out.push(`| Unit, integration and A/B tests (vitest, node + jsdom) | ${unit.numPassedTests}/${unit.numTotalTests - (unit.numPendingTests ?? 0)} tests pass in ${unit.testResults.length} files${unit.numPendingTests ? ` (${unit.numPendingTests} skipped: opt-in, or RoboDK / WSL / network absent)` : ''}${unit.numFailedTests ? ` — **${unit.numFailedTests} failing**` : ''} |`);
 if (cov?.total) out.push(`| Line coverage of \`src/\` | ${pct(cov.total.lines.pct)} lines · ${pct(cov.total.functions.pct)} functions · ${pct(cov.total.branches.pct)} branches |`);
 if (e2e) out.push(`| Browser end-to-end (Playwright over the production build) | ${e2e.numPassedTests}/${e2e.numTotalTests} tests pass${e2e.numFailedTests ? ` — **${e2e.numFailedTests} failing**` : ''} |`);
 { const m = /(\d+)\/(\d+) scenarios pass/.exec(scenarios); if (m) out.push(`| Demo scenarios (navigation, vision, control design, group control) | ${m[1]}/${m[2]} pass |`); }
@@ -70,6 +72,26 @@ if (e2e) {
   out.push('### Browser end-to-end', '', 'Playwright drives the production build in Chromium (software GL): a page error or a console error anywhere fails the test.', '', '| Test | Result | Time |', '|---|---|---|');
   for (const f of e2e.testResults) for (const a of f.assertionResults) out.push(`| ${a.title.replace(/\|/g, '\\|')} | ${a.status === 'passed' ? '✓' : '**' + a.status + '**'} | ${((a.duration ?? 0) / 1000).toFixed(0)} s |`);
   out.push('');
+}
+
+// --- RoboDK Library in the browser (tests/e2e/library.e2e.test.ts writes test-results/library-sweep.json) ------------
+const sweep = read('test-results/library-sweep.json');
+if (sweep && Object.keys(sweep).length) {
+  const rows = Object.entries(sweep);
+  const ran = rows.filter(([, v]) => v.main);
+  const same = ran.filter(([, v]) => Array.isArray(v.diffs) && !v.diffs.length).length;
+  const done = ran.filter(([, v]) => v.status === 'done');
+  const cyc = done.filter(([, v]) => typeof v.cycleErr === 'number');
+  const jt = ran.filter(([, v]) => typeof v.jointErrDeg === 'number');
+  const ob = ran.filter(([, v]) => typeof v.objectMaxDevMm === 'number');
+  out.push('### RoboDK Library in the browser', '',
+    `Every RoboDK Library station (${rows.length} files) is opened through File › Open in the production build and its main program is played to the end; the final state is compared with the headless runtime (status, cycle time, joints of every robot, pose of every object) and reported against RoboDK 5.9.4.`, '',
+    '| Check | Result |', '|---|---|',
+    `| Browser = headless runtime | ${same}/${ran.length} stations with a main program (${rows.length - ran.length} have none) |`,
+    `| Main program ends | ${done.length} done, ${ran.filter(([, v]) => v.status === 'error').length} stop at an error, ${ran.filter(([, v]) => v.unfinished).length} still running after 4× RoboDK's cycle |`,
+    `| Cycle time within 10 % of RoboDK \`Update()\` | ${cyc.filter(([, v]) => v.cycleErr <= 0.1).length}/${cyc.length} |`,
+    `| Final joints within 1° of RoboDK's \`InstructionListJoints\` | ${jt.filter(([, v]) => v.jointErrDeg < 1).length}/${jt.length} |`,
+    `| Objects at RoboDK's saved poses (< 1 mm) | ${ob.filter(([, v]) => v.objectMaxDevMm < 1).length}/${ob.length} |`, '');
 }
 
 // --- scenarios ----------------------------------------------------------------------------------------------------

@@ -1,9 +1,14 @@
 import './kuka';
 import './abb';
 import './fanuc';
+import './motoman';
 import './ur';
 import './misc';
 import './robodk_python';
 import './ros2';
 import './more';
+import './vendors';
+import './staubli';
+import './urp';
+import './rdk_builtin';
 export * from './base';

@@ -33,7 +33,7 @@ describe('MenuBar', () => {
   it('has 13 menus with the expected entries', () => {
     expect(menu.el.querySelectorAll('.menu-btn').length).toBe(13);
     expect(menu.el.querySelector('.menu-title')!.textContent).toBe('VerticalBot Studio');
-    const expected: Record<string, [number, number]> = { File: [10, 2], Edit: [4, 1], Add: [12, 2], Program: [9, 2], Robot: [9, 2], 'Mobile & Fleet': [9, 2], Agriculture: [5, 1], Control: [7, 2], Group: [7, 2], Tools: [12, 2], Connect: [5, 2], View: [12, 2], Help: [4, 0] };
+    const expected: Record<string, [number, number]> = { File: [14, 2], Edit: [4, 1], Add: [12, 2], Program: [11, 2], Robot: [9, 2], 'Mobile & Fleet': [10, 2], Agriculture: [5, 1], Control: [7, 2], Group: [7, 2], Tools: [12, 2], Connect: [5, 2], View: [12, 2], Help: [4, 0] };
     for (const [name, [items, seps]] of Object.entries(expected)) {
       const m = openMenu(name);
       expect(m.querySelectorAll('.ctx-item').length, name).toBe(items);
@@ -88,7 +88,8 @@ describe('MenuBar', () => {
   it('Program: new / teach / run / pause / stop / validate / export', async () => {
     pickplace();
     clickMenu('Program', 'New program'); const p = app.activeProgram!; expect(p.name).toBe('Prog 2'); expect(p.robot()).toBe(app.activeRobot);
-    clickMenu('Program', 'Teach MoveJ'); clickMenu('Program', 'Teach MoveL'); expect(p.instructions().length).toBe(2);
+    // the first move taught into an empty program brings "Set reference frame" / "Set tool" (RoboDK)
+    clickMenu('Program', 'Teach MoveJ'); clickMenu('Program', 'Teach MoveL'); expect(p.instructions().map((i) => i.data.kind)).toEqual(['frame', 'tool', 'move', 'move']);
     clickMenu('Program', 'Run'); expect(app.sim.playing).toBe(true);
     clickMenu('Program', 'Pause'); expect(app.sim.playing).toBe(false);
     clickMenu('Program', 'Stop'); expect(app.sim.time).toBe(0);
@@ -227,13 +228,17 @@ describe('BottomPanel', () => {
     pickplace();
     bottom.show('sim');
     const page = bottom.el.querySelector<HTMLElement>('.sim-panel')!;
-    buttonByText(page, '▶ Run').click(); expect(app.sim.playing).toBe(true);
-    buttonByText(page, '⏸ Pause').click(); expect(app.sim.playing).toBe(false);
-    buttonByText(page, '⏭ End').click(); expect(app.sim.time).toBeCloseTo(app.sim.duration, 5); expect(page.querySelector('.time-label')!.textContent).toMatch(/^[\d.]+ \/ [\d.]+ s$/);
-    buttonByText(page, '⏹ Stop').click(); expect(app.sim.time).toBe(0);
+    const box = app.station.find('Box 1')!; const box0 = box.poseAbs();
+    buttonByText(page, '▶ Run').click(); expect(app.isPlaying()).toBe(true);
+    buttonByText(page, '⏸ Pause').click(); expect(app.isPlaying()).toBe(false); expect(app.simState).toBe('paused');
+    buttonByText(page, '⏯ Resume').click(); expect(app.isPlaying()).toBe(true);
+    buttonByText(page, '⏭ End').click(); expect(app.activeRuns().length).toBe(0); expect(app.runs.at(-1)!.status).toBe('done'); expect(page.querySelector('.time-label')!.textContent).toMatch(/^[\d.]+ \/ [\d.]+ s$/);
+    expect(Math.hypot(box.poseAbs()[12] - box0[12], box.poseAbs()[13] - box0[13])).toBeGreaterThan(100); // the box was carried away
+    buttonByText(page, '⏮ Reset').click(); expect(app.simTime).toBe(0); box.poseAbs().forEach((v, i) => expect(v).toBeCloseTo(box0[i], 6)); // Reset = Replace objects
+    buttonByText(page, '⏹ Stop').click(); expect(app.isPlaying()).toBe(false);
     const speed = page.querySelector('select')!; change(speed, '2'); expect(app.simSpeed).toBe(2); change(speed, '1');
-    const range = page.querySelector<HTMLInputElement>('input.timeline')!; expect(Number(range.max)).toBeCloseTo(app.sim.duration, 5);
-    app.runProgram(); input(range, '1'); expect(app.sim.playing).toBe(false); expect(app.sim.time).toBeCloseTo(1, 5);
+    const range = page.querySelector<HTMLInputElement>('input.timeline')!; expect(Number(range.max)).toBeCloseTo(app.simDuration, 5);
+    app.runProgram(); input(range, '1'); expect(app.isPlaying()).toBe(false); expect(app.simTime).toBeCloseTo(1, 5);
     buttonByText(page, '▶ Start').click(); expect(app.worldRunning).toBe(true);
     buttonByText(page, '⏸ Pause', ).click(); // first "⏸ Pause" is the program one; the world pause is the second
     const pauses = [...page.querySelectorAll('button')].filter((b) => b.textContent === '⏸ Pause'); pauses[1].click(); expect(app.worldRunning).toBe(false);
@@ -257,7 +262,8 @@ describe('BottomPanel', () => {
     expect(body.querySelector('canvas.mini-chart')).not.toBeNull(); expect(body.querySelectorAll('table.grid tbody tr').length).toBe(app.station.itemsOfType(ItemType.COMPONENT).length);
     app.startWorld(); for (let i = 0; i < 12; i++) { (app as any).tick(1); bottom.show('process'); } app.pauseWorld();
     expect(body.textContent).toMatch(/Process clock [\d.]+ s/); expect(body.textContent).toMatch(/output \d+/);
-    app.processSim.setSignal('door', true); bottom.show('process'); expect(body.textContent).toContain('Signals: door=true');
+    // the packing demo's own components publish signals too (R4: gripper of the pick & place cell): door is one of them
+    app.processSim.setSignal('door', true); bottom.show('process'); expect(body.textContent).toMatch(/Signals: (.*, )?door=true/);
     (body.querySelector('table.grid tbody tr') as HTMLElement).click(); expect(app.station.selection[0]).toBeInstanceOf(Component);
     app.newStation(); bottom.show('process'); expect(body.textContent).toContain('No process components');
     app.resetWorld();
@@ -474,7 +480,8 @@ describe('PropertiesPanel', () => {
       app.select(c); change(fieldIn('Enabled'), 'false'); expect(b.enabled).toBe(false); b.enabled = true;
       if ('next' in b) { app.select(c); const other = comps.find((x) => x !== c)!; change(fieldIn('Output to'), other.id); expect(b.next).toBe(other.id); }
     }
-    expect([...types].sort()).toEqual(['buffer', 'conveyor', 'feeder', 'process', 'sink']);
+    // the five editable behaviours are all present (the packing demo also has transfer / signal components since R4)
+    expect([...types].sort()).toEqual(expect.arrayContaining(['buffer', 'conveyor', 'feeder', 'process', 'sink']));
     const cam = addCamera(app); app.select(cam);
     expect(sectionTitles()).toContain('Camera / sensor'); expect(body().textContent).toContain('Machine vision'); expect(body().textContent).toContain('not configured');
     change(fieldIn('Kind'), 'lidar2d'); expect(cam.kind).toBe('lidar2d'); app.select(cam); change(fieldIn('Field of view (deg)'), '120'); expect(cam.fov).toBe(120);
@@ -536,9 +543,9 @@ describe('ProgramEditor', () => {
     const n = p.instructions().length; const idx = p.instructions().indexOf(speedIns);
     rows()[idx].dispatchEvent(mouse('contextmenu')); ctxItem('Insert MoveL (teach) after').click(); expect(p.instructions().length).toBe(n + 1); expect((p.instructions()[idx + 1].data as any).moveType).toBe('MoveL'); ed.render();
     rows()[idx].dispatchEvent(mouse('contextmenu')); ctxItem('Insert MoveJ (teach) after').click(); expect((p.instructions()[idx + 1].data as any).moveType).toBe('MoveJ'); ed.render();
-    rows()[idx].dispatchEvent(mouse('contextmenu')); ctxItem('Run from here').click(); expect(app.sim.playing).toBe(app.sim.result!.ok); app.stopProgram(); ed.render();
+    rows()[idx].dispatchEvent(mouse('contextmenu')); ctxItem('Run from here').click(); expect(app.isPlaying()).toBe(true); app.stopProgram(); ed.render();
     rows()[idx + 1].dispatchEvent(mouse('contextmenu')); ctxItem('Delete').click(); expect(p.instructions().length).toBe(n + 1); ed.render();
-    app.runProgram(); ed.render(); (app as any).tick(0.05); if (app.sim.result!.ok) expect(rows().some((x) => x.classList.contains('running'))).toBe(true); else expect(app.sim.playing).toBe(false); app.seekProgram(app.sim.duration - 0.01); app.stopProgram();
+    app.resetSimulation(); app.runProgram(); (app as any).tick(0.05); expect(rows().some((x) => x.classList.contains('running'))).toBe(true); app.stopProgram();
     const p2 = app.addProgram(null, 'Second'); ed.render();
     const sel = ed.el.querySelector<HTMLSelectElement>('select.prog-select')!; expect(sel.options.length).toBe(3); expect(sel.value).toBe(p2.id);
     change(sel, p.id); expect(app.activeProgram).toBe(p); expect(app.station.selection[0]).toBe(p);

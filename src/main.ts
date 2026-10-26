@@ -2,16 +2,24 @@ import './ui/styles.css';
 import { App } from './app';
 import { TreePanel } from './ui/tree';
 import { PropertiesPanel } from './ui/properties';
+import { sideDock } from './ui/side_panels';
 import { BottomPanel } from './ui/bottom';
 import { MenuBar } from './ui/menu';
 import { h, toast, contextMenu } from './ui/dom';
-import { itemContextMenu } from './ui/dialogs';
+import { itemContextMenu, importChoiceDialogs } from './ui/dialogs';
 import { demos } from './demos';
 import { Robolink, robomath } from './api/robolink';
 import { connectToStudioServer } from './api/ws-client';
+import { installPyodideRunner } from './api/runner_pyodide';
+import { installVisionRunnerGlobal } from './vision/program_vision';
+import { setNativePostServer, registerNativePosts } from './posts/native_client';
 import { StationTabs, measureDialog } from './ui/tools';
+import { Station } from './core/items/item';
+import { MemoryFileSystem } from './api/memory_fs';
 
 const app = new App();
+// import choices (world of a multi-world folder, Webots vs ROS, ROS entry point / xacro args) are asked with dialogs
+app.importUi = importChoiceDialogs();
 const viewport = h('div', { class: 'viewport' });
 const bottom = new BottomPanel(app);
 (app as any).bottom = bottom;
@@ -27,8 +35,10 @@ const toolbar = h('div', { class: 'toolbar' },
   h('span', { class: 'tb-sep' }),
   h('button', { class: 'tb', title: 'Teach MoveJ (J)', onClick: () => app.teach('MoveJ') }, '+J'),
   h('button', { class: 'tb', title: 'Teach MoveL (L)', onClick: () => app.teach('MoveL') }, '+L'),
-  h('button', { class: 'tb primary', title: 'Run program (F5)', onClick: () => app.runProgram() }, '▶'),
-  h('button', { class: 'tb', title: 'Stop', onClick: () => app.stopProgram() }, '⏹'),
+  h('button', { class: 'tb primary', title: 'Run / resume program (F5)', dataset: { sim: 'play' }, onClick: () => app.runProgram() }, '▶'),
+  h('button', { class: 'tb', title: 'Pause (Space)', dataset: { sim: 'pause' }, onClick: () => app.pauseProgram() }, '⏸'),
+  h('button', { class: 'tb', title: 'Stop', dataset: { sim: 'stop' }, onClick: () => app.stopProgram() }, '⏹'),
+  h('button', { class: 'tb', title: 'Reset: restore the home state (Replace objects)', dataset: { sim: 'reset' }, onClick: () => app.resetSimulation() }, '⏮'),
   h('span', { class: 'tb-sep' }),
   h('button', { class: 'tb', title: 'Start world (fleet/process)', onClick: () => app.startWorld() }, '🌍 ▶'),
   h('button', { class: 'tb', title: 'Pause world', onClick: () => app.pauseWorld() }, '🌍 ⏸'),
@@ -41,17 +51,44 @@ const status = h('div', { class: 'statusbar' }, 'Ready');
 const layout = h('div', { class: 'layout' },
   menu.el,
   h('div', { class: 'main' },
-    tree.el,
+    sideDock(tree.el, { side: 'left', title: 'Station', defaultWidth: 290, key: 'vbs.dock.tree' }).el,
     h('div', { class: 'center' }, tabs.el, toolbar, viewport, bottom.el),
-    props.el),
+    sideDock(props.el, { side: 'right', title: 'Properties', defaultWidth: 330, key: 'vbs.dock.props' }).el),
   status);
 document.body.appendChild(layout);
 app.mount(viewport);
 
-// Drag & drop files
+// Drag & drop files and folders (a ROS package or a Webots project is read recursively, keeping relative paths)
 viewport.addEventListener('dragover', (e) => { e.preventDefault(); viewport.classList.add('drop'); });
 viewport.addEventListener('dragleave', () => viewport.classList.remove('drop'));
-viewport.addEventListener('drop', async (e) => { e.preventDefault(); viewport.classList.remove('drop'); const files = [...(e.dataTransfer?.files ?? [])]; if (files.length) await app.openFiles(files); });
+viewport.addEventListener('drop', async (e) => { e.preventDefault(); viewport.classList.remove('drop'); const files = await droppedFiles(e.dataTransfer); if (files.length) await app.openFiles(files); });
+
+/** Files of a drop; directories are walked (File objects get `relativePath` = path inside the dropped folder). */
+async function droppedFiles(dt: DataTransfer | null): Promise<File[]> {
+  if (!dt) return [];
+  const entries = [...(dt.items ?? [])].map((it) => (it as any).webkitGetAsEntry?.()).filter(Boolean);
+  if (!entries.length || !entries.some((en: any) => en.isDirectory)) return [...(dt.files ?? [])];
+  const out: File[] = [];
+  const walk = async (en: any, prefix: string): Promise<void> => {
+    if (en.isFile) { const f: File = await new Promise((res, rej) => en.file(res, rej)); Object.defineProperty(f, 'relativePath', { value: prefix + f.name }); out.push(f); return; }
+    const reader = en.createReader();
+    for (;;) { const batch: any[] = await new Promise((res, rej) => reader.readEntries(res, rej)); if (!batch.length) break; for (const c of batch) await walk(c, `${prefix}${en.name}/`); }
+  };
+  for (const en of entries) await walk(en, '');
+  return out;
+}
+
+// Progress of long operations (worker import / compile): a small non-blocking indicator
+const progressEl = h('div', { class: 'progress-pill', style: { display: 'none' } });
+document.body.appendChild(progressEl);
+const progressJobs = new Map<string, { detail?: string; t0: number }>();
+const paintProgress = () => {
+  if (!progressJobs.size) { progressEl.style.display = 'none'; return; }
+  progressEl.style.display = '';
+  progressEl.textContent = [...progressJobs].map(([label, j]) => `⏳ ${label}${j.detail ? ` — ${j.detail}` : ''} (${((performance.now() - j.t0) / 1000).toFixed(0)} s)`).join('   ');
+};
+app.events.on('progress', ({ label, detail, done }) => { if (done) progressJobs.delete(label); else progressJobs.set(label, { detail, t0: progressJobs.get(label)?.t0 ?? performance.now() }); paintProgress(); });
+setInterval(() => { if (progressJobs.size) paintProgress(); }, 500);
 viewport.addEventListener('contextmenu', (e) => { e.preventDefault(); const it = app.renderer.pick(e.clientX, e.clientY) ?? app.station.selection[0] ?? app.station; if (it !== app.station.selection[0]) app.select(it); contextMenu(e.clientX, e.clientY, itemContextMenu(app, it)); });
 
 // Keyboard shortcuts
@@ -71,7 +108,7 @@ window.addEventListener('keydown', (e) => {
   else if (k === 'j') app.teach('MoveJ');
   else if (k === 'l') app.teach('MoveL');
   else if (k === 'f5') { e.preventDefault(); app.runProgram(); }
-  else if (k === ' ') { e.preventDefault(); if (app.sim.playing) app.pauseProgram(); else app.runProgram(); }
+  else if (k === ' ') { e.preventDefault(); if (app.isPlaying()) app.pauseProgram(); else app.runProgram(); }
   else if (k === 'escape') app.select(null);
   else if (k === 'm') measureDialog(app);
 });
@@ -86,32 +123,62 @@ setInterval(() => {
 
 // Expose the API for scripting from the browser devtools and for the server bridge
 const RDK = new Robolink(app.station);
-app.events.on('stationChanged', () => { RDK.station = app.station; });
+// the API follows the active station; its spray simulator (RoboDK Spray_*) is per station and samples the station's
+// meshes through the app's asset store (RDK.assets is set below, before the first station is shown)
+const sprays = new WeakMap<Station, typeof RDK.spray>();
+app.events.on('stationChanged', () => {
+  const kept = sprays.get(app.station);
+  RDK.setStation(app.station);
+  if (kept) (RDK as { spray: typeof RDK.spray }).spray = kept; else sprays.set(app.station, RDK.spray);
+});
 RDK.onRunProgram = (p) => app.runProgram(p);
 RDK.onRender = () => {};
 RDK.onMessage = (m, popup) => (popup ? toast(m, 'info', 6000) : app.log(m));
 RDK.assets = app.assets;
+// files written through the API (Cam2D_Snapshot, MakeProgram, Save, script CSVs) stay in memory for the session, like
+// RoboDK's calls they succeed; File › Files saved by scripts downloads them
+const savedFiles = new MemoryFileSystem();
+RDK.fileSystem = savedFiles;
+savedFiles.onWrite = (f) => app.log(`Saved ${f.path} (${f.data.length < 1024 ? `${f.data.length} B` : `${(f.data.length / 1024).toFixed(1)} KB`}) — File › Files saved by scripts`);
+(window as any).savedFiles = savedFiles;
 RDK.onSnapshot = (cam, w, h) => { const c = document.createElement('canvas'); c.width = w; c.height = h; app.renderer.renderFromItem(cam, c, (cam as any).fov ?? 60); return c.toDataURL('image/png'); };
 RDK.onViewPose = { get: () => app.renderer.getViewPose(), set: (m) => app.renderer.setViewPose(m) };
 RDK.onStations = { list: () => app.stations, setActive: (s) => app.setStation(s), add: (n) => app.addStation(n), close: () => app.closeStation() };
 RDK.onWindow = (cmd, value) => { if (cmd === 'state' && value === -1) bottom.el.classList.add('collapsed'); if (cmd === 'state' && value === 2) bottom.el.classList.remove('collapsed'); if (cmd === 'close') app.newStation(); };
 RDK.onShowSequence = (r, rows) => app.renderer.showSequence(r, rows);
 RDK.onInteractiveMode = (mode) => { if (mode === 2 || mode === 5) app.renderer.setGizmoMode(mode === 2 ? 'rotate' : 'translate'); };
-RDK.simTime = { get: () => app.sim.time, set: (t) => app.seekProgram(t) };
+RDK.simTime = { get: () => app.simTime, set: (t) => app.seekProgram(t) };
 RDK.onPluginLoad = (name) => { import(/* @vite-ignore */ name).then((mod) => { const plugin = mod.default ?? mod; RDK.registerPlugin(name, plugin); plugin.onLoad?.(app, RDK); app.log(`Plugin ${name} loaded`); }).catch((e) => app.log(`Plugin ${name} failed: ${e.message}`, 'error')); return true; };
 app.onStationEvent = (type, itemId, data) => RDK.events.push({ type, itemId, data });
-app.renderer.onAnimate((dt) => { if (app.sim.playing || app.worldRunning) RDK.spray.step(dt * app.simSpeed); });
+app.renderer.onAnimate((dt) => { if (app.isPlaying() || app.worldRunning) RDK.spray.step(dt * app.simSpeed); });
+// Station Python programs (RoboDK PROGRAM_PYTHON items, calls such as SprayOn(1)) run in the browser with Pyodide,
+// loaded on the first call; while the studio server is connected its CPython runner takes precedence (ws-client).
+const pyRunner = installPyodideRunner(RDK, { app, onOutput: (name, line, stream) => app.log(`${name}: ${line}`, stream === 'stderr' ? 'warn' : 'info') });
 (window as any).app = app;
 (window as any).RDK = RDK;
+(window as any).pyRunner = pyRunner;
+// the vision script runner (VisionDetect calls), registered by the Vision panel; exposed with the Pyodide runner so a
+// test can play programs without any script runner (same semantics as the headless runtime)
+(window as any).visionRunnerOff = installVisionRunnerGlobal();
 (window as any).robomath = robomath;
 
 // Optional WebSocket bridge to the studio server (python clients)
 const params = new URLSearchParams(location.search);
-const wsUrl = params.get('server') ?? (location.hostname ? `ws://${location.hostname}:20500` : '');
-if (wsUrl && params.get('server') !== 'off') connectToStudioServer(app, RDK, wsUrl).catch(() => {});
+// Connected only when asked for (?server=ws://host:port, as the server's start message says, or Connect › Studio server):
+// probing ws://<host>:20500 on every page load logged a connection-refused console error whenever no server ran.
+// ?server (no value) or ?server=auto use the default port on this host.
+const serverParam = params.get('server');
+const wsUrl = serverParam === null || serverParam === 'off' ? '' : serverParam === '' || serverParam === 'auto' ? (location.hostname ? `ws://${location.hostname}:20500` : '') : serverParam;
+if (wsUrl) connectToStudioServer(app, RDK, wsUrl).catch(() => {});
+(window as any).connectStudioServer = (url = `ws://${location.hostname || 'localhost'}:20500`) => connectToStudioServer(app, RDK, url);
+// RoboDK's own post processors (compiled ones included) run on the studio server: list them in the post selectors
+if (wsUrl) {
+  setNativePostServer(wsUrl);
+  registerNativePosts().then((ids) => { if (ids.length) app.log(`${ids.length} RoboDK post processors available through the studio server`); }).catch(() => {});
+}
 
-// Initial station
+// Initial station: ?demo=<id>; ?demo=none (or an unknown id) opens an empty station
 const demoId = params.get('demo') ?? 'pickplace';
-const demo = demos.find((d) => d.id === demoId) ?? demos[0];
-app.setStation(demo.build());
-app.log(`Loaded demo: ${demo.name}`);
+const demo = demos.find((d) => d.id === demoId);
+if (demo) { app.setStation(demo.build()); app.log(`Loaded demo: ${demo.name}`); }
+else { app.setStation(new Station('New station')); if (demoId !== 'none') app.log(`Unknown demo "${demoId}": empty station`, 'warn'); }

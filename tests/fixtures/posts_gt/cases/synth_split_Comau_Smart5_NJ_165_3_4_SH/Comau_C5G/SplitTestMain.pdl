@@ -1,0 +1,13 @@
+PROGRAM SplitTestMain
+IMPORT 'SplitTest'
+IMPORT 'SplitTest1'
+IMPORT 'SplitTest2'
+IMPORT 'SplitTest3'
+CONST
+VAR
+BEGIN
+  R_SplitTest()
+  R_SplitTest1()
+  R_SplitTest2()
+  R_SplitTest3()
+END SplitTestMain

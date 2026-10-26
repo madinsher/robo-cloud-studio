@@ -1,0 +1,5 @@
+warning: redefining global symbol: e
+when processing file: c04.xacro
+warning: redefining global symbol: e
+when instantiating macro: m (c04.xacro)
+in file: c04.xacro

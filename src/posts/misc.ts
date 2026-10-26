@@ -1,48 +1,8 @@
 import { PostProcessor, PostProgram, PostFile, f, safeName, registerPost } from './base';
 import { poseToKuka, poseToXyzrpw, poseToZyz, getPos, poseToQuat } from './euler';
 
-/** Yaskawa Motoman INFORM (.JBI) post processor. */
-export const MOTOMAN: PostProcessor = {
-  id: 'Motoman',
-  name: 'Yaskawa Motoman (INFORM JBI)',
-  brand: 'Yaskawa',
-  extension: 'JBI',
-  generate(p: PostProgram): PostFile[] {
-    const name = safeName(p.name).toUpperCase().slice(0, 32);
-    const pos: string[] = [];
-    const ins: string[] = [];
-    let c = 0;
-    let vl = 500; // mm/s -> V=mm/s*10? INFORM uses 0.1mm/s units
-    let vj = 50;
-    let pl = 0;
-    for (const ev of p.events) {
-      switch (ev.kind) {
-        case 'moveJ': pos.push(`C${String(c).padStart(5, '0')}=${[0, 1, 2, 3, 4, 5].map((i) => f(ev.joints[i] ?? 0, 4)).join(',')}`); ins.push(`MOVJ C${String(c).padStart(5, '0')} VJ=${f(vj, 2)}${pl ? ` PL=${pl}` : ''}`); c++; break;
-        case 'moveL': { const [x, y, z, rz, ry, rx] = poseToKuka(ev.pose); pos.push(`C${String(c).padStart(5, '0')}=${f(x)},${f(y)},${f(z)},${f(rx, 4)},${f(ry, 4)},${f(rz, 4)}`); ins.push(`MOVL C${String(c).padStart(5, '0')} V=${f(vl, 1)}${pl ? ` PL=${pl}` : ''}`); c++; break; }
-        case 'moveC': { for (const m of [ev.via, ev.pose]) { const [x, y, z, rz, ry, rx] = poseToKuka(m); pos.push(`C${String(c).padStart(5, '0')}=${f(x)},${f(y)},${f(z)},${f(rx, 4)},${f(ry, 4)},${f(rz, 4)}`); ins.push(`MOVC C${String(c).padStart(5, '0')} V=${f(vl, 1)}`); c++; } break; }
-        case 'setSpeed': if (ev.speedLinear !== undefined) vl = ev.speedLinear; if (ev.speedJoints !== undefined) vj = Math.min(100, ev.speedJoints / 2); break;
-        case 'setRounding': pl = ev.radius <= 0 ? 0 : Math.min(8, Math.ceil(ev.radius / 10)); break;
-        case 'pause': ins.push(ev.timeMs < 0 ? `PAUSE` : `TIMER T=${f(ev.timeMs / 1000, 2)}`); break;
-        case 'setDO': ins.push(`DOUT OT#(${ev.io.replace(/\D/g, '') || 1}) ${ev.value ? 'ON' : 'OFF'}`); break;
-        case 'waitDI': ins.push(`WAIT IN#(${ev.io.replace(/\D/g, '') || 1})=${ev.value ? 'ON' : 'OFF'}`); break;
-        case 'runCode': ins.push(ev.isCall ? `CALL JOB:${safeName(ev.code).toUpperCase()}` : ev.code); break;
-        case 'comment': ins.push(`'${ev.text.slice(0, 32)}`); break;
-        case 'message': ins.push(`MSG "${ev.text.slice(0, 32)}"`); break;
-        case 'callProgram': ins.push(`CALL JOB:${safeName(ev.name).toUpperCase()}`); break;
-        case 'gripper': ins.push(`DOUT OT#(1) ${ev.close ? 'ON' : 'OFF'}`); break;
-        case 'setFrame': case 'setTool': ins.push(`'${ev.kind} ${ev.name}`); break;
-        case 'navigate': ins.push(`'NAV ${f(ev.x, 0)} ${f(ev.y, 0)}`); break;
-        case 'task': ins.push(`'TASK ${ev.task}`); break;
-      }
-    }
-    const content = [`/JOB`, `//NAME ${name}`, `//POS`, `///NPOS ${c},0,0,0,0,0`, `///TOOL 0`, `///POSTYPE PULSE`, `///PULSE`, ...pos, `//INST`, `///DATE ${new Date().toISOString().slice(0, 10)}`, `///ATTR SC,RW`, `///GROUP1 RB1`, `NOP`, ...ins, `END`].join('\n') + '\n';
-    return [{ name: `${name}.JBI`, content }];
-  },
-};
-registerPost(MOTOMAN);
-
 /** Stäubli VAL3 post processor (.pgx + .dtx simplified). */
-export const STAUBLI_VAL3: PostProcessor = {
+const STAUBLI_VAL3_LEGACY: PostProcessor = {
   id: 'Staubli_VAL3',
   name: 'Stäubli VAL3',
   brand: 'Staubli',
@@ -77,10 +37,10 @@ export const STAUBLI_VAL3: PostProcessor = {
     return [{ name: `${name}.pgx`, content: L.join('\n') + '\n' }];
   },
 };
-registerPost(STAUBLI_VAL3);
+// Staubli_VAL3: RoboDK-compatible VAL3 project post in staubli.ts
 
 /** Doosan DRL (Python-like) post processor. */
-export const DOOSAN: PostProcessor = {
+const DOOSAN_LEGACY: PostProcessor = {
   id: 'Doosan_Robotics',
   name: 'Doosan Robotics (DRL)',
   brand: 'Doosan',
@@ -113,7 +73,7 @@ export const DOOSAN: PostProcessor = {
     return [{ name: `${safeName(p.name)}.drl`, content: L.join('\n') + '\n' }];
   },
 };
-registerPost(DOOSAN);
+// Doosan_Robotics: RoboDK-compatible DRL post in vendors.ts
 
 /** Mecademic (Python API-like) */
 export const MECADEMIC: PostProcessor = {
@@ -149,7 +109,7 @@ export const MECADEMIC: PostProcessor = {
     return [{ name: `${safeName(p.name)}.py`, content: L.join('\n') + '\n' }];
   },
 };
-registerPost(MECADEMIC);
+// Mecademic: RoboDK-compatible program text post in vendors.ts
 
 /** Generic CSV trace: one line per move with pose (XYZRPW) and joints. */
 export const GENERIC_CSV: PostProcessor = {

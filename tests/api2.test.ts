@@ -28,11 +28,12 @@ describe('RoboDK API — extended surface', () => {
     RDK.setCollisionActive(COLLISION_ON);
     expect(RDK.Collision_SetPair(robot, box, -1, -1, false)).toBe(true);
     const prog = RDK.Item('PickPlace', ITEM_TYPE_PROGRAM);
+    // RoboDK format: rows [J1..J6, ERROR, MM_STEP, DEG_STEP, MOVE_ID]; status = number of executable instructions
     const [msg, rows, status] = prog.InstructionListJoints();
-    expect(status).toBe(0);
+    expect(status).toBe(prog.InstructionCount());
     expect(msg).toBe('Success');
     expect(rows.length).toBeGreaterThan(20);
-    expect(rows[0].length).toBe(8);
+    expect(rows[0].length).toBe(10);
     RDK.Copy(prog);
     const pasted = RDK.Paste() as RL.RobolinkItem;
     expect(pasted.Name()).toBe('PickPlace 2');
@@ -59,9 +60,11 @@ describe('RoboDK API — extended surface', () => {
     const part = RDK.AddCurve([[0, 0, 0], [100, 0, 0], [150, 50, 0]]);
     part.setPose(robomath.transl(650, 0, 300));
     const proj = RDK.AddMachiningProject('Weld', r);
-    const [, points, unreachable] = proj.setMachiningParameters('', part, 'Step=10 Approach=30 FreeZ');
-    expect(points).toBeGreaterThan(10);
-    expect(unreachable).toBe(0);
+    // RoboDK returns (program, status); status 0 = the whole path is reachable (Library scripts test `status == 0`)
+    const [mprog, mstatus] = proj.setMachiningParameters('', part, 'Step=10 Approach=30 FreeZ');
+    expect(mprog.Type()).toBe(ITEM_TYPE_PROGRAM);
+    expect(mprog.InstructionCount()).toBeGreaterThan(10);
+    expect(mstatus).toBe(0);
     expect(RDK.ItemList(ITEM_TYPE_PROGRAM, true)).toContain('Weld');
     const tool = r.AddTool(robomath.transl(0, 0, 120), 'Gun');
     const panel = RDK.Item('Curve');
@@ -70,13 +73,14 @@ describe('RoboDK API — extended surface', () => {
     expect(gid).toBeGreaterThan(0);
     RDK.Spray_SetState(1, gid);
     const q = (r.item as Robot).solveIK(mul(transl(800, 0, 600), rotx(180 * DEG)), { seed: (r.item as Robot).joints() }, transl(0, 0, 120));
-    if (q.ok) { (r.item as Robot).setJoints(q.joints); for (let i = 0; i < 10; i++) RDK.spray.step(0.1); const [, stats] = RDK.Spray_GetStats(gid); expect(stats[0]).toBeGreaterThan(0); }
+    if (q.ok) { (r.item as Robot).setJoints(q.joints); for (let i = 0; i < 10; i++) RDK.spray.step(0.1); const [, stats] = RDK.Spray_GetStats(gid); expect(stats[0][0]).toBe(gid); expect(stats[0][3]).toBeGreaterThan(0); }
     RDK.Spray_Clear(gid);
     const frame = RDK.Calibrate_Reference([[100, 0, 0], [200, 0, 0], [100, 100, 0]], CALIBRATE_FRAME_3P_P1_ORIGIN, false, r);
     expect(frame.Pos()[0]).toBeCloseTo(100);
-    const [tcp, stats] = RDK.CalibrateTool([[0, -60, 60, 0, 0, 0], [20, -60, 60, 0, 30, 0], [-20, -50, 70, 10, -20, 5], [5, -70, 50, 40, 40, 20]].map((j) => j), RL.JOINT_FORMAT, RL.CALIBRATE_TCP_BY_POINT, r, tool);
+    const [tcp, stats, errs] = RDK.CalibrateTool([[0, -60, 60, 0, 0, 0], [20, -60, 60, 0, 30, 0], [-20, -50, 70, 10, -20, 5], [5, -70, 50, 40, 40, 20]].map((j) => j), RL.JOINT_FORMAT, RL.CALIBRATE_TCP_BY_POINT, r, tool);
     expect(tcp.length).toBe(3);
-    expect(stats.length).toBeGreaterThan(2);
+    expect(stats.length).toBe(2); // [mean, max]
+    expect(errs.length).toBe(4); // one error per pose
     const iso = RDK.Popup_ISO9283_CubeProgram(r, [800, 0, 600], 300);
     expect(iso.Valid()).toBe(true);
     expect(RDK.Popup_ISO9283_CubeProgram(r).Update()[1]).toBeGreaterThan(0);

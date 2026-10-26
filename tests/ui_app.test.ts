@@ -7,6 +7,7 @@ import { Station, Tool } from '../src/core/items/item';
 import { demos } from '../src/demos';
 import { loadStation } from '../src/io/station-file';
 import { transl } from '../src/core/math/pose';
+import { unzipSync as fflateUnzip } from 'fflate';
 import { t, setLang, getLang, onLangChange } from '../src/ui/i18n';
 import { h, append, clear, icon, formField, dialog, confirmDialog, toast, contextMenu, downloadText, downloadBlob, pickFiles, fmt } from '../src/ui/dom';
 import { StationTabs, collisionMapDialog, measureDialog, cameraDialog, VideoRecorder, exportHtml3D, exportGlb, exportAnimationGltf, exportUrdfPackage, importRoboDKPosts, saveForBlender } from '../src/ui/tools';
@@ -223,20 +224,26 @@ describe('App', () => {
     app.teach('MoveJ'); expect(app.logs.at(-1)!.text).toBe('Select a robot first');
     const r = app.addRobotFromLibrary('UR5e');
     app.teach('MoveJ');
-    const prog = app.activeProgram!; expect(prog.instructions().length).toBe(1); expect((prog.instructions()[0].data as any).moveType).toBe('MoveJ');
+    // RoboDK: the first move taught into an empty program brings "Set reference frame" and "Set tool" with it
+    const prog = app.activeProgram!; expect(prog.instructions().map((i) => i.data.kind)).toEqual(['frame', 'tool', 'move']); expect((prog.instructions()[2].data as any).moveType).toBe('MoveJ');
     const t0 = app.station.itemsOfType<Target>(ItemType.TARGET)[0]; expect(t0.isJointTarget).toBe(true);
     r.setJoints([20, -80, 90, -100, -90, 10]);
-    app.teach('MoveL'); expect(prog.instructions().length).toBe(2); expect((prog.instructions()[1].data as any).moveType).toBe('MoveL');
-    const simEv: Array<{ playing: boolean; time: number; duration: number }> = []; app.events.on('simulation', (e) => simEv.push(e));
+    app.teach('MoveL'); expect(prog.instructions().length).toBe(4); expect((prog.instructions()[3].data as any).moveType).toBe('MoveL');
+    const simEv: Array<{ playing: boolean; time: number; duration: number; paused?: boolean }> = []; app.events.on('simulation', (e) => simEv.push(e));
     app.previewProgram(); expect(app.sim.duration).toBeGreaterThan(0); expect(simEv.at(-1)!.playing).toBe(false);
-    const d = app.sim.duration;
-    app.runProgram(); expect(app.sim.playing).toBe(true); expect(simEv.at(-1)).toEqual({ playing: true, time: 0, duration: d });
-    (app as any).tick(0.1); expect(app.sim.time).toBeCloseTo(0.1, 5); expect(simEv.at(-1)!.time).toBeCloseTo(0.1, 5);
-    app.simSpeed = 2; (app as any).tick(0.1); expect(app.sim.time).toBeCloseTo(0.3, 5);
-    app.pauseProgram(); expect(app.sim.playing).toBe(false); expect(simEv.at(-1)!.playing).toBe(false);
-    app.seekProgram(d); expect(app.sim.time).toBeCloseTo(d, 5);
-    app.stopProgram(); expect(app.sim.time).toBe(0);
-    let still = true; app.runProgram(prog); for (let i = 0; i < 200 && still; i++) still = app.sim.tick(1); expect(still).toBe(false);
+    const d = app.sim.duration; const home = r.joints();
+    // playback runs on the station runtime; app.sim.playing mirrors it for older callers
+    app.runProgram(); expect(app.isPlaying()).toBe(true); expect(app.sim.playing).toBe(true); expect(simEv.at(-1)).toMatchObject({ playing: true, time: 0, duration: d });
+    (app as any).tick(0.1); expect(app.simTime).toBeCloseTo(0.1, 5); expect(simEv.at(-1)!.time).toBeCloseTo(0.1, 5);
+    app.simSpeed = 2; (app as any).tick(0.1); expect(app.simTime).toBeCloseTo(0.3, 5); app.simSpeed = 1;
+    app.pauseProgram(); expect(app.isPlaying()).toBe(false); expect(simEv.at(-1)).toMatchObject({ playing: false, paused: true });
+    const qPaused = r.joints(); (app as any).tick(0.5); expect(app.simTime).toBeCloseTo(0.3, 5); expect(r.joints()).toEqual(qPaused); // frozen while paused
+    app.runProgram(); expect(app.isPlaying()).toBe(true); expect(app.simTime).toBeCloseTo(0.3, 5); expect(app.runs.length).toBe(1); // Play resumes, it does not restart
+    app.seekProgram(d); expect(app.simTime).toBeCloseTo(d, 5);
+    app.stopProgram(); expect(app.isPlaying()).toBe(false); expect(app.atHome).toBe(false);
+    app.resetSimulation(); expect(app.simTime).toBe(0); expect(r.joints()).toEqual(home); // Reset restores the home state
+    app.runProgram(prog); for (let i = 0; i < 200 && app.isPlaying(); i++) (app as any).tick(1); expect(app.isPlaying()).toBe(false); expect(app.runs.at(-1)!.status).toBe('done');
+    const t2 = app.station.itemsOfType<Target>(ItemType.TARGET)[1]; r.joints().forEach((v, i) => expect(v).toBeCloseTo(t2.joints![i], 3));
     app.setActiveProgram(null); app.previewProgram(); app.runProgram(); expect(app.logs.at(-1)!.text).toBe('No program selected');
     const m = app.addMobileRobot(); const mp = app.addProgram(m); expect(app.activeProgram).toBe(mp); app.previewProgram(); // non-arm program: no trajectory preview
     expect(rendererCalls.filter((c) => c === 'showTrajectoryPreview').length).toBeGreaterThan(2);
@@ -347,8 +354,16 @@ describe('App', () => {
     const app = makeApp('pickplace');
     const { exportStationURDF, packageZip } = await import('../src/io/urdf/urdf_export');
     const zip = packageZip(exportStationURDF(app.station, app.assets, {}));
+    // a zip holding a ROS package (package.xml) goes to the ROS package importer (I7) and adds its robot(s)
+    const n0 = app.station.children.length;
     await app.openFiles([new File([zip as BlobPart], 'pkg.zip')]);
-    expect(app.logs.some((l) => /^Archive pkg\.zip: \d+ meshes, \d+ metadata files/.test(l.text))).toBe(true); expect(app.station.selection[0]).toBeInstanceOf(Folder); expect(app.station.selection[0].name).toBe('pkg');
+    expect(app.logs.some((l) => /^Imported ROS package: \S/.test(l.text))).toBe(true); expect(app.station.children.length).toBeGreaterThan(n0);
+    // any other zip is a generic container: its meshes land in a folder
+    const { zipSync } = await import('fflate');
+    expect(Object.keys(fflateUnzip(zip as Uint8Array)).some((k) => /(^|\/)package\.xml$/.test(k))).toBe(true);
+    const stl = new Uint8Array(134); new DataView(stl.buffer).setUint32(80, 1, true); [0, 0, 0, 10, 0, 0, 0, 10, 0].forEach((v, k) => new DataView(stl.buffer).setFloat32(96 + k * 4, v, true));
+    await app.openFiles([new File([zipSync({ 'parts/bracket.stl': stl, 'parts/info.json': new TextEncoder().encode('{"name":"bracket"}') }) as BlobPart], 'parts.zip')]);
+    expect(app.logs.some((l) => /^Archive parts\.zip: \d+ meshes, \d+ metadata files/.test(l.text))).toBe(true); expect(app.station.selection[0]).toBeInstanceOf(Folder); expect(app.station.selection[0].name).toBe('parts');
     const pcd = ['# .PCD v0.7', 'VERSION 0.7', 'FIELDS x y z', 'SIZE 4 4 4', 'TYPE F F F', 'COUNT 1 1 1', 'WIDTH 3', 'HEIGHT 1', 'POINTS 3', 'DATA ascii', '0 0 0', '1 0 0.5', '0 1 1'].join('\n');
     await app.openFiles([textFile('cloud.pcd', pcd)]);
     expect(app.logs.at(-1)!.text).toMatch(/^cloud\.pcd: 3 points, extent 1\.0 × 1\.0 × 1\.0 m/); expect((app.station.find('cloud') as SceneObject).points.length).toBe(3);

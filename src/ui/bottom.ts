@@ -2,11 +2,12 @@ import { App } from '../app';
 import { ProgramEditor } from './program-editor';
 import { h, clear, fmt, icon } from './dom';
 import { ItemType } from '../core/items/item';
-import { FleetItem } from '../fleet/fleet';
+import { FleetItem, FleetManager } from '../fleet/fleet';
 import { MobileRobot } from '../mobile/items';
 import { MissionItem } from '../agri/items';
 import { Camera as CameraItem, Item } from '../core/items/item';
 import { detectFruit } from '../agri/vision';
+import { rescalePixel } from '../vision/camera_model';
 import { Robolink, robomath, RobolinkItem, Mat } from '../api/robolink';
 import * as RobolinkConsts from '../api/robolink';
 import { t } from './i18n';
@@ -58,7 +59,19 @@ export class BottomPanel {
       el.style.display = id === this.active ? '' : 'none';
       content.appendChild(el);
     }
-    this.el.append(tabBar, content);
+    // the dock's height is dragged at its top edge (and remembered): the Vision camera image and the long tabs need
+    // more than the default 260 px; the vision image always fits the dock height (styles.css .vision-canvas)
+    const grip = h('div', { class: 'dock-resize', title: 'Drag to resize the panel' });
+    const setH = (px: number) => { const hpx = Math.max(120, Math.min(Math.round(px), Math.round(window.innerHeight * 0.85))); this.el.style.height = `${hpx}px`; this.el.style.setProperty('--dock-h', `${hpx}px`); setTimeout(() => app.renderer?.resize?.(), 30); return hpx; };
+    try { const saved = Number(localStorage.getItem('vbs.dockHeight')); if (saved > 0) setH(saved); } catch { /* storage unavailable */ }
+    grip.addEventListener('pointerdown', (e: PointerEvent) => {
+      e.preventDefault();
+      const y0 = e.clientY, h0 = this.el.getBoundingClientRect().height;
+      const move = (ev: PointerEvent) => setH(h0 + (y0 - ev.clientY));
+      const up = (ev: PointerEvent) => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); try { localStorage.setItem('vbs.dockHeight', String(setH(h0 + (y0 - ev.clientY)))); } catch { /* ignore */ } };
+      window.addEventListener('pointermove', move); window.addEventListener('pointerup', up);
+    });
+    this.el.append(grip, tabBar, content);
     app.events.on('simulation', ({ time, duration }) => { this.timelineRange.max = String(duration); this.timelineRange.value = String(time); this.timeLabel.textContent = `${fmt(time, 2)} / ${fmt(duration, 2)} s`; });
     app.events.on('log', ({ text, level }) => { this.logOut.appendChild(h('div', { class: `log-${level}` }, `${new Date().toLocaleTimeString()}  ${text}`)); this.logOut.scrollTop = this.logOut.scrollHeight; });
     setInterval(() => { if (this.active === 'fleet') this.renderFleet(); if (this.active === 'process') this.renderProcess(); if (this.active === 'nav') this.navPanel.render(); }, 500);
@@ -78,6 +91,9 @@ export class BottomPanel {
   private buildSim(): HTMLElement {
     this.timelineRange = h('input', { type: 'range', min: 0, max: 1, step: 0.01, value: 0, class: 'timeline' }) as HTMLInputElement;
     this.timelineRange.addEventListener('input', () => { const t = parseFloat(this.timelineRange.value); this.app.pauseProgram(); this.app.seekProgram(t); });
+    const state = h('span', { class: 'sim-state' });
+    const restart = h('input', { type: 'checkbox', checked: this.app.restartFromHome, title: 'Play after a finished run restores the home state first (repeatable runs)', onChange: (e: Event) => { this.app.restartFromHome = (e.target as HTMLInputElement).checked; } }) as HTMLInputElement;
+    this.app.events.on('simulation', ({ playing, paused }) => { const n = this.app.activeRuns().length; state.textContent = playing ? `playing · ${n} program${n === 1 ? '' : 's'}` : paused ? 'paused' : this.app.atHome ? 'at home' : 'stopped'; });
     this.timeLabel = h('span', { class: 'time-label' }, '0.00 / 0.00 s');
     const speed = h('select', { onChange: (e: Event) => { this.app.simSpeed = parseFloat((e.target as HTMLSelectElement).value); } }, ...[0.25, 0.5, 1, 2, 5, 10, 50, 100].map((s) => h('option', { value: s, selected: s === 1 }, `${s}×`)));
     const worldState = h('span', { class: 'hint' });
@@ -85,11 +101,15 @@ export class BottomPanel {
     return h('div', { class: 'pad sim-panel' },
       h('div', { class: 'btn-row' },
         h('b', null, 'Program: '),
-        h('button', { class: 'btn primary', onClick: () => this.app.runProgram() }, '▶ Run'),
-        h('button', { class: 'btn', onClick: () => this.app.pauseProgram() }, '⏸ Pause'),
-        h('button', { class: 'btn', onClick: () => this.app.stopProgram() }, '⏹ Stop'),
-        h('button', { class: 'btn', onClick: () => this.app.seekProgram(this.app.sim.duration) }, '⏭ End'),
-        h('label', null, ' Speed ', speed), this.timeLabel),
+        h('button', { class: 'btn primary', dataset: { sim: 'run' }, onClick: () => this.app.runProgram() }, '▶ Run'),
+        h('button', { class: 'btn', dataset: { sim: 'pause' }, onClick: () => this.app.pauseProgram() }, '⏸ Pause'),
+        h('button', { class: 'btn', dataset: { sim: 'resume' }, onClick: () => this.app.resumeProgram() }, '⏯ Resume'),
+        h('button', { class: 'btn', dataset: { sim: 'stop' }, onClick: () => this.app.stopProgram() }, '⏹ Stop'),
+        h('button', { class: 'btn', dataset: { sim: 'reset' }, title: 'Restore the home state: object poses, attachments, robot joints, IO (Replace objects)', onClick: () => this.app.resetSimulation() }, '⏮ Reset'),
+        h('button', { class: 'btn', dataset: { sim: 'end' }, onClick: () => { if (!this.app.runs.length && this.app.activeProgram) this.app.runProgram(); this.app.runToEnd(); } }, '⏭ End'),
+        h('button', { class: 'btn', dataset: { sim: 'home' }, title: 'Make the current state the home state restored by Reset', onClick: () => this.app.setHome() }, '⌂ Set home'),
+        h('label', { title: 'Play after a finished run restores the home state first' }, restart, ' restart from home'),
+        h('label', null, ' Speed ', speed), this.timeLabel, state),
       this.timelineRange,
       h('div', { class: 'btn-row' },
         h('b', null, 'World (fleet & process): '),
@@ -112,12 +132,30 @@ export class BottomPanel {
       const table = h('table', { class: 'grid' }, h('thead', null, h('tr', null, ...['Robot', 'Status', 'Battery', 'Task', 'Speed', 'Odometer', 'Busy'].map((c) => h('th', null, c)))),
         h('tbody', null, ...robots.map((r: MobileRobot) => { const pr = k.perRobot[r.id]; return h('tr', { onClick: () => this.app.select(r) }, h('td', null, r.name), h('td', { class: `st-${r.state.status}` }, r.state.status), h('td', null, this.bar(r.batteryLevel())), h('td', null, r.state.taskId ?? '—'), h('td', null, `${fmt(r.state.v / 1000, 2)} m/s`), h('td', null, `${fmt(r.state.odometer / 1000, 0)} m`), h('td', null, `${fmt((pr?.busyTime ?? 0) / Math.max(1, fm.time) * 100, 0)} %`)); })));
       body.appendChild(table);
+      body.appendChild(this.kpiGroups(k, robots));
       const tasks = f.tasks.slice(-40).reverse();
       body.appendChild(h('table', { class: 'grid small' }, h('thead', null, h('tr', null, ...['Task', 'Type', 'Status', 'Robot', 'Row', 'Wait', 'Duration'].map((c) => h('th', null, c)))),
         h('tbody', null, ...tasks.map((t) => { const rb = t.robotId ? this.app.station.findById(t.robotId) : null; return h('tr', { class: `task-${t.status}` }, h('td', null, t.id), h('td', null, t.type), h('td', null, t.status), h('td', null, rb?.name ?? '—'), h('td', null, t.meta?.rowId ? (this.app.station.findById(t.meta.rowId)?.name ?? '') + (t.meta.side ? (t.meta.side > 0 ? ' R' : ' L') : '') : '—'), h('td', null, t.startedAt !== undefined ? `${fmt(t.startedAt - t.createdAt, 0)} s` : '—'), h('td', null, t.finishedAt !== undefined ? `${fmt(t.finishedAt - (t.startedAt ?? t.createdAt), 0)} s` : '—')); }))));
       const missions = this.app.station.itemsOfType<MissionItem>(ItemType.MISSION).filter((m) => !m.fleetId || m.fleetId === f.id);
       if (missions.length) body.appendChild(h('div', null, ...missions.map((m) => h('div', { class: 'mission-row' }, h('span', null, `${m.name} (${m.missionType}) — ${m.status}`), h('progress', { value: m.progress, max: 1 })))));
     }
+  }
+
+  /** Fleet KPI groups: contacts, traffic management, process results (spraying, harvest, ...) and equipment reconfiguration. */
+  private kpiGroups(k: ReturnType<FleetManager['kpis']>, robots: MobileRobot[]): HTMLElement {
+    const num = (v: number) => (Number.isInteger(v) ? String(v) : fmt(v, Math.abs(v) >= 100 ? 0 : 2));
+    const group = (title: string, rows: Array<[string, string]>) => h('div', { class: 'kpi-group', dataset: { kpi: title.toLowerCase() } }, h('b', null, title), ...rows.map(([n, v]) => h('div', { class: 'kv' }, h('span', null, n), h('span', null, v))));
+    const c = k.contacts, tr = k.traffic;
+    const groups: HTMLElement[] = [
+      group('Contacts', [['robot–obstacle events', String(c?.robotObstacle ?? 0)], ['robot–robot events', String(c?.robotRobot ?? 0)], ['steps in contact (obstacle / robot)', `${c?.robotObstacleSteps ?? 0} / ${c?.robotRobotSteps ?? 0}`], ['max depth', `${fmt(c?.maxDepth ?? 0, 0)} mm`]]),
+      group('Traffic', [['waiting', `${fmt(tr?.waitSeconds ?? 0, 1)} s`], ['replans', String(tr?.replans ?? 0)], ['yields', String(tr?.yields ?? 0)], ['deadlocks resolved', String(tr?.deadlocks ?? 0)]]),
+    ];
+    const proc = Object.entries(k.process ?? {}).filter(([kind]) => kind !== 'equipment');
+    groups.push(group('Process', proc.length ? proc.flatMap(([kind, vals]) => Object.entries(vals).map(([n, v]) => [`${kind}: ${n}`, num(v)] as [string, string])) : [['—', 'no process results yet']]));
+    const eq = k.process?.equipment ?? {};
+    const fitted = robots.filter((r) => r.equipment?.length).map((r) => `${r.name}: ${r.equipment.join(', ')}`);
+    groups.push(group('Equipment', [...Object.entries(eq).map(([n, v]) => [n, num(v)] as [string, string]), ...fitted.map((t) => ['fitted', t] as [string, string]), ...(!Object.keys(eq).length && !fitted.length ? [['—', 'no reconfiguration']] as Array<[string, string]> : [])]));
+    return h('div', { class: 'kpi-groups' }, ...groups);
   }
 
   /** Small canvas chart: cumulative output (green) and WIP (blue) over process time. */
@@ -179,9 +217,9 @@ export class BottomPanel {
       if (cam instanceof CameraItem) {
         const det = detectFruit(this.app.station, cam, { onlyRipe: false, maxRange: 6000 });
         const ctx = this.camCanvas.getContext('2d')!;
-        const sx = this.camCanvas.width / cam.width, sy = this.camCanvas.height / cam.height;
         ctx.lineWidth = 2;
-        for (const d of det) { ctx.strokeStyle = d.ripe >= 0.5 ? '#ff4d4d' : '#ffd43b'; ctx.strokeRect((d.u - d.w / 2) * sx, (d.v - d.h / 2) * sy, Math.max(4, d.w * sx), Math.max(4, d.h * sy)); }
+        // the canvas renders with the camera model (fov along cam.fovAxis): map each detection box corner through K
+        for (const d of fruitOverlayBoxes(cam, det, this.camCanvas.width, this.camCanvas.height)) { ctx.strokeStyle = d.ripe >= 0.5 ? '#ff4d4d' : '#ffd43b'; ctx.strokeRect(d.x, d.y, d.w, d.h); }
         txt += ` — ${det.length} fruit detections (${det.filter((d) => d.ripe >= 0.5).length} ripe)`;
       }
       this.camInfo.textContent = txt;
@@ -242,6 +280,19 @@ export class BottomPanel {
     const fn = new Function(...names, `"use strict"; return (async () => { ${body} })();`);
     return fn(...vals);
   }
+}
+
+/**
+ * Fruit detection boxes (camera pixels at the camera's own resolution) in a width×height view rendered with the same
+ * camera model: both corners go through rescalePixel (K of the camera vs K of the view), so the boxes stay on the fruit
+ * whatever the view's aspect ratio. Boxes are at least 4 px wide / high.
+ */
+export function fruitOverlayBoxes(cam: CameraItem, det: Array<{ u: number; v: number; w: number; h: number; ripe: number }>, width: number, height: number): Array<{ x: number; y: number; w: number; h: number; ripe: number }> {
+  return det.map((d) => {
+    const [x0, y0] = rescalePixel(cam, d.u - d.w / 2, d.v - d.h / 2, width, height);
+    const [x1, y1] = rescalePixel(cam, d.u + d.w / 2, d.v + d.h / 2, width, height);
+    return { x: x0, y: y0, w: Math.max(4, x1 - x0), h: Math.max(4, y1 - y0), ripe: d.ripe };
+  });
 }
 
 function formatValue(v: any): string {

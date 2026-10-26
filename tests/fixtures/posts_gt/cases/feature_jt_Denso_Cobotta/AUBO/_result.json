@@ -1,0 +1,9 @@
+{
+ "ok": true,
+ "error": null,
+ "log": "ProgSave: files written; the post then needed the RoboDK API (robodk.robolink.Robolink is not available while generating code from VerticalBot Studio)",
+ "files": [
+  "JointTargets/main.aubo",
+  "JointTargets/main.xml"
+ ]
+}

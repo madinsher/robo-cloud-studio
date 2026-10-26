@@ -1,0 +1,4 @@
+<?xml version="1.0"?>
+<robot name="r" xmlns:xacro="http://www.ros.org/wiki/xacro">
+<xacro:property name="a" value="2" lazy_eval="false"/><xacro:property name="c" value="${a*3}" lazy_eval="false"/><xacro:property name="a" value="5"/><v c="${c}"/>
+</robot>
