@@ -24,6 +24,8 @@ describe('demo motion and playback regressions', () => {
   for (const demo of demos) it(`${demo.id}: every program is free of self-collisions and reaches its Cartesian targets`, () => {
     const st = demo.build();
     for (const program of st.itemsOfType<Program>(ItemType.PROGRAM)) {
+      // arm programs only: a mobile base's Navigate program (agri demos) has no Cartesian targets of its own
+      if (!(program.robot() instanceof Robot)) continue;
       const sim = simulate(st, program), robot = program.robot() as Robot;
       // RoboDK rounding: a move followed by another move with rounding r > 0 passes within r of its target
       // (the step ends at the middle of the blend zone); fine points are reached exactly.

@@ -9,7 +9,9 @@ import { FieldItem, MissionItem, cropParams } from './agri/items';
 import { generateOrchard, buildFieldMap, rectPolygon, makeHeadlandZones, makeCanopyZones } from './agri/orchard';
 import { planMission } from './agri/missions';
 import { buildGreenhouse, useRails } from './agri/greenhouse';
-import { mountArmOnLift, addLiftColumn } from './agri/harvest';
+import { mountArmOnLift, addLiftColumn, generateHarvestProgram } from './agri/harvest';
+import { Robot } from './core/items/robot';
+import { CropRow } from './agri/items';
 import { makeConveyor, makeFeeder, makeProcess, makeSink, makeBuffer, Component } from './vc/component';
 import { multiply, invert } from './core/math/pose';
 
@@ -209,7 +211,48 @@ function orchard(): Station {
   sprayMission.rowIds = field.rows().slice(4, 8).map((r) => r.id);
   sprayMission.settings = { workSpeed: 1500, bothSides: false, sideOffset: field.crop.rowSpacing / 2, tankL: 400 };
   try { planMission(st, sprayMission, fm); } catch { /* fleet may be empty */ }
+  addHarvestStopProgram(st, fleet);
   return st;
+}
+
+/**
+ * A program to run with ▶ next to the fleet missions: the first picking platform drives into the row of the first
+ * harvest task, stops, its arm picks the fruit within reach (the called arm program; a fruit leaves the plant when the
+ * gripper closes on it) and the platform drives home. The stop along the row is the one with the most reachable fruit.
+ */
+function addHarvestStopProgram(st: Station, fleet: FleetItem): void {
+  const task = fleet.tasks.find((t) => t.type === 'harvest' && t.workPath && t.workPath.length >= 2);
+  const mob = [...st.walk()].find((i) => i instanceof MobileRobot && i.children.some((c) => c instanceof Robot)) as MobileRobot | undefined;
+  const arm = mob?.children.find((c) => c instanceof Robot) as Robot | undefined;
+  const row = task ? (st.findById(String(task.meta?.rowId ?? '')) as CropRow | null) : null;
+  if (!task || !mob || !arm || !row) return;
+  const [a, b] = task.workPath!;
+  const L = Math.hypot(b[0] - a[0], b[1] - a[1]);
+  const heading = task.goalHeading ?? (Math.atan2(b[1] - a[1], b[0] - a[0]) * 180) / Math.PI;
+  const home = { x: mob.home?.x ?? mob.state.x, y: mob.home?.y ?? mob.state.y, theta: mob.home?.theta ?? 0 };
+  const q0 = arm.joints();
+  let best: { stop: [number, number]; picked: number } | null = null;
+  for (const d of [3000, 6000, 9000, 12000]) {
+    if (d > L - 1000) break;
+    const stop: [number, number] = [a[0] + ((b[0] - a[0]) * d) / L, a[1] + ((b[1] - a[1]) * d) / L];
+    mob.setPose2D(stop[0], stop[1], heading);
+    arm.setJoints(q0);
+    const r = generateHarvestProgram(st, arm, [row], { limit: 8 });
+    if (!best || r.picked > best.picked) best = { stop, picked: r.picked };
+  }
+  if (!best || !best.picked) { mob.setPose2D(home.x, home.y, home.theta); arm.setJoints(q0); return; }
+  // regenerate at the chosen stop (the program and its target frame are reused by name)
+  mob.setPose2D(best.stop[0], best.stop[1], heading);
+  arm.setJoints(q0);
+  const pick = generateHarvestProgram(st, arm, [row], { limit: 8 }).program;
+  mob.setPose2D(home.x, home.y, home.theta);
+  arm.setJoints(q0);
+  const prog = st.addChild(new Program(`Harvest stop ${mob.name}`));
+  prog.setRobot(mob);
+  prog.comment(`Drive into the row, pick the fruit within reach with ${arm.name}, drive home`);
+  prog.navigateTo(best.stop[0], best.stop[1], heading);
+  prog.callProgram(pick);
+  prog.navigateTo(home.x, home.y, home.theta);
 }
 
 function greenhouse(): Station {
@@ -256,6 +299,7 @@ function greenhouse(): Station {
   mission.fleetId = fleet.id;
   mission.settings = { workSpeed: 300, bothSides: true, sideOffset: field.crop.rowSpacing / 2, secondsPerFruit: 5, animateArm: true };
   try { planMission(st, mission, fm); } catch { /* ignore */ }
+  addHarvestStopProgram(st, fleet);
   return st;
 }
 

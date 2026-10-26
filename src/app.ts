@@ -28,7 +28,7 @@ import { MobileRobot, MapItem, ZoneItem } from './mobile/items';
 import { FleetItem, FleetManager } from './fleet/fleet';
 import { ProcessSimulator, Component } from './vc/component';
 import { FieldItem, MissionItem, CropRow } from './agri/items';
-import { updateMissionProgress } from './agri/missions';
+import { updateMissionProgress, bindHarvestEvents, fruitByRef } from './agri/missions';
 import { workerImportRdk, workerCompile, workerAvailable, cancelWorkerJobs, ImportProgress } from './scene/worker_client';
 import { toast } from './ui/dom';
 import { viewpointLook } from './io/webots/shots';
@@ -78,6 +78,9 @@ export class App {
   runtime!: StationRuntime;
   /** Applied to every new runtime (script runners, signal bridges registered by other modules). */
   runtimeHooks: Array<(rt: StationRuntime, app: App) => void> = [];
+  /** Fruit picked by harvest programs since the home state (restored by Reset). */
+  private harvestPicked: string[] = [];
+  private harvestBinding: { off: () => void } | null = null;
   processSim: ProcessSimulator;
   fleets = new Map<string, FleetManager>();
   readonly events = new EventBus<AppEvents>();
@@ -217,6 +220,10 @@ export class App {
     this.runtime.assets = this.assets;
     this.runtime.sink.message ??= (text, level) => this.log(text, level);
     for (const hook of this.runtimeHooks) { try { hook(this.runtime, this); } catch (e) { console.error(e); } }
+    // harvest programs: a fruit leaves the plant when the gripper closes on it (event 'fruit:…'); Reset puts it back
+    this.harvestBinding?.off();
+    this.harvestPicked = [];
+    this.harvestBinding = bindHarvestEvents(this.runtime as any, st, (ref) => this.harvestPicked.push(ref));
     // a station that already ran (tab switched back, API runs) keeps its home state: Reset / the next Play restore it
     this.simState = 'idle'; this.simTime = 0; this.runs = []; this.session = []; this.atHome = !this.runtime.hasHome;
   }
@@ -702,6 +709,7 @@ export class App {
   resetSimulation(): void {
     this.runtime.stop();
     if (!this.atHome) this.runtime.reset();
+    for (const ref of this.harvestPicked.splice(0)) { const f = fruitByRef(this.station, ref); if (f) { f.fruit.picked = false; f.row.notify('plants'); } }
     this.runs = [];
     this.session = [];
     this.simTime = 0;
