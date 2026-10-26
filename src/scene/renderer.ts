@@ -14,7 +14,7 @@ import { FieldItem, CropRow } from '../agri/items';
 import { AssetStore } from './assets';
 import { buildGeometry, buildLinkVisuals, makeTriad, makeTargetGlyph, polylineObject, polygonMesh, mat4ToThree, materialFor } from './three-geometry';
 import { Mat4, multiply, invert, getPos, fromArray, transl } from '../core/math/pose';
-import { actuatedIndices } from '../core/kinematics/chain';
+import { actuatedIndices, visualOrigin, LinkVisual } from '../core/kinematics/chain';
 import { Trajectory } from '../core/motion/trajectory';
 import { threeFovDeg, cameraIntrinsics } from '../vision/camera_model';
 import type { CameraRender } from '../vision/sensing';
@@ -33,6 +33,8 @@ interface Entry {
   /** Sub-objects that need per-frame updates (robot links). */
   links?: THREE.Group[];
   flangeGroup?: THREE.Group;
+  /** Passive look-at visuals (counterbalance cylinder / rod): posed from the link poses every frame. */
+  passive?: Array<{ group: THREE.Group; link: number; visual: LinkVisual }>;
   selectionBox?: THREE.BoxHelper;
   /** Mesh references (ids and lower-case basenames) used by this entry: rebuilt when such an asset arrives. */
   meshKeys?: string[];
@@ -172,6 +174,8 @@ export class SceneRenderer {
     this.renderer.domElement.addEventListener('pointerup', (e) => this.onPointerUp(e));
     this.renderer.domElement.addEventListener('dblclick', (e) => this.focusAt(e));
     window.addEventListener('resize', () => this.resize());
+    // the viewport also changes size when a side panel is resized or collapsed
+    if (typeof ResizeObserver !== 'undefined') new ResizeObserver(() => this.resize()).observe(this.canvasHost);
     // an asset that arrives (or changes) rebuilds exactly the entries referencing it (late URDF meshes replace placeholders)
     this.assets.onChange((id) => this.onAssetChanged(id));
     this.bindStation(station);
@@ -572,8 +576,18 @@ export class SceneRenderer {
       g.matrixAutoUpdate = false;
       g.userData.itemId = robot.id;
       const link = chain.links[i];
-      if (link.visuals.length) g.add(buildLinkVisuals(link.visuals, this.assets, color));
-      else if (!hasMeshes) this.addProceduralLink(g, robot, i, fk, reach, color);
+      const rigid = link.visuals.filter((v) => !v.passive);
+      if (rigid.length) g.add(buildLinkVisuals(rigid, this.assets, color));
+      for (const v of link.visuals) {
+        if (!v.passive) continue;
+        const pg = new THREE.Group();
+        pg.matrixAutoUpdate = false;
+        pg.matrix.copy(mat4ToThree(visualOrigin(fk.linkPoses, i, v)));
+        pg.add(buildLinkVisuals([{ ...v, origin: fromArray([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]) }], this.assets, color));
+        g.add(pg);
+        (e.passive ??= []).push({ group: pg, link: i, visual: v });
+      }
+      if (!link.visuals.length && !hasMeshes) this.addProceduralLink(g, robot, i, fk, reach, color);
       links.push(g);
       e.root.add(g);
     }
@@ -953,6 +967,7 @@ export class SceneRenderer {
       if (item instanceof Robot && e.links) {
         const fk = item.fk();
         e.links.forEach((g, i) => g.matrix.copy(mat4ToThree(fk.linkPoses[i] ?? fk.linkPoses[fk.linkPoses.length - 1])));
+        for (const p of e.passive ?? []) p.group.matrix.copy(mat4ToThree(visualOrigin(fk.linkPoses, p.link, p.visual)));
         e.flangeGroup?.matrix.copy(mat4ToThree(fk.flange));
       }
       if (item instanceof MobileRobot) {

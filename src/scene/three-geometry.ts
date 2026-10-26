@@ -127,18 +127,19 @@ function flipWinding(positions: Float32Array): Float32Array {
 export function meshDataToGeometry(m: MeshData): THREE.BufferGeometry {
   // textured meshes keep their corners (welding by position would merge UV seams)
   const textured = !!m.uvs && !!m.materials?.some((x) => x.map);
-  // a closed mesh wound inwards (mirrored *_l STLs of the MUROM v1 arms) would be culled: turn it outwards; meshes that
-  // cannot be turned (authored normals, textures) or are open (no inside) are drawn double-sided, as Webots / RoboDK do
+  // a closed mesh wound inwards (mirrored *_l STLs of the MUROM v1 arms) is turned outwards so it is lit correctly; every
+  // mesh is drawn double-sided as RoboDK does: thin shells (a car windshield, a sheet part) have no reliable inside, and a
+  // volume test misjudges them, so their back faces vanished
   const { volume, box } = soupVolume(m.positions);
   const closed = box > 0 && Math.abs(volume) > 0.02 * box;
   const inwards = closed && volume < 0;
   if (!textured && !authoredSmoothNormals(m)) {
     const g = addMeshGroups(smoothTriangleSoup(inwards ? flipWinding(m.positions) : m.positions), m);
-    g.userData.doubleSided = !closed;
+    g.userData.doubleSided = true;
     return g;
   }
   const g = new THREE.BufferGeometry();
-  g.userData.doubleSided = !closed || inwards;
+  g.userData.doubleSided = true;
   g.setAttribute('position', new THREE.BufferAttribute(m.positions, 3));
   g.setAttribute('normal', new THREE.BufferAttribute(m.normals, 3));
   if (m.uvs && m.uvs.length === (m.positions.length / 3) * 2) g.setAttribute('uv', new THREE.BufferAttribute(m.uvs, 2));

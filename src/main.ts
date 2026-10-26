@@ -2,6 +2,7 @@ import './ui/styles.css';
 import { App } from './app';
 import { TreePanel } from './ui/tree';
 import { PropertiesPanel } from './ui/properties';
+import { sideDock } from './ui/side_panels';
 import { BottomPanel } from './ui/bottom';
 import { MenuBar } from './ui/menu';
 import { h, toast, contextMenu } from './ui/dom';
@@ -50,9 +51,9 @@ const status = h('div', { class: 'statusbar' }, 'Ready');
 const layout = h('div', { class: 'layout' },
   menu.el,
   h('div', { class: 'main' },
-    tree.el,
+    sideDock(tree.el, { side: 'left', title: 'Station', defaultWidth: 290, key: 'vbs.dock.tree' }).el,
     h('div', { class: 'center' }, tabs.el, toolbar, viewport, bottom.el),
-    props.el),
+    sideDock(props.el, { side: 'right', title: 'Properties', defaultWidth: 330, key: 'vbs.dock.props' }).el),
   status);
 document.body.appendChild(layout);
 app.mount(viewport);

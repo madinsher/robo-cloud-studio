@@ -103,9 +103,22 @@ describe('mesh units and winding (V5 / V7 findings)', () => {
     const gOut = meshDataToGeometry(mesh(out)), gMir = meshDataToGeometry(mesh(mirrored));
     expect(signedVolume(gOut)).toBeCloseTo(100 * 50 * 20, 0);
     expect(signedVolume(gMir)).toBeCloseTo(100 * 50 * 20, 0);   // was -100000: every face back-facing, the forearm invisible
-    expect(gMir.userData.doubleSided).toBe(false);
-    // an open surface has no inside: drawn from both sides
+    // every mesh is drawn from both sides, as RoboDK does (closed, turned or open)
+    expect(gMir.userData.doubleSided).toBe(true);
     const open = new Float32Array(out.slice(0, 18));
     expect(meshDataToGeometry(mesh(open)).userData.doubleSided).toBe(true);
+  });
+  it('a thin curved shell whose signed volume looks closed is still drawn from both sides (painted part, windshield)', () => {
+    // a half-cylinder strip (no caps): its signed volume about the origin is large, but it has no inside
+    const pts: number[] = [];
+    const R = 400, H = 300, n = 24;
+    for (let k = 0; k < n; k++) {
+      const a0 = (Math.PI * k) / n, a1 = (Math.PI * (k + 1)) / n;
+      const p = (a: number, z: number) => [R * Math.cos(a), R * Math.sin(a) + 500, z];
+      pts.push(...p(a0, 0), ...p(a1, 0), ...p(a1, H), ...p(a0, 0), ...p(a1, H), ...p(a0, H));
+    }
+    const positions = new Float32Array(pts);
+    const g = meshDataToGeometry({ positions, normals: new Float32Array(0), min: [0, 0, 0], max: [0, 0, 0], triangles: positions.length / 9 });
+    expect(g.userData.doubleSided).toBe(true);
   });
 });
